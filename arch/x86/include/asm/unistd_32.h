@@ -340,6 +340,7 @@
 #define __NR_inotify_init1	332
 #define __NR_preadv		333
 #define __NR_pwritev		334
+#define __NR_perf_counter_open	335
 
 #ifdef __KERNEL__
 
