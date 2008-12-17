@@ -34,7 +34,7 @@
 #include <linux/smp.h>
 #include <linux/mm.h>
 
-#include <asm/intel_arch_perfmon.h>
+#include <asm/perf_counter.h>
 #include <asm/pgalloc.h>
 #include <asm/atomic.h>
 #include <asm/mpspec.h>
