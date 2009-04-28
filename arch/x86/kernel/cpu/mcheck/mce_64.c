@@ -617,6 +617,21 @@ static void mce_cpu_quirks(struct cpuinfo_x86 *c)
 
 }
 
+static void __cpuinit mce_ancient_init(struct cpuinfo_x86 *c)
+{
+	if (c->x86 != 5)
+		return;
+	switch (c->x86_vendor) {
+	case X86_VENDOR_INTEL:
+		if (mce_p5_enabled())
+			intel_p5_mcheck_init(c);
+		break;
+	case X86_VENDOR_CENTAUR:
+		winchip_mcheck_init(c);
+		break;
+	}
+}
+
 static void mce_cpu_features(struct cpuinfo_x86 *c)
 {
 	switch (c->x86_vendor) {
@@ -650,6 +665,11 @@ static void mce_init_timer(void)
  */
 void __cpuinit mcheck_init(struct cpuinfo_x86 *c)
 {
+	if (mce_dont_init)
+		return;
+
+	mce_ancient_init(c);
+
 	if (!mce_available(c))
 		return;
 
@@ -846,6 +866,10 @@ static int __init mcheck_disable(char *str)
    mce=nobootlog Don't log MCEs from before booting. */
 static int __init mcheck_enable(char *str)
 {
+	if (*str == 0)
+		enable_p5_mce();
+	if (*str == '=')
+		str++;
 	if (!strcmp(str, "off"))
 		mce_dont_init = 1;
 	else if (!strcmp(str, "bootlog") || !strcmp(str,"nobootlog"))
@@ -853,12 +877,12 @@ static int __init mcheck_enable(char *str)
 	else if (isdigit(str[0]))
 		get_option(&str, &tolerant);
 	else
-		printk("mce= argument %s ignored. Please use /sys", str);
+		printk("mce argument %s ignored. Please use /sys", str);
 	return 1;
 }
 
 __setup("nomce", mcheck_disable);
-__setup("mce=", mcheck_enable);
+__setup("mce", mcheck_enable);
 
 /*
  * Sysfs support

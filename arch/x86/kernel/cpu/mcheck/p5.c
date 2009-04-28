@@ -15,6 +15,9 @@
 
 #include "mce.h"
 
+/* By default disabled */
+int		mce_p5_enable;
+
 /* Machine check handler for Pentium class Intel */
 static void pentium_machine_check(struct pt_regs *regs, long error_code)
 {
@@ -36,9 +39,12 @@ void intel_p5_mcheck_init(struct cpuinfo_x86 *c)
 	if (!cpu_has(c, X86_FEATURE_MCE))
 		return;
 
+#ifdef CONFIG_X86_OLD_MCE
 	/* Default P5 to off as its often misconnected */
 	if (mce_disabled != -1)
 		return;
+#endif
+
 	machine_check_vector = pentium_machine_check;
 	wmb();
 
