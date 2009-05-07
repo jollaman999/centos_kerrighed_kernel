@@ -3649,6 +3649,8 @@ link_up:
 			 */
 			adapter->tx_timeout_count++;
 			schedule_work(&adapter->reset_task);
+			/* return immediately since reset is imminent */
+			return;
 		}
 	}
 

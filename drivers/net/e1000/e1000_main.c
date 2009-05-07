@@ -2645,6 +2645,8 @@ static void e1000_watchdog(unsigned long data)
 			 * (Do the reset outside of interrupt context). */
 			adapter->tx_timeout_count++;
 			schedule_work(&adapter->reset_task);
+			/* return immediately since reset is imminent */
+			return;
 		}
 	}
 
