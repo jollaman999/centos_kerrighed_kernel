@@ -1225,7 +1225,9 @@ int mp_register_gsi(struct device *dev, u32 gsi, int triggering, int polarity)
 		       ioapic_pin);
 		return gsi;
 	}
-	mp_config_acpi_gsi(dev, gsi, triggering, polarity);
+
+	if (enable_update_mptable)
+		mp_config_acpi_gsi(dev, gsi, triggering, polarity);
 
 	io_apic_set_pci_routing(dev, ioapic, ioapic_pin, gsi,
 				triggering == ACPI_EDGE_SENSITIVE ? 0 : 1,
