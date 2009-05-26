@@ -3977,6 +3977,7 @@ int __init io_apic_get_unique_id(int ioapic, int apic_id)
 
 	return apic_id;
 }
+#endif
 
 int __init io_apic_get_version(int ioapic)
 {
@@ -3989,7 +3990,6 @@ int __init io_apic_get_version(int ioapic)
 
 	return reg_01.bits.version;
 }
-#endif
 
 static int __io_apic_set_pci_routing(struct device *dev, int ioapic, int pin, int irq,
 				 int triggering, int polarity)
