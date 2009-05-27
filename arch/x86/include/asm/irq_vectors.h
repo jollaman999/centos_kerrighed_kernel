@@ -90,8 +90,8 @@
 #ifdef CONFIG_X86_32
 /* 0xf8 - 0xf9 : free */
 #else
-# define THRESHOLD_APIC_VECTOR		0xf9
-# define UV_BAU_MESSAGE			0xf8
+#define REBOOT_VECTOR			0xf8
+#define THRESHOLD_APIC_VECTOR		0xf9
 #endif
 
 /* f0-f7 used for spreading out TLB flushes: */
@@ -115,6 +115,8 @@
  * Generic system vector for platform specific use
  */
 #define GENERIC_INTERRUPT_VECTOR	0xed
+
+#define UV_BAU_MESSAGE			0xec
 
 /*
  * First APIC vector available to drivers: (vectors 0x30-0xee) we
