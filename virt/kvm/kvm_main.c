@@ -577,8 +577,7 @@ static bool make_all_cpus_request(struct kvm *kvm, unsigned int req)
 	bool called = true;
 	struct kvm_vcpu *vcpu;
 
-	if (alloc_cpumask_var(&cpus, GFP_ATOMIC))
-		cpumask_clear(cpus);
+	zalloc_cpumask_var(&cpus, GFP_ATOMIC);
 
 	me = get_cpu();
 	for (i = 0; i < KVM_MAX_VCPUS; ++i) {

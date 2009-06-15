@@ -894,13 +894,12 @@ static int efx_wanted_rx_queues(void)
 	int count;
 	int cpu;
 
-	if (!alloc_cpumask_var(&core_mask, GFP_KERNEL)) {
+	if (!zalloc_cpumask_var(&core_mask, GFP_KERNEL)) {
 		printk(KERN_WARNING
 		       "efx.c: allocation failure, irq balancing hobbled\n");
 		return 1;
 	}
 
-	cpumask_clear(core_mask);
 	count = 0;
 	for_each_online_cpu(cpu) {
 		if (!cpumask_test_cpu(cpu, core_mask)) {
