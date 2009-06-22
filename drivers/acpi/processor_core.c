@@ -79,7 +79,6 @@ MODULE_DESCRIPTION("ACPI Processor Driver");
 MODULE_LICENSE("GPL");
 
 static int acpi_processor_add(struct acpi_device *device);
-static int acpi_processor_start(struct acpi_device *device);
 static int acpi_processor_remove(struct acpi_device *device, int type);
 #ifdef CONFIG_ACPI_PROCFS
 static int acpi_processor_info_open_fs(struct inode *inode, struct file *file);
@@ -103,7 +102,6 @@ static struct acpi_driver acpi_processor_driver = {
 	.ops = {
 		.add = acpi_processor_add,
 		.remove = acpi_processor_remove,
-		.start = acpi_processor_start,
 		.suspend = acpi_processor_suspend,
 		.resume = acpi_processor_resume,
 		.notify = acpi_processor_notify,
@@ -773,10 +771,8 @@ static struct notifier_block acpi_cpu_notifier =
 static int acpi_processor_add(struct acpi_device *device)
 {
 	struct acpi_processor *pr = NULL;
-
-
-	if (!device)
-		return -EINVAL;
+	int result = 0;
+	struct sys_device *sysdev;
 
 	pr = kzalloc(sizeof(struct acpi_processor), GFP_KERNEL);
 	if (!pr)
@@ -791,17 +787,6 @@ static int acpi_processor_add(struct acpi_device *device)
 	strcpy(acpi_device_name(device), ACPI_PROCESSOR_DEVICE_NAME);
 	strcpy(acpi_device_class(device), ACPI_PROCESSOR_CLASS);
 	device->driver_data = pr;
-
-	return 0;
-}
-
-static int __cpuinit acpi_processor_start(struct acpi_device *device)
-{
-	int result = 0;
-	struct acpi_processor *pr;
-	struct sys_device *sysdev;
-
-	pr = acpi_driver_data(device);
 
 	result = acpi_processor_get_info(device);
 	if (result) {
@@ -820,7 +805,8 @@ static int __cpuinit acpi_processor_start(struct acpi_device *device)
 	    per_cpu(processor_device_array, pr->id) != device) {
 		printk(KERN_WARNING "BIOS reported wrong ACPI id "
 			"for the processor\n");
-		return -ENODEV;
+		result = -ENODEV;
+		goto err_free_cpumask;
 	}
 	per_cpu(processor_device_array, pr->id) = device;
 
@@ -828,7 +814,7 @@ static int __cpuinit acpi_processor_start(struct acpi_device *device)
 
 	result = acpi_processor_add_fs(device);
 	if (result)
-		return result;
+		goto err_free_cpumask;
 
 	sysdev = get_cpu_sysdev(pr->id);
 	if (sysfs_create_link(&device->dev.kobj, &sysdev->kobj, "sysdev")) {
@@ -892,6 +878,8 @@ err_power_exit:
 	acpi_processor_power_exit(pr, device);
 err_remove_fs:
 	acpi_processor_remove_fs(device);
+err_free_cpumask:
+	free_cpumask_var(pr->throttling.shared_cpu_map);
 
 	return result;
 }
@@ -970,7 +958,6 @@ int acpi_processor_device_add(acpi_handle handle, struct acpi_device **device)
 {
 	acpi_handle phandle;
 	struct acpi_device *pdev;
-	struct acpi_processor *pr;
 
 
 	if (acpi_get_parent(handle, &phandle)) {
@@ -984,12 +971,6 @@ int acpi_processor_device_add(acpi_handle handle, struct acpi_device **device)
 	if (acpi_bus_add(device, pdev, handle, ACPI_BUS_TYPE_PROCESSOR)) {
 		return -ENODEV;
 	}
-
-	acpi_bus_start(*device);
-
-	pr = acpi_driver_data(*device);
-	if (!pr)
-		return -ENODEV;
 
 	return 0;
 }
@@ -1020,17 +1001,6 @@ static void __ref acpi_processor_hotplug_notify(acpi_handle handle,
 					    "Unable to add the device\n");
 			break;
 		}
-
-		pr = acpi_driver_data(device);
-		if (!pr) {
-			printk(KERN_ERR PREFIX "Driver data is NULL\n");
-			break;
-		}
-
-		result = acpi_processor_start(device);
-		if (result)
-			printk(KERN_ERR PREFIX "Device [%s] failed to start\n",
-				    acpi_device_bid(device));
 		break;
 	case ACPI_NOTIFY_EJECT_REQUEST:
 		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
