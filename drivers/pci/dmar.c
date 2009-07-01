@@ -33,6 +33,7 @@
 #include <linux/timer.h>
 #include <linux/irq.h>
 #include <linux/interrupt.h>
+#include <asm/tboot.h>
 
 #define PREFIX "DMAR: "
 
@@ -327,6 +328,12 @@ parse_dmar_table(void)
 	 * fixed map.
 	 */
 	dmar_table_detect();
+
+	/*
+	 * ACPI tables may not be DMA protected by tboot, so use DMAR copy
+	 * SINIT saved in SinitMleData in TXT heap (which is DMA protected)
+	 */
+	dmar_tbl = tboot_get_dmar_table(dmar_tbl);
 
 	dmar = (struct acpi_table_dmar *)dmar_tbl;
 	if (!dmar)
