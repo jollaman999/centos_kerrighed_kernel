@@ -1135,6 +1135,9 @@ static int __init acpi_processor_init(void)
 {
 	int result = 0;
 
+	if (acpi_disabled)
+		return 0;
+
 	memset(&errata, 0, sizeof(errata));
 
 #ifdef CONFIG_SMP
@@ -1183,6 +1186,9 @@ out_proc:
 
 static void __exit acpi_processor_exit(void)
 {
+	if (acpi_disabled)
+		return;
+
 	acpi_processor_ppc_exit();
 
 	acpi_thermal_cpufreq_exit();
