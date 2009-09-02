@@ -3,6 +3,7 @@
 #include <linux/init.h>
 #include <linux/pm.h>
 #include <linux/efi.h>
+#include <linux/tboot.h>
 #include <acpi/reboot.h>
 #include <asm/io.h>
 #include <asm/apic.h>
