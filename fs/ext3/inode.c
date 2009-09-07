@@ -2907,6 +2907,10 @@ static int ext3_do_update_inode(handle_t *handle,
 	struct buffer_head *bh = iloc->bh;
 	int err = 0, rc, block;
 
+again:
+	/* we can't allow multiple procs in here at once, its a bit racey */
+	lock_buffer(bh);
+
 	/* For fields not not tracking in the in-memory inode,
 	 * initialise them to zero for new inodes. */
 	if (ei->i_state & EXT3_STATE_NEW)
@@ -2966,10 +2970,12 @@ static int ext3_do_update_inode(handle_t *handle,
 			       /* If this is the first large file
 				* created, add a flag to the superblock.
 				*/
+				unlock_buffer(bh);
 				err = ext3_journal_get_write_access(handle,
 						EXT3_SB(sb)->s_sbh);
 				if (err)
 					goto out_brelse;
+
 				ext3_update_dynamic_rev(sb);
 				EXT3_SET_RO_COMPAT_FEATURE(sb,
 					EXT3_FEATURE_RO_COMPAT_LARGE_FILE);
@@ -2977,6 +2983,8 @@ static int ext3_do_update_inode(handle_t *handle,
 				handle->h_sync = 1;
 				err = ext3_journal_dirty_metadata(handle,
 						EXT3_SB(sb)->s_sbh);
+				/* get our lock and start over */
+				goto again;
 			}
 		}
 	}
@@ -2999,6 +3007,7 @@ static int ext3_do_update_inode(handle_t *handle,
 		raw_inode->i_extra_isize = cpu_to_le16(ei->i_extra_isize);
 
 	BUFFER_TRACE(bh, "call ext3_journal_dirty_metadata");
+	unlock_buffer(bh);
 	rc = ext3_journal_dirty_metadata(handle, bh);
 	if (!err)
 		err = rc;
