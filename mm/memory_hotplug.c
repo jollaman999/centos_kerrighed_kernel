@@ -26,6 +26,7 @@
 #include <linux/migrate.h>
 #include <linux/page-isolation.h>
 #include <linux/pfn.h>
+#include <linux/firmware-map.h>
 
 #include <asm/tlbflush.h>
 
@@ -508,6 +509,9 @@ int __ref add_memory(int nid, u64 start, u64 size)
 		 */
 		BUG_ON(ret);
 	}
+
+	/* create new memmap entry */
+	firmware_map_add_hotplug(start, start + size, "System RAM");
 
 	return ret;
 error:
