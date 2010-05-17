@@ -21,6 +21,7 @@ unsigned long idle_nomwait;
 EXPORT_SYMBOL(idle_nomwait);
 
 struct kmem_cache *task_xstate_cachep;
+EXPORT_SYMBOL_GPL(task_xstate_cachep);
 
 DEFINE_TRACE(power_start);
 DEFINE_TRACE(power_end);

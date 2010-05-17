@@ -502,4 +502,8 @@ static inline void fpu_copy(struct fpu *dst, struct fpu *src)
 	memcpy(dst->state, src->state, xstate_size);
 }
 
+extern void fpu_finit(struct fpu *fpu);
+
+#endif /* __ASSEMBLY__ */
+
 #endif /* _ASM_X86_I387_H */
