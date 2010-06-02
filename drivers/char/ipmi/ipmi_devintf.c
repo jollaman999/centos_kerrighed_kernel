@@ -43,7 +43,6 @@
 #include <linux/init.h>
 #include <linux/device.h>
 #include <linux/compat.h>
-#include <linux/smp_lock.h>
 
 struct ipmi_file_private
 {
@@ -58,6 +57,7 @@ struct ipmi_file_private
 	unsigned int         default_retry_time_ms;
 };
 
+static DEFINE_MUTEX(ipmi_mutex);
 static void file_receive_handler(struct ipmi_recv_msg *msg,
 				 void                 *handler_data)
 {
@@ -101,9 +101,9 @@ static int ipmi_fasync(int fd, struct file *file, int on)
 	struct ipmi_file_private *priv = file->private_data;
 	int                      result;
 
-	lock_kernel(); /* could race against open() otherwise */
+	mutex_lock(&ipmi_mutex); /* could race against open() otherwise */
 	result = fasync_helper(fd, file, on, &priv->fasync_queue);
-	unlock_kernel();
+	mutex_unlock(&ipmi_mutex);
 
 	return (result);
 }
@@ -124,7 +124,7 @@ static int ipmi_open(struct inode *inode, struct file *file)
 	if (!priv)
 		return -ENOMEM;
 
-	lock_kernel();
+	mutex_lock(&ipmi_mutex);
 	priv->file = file;
 
 	rv = ipmi_create_user(if_num,
@@ -149,7 +149,7 @@ static int ipmi_open(struct inode *inode, struct file *file)
 	priv->default_retry_time_ms = 0;
 
 out:
-	unlock_kernel();
+	mutex_unlock(&ipmi_mutex);
 	return rv;
 }
 
