@@ -77,7 +77,7 @@ static __always_inline __pure bool use_eager_fpu(void)
 
 static __always_inline __pure bool use_xsaveopt(void)
 {
-	return 0;
+	return static_cpu_has(X86_FEATURE_XSAVEOPT);
 }
 
 static __always_inline __pure bool use_xsave(void)
