@@ -5,6 +5,8 @@
 #include <asm/processor.h>
 #include <asm/i387.h>
 
+#define XSTATE_CPUID		0x0000000d
+
 #define XSTATE_FP	0x1
 #define XSTATE_SSE	0x2
 #define XSTATE_YMM	0x4
