@@ -1232,13 +1232,6 @@ void __cpuinit cpu_init(void)
 
 	clear_all_debug_regs();
 
-	/*
-	 * Force FPU initialization:
-	 */
-	current_thread_info()->status = 0;
-	clear_used_math();
-	mxcsr_feature_mask_init();
-
 	fpu_init();
 	xsave_init();
 }
