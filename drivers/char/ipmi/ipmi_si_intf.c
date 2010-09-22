@@ -305,6 +305,9 @@ static int num_force_kipmid;
 #ifdef CONFIG_PCI
 static int pci_registered;
 #endif
+#ifdef CONFIG_ACPI
+static int pnp_registered;
+#endif
 #ifdef CONFIG_PPC_OF
 static int of_registered;
 #endif
@@ -3356,6 +3359,7 @@ static __devinit int init_ipmi_si(void)
 
 #ifdef CONFIG_ACPI
 	pnp_register_driver(&ipmi_pnp_driver);
+	pnp_registered = 1;
 #endif
 
 #ifdef CONFIG_DMI
@@ -3522,8 +3526,9 @@ static __exit void cleanup_ipmi_si(void)
 	if (pci_registered)
 		pci_unregister_driver(&ipmi_pci_driver);
 #endif
-#ifdef CONFIG_PNP
-	pnp_unregister_driver(&ipmi_pnp_driver);
+#ifdef CONFIG_ACPI
+	if (pnp_registered)
+		pnp_unregister_driver(&ipmi_pnp_driver);
 #endif
 
 #ifdef CONFIG_PPC_OF
