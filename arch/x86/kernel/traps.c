@@ -880,6 +880,7 @@ void math_emulate(struct math_emu_info *info)
 dotraplinkage void __kprobes
 do_device_not_available(struct pt_regs *regs, long error_code)
 {
+	WARN_ON_ONCE(!user_mode_vm(regs));
 #ifdef CONFIG_X86_32
 	if (read_cr0() & X86_CR0_EM) {
 		struct math_emu_info info = { };
