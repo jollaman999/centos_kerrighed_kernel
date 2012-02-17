@@ -414,6 +414,8 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	struct tss_struct *tss = &per_cpu(init_tss, cpu);
 	unsigned fsindex, gsindex;
 
+	__unlazy_fpu(prev_p);
+
 	/*
 	 * Reload esp0, LDT and the page table pointer:
 	 */
