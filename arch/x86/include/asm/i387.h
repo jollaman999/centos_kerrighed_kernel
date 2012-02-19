@@ -30,6 +30,8 @@ extern int init_fpu(struct task_struct *child);
 extern void math_state_restore(void);
 extern int dump_fpu(struct pt_regs *, struct user_i387_struct *);
 
+DECLARE_PER_CPU(struct task_struct *, fpu_owner_task);
+
 extern user_regset_active_fn fpregs_active, xfpregs_active;
 extern user_regset_get_fn fpregs_get, xfpregs_get, fpregs_soft_get,
 				xstateregs_get;
@@ -258,6 +260,8 @@ static inline int fpu_restore_checking(struct fpu *fpu)
 
 static inline int restore_fpu_checking(struct task_struct *tsk)
 {
+	struct thread_info *ti = task_thread_info(tsk);
+
 	/* AMD K7/K8 CPUs don't save/restore FDP/FIP/FOP unless an exception
 	   is pending.  Clear the x87 state here by setting it to fixed
 	   values. "m" is a random variable that should be in L1 */
@@ -266,7 +270,7 @@ static inline int restore_fpu_checking(struct task_struct *tsk)
 		"emms\n\t"	  	/* clear stack tags */
 		"fildl %P[addr]",	/* set F?P to defined value */
 		X86_FEATURE_FXSAVE_LEAK,
-		[addr] "m" (tsk->thread.has_fpu));
+		[addr] "m" (ti->status & TS_USEDFPU));
 
 	return fpu_restore_checking(&tsk->thread.fpu);
 }
@@ -285,12 +289,14 @@ static inline int __thread_has_fpu(struct thread_info *ti)
 static inline void __thread_clear_has_fpu(struct thread_info *ti)
 {
 	ti->status &= ~TS_USEDFPU;
+	percpu_write(fpu_owner_task, NULL);
 }
 
 /* Must be paired with a 'clts' before! */
 static inline void __thread_set_has_fpu(struct thread_info *ti)
 {
 	ti->status |= TS_USEDFPU;
+	percpu_write(fpu_owner_task, tsk);
 }
 
 /*
@@ -335,18 +341,22 @@ typedef struct { int preload; } fpu_switch_t;
  * We don't do that yet, so "fpu_lazy_restore()" always returns
  * false, but some day..
  */
-#define fpu_lazy_restore(tsk) (0)
-#define fpu_lazy_state_intact(tsk) do { } while (0)
+static inline int fpu_lazy_restore(struct task_struct *new, unsigned int cpu)
+{
+	return new == percpu_read_stable(fpu_owner_task) &&
+		cpu == new->thread.fpu.last_cpu;
+}
 
-static inline fpu_switch_t switch_fpu_prepare(struct task_struct *old, struct task_struct *new)
+static inline fpu_switch_t switch_fpu_prepare(struct task_struct *old, struct task_struct *new, int cpu)
 {
 	fpu_switch_t fpu;
 
 	fpu.preload = tsk_used_math(new) && new->fpu_counter > 5;
 	if (__thread_has_fpu(old)) {
-		if (__save_init_fpu(old))
-			fpu_lazy_state_intact(old);
-		__thread_clear_has_fpu(old);
+		if (!__save_init_fpu(old))
+			cpu = ~0;
+		old->thread.fpu.last_cpu = cpu;
+		old->thread.fpu.has_fpu = 0;	/* But leave fpu_owner_task! */
 
 		/* Don't change CR0.TS if we just switch! */
 		if (fpu.preload) {
@@ -357,9 +367,10 @@ static inline fpu_switch_t switch_fpu_prepare(struct task_struct *old, struct ta
 			stts();
 	} else {
 		old->fpu_counter = 0;
+		old->thread.fpu.last_cpu = ~0;
 		if (fpu.preload) {
 			new->fpu_counter++;
-			if (fpu_lazy_restore(new))
+			if (fpu_lazy_restore(new, cpu))
 				fpu.preload = 0;
 			else
 				prefetch(new->thread.fpu.state);
@@ -453,8 +464,10 @@ static inline void kernel_fpu_begin(void)
 		__save_init_fpu(me->task);
 		__thread_clear_has_fpu(me);
 		/* We do 'stts()' in kernel_fpu_end() */
-	} else
+	} else {
+		percpu_write(fpu_owner_task, NULL);
 		clts();
+	}
 }
 
 static inline void kernel_fpu_end(void)
