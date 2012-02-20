@@ -313,6 +313,7 @@ int copy_thread(unsigned long clone_flags, unsigned long sp,
 		set_tsk_thread_flag(p, TIF_MIGRATION);
 #endif
 
+	p->fpu_counter = 0;
 	p->thread.fs = me->thread.fs;
 	p->thread.gs = me->thread.gs;
 

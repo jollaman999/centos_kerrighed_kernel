@@ -272,6 +272,7 @@ int copy_thread(unsigned long clone_flags, unsigned long sp,
 #endif
 	task_user_gs(p) = get_user_gs(regs);
 
+	p->fpu_counter = 0;
 	tsk = current;
 	if (unlikely(test_tsk_thread_flag(tsk, TIF_IO_BITMAP))) {
 		p->thread.io_bitmap_ptr = kmemdup(tsk->thread.io_bitmap_ptr,
