@@ -20,7 +20,15 @@
 /*
  * Were we in an interrupt that interrupted kernel mode?
  *
- * We can do a kernel_fpu_begin/end() pair *ONLY* if that
+ * For now, on xsave platforms we will return interrupted
+ * kernel FPU as not-idle. TBD: As we use non-lazy FPU restore
+ * for xsave platforms, ideally we can change the return value
+ * to something like __thread_has_fpu(current). But we need to
+ * be careful of doing __thread_clear_has_fpu() before saving
+ * the FPU etc for supporting nested uses etc. For now, take
+ * the simple route!
+ *
+ * On others, we can do a kernel_fpu_begin/end() pair *ONLY* if that
  * pair does nothing at all: the thread must not have fpu (so
  * that we don't try to save the FPU state), and TS must
  * be set (so that the clts/stts pair does nothing that is
@@ -28,6 +36,9 @@
  */
 static inline bool interrupted_kernel_fpu_idle(void)
 {
+	if (use_xsave())
+		return 0;
+
 	return !__thread_has_fpu(current_thread_info()) &&
 		(read_cr0() & X86_CR0_TS);
 }
@@ -71,7 +82,7 @@ void kernel_fpu_begin(void)
 		__save_init_fpu(me);
 		__thread_clear_has_fpu(me);
 		/* We do 'stts()' in kernel_fpu_end() */
-	} else {
+	} else if (!use_xsave()) {
 		percpu_write(fpu_owner_task, NULL);
 		clts();
 	}
@@ -80,7 +91,10 @@ EXPORT_SYMBOL(kernel_fpu_begin);
 
 void kernel_fpu_end(void)
 {
-	stts();
+	if (use_xsave())
+		math_state_restore();
+	else
+		stts();
 	preempt_enable();
 }
 EXPORT_SYMBOL(kernel_fpu_end);

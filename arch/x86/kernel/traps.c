@@ -839,11 +839,12 @@ void math_state_restore(void)
 	}
 
 	__thread_fpu_begin(thread);
+
 	/*
 	 * Paranoid restore. send a SIGSEGV if we fail to restore the state.
 	 */
 	if (unlikely(restore_fpu_checking(tsk))) {
-		__thread_fpu_end(task_thread_info(tsk));
+		drop_init_fpu(tsk);
 		force_sig(SIGSEGV, tsk);
 		return;
 	}
@@ -866,6 +867,8 @@ void math_emulate(struct math_emu_info *info)
 dotraplinkage void __kprobes
 do_device_not_available(struct pt_regs *regs, long error_code)
 {
+	BUG_ON(use_xsave());
+
 #ifdef CONFIG_X86_32
 	if (read_cr0() & X86_CR0_EM) {
 		struct math_emu_info info = { };
