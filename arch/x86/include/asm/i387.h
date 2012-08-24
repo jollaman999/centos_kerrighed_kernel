@@ -524,17 +524,12 @@ static inline void save_init_fpu(struct task_struct *tsk)
 
 extern void unlazy_fpu(struct task_struct *tsk);
 
-static inline void stop_fpu_preload(struct task_struct *tsk)
-{
-	tsk->fpu_counter = 0;
-}
-
 static inline void drop_fpu(struct task_struct *tsk)
 {
 	/*
 	 * Forget coprocessor state..
 	 */
-	stop_fpu_preload(tsk);
+	tsk->fpu_counter = 0;
 	preempt_disable();
 	__drop_fpu(tsk);
 	preempt_enable();
