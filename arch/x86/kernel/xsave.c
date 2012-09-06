@@ -567,9 +567,11 @@ static void __init xstate_enable_boot_cpu(void)
 	prepare_fx_sw_frame();
 	setup_init_fpu_buf();
 
-	printk(KERN_INFO "xsave/xrstor: enabled xstate_bv 0x%llx, "
-	       "cntxt size 0x%x\n",
-	       pcntxt_mask, xstate_size);
+	if (cpu_has_xsaveopt && !disable_eagerfpu)
+		setup_force_cpu_cap(X86_FEATURE_EAGER_FPU);
+
+	pr_info("enabled xstate_bv 0x%llx, cntxt size 0x%x\n",
+		pcntxt_mask, xstate_size);
 }
 
 /*
