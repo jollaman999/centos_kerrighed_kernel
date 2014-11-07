@@ -1031,19 +1031,22 @@ static const struct rapl_defaults rapl_defaults_atom = {
 		}
 
 static const struct x86_cpu_id rapl_ids[] = {
-	RAPL_CPU(0x2a, rapl_defaults_core),/* Sandy Bridge */
-	RAPL_CPU(0x2d, rapl_defaults_core),/* Sandy Bridge EP */
+	RAPL_CPU(0x2A, rapl_defaults_core),/* Sandy Bridge */
+	RAPL_CPU(0x2D, rapl_defaults_core),/* Sandy Bridge EP */
 	RAPL_CPU(0x37, rapl_defaults_byt),/* Valleyview */
-	RAPL_CPU(0x3a, rapl_defaults_core),/* Ivy Bridge */
-	RAPL_CPU(0x3c, rapl_defaults_core),/* Haswell */
-	RAPL_CPU(0x3d, rapl_defaults_core),/* Broadwell */
-	RAPL_CPU(0x3f, rapl_defaults_core),/* Haswell servers */
-	RAPL_CPU(0x4f, rapl_defaults_core),/* Broadwell servers */
+	RAPL_CPU(0x3A, rapl_defaults_core),/* Ivy Bridge */
+	RAPL_CPU(0x3C, rapl_defaults_core),/* Haswell */
+	RAPL_CPU(0x3D, rapl_defaults_core),/* Broadwell */
+	RAPL_CPU(0x3F, rapl_defaults_core),/* Haswell servers */
+	RAPL_CPU(0x4A, rapl_defaults_atom),/* Tangier */
+	RAPL_CPU(0x4C, rapl_defaults_atom),/* Braswell */
+	RAPL_CPU(0x4F, rapl_defaults_core),/* Broadwell servers */
 	RAPL_CPU(0x45, rapl_defaults_core),/* Haswell ULT */
 	RAPL_CPU(0x46, rapl_defaults_core),/* Haswell */
 	RAPL_CPU(0x47, rapl_defaults_core),/* Broadwell-H */
 	RAPL_CPU(0x4E, rapl_defaults_core),/* Skylake */
 	RAPL_CPU(0x56, rapl_defaults_core),/* Future Xeon */
+	RAPL_CPU(0x5A, rapl_defaults_atom),/* Annidale */
 	RAPL_CPU(0x5E, rapl_defaults_core),/* Skylake-H/S */
 	/* TODO: Add more CPU IDs after testing */
 	{}
