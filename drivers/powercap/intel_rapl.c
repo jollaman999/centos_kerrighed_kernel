@@ -188,6 +188,15 @@ struct rapl_package {
 					*/
 	struct list_head plist;
 };
+
+struct rapl_defaults {
+	int (*check_unit)(struct rapl_package *rp, int cpu);
+	void (*set_floor_freq)(struct rapl_domain *rd, bool mode);
+	u64 (*compute_time_window)(struct rapl_package *rp, u64 val,
+				bool to_raw);
+};
+static struct rapl_defaults *rapl_defaults;
+
 #define PACKAGE_PLN_INT_SAVED   BIT(0)
 #define MAX_PRIM_NAME (32)
 
@@ -946,20 +955,34 @@ static void package_power_limit_irq_restore(int package_id)
 	wrmsr_on_cpu(cpu, MSR_IA32_PACKAGE_THERM_INTERRUPT, l, h);
 }
 
+static const struct rapl_defaults rapl_defaults_core = {
+};
+
+static const struct rapl_defaults rapl_defaults_atom = {
+};
+
+#define RAPL_CPU(_model, _ops) {			\
+		.vendor = X86_VENDOR_INTEL,		\
+		.family = 6,				\
+		.model = _model,			\
+		.driver_data = (kernel_ulong_t)&_ops,	\
+		}
+
 static const struct x86_cpu_id rapl_ids[] = {
-	{ X86_VENDOR_INTEL, 6, 0x2a},/* Sandy Bridge */
-	{ X86_VENDOR_INTEL, 6, 0x2d},/* Sandy Bridge EP */
-	{ X86_VENDOR_INTEL, 6, 0x37},/* Valleyview */
-	{ X86_VENDOR_INTEL, 6, 0x3a},/* Ivy Bridge */
-	{ X86_VENDOR_INTEL, 6, 0x3c},/* Haswell */
-	{ X86_VENDOR_INTEL, 6, 0x3d},/* Broadwell */
-	{ X86_VENDOR_INTEL, 6, 0x3f},/* Haswell */
-	{ X86_VENDOR_INTEL, 6, 0x4f},/* Broadwell servers */
-	{ X86_VENDOR_INTEL, 6, 0x45},/* Haswell ULT */
-	{ X86_VENDOR_INTEL, 6, 0x47},/* Broadwell-H */
-	{ X86_VENDOR_INTEL, 6, 0x4E},/* Skylake */
-	{ X86_VENDOR_INTEL, 6, 0x56},/* Future Xeon */
-	{ X86_VENDOR_INTEL, 6, 0x5E},/* Skylake-H/S */
+	RAPL_CPU(0x2a, rapl_defaults_core),/* Sandy Bridge */
+	RAPL_CPU(0x2d, rapl_defaults_core),/* Sandy Bridge EP */
+	RAPL_CPU(0x37, rapl_defaults_byt),/* Valleyview */
+	RAPL_CPU(0x3a, rapl_defaults_core),/* Ivy Bridge */
+	RAPL_CPU(0x3c, rapl_defaults_core),/* Haswell */
+	RAPL_CPU(0x3d, rapl_defaults_core),/* Broadwell */
+	RAPL_CPU(0x3f, rapl_defaults_core),/* Haswell servers */
+	RAPL_CPU(0x4f, rapl_defaults_core),/* Broadwell servers */
+	RAPL_CPU(0x45, rapl_defaults_core),/* Haswell ULT */
+	RAPL_CPU(0x46, rapl_defaults_core),/* Haswell */
+	RAPL_CPU(0x47, rapl_defaults_core),/* Broadwell-H */
+	RAPL_CPU(0x4E, rapl_defaults_core),/* Skylake */
+	RAPL_CPU(0x56, rapl_defaults_core),/* Future Xeon */
+	RAPL_CPU(0x5E, rapl_defaults_core),/* Skylake-H/S */
 	/* TODO: Add more CPU IDs after testing */
 	{}
 };
@@ -1373,13 +1396,18 @@ static struct notifier_block rapl_cpu_notifier = {
 static int __init rapl_init(void)
 {
 	int ret = 0;
+	const struct x86_cpu_id *id;
 
-	if (!x86_match_cpu(rapl_ids)) {
+	id = x86_match_cpu(rapl_ids);
+	if (!id) {
 		pr_err("driver does not support CPU family %d model %d\n",
 			boot_cpu_data.x86, boot_cpu_data.x86_model);
 
 		return -ENODEV;
 	}
+
+	rapl_defaults = (struct rapl_defaults *)id->driver_data;
+
 	/* prevent CPU hotplug during detection */
 	get_online_cpus();
 	ret = rapl_detect_topology();
