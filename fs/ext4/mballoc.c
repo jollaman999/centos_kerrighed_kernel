@@ -23,7 +23,7 @@
 
 #include "mballoc.h"
 #include <linux/debugfs.h>
-#include <trace/events/ext4.h>
+#include <trace/ext4.h>
 
 /*
  * MUSTDO:

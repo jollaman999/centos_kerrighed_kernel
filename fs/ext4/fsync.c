@@ -32,7 +32,7 @@
 #include "ext4.h"
 #include "ext4_jbd2.h"
 
-#include <trace/events/ext4.h>
+#include <trace/ext4.h>
 
 /*
  * akpm: A new design for ext4_sync_file().
