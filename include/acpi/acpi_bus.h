@@ -53,6 +53,8 @@ acpi_evaluate_reference(acpi_handle handle,
 			struct acpi_object_list *arguments,
 			struct acpi_handle_list *list);
 
+bool acpi_has_method(acpi_handle handle, char *name);
+
 #ifdef CONFIG_ACPI
 
 #include <linux/proc_fs.h>

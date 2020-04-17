@@ -718,6 +718,32 @@ static int do_platform_entry(const char *filename,
 	return 1;
 }
 
+#if 0
+/* LOOKS like x86cpu:vendor:VVVV:family:FFFF:model:MMMM:feature:*,FEAT,*
+ * All fields are numbers. It would be nicer to use strings for vendor
+ * and feature, but getting those out of the build system here is too
+ * complicated.
+ */
+
+static int do_x86cpu_entry(const char *filename, struct x86_cpu_id *id,
+			   char *alias)
+{
+	id->feature = TO_NATIVE(id->feature);
+	id->family = TO_NATIVE(id->family);
+	id->model = TO_NATIVE(id->model);
+	id->vendor = TO_NATIVE(id->vendor);
+
+	strcpy(alias, "x86cpu:");
+	ADD(alias, "vendor:",  id->vendor != X86_VENDOR_ANY, id->vendor);
+	ADD(alias, ":family:", id->family != X86_FAMILY_ANY, id->family);
+	ADD(alias, ":model:",  id->model  != X86_MODEL_ANY,  id->model);
+	ADD(alias, ":feature:*,", id->feature != X86_FEATURE_ANY, id->feature);
+	strcat(alias, ",*");
+	return 1;
+}
+ADD_TO_DEVTABLE("x86cpu", struct x86_cpu_id, do_x86cpu_entry);
+#endif
+
 /* Ignore any prefix, eg. some architectures prepend _ */
 static inline int sym_is(const char *symbol, const char *name)
 {

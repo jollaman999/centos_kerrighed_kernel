@@ -6,6 +6,7 @@
 struct msr_info {
 	u32 msr_no;
 	u32 l, h;
+	u64 q;
 	int err;
 };
 
@@ -44,6 +45,31 @@ int wrmsr_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h)
 	rv.msr_no = msr_no;
 	rv.l = l;
 	rv.h = h;
+	err = smp_call_function_single(cpu, __wrmsr_on_cpu, &rv, 1);
+
+	return err;
+}
+
+int rdmsrl_on_cpu(unsigned int cpu, u32 msr_no, u64 *q)
+{
+	int err;
+	struct msr_info rv;
+
+	rv.msr_no = msr_no;
+	err = smp_call_function_single(cpu, __rdmsr_on_cpu, &rv, 1);
+	*q = rv.q;
+
+	return err;
+}
+
+int wrmsrl_on_cpu(unsigned int cpu, u32 msr_no, u64 q)
+{
+	int err;
+	struct msr_info rv;
+
+	rv.msr_no = msr_no;
+	rv.q = q;
+
 	err = smp_call_function_single(cpu, __wrmsr_on_cpu, &rv, 1);
 
 	return err;
@@ -93,5 +119,7 @@ int wrmsr_safe_on_cpu(unsigned int cpu, u32 msr_no, u32 l, u32 h)
 
 EXPORT_SYMBOL(rdmsr_on_cpu);
 EXPORT_SYMBOL(wrmsr_on_cpu);
+EXPORT_SYMBOL(rdmsrl_on_cpu);
+EXPORT_SYMBOL(wrmsrl_on_cpu);
 EXPORT_SYMBOL(rdmsr_safe_on_cpu);
 EXPORT_SYMBOL(wrmsr_safe_on_cpu);
