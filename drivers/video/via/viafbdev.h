@@ -96,9 +96,6 @@ extern int viafb_accel;
 extern int viafb_hotplug;
 extern int viafb_memsize;
 
-extern int strict_strtoul(const char *cp, unsigned int base,
-	unsigned long *res);
-
 void viafb_memory_pitch_patch(struct fb_info *info);
 void viafb_fill_var_timing_info(struct fb_var_screeninfo *var, int refresh,
 			  int mode_index);

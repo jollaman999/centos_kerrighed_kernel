@@ -964,3 +964,6 @@ config DMA_API_DEBUG
 source "samples/Kconfig"
 
 source "lib/Kconfig.kgdb"
+
+config TEST_KSTRTOX
+	tristate "Test kstrto*() family of functions at runtime"
