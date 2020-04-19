@@ -1,7 +1,7 @@
 #
 # Automatically generated make config: don't edit
 # Linux kernel version: 2.6.30-krg
-# Sun Apr 19 21:52:28 2020
+# Sun Apr 19 21:59:56 2020
 #
 CONFIG_64BIT=y
 # CONFIG_X86_32 is not set
@@ -379,6 +379,7 @@ CONFIG_ACPI_VIDEO=y
 CONFIG_ACPI_FAN=y
 CONFIG_ACPI_DOCK=y
 CONFIG_ACPI_PROCESSOR=y
+CONFIG_ACPI_IPMI=y
 CONFIG_ACPI_HOTPLUG_CPU=y
 CONFIG_ACPI_PROCESSOR_AGGREGATOR=y
 CONFIG_ACPI_THERMAL=y
