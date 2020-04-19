@@ -1,7 +1,7 @@
 #
 # Automatically generated make config: don't edit
 # Linux kernel version: 2.6.30-krg
-# Fri Apr 17 19:01:16 2020
+# Sun Apr 19 11:33:05 2020
 #
 CONFIG_64BIT=y
 # CONFIG_X86_32 is not set
@@ -422,6 +422,7 @@ CONFIG_X86_ACPI_CPUFREQ=y
 CONFIG_CPU_IDLE=y
 CONFIG_CPU_IDLE_GOV_LADDER=y
 CONFIG_CPU_IDLE_GOV_MENU=y
+CONFIG_INTEL_IDLE=y
 
 #
 # Memory power savings
@@ -2487,6 +2488,7 @@ CONFIG_PROVIDE_OHCI1394_DMA_INIT=y
 # CONFIG_SAMPLES is not set
 CONFIG_HAVE_ARCH_KGDB=y
 # CONFIG_KGDB is not set
+# CONFIG_TEST_KSTRTOX is not set
 # CONFIG_STRICT_DEVMEM is not set
 CONFIG_X86_VERBOSE_BOOTUP=y
 CONFIG_EARLY_PRINTK=y
