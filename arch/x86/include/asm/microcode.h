@@ -1,6 +1,21 @@
 #ifndef _ASM_X86_MICROCODE_H
 #define _ASM_X86_MICROCODE_H
 
+#define native_rdmsr(msr, val1, val2)			\
+do {							\
+	u64 __val = native_read_msr((msr));		\
+	(void)((val1) = (u32)__val);			\
+	(void)((val2) = (u32)(__val >> 32));		\
+} while (0)
+
+#define native_wrmsr(msr, low, high)			\
+	native_write_msr(msr, low, high)
+
+#define native_wrmsrl(msr, val)				\
+	native_write_msr((msr),				\
+			 (u32)((u64)(val)),		\
+			 (u32)((u64)(val) >> 32))
+
 struct cpu_signature {
 	unsigned int sig;
 	unsigned int pf;
@@ -9,20 +24,33 @@ struct cpu_signature {
 
 struct device;
 
+enum ucode_state { UCODE_ERROR, UCODE_OK, UCODE_NFOUND };
+
 struct microcode_ops {
-	int  (*request_microcode_user) (int cpu, const void __user *buf, size_t size);
-	int  (*request_microcode_fw) (int cpu, struct device *device);
+	void (*init)(struct device *device);
+	void (*fini)(void);
+	enum ucode_state (*request_microcode_user) (int cpu,
+				const void __user *buf, size_t size);
 
-	void (*apply_microcode) (int cpu);
+	enum ucode_state (*request_microcode_fw) (int cpu,
+				struct device *device);
 
-	int  (*collect_cpu_info) (int cpu, struct cpu_signature *csig);
 	void (*microcode_fini_cpu) (int cpu);
+
+	/*
+	 * The generic 'microcode_core' part guarantees that
+	 * the callbacks below run on a target cpu when they
+	 * are being called.
+	 * See also the "Synchronization" section in microcode_core.c.
+	 */
+	int (*apply_microcode) (int cpu);
+	int (*collect_cpu_info) (int cpu, struct cpu_signature *csig);
 };
 
 struct ucode_cpu_info {
-	struct cpu_signature cpu_sig;
-	int valid;
-	void *mc;
+	struct cpu_signature	cpu_sig;
+	int			valid;
+	void			*mc;
 };
 extern struct ucode_cpu_info ucode_cpu_info[];
 
