@@ -241,6 +241,16 @@ config PCF50633_GPIO
 	 Say yes here if you want to include support GPIO for pins on
 	 the PCF50633 chip.
 
+config LPC_ICH
+	tristate "Intel ICH LPC"
+	depends on PCI
+	select MFD_CORE
+	help
+	  The LPC bridge function of the Intel ICH provides support for
+	  many functional units. This driver provides needed support for
+	  other drivers to control these functions, currently GPIO and
+	  watchdog.
+
 endmenu
 
 menu "Multimedia Capabilities Port drivers"
