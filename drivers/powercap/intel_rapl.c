@@ -1106,6 +1106,7 @@ static const struct x86_cpu_id rapl_ids[] = {
 	RAPL_CPU(0x56, rapl_defaults_core),/* Future Xeon */
 	RAPL_CPU(0x5A, rapl_defaults_ann),/* Annidale */
 	RAPL_CPU(0x5E, rapl_defaults_core),/* Skylake-H/S */
+	RAPL_CPU(0x57, rapl_defaults_hsw_server),/* Knights Landing */
 	/* TODO: Add more CPU IDs after testing */
 	{}
 };
