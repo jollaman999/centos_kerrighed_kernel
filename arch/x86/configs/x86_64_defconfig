@@ -1,7 +1,7 @@
 #
 # Automatically generated make config: don't edit
 # Linux kernel version: 2.6.30-krg
-# Mon Apr 20 03:49:14 2020
+# Mon Apr 20 12:26:36 2020
 #
 CONFIG_64BIT=y
 # CONFIG_X86_32 is not set
@@ -492,6 +492,7 @@ CONFIG_CORE_DUMP_DEFAULT_ELF_HEADERS=y
 CONFIG_BINFMT_MISC=y
 # CONFIG_IA32_EMULATION is not set
 # CONFIG_COMPAT_FOR_U64_ALIGNMENT is not set
+CONFIG_IOSF_MBI=y
 CONFIG_NET=y
 
 #
