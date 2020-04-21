@@ -319,4 +319,27 @@ struct acpi_table_desc {
 
 #include <acpi/actbl1.h>
 
+/*
+ * Sizes of the various flavors of FADT. We need to look closely
+ * at the FADT length because the version number essentially tells
+ * us nothing because of many BIOS bugs where the version does not
+ * match the expected length. In other words, the length of the
+ * FADT is the bottom line as to what the version really is.
+ *
+ * For reference, the values below are as follows:
+ *     FADT V1 size: 0x074
+ *     FADT V2 size: 0x084
+ *     FADT V3 size: 0x0F4
+ *     FADT V4 size: 0x0F4
+ *     FADT V5 size: 0x10C
+ *     FADT V6 size: 0x114
+ */
+#define ACPI_FADT_V1_SIZE       (u32) (ACPI_FADT_OFFSET (flags) + 4)
+#define ACPI_FADT_V2_SIZE       (u32) (ACPI_FADT_OFFSET (reserved4[0]) + 3)
+#define ACPI_FADT_V3_SIZE       (u32) (ACPI_FADT_OFFSET (sleep_control))
+#define ACPI_FADT_V5_SIZE       (u32) (ACPI_FADT_OFFSET (hypervisor_id))
+#define ACPI_FADT_V6_SIZE       (u32) (sizeof (struct acpi_table_fadt))
+
+#define ACPI_FADT_CONFORMANCE   "ACPI 6.1 (FADT version 6)"
+
 #endif				/* __ACTBL_H__ */
