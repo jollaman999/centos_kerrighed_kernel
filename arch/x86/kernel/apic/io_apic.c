@@ -1712,7 +1712,7 @@ static void __init setup_IO_APIC_irqs(void)
 void setup_IO_APIC_irq_extra(u32 gsi)
 {
 	int apic_id = 0, pin, idx, irq;
-	int node = cpu_to_node(boot_cpu_id);
+	int cpu = boot_cpu_id;
 	struct irq_desc *desc;
 	struct irq_cfg *cfg;
 
@@ -1734,14 +1734,14 @@ void setup_IO_APIC_irq_extra(u32 gsi)
 	if (desc)
 		return;
 #endif
-	desc = irq_to_desc_alloc_node(irq, node);
+	desc = irq_to_desc_alloc_cpu(irq, cpu);
 	if (!desc) {
 		printk(KERN_INFO "can not get irq_desc for %d\n", irq);
 		return;
 	}
 
 	cfg = desc->chip_data;
-	add_pin_to_irq_node(cfg, node, apic_id, pin);
+	add_pin_to_irq_cpu(cfg, cpu, apic_id, pin);
 
 	if (test_bit(pin, mp_ioapic_routing[apic_id].pin_programmed)) {
 		pr_debug("Pin %d-%d already programmed\n",
