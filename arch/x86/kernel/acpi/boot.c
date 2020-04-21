@@ -1767,6 +1767,20 @@ int __init acpi_boot_table_init(void)
 {
 	int error;
 
+	/*
+	 * Disable ACPI OSI Win8 for everyone except Intel Broadwell.
+	 * Note, if necessary, dmi_check_system or acpi_blacklisted
+	 * can disable OSI Win8 for specific Broadwell-based systems.
+	 */
+	if (!((boot_cpu_data.x86_vendor == X86_VENDOR_INTEL) &&
+	      (boot_cpu_data.x86 == 6) &&
+	      (boot_cpu_data.x86_model == 61))) {
+		char windows2012[] = "!Windows 2012";
+		char windows2013[] = "!Windows 2013";
+		acpi_osi_setup(windows2012);
+		acpi_osi_setup(windows2013);
+	}
+
 	dmi_check_system(acpi_dmi_table);
 
 	/*
