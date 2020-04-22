@@ -485,6 +485,8 @@ static void __init setup_xstate_features(void)
 		xstate_offsets[leaf] = ebx;
 		xstate_sizes[leaf] = eax;
 
+		printk(KERN_INFO "x86/fpu: xstate_offset[%d]: %04x, xstate_sizes[%d]: %04x\n", leaf, ebx, leaf, eax);
+
 		leaf++;
 	} while (1);
 }
