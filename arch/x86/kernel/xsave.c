@@ -19,7 +19,10 @@ u64 pcntxt_mask;
  */
 struct xsave_struct *init_xstate_buf;
 
-static struct _fpx_sw_bytes fx_sw_reserved, fx_sw_reserved_ia32;
+static struct _fpx_sw_bytes fx_sw_reserved;
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
+static struct fx_sw_reserved_ia32;
+#endif
 static unsigned int *xstate_offsets, *xstate_sizes, xstate_features;
 
 /*
