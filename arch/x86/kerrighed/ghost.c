@@ -42,7 +42,7 @@ error:
 
 static void __free_thread_info(struct thread_info *ti)
 {
-	ti->task->thread.xstate = NULL;
+	ti->task->thread.fpu.state = NULL;
 	free_thread_info(ti);
 }
 
@@ -120,8 +120,8 @@ int export_thread_struct(struct epm_action *action,
 	r = ghost_write(ghost, &tsk->thread, sizeof (tsk->thread));
 	if (r)
 		goto out;
-	if (tsk->thread.xstate)
-		r = ghost_write(ghost, tsk->thread.xstate, xstate_size);
+	if (tsk->thread.fpu.state)
+		r = ghost_write(ghost, tsk->thread.fpu.state, xstate_size);
 
 out:
 	return r;
@@ -136,13 +136,13 @@ int import_thread_struct(struct epm_action *action,
 	if (r)
 		goto out;
 
-	if (tsk->thread.xstate) {
+	if (tsk->thread.fpu.state) {
 		r = -ENOMEM;
-		tsk->thread.xstate = kmem_cache_alloc(task_xstate_cachep,
+		tsk->thread.fpu.state = kmem_cache_alloc(task_xstate_cachep,
 						      GFP_KERNEL);
-		if (!tsk->thread.xstate)
+		if (!tsk->thread.fpu.state)
 			goto out;
-		r = ghost_read(ghost, tsk->thread.xstate, xstate_size);
+		r = ghost_read(ghost, tsk->thread.fpu.state, xstate_size);
 		if (r)
 			free_thread_xstate(tsk);
 	}

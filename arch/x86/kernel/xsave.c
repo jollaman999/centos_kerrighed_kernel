@@ -153,7 +153,7 @@ static inline int save_fsave_header(struct task_struct *tsk, void __user *buf)
 	return 0;
 }
 
-static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
+static inline int save_xstate_epilog(void __user *buf)
 {
 	struct xsave_struct __user *x = buf;
 	struct _fpx_sw_bytes *sw_bytes;
@@ -161,7 +161,11 @@ static inline int save_xstate_epilog(void __user *buf, int ia32_frame)
 	int err;
 
 	/* Setup the bytes not touched by the [f]xsave and reserved for SW. */
-	sw_bytes = ia32_frame ? &fx_sw_reserved_ia32 : &fx_sw_reserved;
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
+	sw_bytes = &fx_sw_reserved_ia32;
+#else
+	sw_bytes = &fx_sw_reserved;
+#endif
 	err = __copy_to_user(&x->i387.sw_reserved, sw_bytes, sizeof(*sw_bytes));
 
 	if (!use_xsave())
@@ -233,10 +237,9 @@ int save_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 {
 	struct xsave_struct *xsave = &current->thread.fpu.state->xsave;
 	struct task_struct *tsk = current;
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
 	int ia32_fxstate = (buf != buf_fx);
-
-	ia32_fxstate &= (config_enabled(CONFIG_X86_32) ||
-			 config_enabled(CONFIG_IA32_EMULATION));
+#endif
 
 	if (!access_ok(VERIFY_WRITE, buf, size))
 		return -EACCES;
@@ -251,9 +254,10 @@ int save_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 		if (save_user_xstate(buf_fx))
 			return -1;
 		/* Update the thread's fxstate to save the fsave header. */
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
 		if (ia32_fxstate)
 			fpu_fxsave(&tsk->thread.fpu);
-		user_fpu_end();
+#endif
 	} else {
 		sanitize_i387_state(tsk);
 		if (__copy_to_user(buf_fx, xsave, xstate_size))
@@ -261,10 +265,14 @@ int save_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 	}
 
 	/* Save the fsave header for the 32-bit frames. */
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
 	if ((ia32_fxstate || !use_fxsr()) && save_fsave_header(tsk, buf))
+#else
+	if (!use_fxsr() && save_fsave_header(tsk, buf))
+#endif
 		return -1;
 
-	if (use_fxsr() && save_xstate_epilog(buf_fx, ia32_fxstate))
+	if (use_fxsr() && save_xstate_epilog(buf_fx))
 		return -1;
 
 	drop_init_fpu(tsk);	/* trigger finit */
@@ -321,22 +329,19 @@ static inline int restore_user_xstate(void __user *buf, u64 xbv, int fx_only)
 				xrstor_state(init_xstate_buf, init_bv);
 			return xrestore_user(buf, xbv);
 		}
-	} else if (use_fxsr()) {
-		return fxrstor_checking((__force void *) buf);
 	} else
-		return frstor_checking((__force void *) buf);
+		return fxrstor_checking((__force void *) buf);
 }
 
 int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 {
-	int ia32_fxstate = (buf != buf_fx);
 	struct task_struct *tsk = current;
 	int state_size = xstate_size;
 	u64 xstate_bv = 0;
 	int fx_only = 0;
-
-	ia32_fxstate &= (config_enabled(CONFIG_X86_32) ||
-			 config_enabled(CONFIG_IA32_EMULATION));
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
+	int ia32_fxstate = (buf != buf_fx);
+#endif
 
 	if (!buf) {
 		drop_init_fpu(tsk);
@@ -371,6 +376,7 @@ int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 		}
 	}
 
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
 	if (ia32_fxstate) {
 		/*
 		 * For 32-bit frames with fxstate, copy the user state to the
@@ -403,7 +409,9 @@ int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 			math_state_restore();
 
 		return err;
-	} else {
+	} else
+#endif
+	{
 		/*
 		 * For 64-bit frames and 32-bit fsave frames, restore the user
 		 * state to the registers directly (with exceptions handled).
@@ -427,21 +435,24 @@ int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size)
  */
 static void prepare_fx_sw_frame(void)
 {
+#ifdef CONFIG_X86_32
 	int fsave_header_size = sizeof(struct i387_fsave_struct);
+#endif
 	int size = xstate_size + FP_XSTATE_MAGIC2_SIZE;
 
-	if (config_enabled(CONFIG_X86_32))
-		size += fsave_header_size;
+#ifdef CONFIG_X86_32
+	size += fsave_header_size;
+#endif
 
 	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
 	fx_sw_reserved.extended_size = size;
 	fx_sw_reserved.xstate_bv = pcntxt_mask;
 	fx_sw_reserved.xstate_size = xstate_size;
 
-	if (config_enabled(CONFIG_IA32_EMULATION)) {
-		fx_sw_reserved_ia32 = fx_sw_reserved;
-		fx_sw_reserved_ia32.extended_size += fsave_header_size;
-	}
+#ifdef CONFIG_IA32_EMULATION
+	fx_sw_reserved_ia32 = fx_sw_reserved;
+	fx_sw_reserved_ia32.extended_size += fsave_header_size;
+#endif
 }
 
 /*
@@ -610,7 +621,7 @@ void __cpuinit eager_fpu_init(void)
 	 * not yet patched to use math_state_restore().
 	 */
 	init_fpu(current);
-	__thread_fpu_begin(current);
+	__thread_fpu_begin(task_thread_info(current));
 	if (cpu_has_xsave)
 		xrstor_state(init_xstate_buf, -1);
 	else

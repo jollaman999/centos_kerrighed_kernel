@@ -117,7 +117,7 @@ restore_sigcontext(struct pt_regs *regs, struct sigcontext __user *sc,
 		regs->orig_ax = -1;		/* disable syscall checks */
 
 		get_user_ex(buf, &sc->fpstate);
-		err |= restore_xstate_sig(buf, config_enabled(CONFIG_X86_32));
+		err |= restore_xstate_sig(buf);
 
 		get_user_ex(*pax, &sc->ax);
 	} get_user_catch(err);
@@ -237,8 +237,7 @@ get_sigframe(struct k_sigaction *ka, struct pt_regs *regs, size_t frame_size,
 	}
 
 	if (used_math()) {
-		sp = alloc_mathframe(sp, config_enabled(CONFIG_X86_32),
-				     &buf_fx, &math_size);
+		sp = alloc_mathframe(sp, &buf_fx, &math_size);
 		*fpstate = (void __user *)sp;
 	}
 

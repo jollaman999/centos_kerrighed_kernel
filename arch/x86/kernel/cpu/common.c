@@ -998,7 +998,7 @@ EXPORT_PER_CPU_SYMBOL(kernel_stack);
 
 DEFINE_PER_CPU(unsigned int, irq_count) = -1;
 
-DEFINE_PER_CPU(struct task_struct *, fpu_owner_task);
+DEFINE_PER_CPU(struct thread_info *, fpu_owner_task);
 
 /*
  * Special IST stacks which the CPU switches to when it calls

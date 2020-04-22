@@ -22,6 +22,7 @@
 #include <asm/user.h>
 #include <asm/uaccess.h>
 #include <asm/xsave.h>
+#include <asm/proto.h>
 
 #ifdef CONFIG_X86_64
 # include <asm/sigcontext32.h>
@@ -40,7 +41,7 @@ extern void fpu_finit(struct fpu *fpu);
 extern void math_state_restore(void);
 extern int dump_fpu(struct pt_regs *, struct user_i387_struct *);
 
-DECLARE_PER_CPU(struct task_struct *, fpu_owner_task);
+DECLARE_PER_CPU(struct thread_info *, fpu_owner_task);
 
 extern void convert_from_fxsr(struct user_i387_ia32_struct *env,
 			      struct task_struct *tsk);
@@ -124,8 +125,30 @@ static inline int fxrstor_checking(struct i387_fxsave_struct *fx)
 	return err;
 }
 
+#define check_insn(insn, output, input...)				\
+({									\
+	int err;							\
+	asm volatile("1:" #insn "\n\t"					\
+		     "2:\n"						\
+		     ".section .fixup,\"ax\"\n"				\
+		     "3:  movl $-1,%[err]\n"				\
+		     "    jmp  2b\n"					\
+		     ".previous\n"					\
+		     _ASM_EXTABLE(1b, 3b)				\
+		     : [err] "=r" (err), output				\
+		     : "0"(0), input);					\
+	err;								\
+})
+
+static inline int fsave_user(struct i387_fsave_struct __user *fx)
+{
+	return check_insn(fnsave %[fx]; fwait,  [fx] "=m" (*fx), "m" (*fx));
+}
+
 static inline int fxsave_user(struct i387_fxsave_struct __user *fx)
 {
+	int err;
+
 	/* See comment in fxsave() below. */
 	asm volatile("1:  rex64/fxsave (%[fx])\n\t"
 		     "2:\n"
@@ -192,15 +215,6 @@ static inline void fpu_fxsave(struct fpu *fpu)
 
 #endif	/* CONFIG_X86_64 */
 
-/* We need a safe address that is cheap to find and that is already
-   in L1 during context switch. The best choices are unfortunately
-   different for UP and SMP */
-#ifdef CONFIG_SMP
-#define safe_address (__per_cpu_offset[0])
-#else
-#define safe_address (kstat_cpu(0).cpustat.user)
-#endif
-
 /*
  * These must be called with preempt disabled. Returns
  * 'true' if the FPU state is still intact.
@@ -233,17 +247,6 @@ static inline int fpu_save_init(struct fpu *fpu)
 	 */
 	if (unlikely(fpu->state->fxsave.swd & X87_FSW_ES)) {
 		asm volatile("fnclex");
-
-		/* AMD K7/K8 CPUs don't save/restore FDP/FIP/FOP unless an exception
-		   is pending.  Clear the x87 state here by setting it to fixed
-		   values. safe_address is a random variable that should be in L1 */
-		alternative_input(
-			ASM_NOP8 ASM_NOP2,
-			"emms\n\t"	  	/* clear stack tags */
-			"fildl %P[addr]",	/* set F?P to defined value */
-			X86_FEATURE_FXSAVE_LEAK,
-			[addr] "m" (safe_address));
-
 		return 0;
 	}
 	return 1;
@@ -269,7 +272,9 @@ static inline int fpu_restore_checking(struct fpu *fpu)
 
 static inline int restore_fpu_checking(struct task_struct *tsk)
 {
-	struct thread_info *ti = task_thread_info(tsk);
+	/* We need a safe address that is cheap to find and that is already
+	   in L1. We just brought in "tsk", so use that */
+#define safe_address (tsk)
 
 	/* AMD K7/K8 CPUs don't save/restore FDP/FIP/FOP unless an exception
 	   is pending.  Clear the x87 state here by setting it to fixed
@@ -279,7 +284,7 @@ static inline int restore_fpu_checking(struct task_struct *tsk)
 		"emms\n\t"	  	/* clear stack tags */
 		"fildl %P[addr]",	/* set F?P to defined value */
 		X86_FEATURE_FXSAVE_LEAK,
-		[addr] "m" (ti->status & TS_USEDFPU));
+		[addr] "m" (safe_address));
 
 	return fpu_restore_checking(&tsk->thread.fpu);
 }
@@ -305,7 +310,7 @@ static inline void __thread_clear_has_fpu(struct thread_info *ti)
 static inline void __thread_set_has_fpu(struct thread_info *ti)
 {
 	ti->status |= TS_USEDFPU;
-	percpu_write(fpu_owner_task, tsk);
+	percpu_write(fpu_owner_task, ti);
 }
 
 /*
@@ -389,7 +394,7 @@ typedef struct { int preload; } fpu_switch_t;
  */
 static inline int fpu_lazy_restore(struct task_struct *new, unsigned int cpu)
 {
-	return new == percpu_read_stable(fpu_owner_task) &&
+	return task_thread_info(new) == percpu_read(fpu_owner_task) &&
 		cpu == new->thread.fpu.last_cpu;
 }
 
@@ -403,16 +408,16 @@ static inline fpu_switch_t switch_fpu_prepare(struct task_struct *old, struct ta
 	 */
 	fpu.preload = tsk_used_math(new) && (use_eager_fpu() ||
 					     new->fpu_counter > 5);
-	if (__thread_has_fpu(old)) {
+	if (__thread_has_fpu(task_thread_info(old))) {
 		if (!__save_init_fpu(old))
 			cpu = ~0;
 		old->thread.fpu.last_cpu = cpu;
-		old->thread.fpu.has_fpu = 0;	/* But leave fpu_owner_task! */
+		__thread_clear_has_fpu(task_thread_info(old));	/* But leave fpu_owner_task! */
 
 		/* Don't change CR0.TS if we just switch! */
 		if (fpu.preload) {
 			new->fpu_counter++;
-			__thread_set_has_fpu(new);
+			__thread_set_has_fpu(task_thread_info(new));
 			prefetch(new->thread.fpu.state);
 		} else if (!use_eager_fpu())
 			stts();
@@ -425,7 +430,7 @@ static inline fpu_switch_t switch_fpu_prepare(struct task_struct *old, struct ta
 				fpu.preload = 0;
 			else
 				prefetch(new->thread.fpu.state);
-			__thread_fpu_begin(new);
+			__thread_fpu_begin(task_thread_info(new));
 		}
 	}
 	return fpu;
@@ -449,22 +454,24 @@ static inline void switch_fpu_finish(struct task_struct *new, fpu_switch_t fpu)
  * Signal frame handlers...
  */
 extern int save_xstate_sig(void __user *buf, void __user *fx, int size);
-extern int __restore_xstate_sig(void __user *buf, void __user *fx, int size);
+extern int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size);
 
 static inline int xstate_sigframe_size(void)
 {
 	return use_xsave() ? xstate_size + FP_XSTATE_MAGIC2_SIZE : xstate_size;
 }
 
-static inline int restore_xstate_sig(void __user *buf, int ia32_frame)
+static inline int restore_xstate_sig(void __user *buf)
 {
 	void __user *buf_fx = buf;
 	int size = xstate_sigframe_size();
 
-	if (ia32_frame && use_fxsr()) {
+#ifdef CONFIG_X86_32
+	if (use_fxsr()) {
 		buf_fx = buf + sizeof(struct i387_fsave_struct);
 		size += sizeof(struct i387_fsave_struct);
 	}
+#endif
 
 	return __restore_xstate_sig(buf, buf_fx, size);
 }
@@ -638,21 +645,21 @@ static inline void fpu_copy(struct task_struct *dst, struct task_struct *src)
 }
 
 static inline unsigned long
-alloc_mathframe(unsigned long sp, int ia32_frame, unsigned long *buf_fx,
+alloc_mathframe(unsigned long sp, unsigned long *buf_fx,
 		unsigned long *size)
 {
 	unsigned long frame_size = xstate_sigframe_size();
 
 	*buf_fx = sp = round_down(sp - frame_size, 64);
-	if (ia32_frame && use_fxsr()) {
+#ifdef CONFIG_X86_32
+	if (use_fxsr()) {
 		frame_size += sizeof(struct i387_fsave_struct);
 		sp -= sizeof(struct i387_fsave_struct);
 	}
+#endif
 
 	*size = frame_size;
 	return sp;
 }
-
-#endif /* __ASSEMBLY__ */
 
 #endif /* _ASM_X86_I387_H */
