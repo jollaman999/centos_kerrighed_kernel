@@ -486,24 +486,6 @@ static inline void irq_ts_restore(int TS_state)
 		stts();
 }
 
-#ifdef CONFIG_X86_64
-
-static inline void save_init_fpu(struct task_struct *tsk)
-{
-	if (use_xsave()) {
-		xsave_state(&tsk->thread.fpu.state->xsave, -1);
-		return;
-	}
-
-	__save_init_fpu(tsk);
-	stts();
-}
-
-#define unlazy_fpu	__unlazy_fpu
-#define clear_fpu	__clear_fpu
-
-#else  /* CONFIG_X86_32 */
-
 /*
  * The question "does this thread have fpu access?"
  * is slightly racy, since preemption could come in
@@ -528,13 +510,12 @@ static inline int user_has_fpu(void)
 	return __thread_has_fpu(current_thread_info());
 }
 
-static inline void user_fpu_end(void)
-{
-	preempt_disable();
-	__thread_fpu_end(current_thread_info());
-	preempt_enable();
-}
-
+/*
+ * Need to be preemption-safe.
+ *
+ * NOTE! user_fpu_begin() must be used only immediately before restoring
+ * it. This function does not do any save/restore on their own.
+ */
 static inline void user_fpu_begin(void)
 {
 	preempt_disable();
@@ -548,6 +529,11 @@ static inline void user_fpu_begin(void)
  */
 static inline void save_init_fpu(struct task_struct *tsk)
 {
+	if (use_xsave()) {
+		xsave_state(&tsk->thread.fpu.state->xsave, -1);
+		return;
+	}
+
 	WARN_ON_ONCE(!__thread_has_fpu(task_thread_info(tsk)));
 	preempt_disable();
 	__save_init_fpu(tsk);
@@ -556,8 +542,6 @@ static inline void save_init_fpu(struct task_struct *tsk)
 }
 
 extern void unlazy_fpu(struct task_struct *tsk);
-
-#endif	/* CONFIG_X86_64 */
 
 /*
  * i387 state interaction
