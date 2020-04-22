@@ -573,7 +573,8 @@ static void __init xstate_enable_boot_cpu(void)
 	if (cpu_has_xsaveopt && eagerfpu != DISABLE)
 		eagerfpu = ENABLE;
 
-	pr_info("enabled xstate_bv 0x%llx, cntxt size 0x%x\n",
+	pr_info("enabled %s FPU xstate_bv 0x%llx, cntxt size 0x%x\n",
+		eagerfpu == ENABLE ? "eager" : "lazy",
 		pcntxt_mask, xstate_size);
 }
 
