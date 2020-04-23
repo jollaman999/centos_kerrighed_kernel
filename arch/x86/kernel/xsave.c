@@ -618,7 +618,7 @@ void __cpuinit eager_fpu_init(void)
 	clear_used_math();
 	current_thread_info()->status = 0;
 
-	if (eagerfpu == ENABLE)
+	if (eagerfpu != DISABLE)
 		setup_force_cpu_cap(X86_FEATURE_EAGER_FPU);
 
 	if (!cpu_has_eager_fpu) {
