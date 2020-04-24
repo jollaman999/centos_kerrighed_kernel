@@ -14,7 +14,7 @@ if INPUT_KEYBOARD
 
 config KEYBOARD_ATKBD
 	tristate "AT keyboard" if EMBEDDED || !X86
-	default y
+	default n
 	select SERIO
 	select SERIO_LIBPS2
 	select SERIO_I8042 if X86
