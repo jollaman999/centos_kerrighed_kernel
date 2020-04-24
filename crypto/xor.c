@@ -20,7 +20,6 @@
 #include <linux/module.h>
 #include <linux/raid/xor.h>
 #include <linux/jiffies.h>
-#include <linux/preempt.h>
 #include <asm/xor.h>
 
 /* The xor routines to use.  */
@@ -63,13 +62,11 @@ static void
 do_xor_speed(struct xor_block_template *tmpl, void *b1, void *b2)
 {
 	int speed;
-	unsigned long now, j;
+	unsigned long now;
 	int i, count, max;
 
 	tmpl->next = template_list;
 	template_list = tmpl;
-
-	preempt_disable();
 
 	/*
 	 * Count the number of XORs done during a whole jiffy, and use
@@ -78,11 +75,9 @@ do_xor_speed(struct xor_block_template *tmpl, void *b1, void *b2)
 	 */
 	max = 0;
 	for (i = 0; i < 5; i++) {
-		j = jiffies;
+		now = jiffies;
 		count = 0;
-		while ((now = jiffies) == j)
-			cpu_relax();
-		while (time_before(jiffies, now + 1)) {
+		while (jiffies == now) {
 			mb(); /* prevent loop optimzation */
 			tmpl->do_2(BENCH_SIZE, b1, b2);
 			mb();
@@ -92,8 +87,6 @@ do_xor_speed(struct xor_block_template *tmpl, void *b1, void *b2)
 		if (count > max)
 			max = count;
 	}
-
-	preempt_enable();
 
 	speed = max * (HZ * BENCH_SIZE / 1024);
 	tmpl->speed = speed;
@@ -108,12 +101,7 @@ calibrate_xor_blocks(void)
 	void *b1, *b2;
 	struct xor_block_template *f, *fastest;
 
-	/*
-	 * Note: Since the memory is not actually used for _anything_ but to
-	 * test the XOR speed, we don't really want kmemcheck to warn about
-	 * reading uninitialized bytes here.
-	 */
-	b1 = (void *) __get_free_pages(GFP_KERNEL | __GFP_NOTRACK, 2);
+	b1 = (void *) __get_free_pages(GFP_KERNEL, 2);
 	if (!b1) {
 		printk(KERN_WARNING "xor: Yikes!  No memory available.\n");
 		return -ENOMEM;

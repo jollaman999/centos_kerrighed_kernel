@@ -79,8 +79,8 @@ static inline int skcipher_enqueue_givcrypt(
 static inline struct skcipher_givcrypt_request *skcipher_dequeue_givcrypt(
 	struct crypto_queue *queue)
 {
-	return __crypto_dequeue_request(
-		queue, offsetof(struct skcipher_givcrypt_request, creq.base));
+	return container_of(ablkcipher_dequeue_request(queue),
+			    struct skcipher_givcrypt_request, creq);
 }
 
 static inline void *skcipher_givcrypt_reqctx(

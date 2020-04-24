@@ -11,7 +11,6 @@
  */
 
 #include <crypto/internal/aead.h>
-#include <linux/completion.h>
 #include <linux/ctype.h>
 #include <linux/err.h>
 #include <linux/init.h>
@@ -44,9 +43,8 @@ struct cryptomgr_param {
 		} nu32;
 	} attrs[CRYPTO_MAX_ATTRS];
 
+	char larval[CRYPTO_MAX_ALG_NAME];
 	char template[CRYPTO_MAX_ALG_NAME];
-
-	struct crypto_larval *larval;
 
 	u32 otype;
 	u32 omask;
@@ -67,14 +65,9 @@ static int cryptomgr_probe(void *data)
 
 	tmpl = crypto_lookup_template(param->template);
 	if (!tmpl)
-		goto out;
+		goto err;
 
 	do {
-		if (tmpl->create) {
-			err = tmpl->create(tmpl, param->tb);
-			continue;
-		}
-
 		inst = tmpl->alloc(param->tb);
 		if (IS_ERR(inst))
 			err = PTR_ERR(inst);
@@ -84,11 +77,16 @@ static int cryptomgr_probe(void *data)
 
 	crypto_tmpl_put(tmpl);
 
+	if (err)
+		goto err;
+
 out:
-	complete_all(&param->larval->completion);
-	crypto_alg_put(&param->larval->alg);
 	kfree(param);
 	module_put_and_exit(0);
+
+err:
+	crypto_larval_error(param->larval, param->otype, param->omask);
+	goto out;
 }
 
 static int cryptomgr_schedule_probe(struct crypto_larval *larval)
@@ -186,19 +184,14 @@ static int cryptomgr_schedule_probe(struct crypto_larval *larval)
 	param->otype = larval->alg.cra_flags;
 	param->omask = larval->mask;
 
-	crypto_alg_get(&larval->alg);
-	param->larval = larval;
+	memcpy(param->larval, larval->alg.cra_name, CRYPTO_MAX_ALG_NAME);
 
 	thread = kthread_run(cryptomgr_probe, param, "cryptomgr_probe");
 	if (IS_ERR(thread))
-		goto err_put_larval;
-
-	wait_for_completion_interruptible(&larval->completion);
+		goto err_free_param;
 
 	return NOTIFY_STOP;
 
-err_put_larval:
-	crypto_alg_put(&larval->alg);
 err_free_param:
 	kfree(param);
 err_put_module:
@@ -287,13 +280,29 @@ static struct notifier_block cryptomgr_notifier = {
 
 static int __init cryptomgr_init(void)
 {
-	return crypto_register_notifier(&cryptomgr_notifier);
+	int err;
+
+	err = testmgr_init();
+	if (err)
+		return err;
+
+	err = crypto_register_notifier(&cryptomgr_notifier);
+	if (err)
+		goto free_testmgr;
+
+	return 0;
+
+free_testmgr:
+	testmgr_exit();
+	return err;
 }
 
 static void __exit cryptomgr_exit(void)
 {
 	int err = crypto_unregister_notifier(&cryptomgr_notifier);
 	BUG_ON(err);
+
+	testmgr_exit();
 }
 
 subsys_initcall(cryptomgr_init);

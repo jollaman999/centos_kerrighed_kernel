@@ -21,6 +21,12 @@
 #include <linux/percpu.h>
 #include <asm/byteorder.h>
 
+struct sha512_ctx {
+	u64 state[8];
+	u32 count[4];
+	u8 buf[128];
+};
+
 static DEFINE_PER_CPU(u64[80], msg_schedule);
 
 static inline u64 Ch(u64 x, u64 y, u64 z)
@@ -135,7 +141,7 @@ sha512_transform(u64 *state, const u8 *input)
 static int
 sha512_init(struct shash_desc *desc)
 {
-	struct sha512_state *sctx = shash_desc_ctx(desc);
+	struct sha512_ctx *sctx = shash_desc_ctx(desc);
 	sctx->state[0] = SHA512_H0;
 	sctx->state[1] = SHA512_H1;
 	sctx->state[2] = SHA512_H2;
@@ -144,7 +150,7 @@ sha512_init(struct shash_desc *desc)
 	sctx->state[5] = SHA512_H5;
 	sctx->state[6] = SHA512_H6;
 	sctx->state[7] = SHA512_H7;
-	sctx->count[0] = sctx->count[1] = 0;
+	sctx->count[0] = sctx->count[1] = sctx->count[2] = sctx->count[3] = 0;
 
 	return 0;
 }
@@ -152,7 +158,7 @@ sha512_init(struct shash_desc *desc)
 static int
 sha384_init(struct shash_desc *desc)
 {
-	struct sha512_state *sctx = shash_desc_ctx(desc);
+	struct sha512_ctx *sctx = shash_desc_ctx(desc);
 	sctx->state[0] = SHA384_H0;
 	sctx->state[1] = SHA384_H1;
 	sctx->state[2] = SHA384_H2;
@@ -161,24 +167,28 @@ sha384_init(struct shash_desc *desc)
 	sctx->state[5] = SHA384_H5;
 	sctx->state[6] = SHA384_H6;
 	sctx->state[7] = SHA384_H7;
-	sctx->count[0] = sctx->count[1] = 0;
+        sctx->count[0] = sctx->count[1] = sctx->count[2] = sctx->count[3] = 0;
 
 	return 0;
 }
 
-int crypto_sha512_update(struct shash_desc *desc, const u8 *data,
-			unsigned int len)
+static int
+sha512_update(struct shash_desc *desc, const u8 *data, unsigned int len)
 {
-	struct sha512_state *sctx = shash_desc_ctx(desc);
+	struct sha512_ctx *sctx = shash_desc_ctx(desc);
 
 	unsigned int i, index, part_len;
 
 	/* Compute number of bytes mod 128 */
-	index = sctx->count[0] & 0x7f;
+	index = (unsigned int)((sctx->count[0] >> 3) & 0x7F);
 
-	/* Update number of bytes */
-	if ((sctx->count[0] += len) < len)
-		sctx->count[1]++;
+	/* Update number of bits */
+	if ((sctx->count[0] += (len << 3)) < (len << 3)) {
+		if ((sctx->count[1] += 1) < 1)
+			if ((sctx->count[2] += 1) < 1)
+				sctx->count[3]++;
+		sctx->count[1] += (len >> 29);
+	}
 
         part_len = 128 - index;
 
@@ -200,36 +210,37 @@ int crypto_sha512_update(struct shash_desc *desc, const u8 *data,
 
 	return 0;
 }
-EXPORT_SYMBOL(crypto_sha512_update);
 
 static int
 sha512_final(struct shash_desc *desc, u8 *hash)
 {
-	struct sha512_state *sctx = shash_desc_ctx(desc);
+	struct sha512_ctx *sctx = shash_desc_ctx(desc);
         static u8 padding[128] = { 0x80, };
 	__be64 *dst = (__be64 *)hash;
-	__be64 bits[2];
+	__be32 bits[4];
 	unsigned int index, pad_len;
 	int i;
 
 	/* Save number of bits */
-	bits[1] = cpu_to_be64(sctx->count[0] << 3);
-	bits[0] = cpu_to_be64(sctx->count[1] << 3 | sctx->count[0] >> 61);
+	bits[3] = cpu_to_be32(sctx->count[0]);
+	bits[2] = cpu_to_be32(sctx->count[1]);
+	bits[1] = cpu_to_be32(sctx->count[2]);
+	bits[0] = cpu_to_be32(sctx->count[3]);
 
 	/* Pad out to 112 mod 128. */
-	index = sctx->count[0] & 0x7f;
+	index = (sctx->count[0] >> 3) & 0x7f;
 	pad_len = (index < 112) ? (112 - index) : ((128+112) - index);
-	crypto_sha512_update(desc, padding, pad_len);
+	sha512_update(desc, padding, pad_len);
 
 	/* Append length (before padding) */
-	crypto_sha512_update(desc, (const u8 *)bits, sizeof(bits));
+	sha512_update(desc, (const u8 *)bits, sizeof(bits));
 
 	/* Store state in digest */
 	for (i = 0; i < 8; i++)
 		dst[i] = cpu_to_be64(sctx->state[i]);
 
 	/* Zeroize sensitive information. */
-	memset(sctx, 0, sizeof(struct sha512_state));
+	memset(sctx, 0, sizeof(struct sha512_ctx));
 
 	return 0;
 }
@@ -249,9 +260,9 @@ static int sha384_final(struct shash_desc *desc, u8 *hash)
 static struct shash_alg sha512 = {
 	.digestsize	=	SHA512_DIGEST_SIZE,
 	.init		=	sha512_init,
-	.update		=	crypto_sha512_update,
+	.update		=	sha512_update,
 	.final		=	sha512_final,
-	.descsize	=	sizeof(struct sha512_state),
+	.descsize	=	sizeof(struct sha512_ctx),
 	.base		=	{
 		.cra_name	=	"sha512",
 		.cra_flags	=	CRYPTO_ALG_TYPE_SHASH,
@@ -263,9 +274,9 @@ static struct shash_alg sha512 = {
 static struct shash_alg sha384 = {
 	.digestsize	=	SHA384_DIGEST_SIZE,
 	.init		=	sha384_init,
-	.update		=	crypto_sha512_update,
+	.update		=	sha512_update,
 	.final		=	sha384_final,
-	.descsize	=	sizeof(struct sha512_state),
+	.descsize	=	sizeof(struct sha512_ctx),
 	.base		=	{
 		.cra_name	=	"sha384",
 		.cra_flags	=	CRYPTO_ALG_TYPE_SHASH,

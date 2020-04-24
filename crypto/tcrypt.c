@@ -8,13 +8,6 @@
  * Copyright (c) 2002 Jean-Francois Dive <jef@linuxbe.org>
  * Copyright (c) 2007 Nokia Siemens Networks
  *
- * Updated RFC4106 AES-GCM testing.
- *    Authors: Aidan O'Mahony (aidan.o.mahony@intel.com)
- *             Adrian Hoban <adrian.hoban@intel.com>
- *             Gabriele Paoloni <gabriele.paoloni@intel.com>
- *             Tadeusz Struk (tadeusz.struk@intel.com)
- *             Copyright (c) 2010, Intel Corporation.
- *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
  * Software Foundation; either version 2 of the License, or (at your option)
@@ -34,7 +27,6 @@
 #include <linux/timex.h>
 #include <linux/interrupt.h>
 #include "tcrypt.h"
-#include "internal.h"
 
 /*
  * Need slab memory for testing (size in number of pages).
@@ -52,9 +44,6 @@
  */
 static unsigned int sec;
 
-static char *alg = NULL;
-static u32 type;
-static u32 mask;
 static int mode;
 static char *tvmem[TVMEMSIZE];
 
@@ -407,16 +396,16 @@ static void test_hash_speed(const char *algo, unsigned int sec,
 	struct scatterlist sg[TVMEMSIZE];
 	struct crypto_hash *tfm;
 	struct hash_desc desc;
-	static char output[1024];
+	char output[1024];
 	int i;
 	int ret;
 
-	printk(KERN_INFO "\ntesting speed of %s\n", algo);
+	printk("\ntesting speed of %s\n", algo);
 
 	tfm = crypto_alloc_hash(algo, 0, CRYPTO_ALG_ASYNC);
 
 	if (IS_ERR(tfm)) {
-		printk(KERN_ERR "failed to load transform for %s: %ld\n", algo,
+		printk("failed to load transform for %s: %ld\n", algo,
 		       PTR_ERR(tfm));
 		return;
 	}
@@ -425,7 +414,7 @@ static void test_hash_speed(const char *algo, unsigned int sec,
 	desc.flags = 0;
 
 	if (crypto_hash_digestsize(tfm) > sizeof(output)) {
-		printk(KERN_ERR "digestsize(%u) > outputbuffer(%zu)\n",
+		printk("digestsize(%u) > outputbuffer(%zu)\n",
 		       crypto_hash_digestsize(tfm), sizeof(output));
 		goto out;
 	}
@@ -438,14 +427,12 @@ static void test_hash_speed(const char *algo, unsigned int sec,
 
 	for (i = 0; speed[i].blen != 0; i++) {
 		if (speed[i].blen > TVMEMSIZE * PAGE_SIZE) {
-			printk(KERN_ERR
-			       "template (%u) too big for tvmem (%lu)\n",
+			printk("template (%u) too big for tvmem (%lu)\n",
 			       speed[i].blen, TVMEMSIZE * PAGE_SIZE);
 			goto out;
 		}
 
-		printk(KERN_INFO "test%3u "
-		       "(%5u byte blocks,%5u bytes per update,%4u updates): ",
+		printk("test%3u (%5u byte blocks,%5u bytes per update,%4u updates): ",
 		       i, speed[i].blen, speed[i].plen, speed[i].blen / speed[i].plen);
 
 		if (sec)
@@ -456,7 +443,7 @@ static void test_hash_speed(const char *algo, unsigned int sec,
 					       speed[i].plen, output);
 
 		if (ret) {
-			printk(KERN_ERR "hashing failed ret=%d\n", ret);
+			printk("hashing failed ret=%d\n", ret);
 			break;
 		}
 	}
@@ -479,267 +466,239 @@ static void test_available(void)
 
 static inline int tcrypt_test(const char *alg)
 {
-	int ret;
-
-	ret = alg_test(alg, alg, 0, 0);
-	/* non-fips algs return -EINVAL in fips mode */
-	if (fips_enabled && ret == -EINVAL)
-		ret = 0;
-	return ret;
+	return alg_test(alg, alg, 0, 0);
 }
 
-static int do_test(int m)
+static void do_test(int m)
 {
 	int i;
-	int ret = 0;
 
 	switch (m) {
 	case 0:
 		for (i = 1; i < 200; i++)
-			ret += do_test(i);
+			do_test(i);
 		break;
 
 	case 1:
-		ret += tcrypt_test("md5");
+		tcrypt_test("md5");
 		break;
 
 	case 2:
-		ret += tcrypt_test("sha1");
+		tcrypt_test("sha1");
 		break;
 
 	case 3:
-		ret += tcrypt_test("ecb(des)");
-		ret += tcrypt_test("cbc(des)");
+		tcrypt_test("ecb(des)");
+		tcrypt_test("cbc(des)");
 		break;
 
 	case 4:
-		ret += tcrypt_test("ecb(des3_ede)");
-		ret += tcrypt_test("cbc(des3_ede)");
+		tcrypt_test("ecb(des3_ede)");
+		tcrypt_test("cbc(des3_ede)");
 		break;
 
 	case 5:
-		ret += tcrypt_test("md4");
+		tcrypt_test("md4");
 		break;
 
 	case 6:
-		ret += tcrypt_test("sha256");
+		tcrypt_test("sha256");
 		break;
 
 	case 7:
-		ret += tcrypt_test("ecb(blowfish)");
-		ret += tcrypt_test("cbc(blowfish)");
+		tcrypt_test("ecb(blowfish)");
+		tcrypt_test("cbc(blowfish)");
 		break;
 
 	case 8:
-		ret += tcrypt_test("ecb(twofish)");
-		ret += tcrypt_test("cbc(twofish)");
+		tcrypt_test("ecb(twofish)");
+		tcrypt_test("cbc(twofish)");
 		break;
 
 	case 9:
-		ret += tcrypt_test("ecb(serpent)");
+		tcrypt_test("ecb(serpent)");
 		break;
 
 	case 10:
-		ret += tcrypt_test("ecb(aes)");
-		ret += tcrypt_test("cbc(aes)");
-		ret += tcrypt_test("lrw(aes)");
-		ret += tcrypt_test("xts(aes)");
-		ret += tcrypt_test("ctr(aes)");
-		ret += tcrypt_test("rfc3686(ctr(aes))");
+		tcrypt_test("ecb(aes)");
+		tcrypt_test("cbc(aes)");
+		tcrypt_test("lrw(aes)");
+		tcrypt_test("xts(aes)");
+		tcrypt_test("rfc3686(ctr(aes))");
 		break;
 
 	case 11:
-		ret += tcrypt_test("sha384");
+		tcrypt_test("sha384");
 		break;
 
 	case 12:
-		ret += tcrypt_test("sha512");
+		tcrypt_test("sha512");
 		break;
 
 	case 13:
-		ret += tcrypt_test("deflate");
+		tcrypt_test("deflate");
 		break;
 
 	case 14:
-		ret += tcrypt_test("ecb(cast5)");
+		tcrypt_test("ecb(cast5)");
 		break;
 
 	case 15:
-		ret += tcrypt_test("ecb(cast6)");
+		tcrypt_test("ecb(cast6)");
 		break;
 
 	case 16:
-		ret += tcrypt_test("ecb(arc4)");
+		tcrypt_test("ecb(arc4)");
 		break;
 
 	case 17:
-		ret += tcrypt_test("michael_mic");
+		tcrypt_test("michael_mic");
 		break;
 
 	case 18:
-		ret += tcrypt_test("crc32c");
+		tcrypt_test("crc32c");
 		break;
 
 	case 19:
-		ret += tcrypt_test("ecb(tea)");
+		tcrypt_test("ecb(tea)");
 		break;
 
 	case 20:
-		ret += tcrypt_test("ecb(xtea)");
+		tcrypt_test("ecb(xtea)");
 		break;
 
 	case 21:
-		ret += tcrypt_test("ecb(khazad)");
+		tcrypt_test("ecb(khazad)");
 		break;
 
 	case 22:
-		ret += tcrypt_test("wp512");
+		tcrypt_test("wp512");
 		break;
 
 	case 23:
-		ret += tcrypt_test("wp384");
+		tcrypt_test("wp384");
 		break;
 
 	case 24:
-		ret += tcrypt_test("wp256");
+		tcrypt_test("wp256");
 		break;
 
 	case 25:
-		ret += tcrypt_test("ecb(tnepres)");
+		tcrypt_test("ecb(tnepres)");
 		break;
 
 	case 26:
-		ret += tcrypt_test("ecb(anubis)");
-		ret += tcrypt_test("cbc(anubis)");
+		tcrypt_test("ecb(anubis)");
+		tcrypt_test("cbc(anubis)");
 		break;
 
 	case 27:
-		ret += tcrypt_test("tgr192");
+		tcrypt_test("tgr192");
 		break;
 
 	case 28:
 
-		ret += tcrypt_test("tgr160");
+		tcrypt_test("tgr160");
 		break;
 
 	case 29:
-		ret += tcrypt_test("tgr128");
+		tcrypt_test("tgr128");
 		break;
 
 	case 30:
-		ret += tcrypt_test("ecb(xeta)");
+		tcrypt_test("ecb(xeta)");
 		break;
 
 	case 31:
-		ret += tcrypt_test("pcbc(fcrypt)");
+		tcrypt_test("pcbc(fcrypt)");
 		break;
 
 	case 32:
-		ret += tcrypt_test("ecb(camellia)");
-		ret += tcrypt_test("cbc(camellia)");
+		tcrypt_test("ecb(camellia)");
+		tcrypt_test("cbc(camellia)");
 		break;
 	case 33:
-		ret += tcrypt_test("sha224");
+		tcrypt_test("sha224");
 		break;
 
 	case 34:
-		ret += tcrypt_test("salsa20");
+		tcrypt_test("salsa20");
 		break;
 
 	case 35:
-		ret += tcrypt_test("gcm(aes)");
+		tcrypt_test("gcm(aes)");
 		break;
 
 	case 36:
-		ret += tcrypt_test("lzo");
+		tcrypt_test("lzo");
 		break;
 
 	case 37:
-		ret += tcrypt_test("ccm(aes)");
+		tcrypt_test("ccm(aes)");
 		break;
 
 	case 38:
-		ret += tcrypt_test("cts(cbc(aes))");
+		tcrypt_test("cts(cbc(aes))");
 		break;
 
         case 39:
-		ret += tcrypt_test("rmd128");
+		tcrypt_test("rmd128");
 		break;
 
         case 40:
-		ret += tcrypt_test("rmd160");
+		tcrypt_test("rmd160");
 		break;
 
 	case 41:
-		ret += tcrypt_test("rmd256");
+		tcrypt_test("rmd256");
 		break;
 
 	case 42:
-		ret += tcrypt_test("rmd320");
+		tcrypt_test("rmd320");
 		break;
 
 	case 43:
-		ret += tcrypt_test("ecb(seed)");
+		tcrypt_test("ecb(seed)");
 		break;
 
 	case 44:
-		ret += tcrypt_test("zlib");
-		break;
-
-	case 45:
-		ret += tcrypt_test("rfc4309(ccm(aes))");
-		break;
-
-	case 47:
-		ret += tcrypt_test("crct10dif");
+		tcrypt_test("zlib");
 		break;
 
 	case 100:
-		ret += tcrypt_test("hmac(md5)");
+		tcrypt_test("hmac(md5)");
 		break;
 
 	case 101:
-		ret += tcrypt_test("hmac(sha1)");
+		tcrypt_test("hmac(sha1)");
 		break;
 
 	case 102:
-		ret += tcrypt_test("hmac(sha256)");
+		tcrypt_test("hmac(sha256)");
 		break;
 
 	case 103:
-		ret += tcrypt_test("hmac(sha384)");
+		tcrypt_test("hmac(sha384)");
 		break;
 
 	case 104:
-		ret += tcrypt_test("hmac(sha512)");
+		tcrypt_test("hmac(sha512)");
 		break;
 
 	case 105:
-		ret += tcrypt_test("hmac(sha224)");
+		tcrypt_test("hmac(sha224)");
 		break;
 
 	case 106:
-		ret += tcrypt_test("xcbc(aes)");
+		tcrypt_test("xcbc(aes)");
 		break;
 
 	case 107:
-		ret += tcrypt_test("hmac(rmd128)");
+		tcrypt_test("hmac(rmd128)");
 		break;
 
 	case 108:
-		ret += tcrypt_test("hmac(rmd160)");
-		break;
-
-	case 109:
-		ret += tcrypt_test("vmac(aes)");
-		break;
-
-	case 150:
-		ret += tcrypt_test("ansi_cprng");
-		break;
-
-	case 151:
-		ret += tcrypt_test("rfc4106(gcm(aes))");
+		tcrypt_test("hmac(rmd160)");
 		break;
 
 	case 200:
@@ -896,14 +855,6 @@ static int do_test(int m)
 		test_hash_speed("rmd320", sec, generic_hash_speed_template);
 		if (mode > 300 && mode < 400) break;
 
-	case 320:
-		test_hash_speed("crct10dif", sec, generic_hash_speed_template);
-		if (mode > 300 && mode < 400) break;
-
-	case 319:
-		test_hash_speed("crc32c", sec, generic_hash_speed_template);
-		if (mode > 300 && mode < 400) break;
-
 	case 399:
 		break;
 
@@ -911,14 +862,6 @@ static int do_test(int m)
 		test_available();
 		break;
 	}
-
-	return ret;
-}
-
-static int do_alg_test(const char *alg, u32 type, u32 mask)
-{
-	return crypto_has_alg(alg, type, mask ?: CRYPTO_ALG_TYPE_MASK) ?
-	       0 : -ENOENT;
 }
 
 static int __init tcrypt_mod_init(void)
@@ -932,25 +875,15 @@ static int __init tcrypt_mod_init(void)
 			goto err_free_tv;
 	}
 
-	if (alg)
-		err = do_alg_test(alg, type, mask);
-	else
-		err = do_test(mode);
+	do_test(mode);
 
-	if (err) {
-		printk(KERN_ERR "tcrypt: one or more tests failed!\n");
-		goto err_free_tv;
-	}
-
-	/* We intentionaly return -EAGAIN to prevent keeping the module,
-	 * unless we're running in fips mode. It does all its work from
-	 * init() and doesn't offer any runtime functionality, but in
-	 * the fips case, checking for a successful load is helpful.
+	/* We intentionaly return -EAGAIN to prevent keeping
+	 * the module. It does all its work from init()
+	 * and doesn't offer any runtime functionality 
 	 * => we don't need it in the memory, do we?
 	 *                                        -- mludvig
 	 */
-	if (!fips_enabled)
-		err = -EAGAIN;
+	err = -EAGAIN;
 
 err_free_tv:
 	for (i = 0; i < TVMEMSIZE && tvmem[i]; i++)
@@ -968,9 +901,6 @@ static void __exit tcrypt_mod_fini(void) { }
 module_init(tcrypt_mod_init);
 module_exit(tcrypt_mod_fini);
 
-module_param(alg, charp, 0);
-module_param(type, uint, 0);
-module_param(mask, uint, 0);
 module_param(mode, int, 0);
 module_param(sec, uint, 0);
 MODULE_PARM_DESC(sec, "Length in seconds of speed tests "
