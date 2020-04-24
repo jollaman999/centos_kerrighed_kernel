@@ -2500,15 +2500,6 @@ config IXGBE
 	  To compile this driver as a module, choose M here. The module
 	  will be called ixgbe.
 
-config IXGBE_DCA
-	bool "Direct Cache Access (DCA) Support"
-	default y
-	depends on IXGBE && DCA && !(IXGBE=y && DCA=m)
-	---help---
-	  Say Y here if you want to use Direct Cache Access (DCA) in the
-	  driver.  DCA is a method for warming the CPU cache before data
-	  is used, with the intent of lessening the impact of cache misses.
-
 config IXGBE_DCB
 	bool "Data Center Bridging (DCB) Support"
 	default n

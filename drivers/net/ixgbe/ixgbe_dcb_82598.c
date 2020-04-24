@@ -1,32 +1,7 @@
-/*******************************************************************************
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 1999 - 2019 Intel Corporation. */
 
-  Intel 10 Gigabit PCI Express Linux driver
-  Copyright(c) 1999 - 2009 Intel Corporation.
 
-  This program is free software; you can redistribute it and/or modify it
-  under the terms and conditions of the GNU General Public License,
-  version 2, as published by the Free Software Foundation.
-
-  This program is distributed in the hope it will be useful, but WITHOUT
-  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
-  more details.
-
-  You should have received a copy of the GNU General Public License along with
-  this program; if not, write to the Free Software Foundation, Inc.,
-  51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
-
-  The full GNU General Public License is included in this distribution in
-  the file called "COPYING".
-
-  Contact Information:
-  Linux NICS <linux.nics@intel.com>
-  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
-  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
-
-*******************************************************************************/
-
-#include "ixgbe.h"
 #include "ixgbe_type.h"
 #include "ixgbe_dcb.h"
 #include "ixgbe_dcb_82598.h"
@@ -40,13 +15,15 @@
  * This function returns the status data for each of the Traffic Classes in use.
  */
 s32 ixgbe_dcb_get_tc_stats_82598(struct ixgbe_hw *hw,
-                                 struct ixgbe_hw_stats *stats,
-                                 u8 tc_count)
+				 struct ixgbe_hw_stats *stats,
+				 u8 tc_count)
 {
 	int tc;
 
-	if (tc_count > MAX_TRAFFIC_CLASS)
-		return DCB_ERR_PARAM;
+	DEBUGFUNC("dcb_get_tc_stats");
+
+	if (tc_count > IXGBE_DCB_MAX_TRAFFIC_CLASS)
+		return IXGBE_ERR_PARAM;
 
 	/* Statistics pertaining to each traffic class */
 	for (tc = 0; tc < tc_count; tc++) {
@@ -58,9 +35,17 @@ s32 ixgbe_dcb_get_tc_stats_82598(struct ixgbe_hw *hw,
 		stats->qprc[tc] += IXGBE_READ_REG(hw, IXGBE_QPRC(tc));
 		/* Received Bytes */
 		stats->qbrc[tc] += IXGBE_READ_REG(hw, IXGBE_QBRC(tc));
+
+#if 0
+		/* Can we get rid of these??  Consequently, getting rid
+		 * of the tc_stats structure.
+		 */
+		tc_stats_array[up]->in_overflow_discards = 0;
+		tc_stats_array[up]->out_overflow_discards = 0;
+#endif
 	}
 
-	return 0;
+	return IXGBE_SUCCESS;
 }
 
 /**
@@ -72,13 +57,15 @@ s32 ixgbe_dcb_get_tc_stats_82598(struct ixgbe_hw *hw,
  * This function returns the CBFC status data for each of the Traffic Classes.
  */
 s32 ixgbe_dcb_get_pfc_stats_82598(struct ixgbe_hw *hw,
-                                  struct ixgbe_hw_stats *stats,
-                                  u8 tc_count)
+				  struct ixgbe_hw_stats *stats,
+				  u8 tc_count)
 {
 	int tc;
 
-	if (tc_count > MAX_TRAFFIC_CLASS)
-		return DCB_ERR_PARAM;
+	DEBUGFUNC("dcb_get_pfc_stats");
+
+	if (tc_count > IXGBE_DCB_MAX_TRAFFIC_CLASS)
+		return IXGBE_ERR_PARAM;
 
 	for (tc = 0; tc < tc_count; tc++) {
 		/* Priority XOFF Transmitted */
@@ -87,64 +74,25 @@ s32 ixgbe_dcb_get_pfc_stats_82598(struct ixgbe_hw *hw,
 		stats->pxoffrxc[tc] += IXGBE_READ_REG(hw, IXGBE_PXOFFRXC(tc));
 	}
 
-	return 0;
-}
-
-/**
- * ixgbe_dcb_config_packet_buffers_82598 - Configure packet buffers
- * @hw: pointer to hardware structure
- * @dcb_config: pointer to ixgbe_dcb_config structure
- *
- * Configure packet buffers for DCB mode.
- */
-static s32 ixgbe_dcb_config_packet_buffers_82598(struct ixgbe_hw *hw,
-						 struct ixgbe_dcb_config *dcb_config)
-{
-	s32 ret_val = 0;
-	u32 value = IXGBE_RXPBSIZE_64KB;
-	u8  i = 0;
-
-	/* Setup Rx packet buffer sizes */
-	switch (dcb_config->rx_pba_cfg) {
-	case pba_80_48:
-		/* Setup the first four at 80KB */
-		value = IXGBE_RXPBSIZE_80KB;
-		for (; i < 4; i++)
-			IXGBE_WRITE_REG(hw, IXGBE_RXPBSIZE(i), value);
-		/* Setup the last four at 48KB...don't re-init i */
-		value = IXGBE_RXPBSIZE_48KB;
-		/* Fall Through */
-	case pba_equal:
-	default:
-		for (; i < IXGBE_MAX_PACKET_BUFFERS; i++)
-			IXGBE_WRITE_REG(hw, IXGBE_RXPBSIZE(i), value);
-
-		/* Setup Tx packet buffer sizes */
-		for (i = 0; i < IXGBE_MAX_PACKET_BUFFERS; i++) {
-			IXGBE_WRITE_REG(hw, IXGBE_TXPBSIZE(i),
-					IXGBE_TXPBSIZE_40KB);
-		}
-		break;
-	}
-
-	return ret_val;
+	return IXGBE_SUCCESS;
 }
 
 /**
  * ixgbe_dcb_config_rx_arbiter_82598 - Config Rx data arbiter
  * @hw: pointer to hardware structure
- * @dcb_config: pointer to ixgbe_dcb_config structure
+ * @refill: refill credits index by traffic class
+ * @max: max credits index by traffic class
+ * @tsa: transmission selection algorithm indexed by traffic class
  *
  * Configure Rx Data Arbiter and credits for each traffic class.
  */
-s32 ixgbe_dcb_config_rx_arbiter_82598(struct ixgbe_hw *hw,
-                                      struct ixgbe_dcb_config *dcb_config)
+s32 ixgbe_dcb_config_rx_arbiter_82598(struct ixgbe_hw *hw, u16 *refill,
+				      u16 *max, u8 *tsa)
 {
-	struct tc_bw_alloc    *p;
-	u32    reg           = 0;
-	u32    credit_refill = 0;
-	u32    credit_max    = 0;
-	u8     i             = 0;
+	u32 reg = 0;
+	u32 credit_refill = 0;
+	u32 credit_max = 0;
+	u8 i = 0;
 
 	reg = IXGBE_READ_REG(hw, IXGBE_RUPPBMR) | IXGBE_RUPPBMR_MQA;
 	IXGBE_WRITE_REG(hw, IXGBE_RUPPBMR, reg);
@@ -160,14 +108,13 @@ s32 ixgbe_dcb_config_rx_arbiter_82598(struct ixgbe_hw *hw,
 	IXGBE_WRITE_REG(hw, IXGBE_RMCS, reg);
 
 	/* Configure traffic class credits and priority */
-	for (i = 0; i < MAX_TRAFFIC_CLASS; i++) {
-		p = &dcb_config->tc_config[i].path[DCB_RX_CONFIG];
-		credit_refill = p->data_credits_refill;
-		credit_max    = p->data_credits_max;
+	for (i = 0; i < IXGBE_DCB_MAX_TRAFFIC_CLASS; i++) {
+		credit_refill = refill[i];
+		credit_max = max[i];
 
 		reg = credit_refill | (credit_max << IXGBE_RT2CR_MCL_SHIFT);
 
-		if (p->prio_type == prio_link)
+		if (tsa[i] == ixgbe_dcb_tsa_strict)
 			reg |= IXGBE_RT2CR_LSP;
 
 		IXGBE_WRITE_REG(hw, IXGBE_RT2CR(i), reg);
@@ -184,68 +131,70 @@ s32 ixgbe_dcb_config_rx_arbiter_82598(struct ixgbe_hw *hw,
 	reg &= ~IXGBE_RXCTRL_DMBYPS;
 	IXGBE_WRITE_REG(hw, IXGBE_RXCTRL, reg);
 
-	return 0;
+	return IXGBE_SUCCESS;
 }
 
 /**
  * ixgbe_dcb_config_tx_desc_arbiter_82598 - Config Tx Desc. arbiter
  * @hw: pointer to hardware structure
- * @dcb_config: pointer to ixgbe_dcb_config structure
+ * @refill: refill credits index by traffic class
+ * @max: max credits index by traffic class
+ * @bwg_id: bandwidth grouping indexed by traffic class
+ * @tsa: transmission selection algorithm indexed by traffic class
  *
  * Configure Tx Descriptor Arbiter and credits for each traffic class.
  */
 s32 ixgbe_dcb_config_tx_desc_arbiter_82598(struct ixgbe_hw *hw,
-                                           struct ixgbe_dcb_config *dcb_config)
+					   u16 *refill, u16 *max, u8 *bwg_id,
+					   u8 *tsa)
 {
-	struct tc_bw_alloc *p;
-	u32    reg, max_credits;
-	u8     i;
+	u32 reg, max_credits;
+	u8 i;
 
 	reg = IXGBE_READ_REG(hw, IXGBE_DPMCS);
 
 	/* Enable arbiter */
 	reg &= ~IXGBE_DPMCS_ARBDIS;
-	if (!(dcb_config->round_robin_enable)) {
-		/* Enable DFP and Recycle mode */
-		reg |= (IXGBE_DPMCS_TDPAC | IXGBE_DPMCS_TRM);
-	}
 	reg |= IXGBE_DPMCS_TSOEF;
+
 	/* Configure Max TSO packet size 34KB including payload and headers */
 	reg |= (0x4 << IXGBE_DPMCS_MTSOS_SHIFT);
 
 	IXGBE_WRITE_REG(hw, IXGBE_DPMCS, reg);
 
 	/* Configure traffic class credits and priority */
-	for (i = 0; i < MAX_TRAFFIC_CLASS; i++) {
-		p = &dcb_config->tc_config[i].path[DCB_TX_CONFIG];
-		max_credits = dcb_config->tc_config[i].desc_credits_max;
+	for (i = 0; i < IXGBE_DCB_MAX_TRAFFIC_CLASS; i++) {
+		max_credits = max[i];
 		reg = max_credits << IXGBE_TDTQ2TCCR_MCL_SHIFT;
-		reg |= p->data_credits_refill;
-		reg |= (u32)(p->bwg_id) << IXGBE_TDTQ2TCCR_BWG_SHIFT;
+		reg |= (u32)(refill[i]);
+		reg |= (u32)(bwg_id[i]) << IXGBE_TDTQ2TCCR_BWG_SHIFT;
 
-		if (p->prio_type == prio_group)
+		if (tsa[i] == ixgbe_dcb_tsa_group_strict_cee)
 			reg |= IXGBE_TDTQ2TCCR_GSP;
 
-		if (p->prio_type == prio_link)
+		if (tsa[i] == ixgbe_dcb_tsa_strict)
 			reg |= IXGBE_TDTQ2TCCR_LSP;
 
 		IXGBE_WRITE_REG(hw, IXGBE_TDTQ2TCCR(i), reg);
 	}
 
-	return 0;
+	return IXGBE_SUCCESS;
 }
 
 /**
  * ixgbe_dcb_config_tx_data_arbiter_82598 - Config Tx data arbiter
  * @hw: pointer to hardware structure
- * @dcb_config: pointer to ixgbe_dcb_config structure
+ * @refill: refill credits index by traffic class
+ * @max: max credits index by traffic class
+ * @bwg_id: bandwidth grouping indexed by traffic class
+ * @tsa: transmission selection algorithm indexed by traffic class
  *
  * Configure Tx Data Arbiter and credits for each traffic class.
  */
 s32 ixgbe_dcb_config_tx_data_arbiter_82598(struct ixgbe_hw *hw,
-                                           struct ixgbe_dcb_config *dcb_config)
+					   u16 *refill, u16 *max, u8 *bwg_id,
+					   u8 *tsa)
 {
-	struct tc_bw_alloc *p;
 	u32 reg;
 	u8 i;
 
@@ -258,16 +207,15 @@ s32 ixgbe_dcb_config_tx_data_arbiter_82598(struct ixgbe_hw *hw,
 	IXGBE_WRITE_REG(hw, IXGBE_PDPMCS, reg);
 
 	/* Configure traffic class credits and priority */
-	for (i = 0; i < MAX_TRAFFIC_CLASS; i++) {
-		p = &dcb_config->tc_config[i].path[DCB_TX_CONFIG];
-		reg = p->data_credits_refill;
-		reg |= (u32)(p->data_credits_max) << IXGBE_TDPT2TCCR_MCL_SHIFT;
-		reg |= (u32)(p->bwg_id) << IXGBE_TDPT2TCCR_BWG_SHIFT;
+	for (i = 0; i < IXGBE_DCB_MAX_TRAFFIC_CLASS; i++) {
+		reg = refill[i];
+		reg |= (u32)(max[i]) << IXGBE_TDPT2TCCR_MCL_SHIFT;
+		reg |= (u32)(bwg_id[i]) << IXGBE_TDPT2TCCR_BWG_SHIFT;
 
-		if (p->prio_type == prio_group)
+		if (tsa[i] == ixgbe_dcb_tsa_group_strict_cee)
 			reg |= IXGBE_TDPT2TCCR_GSP;
 
-		if (p->prio_type == prio_link)
+		if (tsa[i] == ixgbe_dcb_tsa_strict)
 			reg |= IXGBE_TDPT2TCCR_LSP;
 
 		IXGBE_WRITE_REG(hw, IXGBE_TDPT2TCCR(i), reg);
@@ -278,70 +226,59 @@ s32 ixgbe_dcb_config_tx_data_arbiter_82598(struct ixgbe_hw *hw,
 	reg |= IXGBE_DTXCTL_ENDBUBD;
 	IXGBE_WRITE_REG(hw, IXGBE_DTXCTL, reg);
 
-	return 0;
+	return IXGBE_SUCCESS;
 }
 
 /**
  * ixgbe_dcb_config_pfc_82598 - Config priority flow control
  * @hw: pointer to hardware structure
- * @dcb_config: pointer to ixgbe_dcb_config structure
+ * @pfc_en: enabled pfc bitmask
  *
  * Configure Priority Flow Control for each traffic class.
  */
-s32 ixgbe_dcb_config_pfc_82598(struct ixgbe_hw *hw,
-                               struct ixgbe_dcb_config *dcb_config)
+s32 ixgbe_dcb_config_pfc_82598(struct ixgbe_hw *hw, u8 pfc_en)
 {
-	u32 reg, rx_pba_size;
-	u8  i;
+	u32 fcrtl, reg;
+	u8 i;
 
 	/* Enable Transmit Priority Flow Control */
 	reg = IXGBE_READ_REG(hw, IXGBE_RMCS);
 	reg &= ~IXGBE_RMCS_TFCE_802_3X;
-	/* correct the reporting of our flow control status */
 	reg |= IXGBE_RMCS_TFCE_PRIORITY;
 	IXGBE_WRITE_REG(hw, IXGBE_RMCS, reg);
 
 	/* Enable Receive Priority Flow Control */
 	reg = IXGBE_READ_REG(hw, IXGBE_FCTRL);
-	reg &= ~IXGBE_FCTRL_RFCE;
-	reg |= IXGBE_FCTRL_RPFCE;
+	reg &= ~(IXGBE_FCTRL_RPFCE | IXGBE_FCTRL_RFCE);
+
+	if (pfc_en)
+		reg |= IXGBE_FCTRL_RPFCE;
+
 	IXGBE_WRITE_REG(hw, IXGBE_FCTRL, reg);
 
-	/*
-	 * Configure flow control thresholds and enable priority flow control
-	 * for each traffic class.
-	 */
-	for (i = 0; i < MAX_TRAFFIC_CLASS; i++) {
-		if (dcb_config->rx_pba_cfg == pba_equal) {
-			rx_pba_size = IXGBE_RXPBSIZE_64KB;
-		} else {
-			rx_pba_size = (i < 4) ? IXGBE_RXPBSIZE_80KB
-					      : IXGBE_RXPBSIZE_48KB;
+	/* Configure PFC Tx thresholds per TC */
+	for (i = 0; i < IXGBE_DCB_MAX_TRAFFIC_CLASS; i++) {
+		if (!(pfc_en & (1 << i))) {
+			IXGBE_WRITE_REG(hw, IXGBE_FCRTL(i), 0);
+			IXGBE_WRITE_REG(hw, IXGBE_FCRTH(i), 0);
+			continue;
 		}
 
-		reg = ((rx_pba_size >> 5) &  0xFFF0);
-		if (dcb_config->tc_config[i].dcb_pfc == pfc_enabled_tx ||
-		    dcb_config->tc_config[i].dcb_pfc == pfc_enabled_full)
-			reg |= IXGBE_FCRTL_XONE;
-
-		IXGBE_WRITE_REG(hw, IXGBE_FCRTL(i), reg);
-
-		reg = ((rx_pba_size >> 2) & 0xFFF0);
-		if (dcb_config->tc_config[i].dcb_pfc == pfc_enabled_tx ||
-		    dcb_config->tc_config[i].dcb_pfc == pfc_enabled_full)
-			reg |= IXGBE_FCRTH_FCEN;
-
+		fcrtl = (hw->fc.low_water[i] << 10) | IXGBE_FCRTL_XONE;
+		reg = (hw->fc.high_water[i] << 10) | IXGBE_FCRTH_FCEN;
+		IXGBE_WRITE_REG(hw, IXGBE_FCRTL(i), fcrtl);
 		IXGBE_WRITE_REG(hw, IXGBE_FCRTH(i), reg);
 	}
 
 	/* Configure pause time */
-	for (i = 0; i < (MAX_TRAFFIC_CLASS >> 1); i++)
-		IXGBE_WRITE_REG(hw, IXGBE_FCTTV(i), 0x68006800);
+	reg = hw->fc.pause_time | (hw->fc.pause_time << 16);
+	for (i = 0; i < (IXGBE_DCB_MAX_TRAFFIC_CLASS / 2); i++)
+		IXGBE_WRITE_REG(hw, IXGBE_FCTTV(i), reg);
 
 	/* Configure flow control refresh threshold value */
-	IXGBE_WRITE_REG(hw, IXGBE_FCRTV, 0x3400);
+	IXGBE_WRITE_REG(hw, IXGBE_FCRTV, hw->fc.pause_time / 2);
 
-	return 0;
+	return IXGBE_SUCCESS;
 }
 
 /**
@@ -354,8 +291,8 @@ s32 ixgbe_dcb_config_pfc_82598(struct ixgbe_hw *hw,
 s32 ixgbe_dcb_config_tc_stats_82598(struct ixgbe_hw *hw)
 {
 	u32 reg = 0;
-	u8  i   = 0;
-	u8  j   = 0;
+	u8 i = 0;
+	u8 j = 0;
 
 	/* Receive Queues stats setting -  8 queues per statistics reg */
 	for (i = 0, j = 0; i < 15 && j < 8; i = i + 2, j++) {
@@ -366,32 +303,39 @@ s32 ixgbe_dcb_config_tc_stats_82598(struct ixgbe_hw *hw)
 		reg |= ((0x1010101) * j);
 		IXGBE_WRITE_REG(hw, IXGBE_RQSMR(i + 1), reg);
 	}
-	/* Transmit Queues stats setting -  4 queues per statistics reg */
+	/* Transmit Queues stats setting -  4 queues per statistics reg*/
 	for (i = 0; i < 8; i++) {
 		reg = IXGBE_READ_REG(hw, IXGBE_TQSMR(i));
 		reg |= ((0x1010101) * i);
 		IXGBE_WRITE_REG(hw, IXGBE_TQSMR(i), reg);
 	}
 
-	return 0;
+	return IXGBE_SUCCESS;
 }
 
 /**
  * ixgbe_dcb_hw_config_82598 - Config and enable DCB
  * @hw: pointer to hardware structure
- * @dcb_config: pointer to ixgbe_dcb_config structure
+ * @link_speed: unused
+ * @refill: refill credits index by traffic class
+ * @max: max credits index by traffic class
+ * @bwg_id: bandwidth grouping indexed by traffic class
+ * @tsa: transmission selection algorithm indexed by traffic class
  *
  * Configure dcb settings and enable dcb mode.
  */
-s32 ixgbe_dcb_hw_config_82598(struct ixgbe_hw *hw,
-                              struct ixgbe_dcb_config *dcb_config)
+s32 ixgbe_dcb_hw_config_82598(struct ixgbe_hw *hw, int link_speed,
+			      u16 *refill, u16 *max, u8 *bwg_id,
+			      u8 *tsa)
 {
-	ixgbe_dcb_config_packet_buffers_82598(hw, dcb_config);
-	ixgbe_dcb_config_rx_arbiter_82598(hw, dcb_config);
-	ixgbe_dcb_config_tx_desc_arbiter_82598(hw, dcb_config);
-	ixgbe_dcb_config_tx_data_arbiter_82598(hw, dcb_config);
-	ixgbe_dcb_config_pfc_82598(hw, dcb_config);
+	UNREFERENCED_1PARAMETER(link_speed);
+
+	ixgbe_dcb_config_rx_arbiter_82598(hw, refill, max, tsa);
+	ixgbe_dcb_config_tx_desc_arbiter_82598(hw, refill, max, bwg_id,
+					       tsa);
+	ixgbe_dcb_config_tx_data_arbiter_82598(hw, refill, max, bwg_id,
+					       tsa);
 	ixgbe_dcb_config_tc_stats_82598(hw);
 
-	return 0;
+	return IXGBE_SUCCESS;
 }
