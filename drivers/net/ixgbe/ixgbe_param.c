@@ -1,5 +1,26 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright(c) 1999 - 2019 Intel Corporation. */
+/*******************************************************************************
+
+  Intel 10 Gigabit PCI Express Linux driver
+  Copyright (c) 1999 - 2014 Intel Corporation.
+
+  This program is free software; you can redistribute it and/or modify it
+  under the terms and conditions of the GNU General Public License,
+  version 2, as published by the Free Software Foundation.
+
+  This program is distributed in the hope it will be useful, but WITHOUT
+  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+  more details.
+
+  The full GNU General Public License is included in this distribution in
+  the file called "COPYING".
+
+  Contact Information:
+  Linux NICS <linux.nics@intel.com>
+  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
+  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+
+*******************************************************************************/
 
 #include <linux/types.h>
 #include <linux/module.h>
@@ -32,7 +53,7 @@
  * The true default values are loaded in when ixgbe_check_options is called.
  *
  * This is a GCC extension to ANSI C.
- * See the item "Labelled Elements in Initializers" in the section
+ * See the item "Labeled Elements in Initializers" in the section
  * "Extensions to the C Language Family" of the GCC documentation.
  */
 
@@ -57,14 +78,14 @@
  *
  * Default Value: 2
  */
+IXGBE_PARAM(InterruptType, "Change Interrupt Mode (0=Legacy, 1=MSI, 2=MSI-X), "
+	    "default IntMode (deprecated)");
 IXGBE_PARAM(IntMode, "Change Interrupt Mode (0=Legacy, 1=MSI, 2=MSI-X), "
 	    "default 2");
 #define IXGBE_INT_LEGACY		0
 #define IXGBE_INT_MSI			1
 #define IXGBE_INT_MSIX			2
-
-IXGBE_PARAM(InterruptType, "Change Interrupt Mode (0=Legacy, 1=MSI, 2=MSI-X), "
-	    "default IntMode (deprecated)");
+#define IXGBE_DEFAULT_INT		IXGBE_INT_MSIX
 
 /* MQ - Multiple Queue enable/disable
  *
@@ -121,15 +142,15 @@ IXGBE_PARAM(RSS, "Number of Receive-Side Scaling Descriptor Queues, "
 /* VMDQ - Virtual Machine Device Queues (VMDQ)
  *
  * Valid Range: 1-16
- *  - 0/1 Disables VMDQ by allocating only a single queue.
+ *  - 1 Disables VMDQ by allocating only a single queue.
  *  - 2-16 - enables VMDQ and sets the Desc. Q's to the specified value.
  *
- * Default Value: 8
+ * Default Value: 1
  */
 
 #define IXGBE_DEFAULT_NUM_VMDQ 8
 
-IXGBE_PARAM(VMDQ, "Number of Virtual Machine Device Queues: 0/1 = disable (1 queue) "
+IXGBE_PARAM(VMDQ, "Number of Virtual Machine Device Queues: 0/1 = disable, "
 	    "2-16 enable (default=" XSTRINGIFY(IXGBE_DEFAULT_NUM_VMDQ) ")");
 
 #ifdef CONFIG_PCI_IOV
@@ -283,14 +304,6 @@ IXGBE_PARAM(AtrSampleRate, "Software ATR Tx packet sample rate");
 IXGBE_PARAM(FCoE, "Disable or enable FCoE Offload, default 1");
 #endif /* CONFIG_FCOE */
 
-/* Enable/disable Malicious Driver Detection
- *
- * Valid Values: 0(off), 1(on)
- *
- * Default Value: 1
- */
-IXGBE_PARAM(MDD, "Malicious Driver Detection: (0,1), default 1 = on");
-
 /* Enable/disable Large Receive Offload
  *
  * Valid Values: 0(off), 1(on)
@@ -326,7 +339,6 @@ IXGBE_PARAM(dmac_watchdog,
 IXGBE_PARAM(vxlan_rx,
 	    "VXLAN receive checksum offload (0,1), default 1 = Enable");
 
-
 struct ixgbe_option {
 	enum { enable_option, range_option, list_option } type;
 	const char *name;
@@ -351,20 +363,13 @@ struct ixgbe_option {
 #ifndef IXGBE_NO_LLI
 #ifdef module_param_array
 /**
- * helper function to determine LLI support
- * @adapter: board private structure
- * @opt: pointer to option struct
+ *  helper function to determine LLI support
  *
- * LLI is only supported for 82599 and X540
- * LLIPush is not supported on 82599
+ *  LLI is only supported for 82599 and X540
+ *  LLIPush is not supported on 82599
  **/
-#ifdef HAVE_CONFIG_HOTPLUG
 static bool __devinit ixgbe_lli_supported(struct ixgbe_adapter *adapter,
 					  struct ixgbe_option *opt)
-#else
-static bool ixgbe_lli_supported(struct ixgbe_adapter *adapter,
-				struct ixgbe_option *opt)
-#endif
 {
 	struct ixgbe_hw *hw = &adapter->hw;
 
@@ -386,13 +391,8 @@ not_supp:
 #endif /* module_param_array */
 #endif /* IXGBE_NO_LLI */
 
-#ifdef HAVE_CONFIG_HOTPLUG
 static int __devinit ixgbe_validate_option(unsigned int *value,
 					   struct ixgbe_option *opt)
-#else
-static int ixgbe_validate_option(unsigned int *value,
-				 struct ixgbe_option *opt)
-#endif
 {
 	if (*value == OPTION_UNSET) {
 		printk(KERN_INFO "ixgbe: Invalid %s specified (%d),  %s\n",
@@ -426,9 +426,10 @@ static int ixgbe_validate_option(unsigned int *value,
 		break;
 	case list_option: {
 		int i;
+		const struct ixgbe_opt_list *ent;
 
 		for (i = 0; i < opt->arg.l.nr; i++) {
-			const struct ixgbe_opt_list *ent = &opt->arg.l.p[i];
+			ent = &opt->arg.l.p[i];
 			if (*value == ent->i) {
 				if (ent->str[0] != '\0')
 					printk(KERN_INFO "%s\n", ent->str);
@@ -458,13 +459,8 @@ static int ixgbe_validate_option(unsigned int *value,
  * value exists, a default value is used.  The final value is stored
  * in a variable in the adapter structure.
  **/
-#ifdef HAVE_CONFIG_HOTPLUG
 void __devinit ixgbe_check_options(struct ixgbe_adapter *adapter)
-#else
-void ixgbe_check_options(struct ixgbe_adapter *adapter)
-#endif
 {
-	unsigned int mdd;
 	int bd = adapter->bd_number;
 	u32 *aflags = &adapter->flags;
 	struct ixgbe_ring_feature *feature = adapter->ring_feature;
@@ -485,8 +481,8 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 			.type = range_option,
 			.name = "Interrupt Mode",
 			.err =
-			  "using default of " __MODULE_STRING(IXGBE_INT_MSIX),
-			.def = IXGBE_INT_MSIX,
+			  "using default of "__MODULE_STRING(IXGBE_DEFAULT_INT),
+			.def = IXGBE_DEFAULT_INT,
 			.arg = { .r = { .min = IXGBE_INT_LEGACY,
 					.max = IXGBE_INT_MSIX} }
 		};
@@ -523,7 +519,13 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 #ifdef module_param_array
 		} else {
 			/* default settings */
-			if (*aflags & IXGBE_FLAG_MSIX_CAPABLE) {
+			if (opt.def == IXGBE_INT_MSIX &&
+			    *aflags & IXGBE_FLAG_MSIX_CAPABLE) {
+				*aflags |= IXGBE_FLAG_MSIX_CAPABLE;
+				*aflags |= IXGBE_FLAG_MSI_CAPABLE;
+			} else if (opt.def == IXGBE_INT_MSI &&
+			    *aflags & IXGBE_FLAG_MSI_CAPABLE) {
+				*aflags &= ~IXGBE_FLAG_MSIX_CAPABLE;
 				*aflags |= IXGBE_FLAG_MSI_CAPABLE;
 			} else {
 				*aflags &= ~IXGBE_FLAG_MSIX_CAPABLE;
@@ -551,7 +553,10 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 				*aflags &= ~IXGBE_FLAG_MQ_CAPABLE;
 #ifdef module_param_array
 		} else {
-			*aflags |= IXGBE_FLAG_MQ_CAPABLE;
+			if (opt.def == OPTION_ENABLED)
+				*aflags |= IXGBE_FLAG_MQ_CAPABLE;
+			else
+				*aflags &= ~IXGBE_FLAG_MQ_CAPABLE;
 		}
 #endif
 		/* Check Interoperability */
@@ -613,7 +618,7 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 			.err  = "using default.",
 			.def  = 0,
 			.arg  = { .r = { .min = 0,
-					 .max = 16} }
+					 .max = 1} }
 		};
 		unsigned int rss = RSS[bd];
 		/* adjust Max allowed RSS queues based on MAC type */
@@ -679,7 +684,8 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 			 * perspective */
 			if (vmdq > 1) {
 				*aflags |= IXGBE_FLAG_VMDQ_ENABLED;
-			} else
+			}
+			else
 				*aflags &= ~IXGBE_FLAG_VMDQ_ENABLED;
 
 			feature[RING_F_VMDQ].limit = vmdq;
@@ -727,7 +733,7 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 					"Disabling SR-IOV.\n");
 			}
 
-			adapter->max_vfs = vfs;
+			adapter->num_vfs = vfs;
 
 			if (vfs)
 				*aflags |= IXGBE_FLAG_SRIOV_ENABLED;
@@ -736,10 +742,10 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 #ifdef module_param_array
 		} else {
 			if (opt.def == OPTION_DISABLED) {
-				adapter->max_vfs = 0;
+				adapter->num_vfs = 0;
 				*aflags &= ~IXGBE_FLAG_SRIOV_ENABLED;
 			} else {
-				adapter->max_vfs = opt.def;
+				adapter->num_vfs = opt.def;
 				*aflags |= IXGBE_FLAG_SRIOV_ENABLED;
 			}
 		}
@@ -752,14 +758,14 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 					"IOV is not supported on this "
 					"hardware.  Disabling IOV.\n");
 				*aflags &= ~IXGBE_FLAG_SRIOV_ENABLED;
-				adapter->max_vfs = 0;
+				adapter->num_vfs = 0;
 			} else if (!(*aflags & IXGBE_FLAG_MQ_CAPABLE)) {
 				DPRINTK(PROBE, INFO,
 					"IOV is not supported while multiple "
 					"queues are disabled.  "
 					"Disabling IOV.\n");
 				*aflags &= ~IXGBE_FLAG_SRIOV_ENABLED;
-				adapter->max_vfs = 0;
+				adapter->num_vfs = 0;
 			} 
 		}
 	}
@@ -904,7 +910,10 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 				*aflags &= ~IXGBE_FLAG_LLI_PUSH;
 #ifdef module_param_array
 		} else {
-			*aflags &= ~IXGBE_FLAG_LLI_PUSH;
+			if (opt.def == OPTION_ENABLED)
+				*aflags |= IXGBE_FLAG_LLI_PUSH;
+			else
+				*aflags &= ~IXGBE_FLAG_LLI_PUSH;
 		}
 #endif
 	}
@@ -941,7 +950,7 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 		static struct ixgbe_option opt = {
 			.type = range_option,
 			.name = "Low Latency Interrupt on VLAN priority "
-				"threshold",
+				"threashold",
 			.err  = "using default of "
 					__MODULE_STRING(DEFAULT_LLIVLANP),
 			.def  = DEFAULT_LLIVLANP,
@@ -1084,9 +1093,11 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 		};
 		struct net_device *netdev = adapter->netdev;
 
+#ifdef IXGBE_NO_LRO
 		if (!(adapter->flags2 & IXGBE_FLAG2_RSC_CAPABLE))
 			opt.def = OPTION_DISABLED;
 
+#endif
 #ifdef module_param_array
 		if (num_LRO > bd) {
 #endif
@@ -1097,10 +1108,13 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 			else
 				netdev->features &= ~NETIF_F_LRO;
 #ifdef module_param_array
+		} else if (opt.def == OPTION_ENABLED) {
+			netdev->features |= NETIF_F_LRO;
 		} else {
 			netdev->features &= ~NETIF_F_LRO;
 		}
 #endif
+#ifdef IXGBE_NO_LRO
 		if ((netdev->features & NETIF_F_LRO) &&
 		    !(adapter->flags2 & IXGBE_FLAG2_RSC_CAPABLE)) {
 			DPRINTK(PROBE, INFO,
@@ -1108,6 +1122,7 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 				"hardware.  Disabling RSC.\n");
 			netdev->features &= ~NETIF_F_LRO;
 		}
+#endif /* IXGBE_NO_LRO */
 	}
 	{ /*
 	   * allow_unsupported_sfp - Enable/Disable support for unsupported
@@ -1131,6 +1146,8 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 				adapter->hw.allow_unsupported_sfp = false;
 			}
 #ifdef module_param_array
+		} else if (opt.def == OPTION_ENABLED) {
+				adapter->hw.allow_unsupported_sfp = true;
 		} else {
 				adapter->hw.allow_unsupported_sfp = false;
 		}
@@ -1149,7 +1166,6 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 		switch (adapter->hw.mac.type) {
 		case ixgbe_mac_X550:
 		case ixgbe_mac_X550EM_x:
-		case ixgbe_mac_X550EM_a:
 			if (adapter->rx_itr_setting || adapter->tx_itr_setting)
 				break;
 			opt.err = "interrupt throttling disabled also disables DMA coalescing";
@@ -1211,39 +1227,4 @@ void ixgbe_check_options(struct ixgbe_adapter *adapter)
 #endif
 	}
 
-	{ /* MDD support */
-		struct ixgbe_option opt = {
-			.type = enable_option,
-			.name = "Malicious Driver Detection",
-			.err  = "defaulting to Enabled",
-			.def  = OPTION_ENABLED,
-		};
-
-		switch (adapter->hw.mac.type) {
-		case ixgbe_mac_X550:
-		case ixgbe_mac_X550EM_x:
-		case ixgbe_mac_X550EM_a:
-#ifdef module_param_array
-			if (num_MDD > bd) {
-#endif
-				mdd = MDD[bd];
-				ixgbe_validate_option(&mdd, &opt);
-
-				if (mdd){
-					*aflags |= IXGBE_FLAG_MDD_ENABLED;
-
-				} else{
-					*aflags &= ~IXGBE_FLAG_MDD_ENABLED;
-				}
-#ifdef module_param_array
-			} else {
-				*aflags |= IXGBE_FLAG_MDD_ENABLED;
-			}
-#endif
-			break;
-		default:
-			*aflags &= ~IXGBE_FLAG_MDD_ENABLED;
-			break;
-		}
-	}
 }

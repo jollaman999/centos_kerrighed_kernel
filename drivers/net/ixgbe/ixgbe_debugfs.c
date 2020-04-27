@@ -1,5 +1,26 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright(c) 1999 - 2019 Intel Corporation. */
+/*******************************************************************************
+
+  Intel 10 Gigabit PCI Express Linux driver
+  Copyright (c) 1999 - 2014 Intel Corporation.
+
+  This program is free software; you can redistribute it and/or modify it
+  under the terms and conditions of the GNU General Public License,
+  version 2, as published by the Free Software Foundation.
+
+  This program is distributed in the hope it will be useful, but WITHOUT
+  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+  more details.
+
+  The full GNU General Public License is included in this distribution in
+  the file called "COPYING".
+
+  Contact Information:
+  Linux NICS <linux.nics@intel.com>
+  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
+  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+
+*******************************************************************************/
 
 #include "ixgbe.h"
 
@@ -80,8 +101,7 @@ static ssize_t ixgbe_dbg_reg_ops_write(struct file *filp,
 		u32 reg, value;
 		int cnt;
 		cnt = sscanf(&ixgbe_dbg_reg_ops_buf[5], "%x %x", &reg, &value);
-		/* check format and bounds check register access */
-		if (cnt == 2 && reg <= IXGBE_HFDR) {
+		if (cnt == 2) {
 			IXGBE_WRITE_REG(&adapter->hw, reg, value);
 			value = IXGBE_READ_REG(&adapter->hw, reg);
 			e_dev_info("write: 0x%08x = 0x%08x\n", reg, value);
@@ -92,8 +112,7 @@ static ssize_t ixgbe_dbg_reg_ops_write(struct file *filp,
 		u32 reg, value;
 		int cnt;
 		cnt = sscanf(&ixgbe_dbg_reg_ops_buf[4], "%x", &reg);
-		/* check format and bounds check register access */
-		if (cnt == 1 && reg <= IXGBE_HFDR) {
+		if (cnt == 1) {
 			value = IXGBE_READ_REG(&adapter->hw, reg);
 			e_dev_info("read 0x%08x = 0x%08x\n", reg, value);
 		} else {
@@ -232,7 +251,7 @@ void ixgbe_dbg_adapter_init(struct ixgbe_adapter *adapter)
 
 /**
  * ixgbe_dbg_adapter_exit - clear out the adapter's debugfs entries
- * @adapter: board private structure
+ * @pf: the pf that is stopping
  **/
 void ixgbe_dbg_adapter_exit(struct ixgbe_adapter *adapter)
 {

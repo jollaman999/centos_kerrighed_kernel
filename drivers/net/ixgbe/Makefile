@@ -20,7 +20,6 @@ ixgbe-objs := 	ixgbe_main.o \
 	ixgbe_param.o \
 	ixgbe_phy.o \
 	ixgbe_procfs.o \
-	ixgbe_xsk.o \
 	ixgbe_82598.o \
 	ixgbe_82599.o \
 	ixgbe_x540.o \

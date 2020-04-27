@@ -1,5 +1,26 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright(c) 1999 - 2019 Intel Corporation. */
+/*******************************************************************************
+
+  Intel 10 Gigabit PCI Express Linux driver
+  Copyright (c) 1999 - 2014 Intel Corporation.
+
+  This program is free software; you can redistribute it and/or modify it
+  under the terms and conditions of the GNU General Public License,
+  version 2, as published by the Free Software Foundation.
+
+  This program is distributed in the hope it will be useful, but WITHOUT
+  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+  more details.
+
+  The full GNU General Public License is included in this distribution in
+  the file called "COPYING".
+
+  Contact Information:
+  Linux NICS <linux.nics@intel.com>
+  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
+  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+
+*******************************************************************************/
 
 #ifndef _IXGBE_PHY_H_
 #define _IXGBE_PHY_H_
@@ -59,12 +80,8 @@
 
 #define IXGBE_CS4227			0xBE	/* CS4227 address */
 #define IXGBE_CS4227_GLOBAL_ID_LSB	0
-#define IXGBE_CS4227_GLOBAL_ID_MSB	1
 #define IXGBE_CS4227_SCRATCH		2
 #define IXGBE_CS4227_GLOBAL_ID_VALUE	0x03E5
-#define IXGBE_CS4227_EFUSE_PDF_SKU	0x19F
-#define IXGBE_CS4223_SKU_ID		0x0010	/* Quad port */
-#define IXGBE_CS4227_SKU_ID		0x0014	/* Dual port */
 #define IXGBE_CS4227_RESET_PENDING	0x1357
 #define IXGBE_CS4227_RESET_COMPLETE	0x5AA5
 #define IXGBE_CS4227_RETRIES		15
@@ -162,7 +179,7 @@ s32 ixgbe_reset_phy_nl(struct ixgbe_hw *hw);
 s32 ixgbe_set_copper_phy_power(struct ixgbe_hw *hw, bool on);
 s32 ixgbe_identify_module_generic(struct ixgbe_hw *hw);
 s32 ixgbe_identify_sfp_module_generic(struct ixgbe_hw *hw);
-u64 ixgbe_get_supported_phy_sfp_layer_generic(struct ixgbe_hw *hw);
+s32 ixgbe_get_supported_phy_sfp_layer_generic(struct ixgbe_hw *hw);
 s32 ixgbe_identify_qsfp_module_generic(struct ixgbe_hw *hw);
 s32 ixgbe_get_sfp_init_sequence_offsets(struct ixgbe_hw *hw,
 					u16 *list_offset,
@@ -181,8 +198,4 @@ s32 ixgbe_read_i2c_eeprom_generic(struct ixgbe_hw *hw, u8 byte_offset,
 s32 ixgbe_write_i2c_eeprom_generic(struct ixgbe_hw *hw, u8 byte_offset,
 				   u8 eeprom_data);
 void ixgbe_i2c_bus_clear(struct ixgbe_hw *hw);
-s32 ixgbe_read_i2c_combined_generic_int(struct ixgbe_hw *, u8 addr, u16 reg,
-					u16 *val, bool lock);
-s32 ixgbe_write_i2c_combined_generic_int(struct ixgbe_hw *, u8 addr, u16 reg,
-					 u16 val, bool lock);
 #endif /* _IXGBE_PHY_H_ */

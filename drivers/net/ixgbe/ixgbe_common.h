@@ -1,5 +1,26 @@
-/* SPDX-License-Identifier: GPL-2.0 */
-/* Copyright(c) 1999 - 2019 Intel Corporation. */
+/*******************************************************************************
+
+  Intel 10 Gigabit PCI Express Linux driver
+  Copyright (c) 1999 - 2014 Intel Corporation.
+
+  This program is free software; you can redistribute it and/or modify it
+  under the terms and conditions of the GNU General Public License,
+  version 2, as published by the Free Software Foundation.
+
+  This program is distributed in the hope it will be useful, but WITHOUT
+  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+  more details.
+
+  The full GNU General Public License is included in this distribution in
+  the file called "COPYING".
+
+  Contact Information:
+  Linux NICS <linux.nics@intel.com>
+  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
+  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+
+*******************************************************************************/
 
 #ifndef _IXGBE_COMMON_H_
 #define _IXGBE_COMMON_H_
@@ -12,7 +33,7 @@ u16 ixgbe_get_pcie_msix_count_generic(struct ixgbe_hw *hw);
 s32 ixgbe_init_ops_generic(struct ixgbe_hw *hw);
 s32 ixgbe_init_hw_generic(struct ixgbe_hw *hw);
 s32 ixgbe_start_hw_generic(struct ixgbe_hw *hw);
-void ixgbe_start_hw_gen2(struct ixgbe_hw *hw);
+s32 ixgbe_start_hw_gen2(struct ixgbe_hw *hw);
 s32 ixgbe_clear_hw_cntrs_generic(struct ixgbe_hw *hw);
 s32 ixgbe_read_pba_string_generic(struct ixgbe_hw *hw, u8 *pba_num,
 				  u32 pba_num_size);
@@ -24,7 +45,6 @@ s32 ixgbe_stop_adapter_generic(struct ixgbe_hw *hw);
 
 s32 ixgbe_led_on_generic(struct ixgbe_hw *hw, u32 index);
 s32 ixgbe_led_off_generic(struct ixgbe_hw *hw, u32 index);
-s32 ixgbe_init_led_link_act_generic(struct ixgbe_hw *hw);
 
 s32 ixgbe_init_eeprom_params_generic(struct ixgbe_hw *hw);
 s32 ixgbe_write_eeprom_generic(struct ixgbe_hw *hw, u16 offset, u16 data);
@@ -86,13 +106,11 @@ s32 ixgbe_clear_vmdq_generic(struct ixgbe_hw *hw, u32 rar, u32 vmdq);
 s32 ixgbe_insert_mac_addr_generic(struct ixgbe_hw *hw, u8 *addr, u32 vmdq);
 s32 ixgbe_init_uta_tables_generic(struct ixgbe_hw *hw);
 s32 ixgbe_set_vfta_generic(struct ixgbe_hw *hw, u32 vlan,
-			 u32 vind, bool vlan_on, bool vlvf_bypass);
+			 u32 vind, bool vlan_on);
 s32 ixgbe_set_vlvf_generic(struct ixgbe_hw *hw, u32 vlan, u32 vind,
-			   bool vlan_on, u32 *vfta_delta, u32 vfta,
-			   bool vlvf_bypass);
+			   bool vlan_on, bool *vfta_changed);
 s32 ixgbe_clear_vfta_generic(struct ixgbe_hw *hw);
-s32 ixgbe_find_vlvf_slot(struct ixgbe_hw *hw, u32 vlan, bool vlvf_bypass);
-s32 ixgbe_toggle_txdctl_generic(struct ixgbe_hw *hw, u32 vind);
+s32 ixgbe_find_vlvf_slot(struct ixgbe_hw *hw, u32 vlan);
 
 s32 ixgbe_check_mac_link_generic(struct ixgbe_hw *hw,
 			       ixgbe_link_speed *speed,
@@ -102,20 +120,17 @@ s32 ixgbe_get_wwn_prefix_generic(struct ixgbe_hw *hw, u16 *wwnn_prefix,
 				 u16 *wwpn_prefix);
 
 s32 ixgbe_get_fcoe_boot_status_generic(struct ixgbe_hw *hw, u16 *bs);
-void ixgbe_set_mac_anti_spoofing(struct ixgbe_hw *hw, bool enable, int vf);
+void ixgbe_set_mac_anti_spoofing(struct ixgbe_hw *hw, bool enable, int pf);
 void ixgbe_set_vlan_anti_spoofing(struct ixgbe_hw *hw, bool enable, int vf);
 s32 ixgbe_get_device_caps_generic(struct ixgbe_hw *hw, u16 *device_caps);
 void ixgbe_set_rxpba_generic(struct ixgbe_hw *hw, int num_pb, u32 headroom,
 			     int strategy);
 s32 ixgbe_set_fw_drv_ver_generic(struct ixgbe_hw *hw, u8 maj, u8 min,
-				 u8 build, u8 ver, u16 len, const char *str);
+				 u8 build, u8 ver);
 u8 ixgbe_calculate_checksum(u8 *buffer, u32 length);
 s32 ixgbe_host_interface_command(struct ixgbe_hw *hw, u32 *buffer,
 				 u32 length, u32 timeout, bool return_data);
-s32 ixgbe_hic_unlocked(struct ixgbe_hw *, u32 *buffer, u32 length, u32 timeout);
-s32 ixgbe_shutdown_fw_phy(struct ixgbe_hw *);
-s32 ixgbe_fw_phy_activity(struct ixgbe_hw *, u16 activity,
-			  u32 (*data)[FW_PHY_ACT_DATA_COUNT]);
+
 void ixgbe_clear_tx_pending(struct ixgbe_hw *hw);
 
 extern s32 ixgbe_reset_pipeline_82599(struct ixgbe_hw *hw);
@@ -135,12 +150,6 @@ bool ixgbe_mng_enabled(struct ixgbe_hw *hw);
 
 s32 ixgbe_get_thermal_sensor_data_generic(struct ixgbe_hw *hw);
 s32 ixgbe_init_thermal_sensor_thresh_generic(struct ixgbe_hw *hw);
-
-void ixgbe_get_etk_id(struct ixgbe_hw *hw, struct ixgbe_nvm_version *nvm_ver);
-void ixgbe_get_oem_prod_version(struct ixgbe_hw *hw,
-				struct ixgbe_nvm_version *nvm_ver);
-void ixgbe_get_orom_version(struct ixgbe_hw *hw,
-			    struct ixgbe_nvm_version *nvm_ver);
 void ixgbe_disable_rx_generic(struct ixgbe_hw *hw);
 void ixgbe_enable_rx_generic(struct ixgbe_hw *hw);
 s32 ixgbe_setup_mac_link_multispeed_fiber(struct ixgbe_hw *hw,

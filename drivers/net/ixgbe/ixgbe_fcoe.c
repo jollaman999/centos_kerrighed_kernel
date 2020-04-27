@@ -1,5 +1,26 @@
-// SPDX-License-Identifier: GPL-2.0
-/* Copyright(c) 1999 - 2019 Intel Corporation. */
+/*******************************************************************************
+
+  Intel 10 Gigabit PCI Express Linux driver
+  Copyright (c) 1999 - 2014 Intel Corporation.
+
+  This program is free software; you can redistribute it and/or modify it
+  under the terms and conditions of the GNU General Public License,
+  version 2, as published by the Free Software Foundation.
+
+  This program is distributed in the hope it will be useful, but WITHOUT
+  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+  more details.
+
+  The full GNU General Public License is included in this distribution in
+  the file called "COPYING".
+
+  Contact Information:
+  Linux NICS <linux.nics@intel.com>
+  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
+  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+
+*******************************************************************************/
 
 #include "ixgbe.h"
 
@@ -17,7 +38,7 @@
 
 /**
  * ixgbe_fcoe_clear_ddp - clear the given ddp context
- * @ddp: ptr to the ixgbe_fcoe_ddp
+ * @ddp - ptr to the ixgbe_fcoe_ddp
  *
  * Returns : none
  *
@@ -133,7 +154,6 @@ out_ddp_put:
  * @xid: the exchange id requesting ddp
  * @sgl: the scatter-gather list for this request
  * @sgc: the number of scatter-gather items
- * @target_mode: 1 to setup target mode, 0 to setup initiator mode
  *
  * Returns : 1 for success and 0 for no ddp
  */
@@ -200,7 +220,7 @@ static int ixgbe_fcoe_ddp_setup(struct net_device *netdev, u16 xid,
 	}
 
 	/* alloc the udl from per cpu ddp pool */
-	ddp->udl = dma_pool_alloc(ddp_pool->pool, GFP_KERNEL, &ddp->udp);
+	ddp->udl = dma_pool_alloc(ddp_pool->pool, GFP_ATOMIC, &ddp->udp);
 	if (!ddp->udl) {
 		e_err(drv, "failed allocated ddp context\n");
 		goto out_noddp_unmap;
@@ -449,13 +469,13 @@ int ixgbe_fcoe_ddp(struct ixgbe_adapter *adapter,
 
 	switch (ixgbe_test_staterr(rx_desc, IXGBE_RXDADV_STAT_FCSTAT)) {
 	/* return 0 to bypass going to ULD for DDPed data */
-	case cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_DDP):
+	case __constant_cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_DDP):
 		/* update length of DDPed data */
 		ddp->len = le32_to_cpu(rx_desc->wb.lower.hi_dword.rss);
 		rc = 0;
 		break;
 	/* unmap the sg list when FCPRSP is received */
-	case cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_FCPRSP):
+	case __constant_cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_FCPRSP):
 		dma_unmap_sg(pci_dev_to_dev(adapter->pdev), ddp->sgl,
 			     ddp->sgc, DMA_FROM_DEVICE);
 		ddp->err = ddp_err;
@@ -463,14 +483,14 @@ int ixgbe_fcoe_ddp(struct ixgbe_adapter *adapter,
 		ddp->sgc = 0;
 		/* fall through */
 	/* if DDP length is present pass it through to ULD */
-	case cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_NODDP):
+	case __constant_cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_NODDP):
 		/* update length of DDPed data */
 		ddp->len = le32_to_cpu(rx_desc->wb.lower.hi_dword.rss);
 		if (ddp->len)
 			rc = ddp->len;
 		break;
 	/* no match will return as an error */
-	case cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_NOMTCH):
+	case __constant_cpu_to_le32(IXGBE_RXDADV_STAT_FCSTAT_NOMTCH):
 	default:
 		break;
 	}
@@ -620,7 +640,8 @@ static void ixgbe_fcoe_dma_pool_free(struct ixgbe_fcoe *fcoe, unsigned int cpu)
 	struct ixgbe_fcoe_ddp_pool *ddp_pool;
 
 	ddp_pool = per_cpu_ptr(fcoe->ddp_pool, cpu);
-	dma_pool_destroy(ddp_pool->pool);
+	if (ddp_pool->pool)
+		dma_pool_destroy(ddp_pool->pool);
 	ddp_pool->pool = NULL;
 }
 
@@ -695,8 +716,7 @@ void ixgbe_configure_fcoe(struct ixgbe_adapter *adapter)
 				   IXGBE_FCRETA_ENTRY_HIGH_MASK;
 		}
 		fcoe_i = fcoe->offset + (i % fcoe->indices);
-		if (fcoe_i >= MAX_RX_QUEUES)
-			fcoe_i = MAX_RX_QUEUES - 1;
+		fcoe_i &= IXGBE_FCRETA_ENTRY_MASK;
 		fcoe_q = adapter->rx_ring[fcoe_i]->reg_idx;
 		fcoe_q |= fcoe_q_h;
 		IXGBE_WRITE_REG(hw, IXGBE_FCRETA(i), fcoe_q);
@@ -782,7 +802,7 @@ int ixgbe_setup_fcoe_ddp_resources(struct ixgbe_adapter *adapter)
 		return 0;
 
 	/* Extra buffer to be shared by all DDPs for HW work around */
-	buffer = kmalloc(IXGBE_FCBUFF_MIN, GFP_KERNEL);
+	buffer = kmalloc(IXGBE_FCBUFF_MIN, GFP_ATOMIC);
 	if (!buffer) {
 		e_err(drv, "failed to allocate extra DDP buffer\n");
 		return -ENOMEM;
@@ -1013,7 +1033,7 @@ int ixgbe_fcoe_get_wwn(struct net_device *netdev, u64 *wwn, int type)
 #endif /* HAVE_NETDEV_OPS_FCOE_GETWWN */
 /**
  * ixgbe_fcoe_get_tc - get the current TC that fcoe is mapped to
- * @adapter: pointer to the device adapter structure
+ * @adapter - pointer to the device adapter structure
  *
  * Return : TC that FCoE is mapped to
  */
