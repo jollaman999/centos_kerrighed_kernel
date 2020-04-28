@@ -1,26 +1,5 @@
-/*******************************************************************************
-
-  Intel 10 Gigabit PCI Express Linux driver
-  Copyright (c) 1999 - 2014 Intel Corporation.
-
-  This program is free software; you can redistribute it and/or modify it
-  under the terms and conditions of the GNU General Public License,
-  version 2, as published by the Free Software Foundation.
-
-  This program is distributed in the hope it will be useful, but WITHOUT
-  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
-  more details.
-
-  The full GNU General Public License is included in this distribution in
-  the file called "COPYING".
-
-  Contact Information:
-  Linux NICS <linux.nics@intel.com>
-  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
-  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
-
-*******************************************************************************/
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 1999 - 2019 Intel Corporation. */
 
 #include "ixgbe_type.h"
 #include "ixgbe_82598.h"
@@ -538,6 +517,7 @@ out:
 /**
  *  ixgbe_start_mac_link_82598 - Configures MAC link settings
  *  @hw: pointer to hardware structure
+ *  @autoneg_wait_to_complete: true when waiting for completion is needed
  *
  *  Configures link settings based on values in the ixgbe_hw struct.
  *  Restarts the link.  Performs autonegotiation if needed.
@@ -985,16 +965,19 @@ STATIC s32 ixgbe_clear_vmdq_82598(struct ixgbe_hw *hw, u32 rar, u32 vmdq)
  *  @vlan: VLAN id to write to VLAN filter
  *  @vind: VMDq output index that maps queue to VLAN id in VFTA
  *  @vlan_on: boolean flag to turn on/off VLAN in VFTA
+ *  @vlvf_bypass: boolean flag - unused
  *
  *  Turn on/off specified VLAN in the VLAN filter table.
  **/
 s32 ixgbe_set_vfta_82598(struct ixgbe_hw *hw, u32 vlan, u32 vind,
-			 bool vlan_on)
+			 bool vlan_on, bool vlvf_bypass)
 {
 	u32 regindex;
 	u32 bitindex;
 	u32 bits;
 	u32 vftabyte;
+
+	UNREFERENCED_1PARAMETER(vlvf_bypass);
 
 	DEBUGFUNC("ixgbe_set_vfta_82598");
 
@@ -1192,7 +1175,7 @@ s32 ixgbe_read_i2c_eeprom_82598(struct ixgbe_hw *hw, u8 byte_offset,
  *  ixgbe_read_i2c_sff8472_82598 - Reads 8 bit word over I2C interface.
  *  @hw: pointer to hardware structure
  *  @byte_offset: byte offset at address 0xA2
- *  @eeprom_data: value read
+ *  @sff8472_data: value read
  *
  *  Performs 8 byte read operation to SFP module's SFF-8472 data over I2C
  **/
@@ -1209,9 +1192,9 @@ STATIC s32 ixgbe_read_i2c_sff8472_82598(struct ixgbe_hw *hw, u8 byte_offset,
  *
  *  Determines physical layer capabilities of the current configuration.
  **/
-u32 ixgbe_get_supported_physical_layer_82598(struct ixgbe_hw *hw)
+u64 ixgbe_get_supported_physical_layer_82598(struct ixgbe_hw *hw)
 {
-	u32 physical_layer = IXGBE_PHYSICAL_LAYER_UNKNOWN;
+	u64 physical_layer = IXGBE_PHYSICAL_LAYER_UNKNOWN;
 	u32 autoc = IXGBE_READ_REG(hw, IXGBE_AUTOC);
 	u32 pma_pmd_10g = autoc & IXGBE_AUTOC_10G_PMA_PMD_MASK;
 	u32 pma_pmd_1g = autoc & IXGBE_AUTOC_1G_PMA_PMD_MASK;

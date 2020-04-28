@@ -1,26 +1,5 @@
-/*******************************************************************************
-
-  Intel 10 Gigabit PCI Express Linux driver
-  Copyright (c) 1999 - 2014 Intel Corporation.
-
-  This program is free software; you can redistribute it and/or modify it
-  under the terms and conditions of the GNU General Public License,
-  version 2, as published by the Free Software Foundation.
-
-  This program is distributed in the hope it will be useful, but WITHOUT
-  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
-  more details.
-
-  The full GNU General Public License is included in this distribution in
-  the file called "COPYING".
-
-  Contact Information:
-  Linux NICS <linux.nics@intel.com>
-  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
-  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
-
-*******************************************************************************/
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 1999 - 2019 Intel Corporation. */
 
 #include "ixgbe.h"
 
@@ -377,7 +356,17 @@ static u8 ixgbe_dcbnl_set_all(struct net_device *netdev)
 		} else {
 			hw->mac.ops.fc_enable(hw);
 		}
+		/* This is known driver so disable MDD before updating SRRCTL */
+		if ((adapter->num_vfs) && (hw->mac.ops.disable_mdd) &&
+		    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+			hw->mac.ops.disable_mdd(hw);
+
 		ixgbe_set_rx_drop_en(adapter);
+
+		if ((adapter->num_vfs) && (hw->mac.ops.enable_mdd) &&
+		    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+			hw->mac.ops.enable_mdd(hw);
+
 		if (ret != DCB_HW_CHG_RST)
 			ret = DCB_HW_CHG;
 	}
@@ -555,8 +544,8 @@ static u8 ixgbe_dcbnl_getapp(struct net_device *netdev, u8 idtype, u16 id)
 
 /**
  * ixgbe_dcbnl_setapp - set the DCBX application user priority
- * @netdev : the corresponding netdev
- * @idtype : identifies the id as ether type or TCP/UDP port number
+ * @netdev: the corresponding netdev
+ * @idtype: identifies the id as ether type or TCP/UDP port number
  * @id: id is either ether type or TCP/UDP port number
  * @up: the 802.1p user priority bitmap
  *
@@ -564,10 +553,11 @@ static u8 ixgbe_dcbnl_getapp(struct net_device *netdev, u8 idtype, u16 id)
  */
 #ifdef HAVE_DCBNL_OPS_SETAPP_RETURN_INT
 static int ixgbe_dcbnl_setapp(struct net_device *netdev,
+			      u8 idtype, u16 id, u8 up)
 #else
 static u8 ixgbe_dcbnl_setapp(struct net_device *netdev,
-#endif
 			     u8 idtype, u16 id, u8 up)
+#endif
 {
 	int err = 0;
 #ifdef HAVE_DCBNL_IEEE
@@ -726,7 +716,16 @@ static int ixgbe_dcbnl_ieee_setpfc(struct net_device *dev,
 	else
 		err = hw->mac.ops.fc_enable(hw);
 
+	/* This is known driver so disable MDD before updating SRRCTL */
+	if ((adapter->num_vfs) && (hw->mac.ops.disable_mdd) &&
+	    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+		hw->mac.ops.disable_mdd(hw);
+
 	ixgbe_set_rx_drop_en(adapter);
+
+	if ((adapter->num_vfs) && (hw->mac.ops.enable_mdd) &&
+	    (adapter->flags & IXGBE_FLAG_MDD_ENABLED))
+		hw->mac.ops.enable_mdd(hw);
 
 	return err;
 }
@@ -836,7 +835,7 @@ static u8 ixgbe_dcbnl_setdcbx(struct net_device *dev, u8 mode)
 
 #endif
 
-struct dcbnl_rtnl_ops dcbnl_ops = {
+struct dcbnl_rtnl_ops ixgbe_dcbnl_ops = {
 #ifdef HAVE_DCBNL_IEEE
 	.ieee_getets	= ixgbe_dcbnl_ieee_getets,
 	.ieee_setets	= ixgbe_dcbnl_ieee_setets,

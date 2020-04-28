@@ -1,26 +1,5 @@
-/*******************************************************************************
-
-  Intel 10 Gigabit PCI Express Linux driver
-  Copyright (c) 1999 - 2014 Intel Corporation.
-
-  This program is free software; you can redistribute it and/or modify it
-  under the terms and conditions of the GNU General Public License,
-  version 2, as published by the Free Software Foundation.
-
-  This program is distributed in the hope it will be useful, but WITHOUT
-  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
-  more details.
-
-  The full GNU General Public License is included in this distribution in
-  the file called "COPYING".
-
-  Contact Information:
-  Linux NICS <linux.nics@intel.com>
-  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
-  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
-
-*******************************************************************************/
+/* SPDX-License-Identifier: GPL-2.0 */
+/* Copyright(c) 1999 - 2019 Intel Corporation. */
 
 #ifndef _IXGBE_X550_H_
 #define _IXGBE_X550_H_
@@ -46,12 +25,8 @@ s32 ixgbe_read_ee_hostif_buffer_X550(struct ixgbe_hw *hw,
 				     u16 offset, u16 words, u16 *data);
 s32 ixgbe_read_ee_hostif_X550(struct ixgbe_hw *hw, u16 offset,
 u16				*data);
-s32 ixgbe_read_ee_hostif_data_X550(struct ixgbe_hw *hw, u16 offset,
-				   u16 *data);
 s32 ixgbe_write_ee_hostif_data_X550(struct ixgbe_hw *hw, u16 offset,
 				    u16 data);
-s32 ixgbe_set_eee_X550(struct ixgbe_hw *hw, bool enable_eee);
-s32 ixgbe_setup_eee_X550(struct ixgbe_hw *hw, bool enable_eee);
 void ixgbe_set_source_address_pruning_X550(struct ixgbe_hw *hw, bool enable,
 					   unsigned int pool);
 void ixgbe_set_ethertype_anti_spoofing_X550(struct ixgbe_hw *hw,
@@ -59,6 +34,14 @@ void ixgbe_set_ethertype_anti_spoofing_X550(struct ixgbe_hw *hw,
 s32 ixgbe_write_iosf_sb_reg_x550(struct ixgbe_hw *hw, u32 reg_addr,
 				 u32 device_type, u32 data);
 s32 ixgbe_read_iosf_sb_reg_x550(struct ixgbe_hw *hw, u32 reg_addr,
+	u32 device_type, u32 *data);
+s32 ixgbe_set_fw_drv_ver_x550(struct ixgbe_hw *hw, u8 maj, u8 min,
+			      u8 build, u8 ver, u16 len, const char *str);
+s32 ixgbe_get_phy_token(struct ixgbe_hw *);
+s32 ixgbe_put_phy_token(struct ixgbe_hw *);
+s32 ixgbe_write_iosf_sb_reg_x550a(struct ixgbe_hw *hw, u32 reg_addr,
+	u32 device_type, u32 data);
+s32 ixgbe_read_iosf_sb_reg_x550a(struct ixgbe_hw *hw, u32 reg_addr,
 	u32 device_type, u32 *data);
 void ixgbe_disable_mdd_X550(struct ixgbe_hw *hw);
 void ixgbe_enable_mdd_X550(struct ixgbe_hw *hw);
@@ -75,7 +58,7 @@ s32 ixgbe_setup_kr_x550em(struct ixgbe_hw *hw);
 s32 ixgbe_init_ext_t_x550em(struct ixgbe_hw *hw);
 s32 ixgbe_setup_internal_phy_t_x550em(struct ixgbe_hw *hw);
 s32 ixgbe_setup_phy_loopback_x550em(struct ixgbe_hw *hw);
-u32 ixgbe_get_supported_physical_layer_X550em(struct ixgbe_hw *hw);
+u64 ixgbe_get_supported_physical_layer_X550em(struct ixgbe_hw *hw);
 void ixgbe_disable_rx_x550(struct ixgbe_hw *hw);
 s32 ixgbe_get_lcd_t_x550em(struct ixgbe_hw *hw, ixgbe_link_speed *lcd_speed);
 s32 ixgbe_enter_lplu_t_x550em(struct ixgbe_hw *hw);
@@ -85,6 +68,19 @@ s32 ixgbe_setup_fc_X550em(struct ixgbe_hw *hw);
 s32 ixgbe_setup_mac_link_sfp_x550em(struct ixgbe_hw *hw,
 				    ixgbe_link_speed speed,
 				    bool autoneg_wait_to_complete);
+s32 ixgbe_setup_mac_link_sfp_x550a(struct ixgbe_hw *hw,
+				    ixgbe_link_speed speed,
+				    bool autoneg_wait_to_complete);
+s32 ixgbe_read_phy_reg_x550a(struct ixgbe_hw *hw, u32 reg_addr,
+			       u32 device_type, u16 *phy_data);
+s32 ixgbe_write_phy_reg_x550a(struct ixgbe_hw *hw, u32 reg_addr,
+				u32 device_type, u16 phy_data);
+s32 ixgbe_setup_fc_fiber_x550em_a(struct ixgbe_hw *hw);
+s32 ixgbe_setup_fc_backplane_x550em_a(struct ixgbe_hw *hw);
+s32 ixgbe_setup_fc_sgmii_x550em_a(struct ixgbe_hw *hw);
+void ixgbe_fc_autoneg_fiber_x550em_a(struct ixgbe_hw *hw);
+void ixgbe_fc_autoneg_backplane_x550em_a(struct ixgbe_hw *hw);
+void ixgbe_fc_autoneg_sgmii_x550em_a(struct ixgbe_hw *hw);
 s32 ixgbe_handle_lasi_ext_t_x550em(struct ixgbe_hw *hw);
 s32 ixgbe_setup_mac_link_t_X550em(struct ixgbe_hw *hw,
 				  ixgbe_link_speed speed,
@@ -95,4 +91,5 @@ s32 ixgbe_reset_phy_t_X550em(struct ixgbe_hw *hw);
 s32 ixgbe_identify_sfp_module_X550em(struct ixgbe_hw *hw);
 s32 ixgbe_led_on_t_X550em(struct ixgbe_hw *hw, u32 led_idx);
 s32 ixgbe_led_off_t_X550em(struct ixgbe_hw *hw, u32 led_idx);
+bool ixgbe_fw_recovery_mode_X550(struct ixgbe_hw *hw);
 #endif /* _IXGBE_X550_H_ */

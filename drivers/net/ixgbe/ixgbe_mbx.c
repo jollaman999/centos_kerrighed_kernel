@@ -1,26 +1,5 @@
-/*******************************************************************************
-
-  Intel 10 Gigabit PCI Express Linux driver
-  Copyright (c) 1999 - 2014 Intel Corporation.
-
-  This program is free software; you can redistribute it and/or modify it
-  under the terms and conditions of the GNU General Public License,
-  version 2, as published by the Free Software Foundation.
-
-  This program is distributed in the hope it will be useful, but WITHOUT
-  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
-  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
-  more details.
-
-  The full GNU General Public License is included in this distribution in
-  the file called "COPYING".
-
-  Contact Information:
-  Linux NICS <linux.nics@intel.com>
-  e1000-devel Mailing List <e1000-devel@lists.sourceforge.net>
-  Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
-
-*******************************************************************************/
+// SPDX-License-Identifier: GPL-2.0
+/* Copyright(c) 1999 - 2019 Intel Corporation. */
 
 #include "ixgbe_type.h"
 #include "ixgbe_mbx.h"
@@ -133,6 +112,26 @@ s32 ixgbe_check_for_rst(struct ixgbe_hw *hw, u16 mbx_id)
 
 	if (mbx->ops.check_for_rst)
 		ret_val = mbx->ops.check_for_rst(hw, mbx_id);
+
+	return ret_val;
+}
+
+/**
+ *  ixgbe_clear_mbx - Clear Mailbox Memory
+ *  @hw: pointer to the HW structure
+ *  @vf_number: id of mailbox to write
+ *
+ *  Set VFMBMEM of given VF to 0x0.
+ **/
+s32 ixgbe_clear_mbx(struct ixgbe_hw *hw, u16 vf_number)
+{
+	struct ixgbe_mbx_info *mbx = &hw->mbx;
+	s32 ret_val = IXGBE_SUCCESS;
+
+	DEBUGFUNC("ixgbe_clear_mbx");
+
+	if (mbx->ops.clear)
+		ret_val = mbx->ops.clear(hw, vf_number);
 
 	return ret_val;
 }
@@ -506,6 +505,7 @@ void ixgbe_init_mbx_params_vf(struct ixgbe_hw *hw)
 	mbx->ops.check_for_msg = ixgbe_check_for_msg_vf;
 	mbx->ops.check_for_ack = ixgbe_check_for_ack_vf;
 	mbx->ops.check_for_rst = ixgbe_check_for_rst_vf;
+	mbx->ops.clear = NULL;
 
 	mbx->stats.msgs_tx = 0;
 	mbx->stats.msgs_rx = 0;
@@ -597,6 +597,7 @@ STATIC s32 ixgbe_check_for_rst_pf(struct ixgbe_hw *hw, u16 vf_number)
 		break;
 	case ixgbe_mac_X550:
 	case ixgbe_mac_X550EM_x:
+	case ixgbe_mac_X550EM_a:
 	case ixgbe_mac_X540:
 		vflre = IXGBE_READ_REG(hw, IXGBE_VFLREC(reg_offset));
 		break;
@@ -722,6 +723,27 @@ out_no_read:
 }
 
 /**
+ *  ixgbe_clear_mbx_pf - Clear Mailbox Memory
+ *  @hw: pointer to the HW structure
+ *  @vf_number: the VF index
+ *
+ *  Set VFMBMEM of given VF to 0x0.
+ **/
+STATIC s32 ixgbe_clear_mbx_pf(struct ixgbe_hw *hw, u16 vf_number)
+{
+	u16 mbx_size = hw->mbx.size;
+	u16 i;
+
+	if (vf_number > 63)
+		return IXGBE_ERR_PARAM;
+
+	for (i = 0; i < mbx_size; ++i)
+		IXGBE_WRITE_REG_ARRAY(hw, IXGBE_PFMBMEM(vf_number), i, 0x0);
+
+	return IXGBE_SUCCESS;
+}
+
+/**
  *  ixgbe_init_mbx_params_pf - set initial values for pf mailbox
  *  @hw: pointer to the HW structure
  *
@@ -734,6 +756,7 @@ void ixgbe_init_mbx_params_pf(struct ixgbe_hw *hw)
 	if (hw->mac.type != ixgbe_mac_82599EB &&
 	    hw->mac.type != ixgbe_mac_X550 &&
 	    hw->mac.type != ixgbe_mac_X550EM_x &&
+	    hw->mac.type != ixgbe_mac_X550EM_a &&
 	    hw->mac.type != ixgbe_mac_X540)
 		return;
 
@@ -749,6 +772,7 @@ void ixgbe_init_mbx_params_pf(struct ixgbe_hw *hw)
 	mbx->ops.check_for_msg = ixgbe_check_for_msg_pf;
 	mbx->ops.check_for_ack = ixgbe_check_for_ack_pf;
 	mbx->ops.check_for_rst = ixgbe_check_for_rst_pf;
+	mbx->ops.clear = ixgbe_clear_mbx_pf;
 
 	mbx->stats.msgs_tx = 0;
 	mbx->stats.msgs_rx = 0;
