@@ -794,11 +794,6 @@ config X86_OLD_MCE
 	  check related software problems, but report the problem to
 	  linux-kernel.  When in doubt say no.
 
-config X86_NEW_MCE
-	depends on X86_MCE
-	bool
-	default y if (!X86_OLD_MCE && X86_32) || X86_64
-
 config X86_MCE_INTEL
 	def_bool y
 	prompt "Intel MCE features"
