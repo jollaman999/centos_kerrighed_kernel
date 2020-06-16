@@ -110,16 +110,24 @@ static void __exit_signal(struct task_struct *tsk)
 
 	sighand = rcu_dereference(tsk->sighand);
 	spin_lock(&sighand->siglock);
+#ifndef CONFIG_KRG_EPM
 	atomic_dec(&sig->count);
+#endif
 
 	posix_cpu_timers_exit(tsk);
+
 #ifdef CONFIG_KRG_EPM
 	if (tsk->exit_state == EXIT_MIGRATION) {
-		BUG_ON(atomic_read(&sig->count) >= 1);
+		BUG_ON(atomic_read(&sig->count) > 1);
 		posix_cpu_timers_exit_group(tsk);
 		sig->curr_target = NULL;
-	} else
+
+		goto exit_migration;
+	} else {
+		atomic_dec(&sig->count);
+	}
 #endif
+
 	if (group_dead) {
 		posix_cpu_timers_exit_group(tsk);
 	} else {
@@ -163,6 +171,9 @@ static void __exit_signal(struct task_struct *tsk)
 		sig->sum_sched_runtime += tsk->se.sum_exec_runtime;
 	}
 
+#ifdef CONFIG_KRG_EPM
+exit_migration:
+#endif
 	__unhash_process(tsk, group_dead);
 
 	/*
