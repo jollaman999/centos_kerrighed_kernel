@@ -1968,21 +1968,24 @@ repeat:
 			break;
 	} while_each_thread(current, tsk);
 	read_unlock(&tasklist_lock);
+
 #ifdef CONFIG_KRG_EPM
 	if (current->children_obj) {
-		int tsk_result;
-
-		wo->notask_error = retval;
-
 		/* Try all children, even remote ones but don't wait yet */
 		/* Releases children lock */
-		tsk_result = krg_do_wait(current->children_obj, wo);
+		int tsk_result = krg_do_wait(current->children_obj, wo);
+
 		if (tsk_result)
-			wo->notask_error = tsk_result;
+			retval = tsk_result;
+		else
+			retval = wo->notask_error;
 	}
 #endif
 
 notask:
+#ifdef CONFIG_KRG_EPM
+	if (!current->children_obj)
+#endif
 	retval = wo->notask_error;
 	if (!retval && !(wo->wo_flags & WNOHANG)) {
 		retval = -ERESTARTSYS;
