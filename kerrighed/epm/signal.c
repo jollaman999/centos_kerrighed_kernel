@@ -33,6 +33,8 @@
 #include <net/krgrpc/rpc.h>
 #include <kddm/kddm.h>
 
+spinlock_t signal_struct_attach_lock;
+
 struct signal_struct_kddm_object {
 	struct signal_struct *signal;
 	atomic_t count;
@@ -126,7 +128,9 @@ static int signal_struct_alloc_object(struct kddm_obj *obj_entry,
 		return -ENOMEM;
 	}
 
+	spin_lock(&signal_struct_attach_lock);
 	signal_struct_attach_object(sig, obj, objid);
+	spin_unlock(&signal_struct_attach_lock);
 
 	obj_entry->object = obj;
 
@@ -361,9 +365,12 @@ ____krg_signal_alloc(struct signal_struct *sig, objid_t id)
 	/* Create the signal object */
 	obj = _kddm_grab_object(signal_struct_kddm_set, id);
 	BUG_ON(!obj);
+
+	spin_lock(&signal_struct_attach_lock);
 	/* Must be a first touch */
 	BUG_ON(obj->signal);
 	signal_struct_attach_object(sig, obj, id);
+	spin_unlock(&signal_struct_attach_lock);
 
 	return obj;
 }
@@ -1197,6 +1204,8 @@ int epm_signal_start(void)
 						     KDDM_LOCAL_EXCLUSIVE);
 	if (IS_ERR(signal_struct_kddm_set))
 		OOM;
+
+	spin_lock_init(&signal_struct_attach_lock);
 
 	return 0;
 }
