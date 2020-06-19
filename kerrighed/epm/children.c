@@ -749,6 +749,7 @@ bool krg_wait_consider_task(struct remote_child *child,
 /*                  +| */
 /*                 if (wo->notask_error) */
 /*                         wo->notask_error = ret; */
+/*                 return false; */
 /*         } */
 
 	if (unlikely(child->ptraced)) {
