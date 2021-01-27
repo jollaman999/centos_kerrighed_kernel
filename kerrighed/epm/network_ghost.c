@@ -52,6 +52,7 @@ struct task_struct *recv_task(struct rpc_desc *desc, struct epm_action *action)
 	pid_t pid;
 	int err;
 
+	printk("recv_task Yeah Ah\n");
 	ghost = create_network_ghost(GHOST_READ | GHOST_WRITE, desc);
 	if (IS_ERR(ghost))
 		goto err_ghost;

@@ -882,6 +882,8 @@ int import_one_open_file (struct epm_action *action,
 	int first_import = 0;
 	int r = 0;
 
+	printk("import_one_open_file\n");
+
 	BUG_ON(action->type == EPM_RESTART);
 
 	*returned_file = NULL;
@@ -981,6 +983,7 @@ exit:
 	return r;
 
 err:
+	printk("import_one_open_file ERROR\n");
 	for (j = 0; j < i; j++) {
 		if (fdt->fd[j])
 			filp_close(fdt->fd[j], files);
@@ -1196,6 +1199,8 @@ static int cr_link_to_vma_phys_file(struct epm_action *action,
 	int r;
 	int anon_shared;
 
+	printk("cr_link_to_vma_phys_file\n");
+
 	r = ghost_read_type(ghost, anon_shared);
 	if (r)
 		goto exit;
@@ -1208,8 +1213,10 @@ static int cr_link_to_vma_phys_file(struct epm_action *action,
 	}
 
 	r = cr_link_to_file(action, ghost, tsk, file);
-	if (r)
+	if (r) {
+		printk("cr_link_to_vma_phys_file - cr_link_to_file ERROR\n");
 		goto exit;
+	}
 
 	if (vma->vm_flags & VM_EXEC) {
 
@@ -1249,6 +1256,8 @@ int import_vma_phys_file(struct epm_action *action,
 	int import_file;
 	int r;
 
+	printk("import_vma_phys_file\n");
+
 	if (action->type == EPM_RESTART) {
 		r = cr_link_to_vma_phys_file(action, ghost, tsk, vma, &file);
 		if (r || is_anon_shared_mmap(file))
@@ -1268,8 +1277,10 @@ int import_vma_phys_file(struct epm_action *action,
 		/* First import ? Let's do the job ! */
 		r = import_one_open_file(action, ghost, tsk,
 					 MMAPPED_FILE, &file);
-		if (r)
+		if (r) {
+			printk("import_vma_phys_file - import_one_open_file ERROR\n");
 			goto err;
+		}
 
 		r = __hashtable_add(file_table, key, file);
 		if (r)
@@ -1314,6 +1325,8 @@ int import_vma_file (struct epm_action *action,
 {
 	int vm_file_type;
 	int r;
+
+	printk("import_vma_file\n");
 
 	/* Import the file type flag */
 	r = ghost_read (ghost, &vm_file_type, sizeof (int));

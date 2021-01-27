@@ -1423,6 +1423,7 @@ static struct task_struct *import_task(struct epm_action *action,
 	/* Import the task struct, and registers */
 	task = alloc_task_struct();
 	if (!task) {
+		printk("alloc_task_struct ERROR\n");
 		retval = -ENOMEM;
 		goto err_alloc_task;
 	}
@@ -1659,68 +1660,96 @@ static struct task_struct *import_task(struct epm_action *action,
 	return task;
 
 err_io_context:
+	printk("err_io_context ERROR\n");
 	unimport_exec_ids(task);
 err_exec_ids:
+	printk("err_exec_ids ERROR\n");
 	unimport_delays(task);
 err_delays:
+	printk("err_delays ERROR\n");
 #ifdef CONFIG_KRG_IPC
 	unimport_sysv_sem(task);
 err_sysv_sem:
 #endif
+	printk("err_sysv_sem ERROR\n");
 	unimport_sighand_struct(task);
 err_sighand_struct:
+	printk("err_sighand_struct ERROR\n");
 	unimport_signal_struct(task);
 err_signal_struct:
+	printk("err_signal_struct ERROR\n");
 	unimport_private_signals(task);
 err_signals:
+	printk("err_signals ERROR\n");
 	unimport_kddm_info_struct(task);
 err_kddm_info_struct:
+	printk("err_kddm_info_struct ERROR\n");
 	unimport_krg_structs(action, task);
 err_krg_structs:
+	printk("err_krg_structs ERROR\n");
 	unimport_children(action, task);
 err_children:
+	printk("err_children ERROR\n");
 	unimport_sched(task);
 err_sched:
+	printk("err_sched ERROR\n");
 	unimport_cgroups(task);
 err_cgroups:
+	printk("err_cgroups ERROR\n");
 #ifdef CONFIG_KRG_DVFS
 	unimport_files_struct(task);
 err_files_struct:
+	printk("err_files_struct ERROR\n");
 	unimport_fs_struct(task);
 err_fs_struct:
+	printk("err_fs_struct ERROR\n");
 #endif
 	unimport_thread_struct(task);
 err_thread_struct:
+	printk("err_thread_struct ERROR\n");
 	unimport_audit_context(task);
 err_audit_context:
+	printk("err_audit_context ERROR\n");
 	unimport_cred(task);
 err_cred:
+	printk("err_cred ERROR\n");
 	unimport_vfork_done(task);
 err_vfork_done:
+	printk("err_vfork_done ERROR\n");
 	unimport_binfmt(task);
 err_binfmt:
+	printk("err_binfmt ERROR\n");
 #ifdef CONFIG_KRG_MM
 	unimport_mm_struct(task);
 err_mm_struct:
+	printk("err_mm_struct ERROR\n");
 #endif
 	unimport_sched_info(task);
 err_sched_info:
+	printk("err_sched_info ERROR\n");
 #ifdef CONFIG_KRG_SCHED
 	unimport_krg_sched_info(task);
 err_krg_sched_info:
+	printk("err_krg_sched_info ERROR\n");
 #endif
 	unimport_group_leader(task);
 err_group_leader:
+	printk("err_group_leader ERROR\n");
 	unimport_pids(task);
 err_pids:
+	printk("err_pids ERROR\n");
 	unimport_nsproxy(task);
 err_nsproxy:
+	printk("err_nsproxy ERROR\n");
 	unimport_thread_info(task);
 err_thread_info:
+	printk("err_thread_info ERROR\n");
 /*	unimport_regs(task); */
 err_regs:
+	printk("err_regs ERROR\n");
 /*	unimport_task_struct(task); */
 err_task:
+	printk("err_task ERROR\n");
 	free_task_struct(task);
 err_alloc_task:
 	/* No-op calls, here for symmetry */
@@ -1815,6 +1844,8 @@ struct task_struct *create_new_process_from_ghost(struct task_struct *tskRecv,
 	int retval;
 	bool zombie = tskRecv->exit_state == EXIT_ZOMBIE;
 
+	printk("create_new_process_from_ghost Yeah Ah\n");
+
 	BUG_ON(!l_regs || !tskRecv);
 	BUG_ON(action->type == EPM_CHECKPOINT);
 
@@ -1826,6 +1857,7 @@ struct task_struct *create_new_process_from_ghost(struct task_struct *tskRecv,
 
 	/* Re-attach to the children kddm object of the parent. */
 	if (action->type == EPM_REMOTE_CLONE) {
+		printk("create_new_process_from_ghost EPM_REMOTE_CLONE Yeah Ah\n");
 		real_parent_tgid = action->remote_clone.from_tgid;
 		/* We need writelock to declare the new child later. */
 		parent_children_obj = krg_children_writelock(real_parent_tgid);
@@ -1835,6 +1867,8 @@ struct task_struct *create_new_process_from_ghost(struct task_struct *tskRecv,
 				   parent_children_obj);
 	} else {
 		pid_t parent, real_parent;
+
+		printk("create_new_process_from_ghost NON EPM_REMOTE_CLONE Yeah Ah\n");
 
 		/*
 		 * We must not call krg_parent_children_readlock since we are
@@ -1937,6 +1971,7 @@ struct task_struct *create_new_process_from_ghost(struct task_struct *tskRecv,
 
 	__krg_task_unlock(tskRecv);
 
+	printk("create_new_process_from_ghost register_pids Yeah Ah\n");
 	retval = register_pids(newTsk, action);
 	BUG_ON(retval);
 
@@ -2095,6 +2130,8 @@ struct task_struct *import_process(struct epm_action *action,
 
 	/* Process importation */
 
+	printk("import_process Yeah Ah\n");
+
 	if (action->type == EPM_MIGRATE) {
 		/*
 		 * Ensure that no task struct survives from a previous stay of
@@ -2105,12 +2142,15 @@ struct task_struct *import_process(struct epm_action *action,
 		 */
 		struct pid *pid;
 
+		printk("import_process - EPM_MIGRATE Yeah Ah\n");
+
 		rcu_read_lock();
 		pid = find_kpid(action->migrate.pid);
 		if (pid) {
 			get_pid(pid);
 			while (pid_task(pid, PIDTYPE_PID)) {
 				rcu_read_unlock();
+				printk("import_process - schedule Yeah Ah\n");
 				schedule();
 				rcu_read_lock();
 			}
@@ -2119,15 +2159,19 @@ struct task_struct *import_process(struct epm_action *action,
 		rcu_read_unlock();
 	}
 
+	printk("import_process - ghost_task Yeah Ah\n");
 	ghost_task = import_task(action, ghost, &regs);
 	if (IS_ERR(ghost_task)) {
+		printk("import_process - ghost_task ERROR Yeah Ah\n");
 		err = PTR_ERR(ghost_task);
 		goto err_task;
 	}
 	BUG_ON(!ghost_task);
 
+	printk("import_process - create_new_process_from_ghost Yeah Ah\n");
 	active_task = create_new_process_from_ghost(ghost_task, &regs, action);
 	if (IS_ERR(active_task)) {
+		printk("import_process - create_new_process_from_ghost ERROR Yeah Ah\n");
 		err = PTR_ERR(active_task);
 		goto err_active_task;
 	}

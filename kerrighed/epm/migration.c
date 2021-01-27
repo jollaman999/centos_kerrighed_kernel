@@ -357,6 +357,8 @@ static void handle_migrate(struct rpc_desc *desc, void *msg, size_t size)
 	struct epm_action *action = msg;
 	struct task_struct *task;
 
+	printk("Migration Yeah Ah\n");
+
 #ifdef CONFIG_KRG_SCHED
 	atomic_notifier_call_chain(&kmh_migration_recv_start, 0, action);
 #endif
@@ -371,11 +373,14 @@ static void handle_migrate(struct rpc_desc *desc, void *msg, size_t size)
 	atomic_notifier_call_chain(&kmh_migration_recv_end, 0, action);
 #endif
 
-	if (task->exit_state)
+	if (task->exit_state) {
+		printk("Zombie Yeah Ah\n");
 		/* Never schedule an imported zombie */
 		put_task_struct(task);
-	else
+	} else {
+		printk("Wake Up Yeah Ah\n");
 		wake_up_new_task(task, CLONE_VM);
+	}
 }
 
 static int do_migrate_live(struct task_struct *task, kerrighed_node_t target)

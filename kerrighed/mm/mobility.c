@@ -843,6 +843,8 @@ int cr_import_vma_pages(ghost_t *ghost,
 	pgprot_t prot;
 	int r;
 
+	printk("cr_import_vma_pages\n");
+
 	BUG_ON(!vma);
 
 	while (1) {
@@ -867,8 +869,10 @@ int cr_import_vma_pages(ghost_t *ghost,
 
 			r = shmem_getpage(vma->vm_file->f_path.dentry->d_inode,
 					  pgoff, &new_page, SGP_CACHE, NULL);
-			if (r)
+			if (r) {
+				printk("cr_import_vma_pages - shmem_getpage ERROR\n");
 				goto err_read;
+			}
 
 			BUG_ON(!new_page);
 
@@ -934,6 +938,8 @@ int cr_import_process_pages(struct epm_action *action,
 {
 	struct vm_area_struct *vma;
 	int r = 0;
+
+	printk("cr_import_process_pages\n");
 
 	BUG_ON(!mm);
 
@@ -1064,6 +1070,8 @@ static int import_one_vma (struct epm_action *action,
 	krgsyms_val_t vm_ops_type, initial_vm_ops_type;
 	int r;
 
+	printk("import_one_vma\n");
+
 	vma = kmem_cache_alloc(vm_area_cachep, GFP_KERNEL);
 	if (!vma)
 		return -ENOMEM;
@@ -1078,17 +1086,23 @@ static int import_one_vma (struct epm_action *action,
 #ifdef CONFIG_KRG_DVFS
 	/* Import the associated file */
 	r = import_vma_file(action, ghost, tsk, vma, file_table);
-	if (r)
+	if (r) {
+		printk("import_one_vma - import_vma_file ERROR\n");
 		goto err_vma;
+	}
 #endif
 
 	/* Import the vm_ops type of the vma */
 	r = ghost_read(ghost, &vm_ops_type, sizeof (krgsyms_val_t));
-	if (r)
+	if (r) {
+		printk("import_one_vma - ghost_read vm_ops_type ERROR\n");
 		goto err_vm_ops;
+	}
 	r = ghost_read(ghost, &initial_vm_ops_type, sizeof (krgsyms_val_t));
-	if (r)
+	if (r) {
+		printk("import_one_vma - ghost_read initial_vm_ops_type ERROR\n");
 		goto err_vm_ops;
+	}
 
 	vma->vm_ops = krgsyms_import(vm_ops_type);
 	vma->initial_vm_ops = krgsyms_import (initial_vm_ops_type);
@@ -1110,8 +1124,10 @@ static int import_one_vma (struct epm_action *action,
 	if (vma->vm_flags & VM_EXECUTABLE)
 		added_exe_file_vma(vma->vm_mm);
 	r = reconcile_vmas(tsk->mm, vma, last_end);
-	if (r)
+	if (r) {
+		printk("import_one_vma - reconcile_vmas ERROR\n");
 		goto err_reconcile;
+	}
 
 exit:
 	return r;
@@ -1157,23 +1173,31 @@ static int import_vmas (struct epm_action *action,
 	int nr_vma = -1;
 	int i, r;
 
+	printk("import_vmas\n");
+
 	BUG_ON (tsk == NULL);
 
 	file_table = hashtable_new (FILE_TABLE_SIZE);
-	if (!file_table)
+	if (!file_table) {
+		printk("import_vmas - hashtable_new ERROR\n");
 		return -ENOMEM;
+	}
 
 	mm = tsk->mm;
 
 	r = ghost_read(ghost, &nr_vma, sizeof(int));
-	if (r)
+	if (r) {
+		printk("import_vmas - ghost_read nr_vma ERROR\n");
 		goto exit;
+	}
 
 	for (i = 0; i < nr_vma; i++) {
 		r = import_one_vma(action, ghost, tsk, &last_end, file_table);
-		if (r)
+		if (r) {
+			printk("import_vmas - import_one_vma ERROR\n");
 			/* import_mm_struct will cleanup */
 			goto exit;
+		}
 	}
 
 	if (last_end != TASK_SIZE)
@@ -1185,6 +1209,9 @@ static int import_vmas (struct epm_action *action,
 		int magic = 0;
 
 		r = ghost_read(ghost, &magic, sizeof(int));
+		if (r) {
+			printk("import_vmas - ghost_read magic ERROR\n");
+		}
 		BUG_ON (!r && magic != 650874);
 	}
 
@@ -1242,14 +1269,18 @@ static int import_mm_counters(struct epm_action *action,
 	struct mm_struct *src_mm;
 	int r;
 
+	printk("import_mm_counters\n");
+
 	r = -ENOMEM;
 	src_mm = allocate_mm();
 	if (!src_mm)
 		goto err;
 
 	r = ghost_read(ghost, src_mm, sizeof(struct mm_struct));
-	if (r)
+	if (r) {
+		printk("import_mm_counters - ghost_read src_mm ERROR\n");
 		goto out_free_mm;
+	}
 
 	mm->mmap_base = src_mm->mmap_base;
 	mm->task_size = src_mm->task_size;
@@ -1279,6 +1310,8 @@ static int import_mm_counters(struct epm_action *action,
 	mm->oom_disable_count = src_mm->oom_disable_count;
 
 	r = ghost_read(ghost, &mm->mm_tasks, sizeof(atomic_t));
+	if (r)
+		printk("import_mm_counters - ghost_read mm->mm_tasks ERROR\n");
 
 out_free_mm:
 	free_mm(src_mm);
@@ -1390,6 +1423,8 @@ int import_mm_struct (struct epm_action *action,
 	struct kddm_set *set;
 	int r;
 
+	printk("import_mm_struct\n");
+
 	if (tsk->exit_state)
 		return 0;
 
@@ -1400,8 +1435,10 @@ int import_mm_struct (struct epm_action *action,
 	}
 
 	r = do_import_mm_struct (action, ghost, &mm);
-	if (r)
+	if (r) {
+		printk("import_mm_struct - do_import_mm_struct ERROR\n");
 		return r;
+	}
 
 	tsk->mm = mm;
 	tsk->active_mm = mm;
@@ -1416,17 +1453,23 @@ int import_mm_struct (struct epm_action *action,
 
 #ifdef CONFIG_KRG_DVFS
 	r = import_mm_exe_file(action, ghost, tsk);
-	if (r)
+	if (r) {
+		printk("import_mm_exe_file - do_import_mm_struct ERROR\n");
 		goto err;
+	}
 #endif
 
 	r = import_vmas(action, ghost, tsk);
-	if (r < 0)
+	if (r < 0) {
+		printk("import_mm_struct - import_vmas ERROR\n");
 		goto err;
+	}
 
 	r = import_mm_counters(action, ghost, mm);
-	if (r)
+	if (r) {
+		printk("import_mm_struct - import_mm_counters ERROR\n");
 		goto err;
+	}
 
 	mm->hiwater_rss = get_mm_rss(mm);
 	mm->hiwater_vm = mm->total_vm;
