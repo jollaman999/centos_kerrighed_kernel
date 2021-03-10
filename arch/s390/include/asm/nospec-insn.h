@@ -2,6 +2,9 @@
 #ifndef _ASM_S390_NOSPEC_ASM_H
 #define _ASM_S390_NOSPEC_ASM_H
 
+#include <asm/alternative-asm.h>
+#include <asm/asm-offsets.h>
+
 #ifdef __ASSEMBLY__
 
 #ifdef CONFIG_EXPOLINE

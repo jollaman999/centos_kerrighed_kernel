@@ -142,7 +142,7 @@ struct bfa_fcxp_req_info_s {
 					 * rport nexus is established
 					 */
 	struct fchs_s	fchs;	/*  request FC header structure */
-	u8		cts;	/*  continous sequence */
+	u8		cts;	/*  continuous sequence */
 	u8		class;	/*  FC class for the request/response */
 	u16	max_frmsz;	/*  max send frame size */
 	u16	vf_id;	/*  vsan tag if applicable */
@@ -302,6 +302,7 @@ struct bfa_rport_s {
 	void		*rport_drv;	/*  fcs/driver rport object	    */
 	u16	fw_handle;	/*  firmware rport handle	    */
 	u16	rport_tag;	/*  BFA rport tag		    */
+	u8	lun_mask;	/*  LUN mask flag		    */
 	struct bfa_rport_info_s rport_info; /*  rport info from fcs/driver */
 	struct bfa_reqq_wait_s reqq_wait; /*  to wait for room in reqq     */
 	struct bfa_cb_qe_s hcb_qe;	/*  BFA callback qelem		    */
@@ -407,6 +408,7 @@ struct bfa_lps_s {
 	u16		pr_bbcred;	/*  BB_CREDIT from peer		*/
 	u8		lsrjt_rsn;	/*  LSRJT reason		*/
 	u8		lsrjt_expl;	/*  LSRJT explanation		*/
+	u8		lun_mask;	/*  LUN mask flag		*/
 	wwn_t		pwwn;		/*  port wwn of lport		*/
 	wwn_t		nwwn;		/*  node wwn of lport		*/
 	wwn_t		pr_pwwn;	/*  port wwn of lport peer	*/
@@ -593,6 +595,14 @@ void bfa_cb_rport_scn_no_dev(void *rp);
 void bfa_cb_rport_qos_scn_prio(void *rport,
 			       struct bfa_rport_qos_attr_s old_qos_attr,
 			       struct bfa_rport_qos_attr_s new_qos_attr);
+
+/*
+ *	Rport LUN masking related
+ */
+#define BFA_RPORT_TAG_INVALID	0xffff
+#define BFA_LP_TAG_INVALID	0xff
+void	bfa_rport_set_lunmask(struct bfa_s *bfa, struct bfa_rport_s *rp);
+void	bfa_rport_unset_lunmask(struct bfa_s *bfa, struct bfa_rport_s *rp);
 
 /*
  * bfa fcxp API functions

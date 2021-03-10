@@ -9,20 +9,8 @@ enum xen_domain_type {
 
 #ifdef CONFIG_XEN
 extern enum xen_domain_type xen_domain_type;
-extern void xen_hvm_guest_init(void);
-extern uint32_t xen_cpuid_base(void);
-extern uint32_t xen_version(void);
 #else
 #define xen_domain_type		XEN_NATIVE
-#define xen_hvm_guest_init() do {} while (0)
-static inline uint32_t xen_cpuid_base(void)
-{
-	return 0;
-}
-static inline uint32_t xen_version(void)
-{
-	return 0;
-}
 #endif
 
 #define xen_domain()		(xen_domain_type != XEN_NATIVE)
@@ -35,8 +23,8 @@ static inline uint32_t xen_version(void)
 #include <xen/interface/xen.h>
 #include <asm/xen/hypervisor.h>
 
-#define xen_initial_domain()	(xen_pv_domain() && \
-				 xen_start_info->flags & SIF_INITDOMAIN)
+#define xen_initial_domain()	(xen_domain() && \
+				 xen_start_info && xen_start_info->flags & SIF_INITDOMAIN)
 #else  /* !CONFIG_XEN_DOM0 */
 #define xen_initial_domain()	(0)
 #endif	/* CONFIG_XEN_DOM0 */

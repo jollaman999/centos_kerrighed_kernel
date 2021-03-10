@@ -1,10 +1,9 @@
 /*
- * File...........: arch/s390/mm/extmem.c
  * Author(s)......: Carsten Otte <cotte@de.ibm.com>
  * 		    Rob M van der Heij <rvdheij@nl.ibm.com>
  * 		    Steven Shultz <shultzss@us.ibm.com>
  * Bugreports.to..: <Linux390@de.ibm.com>
- * (C) IBM Corporation 2002-2004
+ * Copyright IBM Corp. 2002, 2004
  */
 
 #define KMSG_COMPONENT "extmem"
@@ -19,6 +18,7 @@
 #include <linux/bootmem.h>
 #include <linux/ctype.h>
 #include <linux/ioport.h>
+#include <asm/diag.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/ebcdic.h>
@@ -105,7 +105,7 @@ static int
 dcss_set_subcodes(void)
 {
 #ifdef CONFIG_64BIT
-	char *name = kmalloc(8 * sizeof(char), GFP_DMA);
+	char *name = kmalloc(8 * sizeof(char), GFP_KERNEL | GFP_DMA);
 	unsigned long rx, ry;
 	int rc;
 
@@ -116,6 +116,7 @@ dcss_set_subcodes(void)
 	ry = DCSS_FINDSEGX;
 
 	strcpy(name, "dummy");
+	diag_stat_inc(DIAG_STAT_X064);
 	asm volatile(
 		"	diag	%0,%1,0x64\n"
 		"0:	ipm	%2\n"
@@ -211,6 +212,7 @@ dcss_diag(int *func, void *parameter,
 
 #ifdef CONFIG_64BIT
 	/* 64-bit Diag x'64' new subcode, keep in 64-bit addressing mode */
+	diag_stat_inc(DIAG_STAT_X064);
 	if (*func > DCSS_SEGEXT)
 		asm volatile(
 			"	diag	%0,%1,0x64\n"
@@ -252,12 +254,13 @@ dcss_diag_translate_rc (int vm_rc) {
 static int
 query_segment_type (struct dcss_segment *seg)
 {
-	struct qin64  *qin = kmalloc (sizeof(struct qin64), GFP_DMA);
-	struct qout64 *qout = kmalloc (sizeof(struct qout64), GFP_DMA);
-
-	int diag_cc, rc, i;
 	unsigned long dummy, vmrc;
+	int diag_cc, rc, i;
+	struct qout64 *qout;
+	struct qin64 *qin;
 
+	qin = kmalloc(sizeof(*qin), GFP_KERNEL | GFP_DMA);
+	qout = kmalloc(sizeof(*qout), GFP_KERNEL | GFP_DMA);
 	if ((qin == NULL) || (qout == NULL)) {
 		rc = -ENOMEM;
 		goto out_free;
@@ -286,7 +289,7 @@ query_segment_type (struct dcss_segment *seg)
 	   copy data for the new format. */
 	if (segext_scode == DCSS_SEGEXT) {
 		struct qout64_old *qout_old;
-		qout_old = kzalloc(sizeof(struct qout64_old), GFP_DMA);
+		qout_old = kzalloc(sizeof(*qout_old), GFP_KERNEL | GFP_DMA);
 		if (qout_old == NULL) {
 			rc = -ENOMEM;
 			goto out_free;
@@ -309,7 +312,7 @@ query_segment_type (struct dcss_segment *seg)
 	}
 #endif
 	if (qout->segcnt > 6) {
-		rc = -ENOTSUPP;
+		rc = -EOPNOTSUPP;
 		goto out_free;
 	}
 
@@ -324,11 +327,11 @@ query_segment_type (struct dcss_segment *seg)
 		for (i=0; i<qout->segcnt; i++) {
 			if (((qout->range[i].start & 0xff) != SEG_TYPE_EW) &&
 			    ((qout->range[i].start & 0xff) != SEG_TYPE_EN)) {
-				rc = -ENOTSUPP;
+				rc = -EOPNOTSUPP;
 				goto out_free;
 			}
 			if (start != qout->range[i].start >> PAGE_SHIFT) {
-				rc = -ENOTSUPP;
+				rc = -EOPNOTSUPP;
 				goto out_free;
 			}
 			start = (qout->range[i].end >> PAGE_SHIFT) + 1;
@@ -357,7 +360,7 @@ query_segment_type (struct dcss_segment *seg)
  * -ENOSYS  : we are not running on VM
  * -EIO     : could not perform query diagnose
  * -ENOENT  : no such segment
- * -ENOTSUPP: multi-part segment cannot be used with linux
+ * -EOPNOTSUPP: multi-part segment cannot be used with linux
  * -ENOMEM  : out of memory
  * 0 .. 6   : type of segment as defined in include/asm-s390/extmem.h
  */
@@ -407,11 +410,12 @@ segment_overlaps_others (struct dcss_segment *seg)
 static int
 __segment_load (char *name, int do_nonshared, unsigned long *addr, unsigned long *end)
 {
-	struct dcss_segment *seg = kmalloc(sizeof(struct dcss_segment),
-			GFP_DMA);
-	int rc, diag_cc;
 	unsigned long start_addr, end_addr, dummy;
+	struct dcss_segment *seg;
+	int rc, diag_cc;
 
+	start_addr = end_addr = 0;
+	seg = kmalloc(sizeof(*seg), GFP_KERNEL | GFP_DMA);
 	if (seg == NULL) {
 		rc = -ENOMEM;
 		goto out;
@@ -515,7 +519,7 @@ __segment_load (char *name, int do_nonshared, unsigned long *addr, unsigned long
  * -ENOSYS  : we are not running on VM
  * -EIO     : could not perform query or load diagnose
  * -ENOENT  : no such segment
- * -ENOTSUPP: multi-part segment cannot be used with linux
+ * -EOPNOTSUPP: multi-part segment cannot be used with linux
  * -ENOSPC  : segment cannot be used (overlaps with storage)
  * -EBUSY   : segment can temporarily not be used (overlaps with dcss)
  * -ERANGE  : segment cannot be used (exceeds kernel mapping range)
@@ -572,6 +576,7 @@ segment_modify_shared (char *name, int do_nonshared)
 	unsigned long start_addr, end_addr, dummy;
 	int rc, diag_cc;
 
+	start_addr = end_addr = 0;
 	mutex_lock(&dcss_lock);
 	seg = segment_by_name (name);
 	if (seg == NULL) {
@@ -680,8 +685,6 @@ void
 segment_save(char *name)
 {
 	struct dcss_segment *seg;
-	int startpfn = 0;
-	int endpfn = 0;
 	char cmd1[160];
 	char cmd2[80];
 	int i, response;
@@ -697,8 +700,6 @@ segment_save(char *name)
 		goto out;
 	}
 
-	startpfn = seg->start_addr >> PAGE_SHIFT;
-	endpfn = (seg->end) >> PAGE_SHIFT;
 	sprintf(cmd1, "DEFSEG %s", name);
 	for (i=0; i<seg->segcnt; i++) {
 		sprintf(cmd1+strlen(cmd1), " %lX-%lX %s",
@@ -742,7 +743,7 @@ void segment_warning(int rc, char *seg_name)
 		pr_err("Loading or querying DCSS %s resulted in a "
 		       "hardware error\n", seg_name);
 		break;
-	case -ENOTSUPP:
+	case -EOPNOTSUPP:
 		pr_err("DCSS %s has multiple page ranges and cannot be "
 		       "loaded or queried\n", seg_name);
 		break;

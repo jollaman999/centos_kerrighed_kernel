@@ -18,6 +18,8 @@
 
 /*----------------------------------------------------------------*/
 
+#ifdef CONFIG_DM_DEBUG_BLOCK_MANAGER_LOCKING
+
 /*
  * This is a read/write semaphore with a couple of differences.
  *
@@ -97,10 +99,6 @@ static void __del_holder(struct block_lock *lock, struct task_struct *task)
 static int __check_holder(struct block_lock *lock)
 {
 	unsigned i;
-#ifdef CONFIG_DM_DEBUG_BLOCK_STACK_TRACING
-	static struct stack_trace t;
-	static stack_entries entries;
-#endif
 
 	for (i = 0; i < MAX_HOLDERS; i++) {
 		if (lock->holders[i] == current) {
@@ -110,12 +108,7 @@ static int __check_holder(struct block_lock *lock)
 			print_stack_trace(lock->traces + i, 4);
 
 			DMERR("subsequent acquisition attempted here:");
-			t.nr_entries = 0;
-			t.max_entries = MAX_STACK;
-			t.entries = entries;
-			t.skip = 3;
-			save_stack_trace(&t);
-			print_stack_trace(&t, 4);
+			dump_stack();
 #endif
 			return -EINVAL;
 		}
@@ -311,6 +304,18 @@ static void report_recursive_bug(dm_block_t b, int r)
 		      (unsigned long long) b);
 }
 
+#else  /* !CONFIG_DM_DEBUG_BLOCK_MANAGER_LOCKING */
+
+#define bl_init(x) do { } while (0)
+#define bl_down_read(x) 0
+#define bl_down_read_nonblock(x) 0
+#define bl_up_read(x) do { } while (0)
+#define bl_down_write(x) 0
+#define bl_up_write(x) do { } while (0)
+#define report_recursive_bug(x, y) do { } while (0)
+
+#endif /* CONFIG_DM_DEBUG_BLOCK_MANAGER_LOCKING */
+
 /*----------------------------------------------------------------*/
 
 /*
@@ -339,8 +344,11 @@ EXPORT_SYMBOL_GPL(dm_block_data);
 
 struct buffer_aux {
 	struct dm_block_validator *validator;
-	struct block_lock lock;
 	int write_locked;
+
+#ifdef CONFIG_DM_DEBUG_BLOCK_MANAGER_LOCKING
+	struct block_lock lock;
+#endif
 };
 
 static void dm_block_manager_alloc_callback(struct dm_buffer *buf)
@@ -369,7 +377,6 @@ struct dm_block_manager {
 
 struct dm_block_manager *dm_block_manager_create(struct block_device *bdev,
 						 unsigned block_size,
-						 unsigned cache_size,
 						 unsigned max_held_per_thread)
 {
 	int r;

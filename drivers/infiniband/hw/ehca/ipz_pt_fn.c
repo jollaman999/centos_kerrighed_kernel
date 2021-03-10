@@ -38,6 +38,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <linux/slab.h>
+
 #include "ehca_tools.h"
 #include "ipz_pt_fn.h"
 #include "ehca_classes.h"
@@ -79,7 +81,7 @@ int ipz_queue_abs_to_offset(struct ipz_queue *queue, u64 addr, u64 *q_offset)
 {
 	int i;
 	for (i = 0; i < queue->queue_length / queue->pagesize; i++) {
-		u64 page = (u64)virt_to_abs(queue->queue_pages[i]);
+		u64 page = __pa(queue->queue_pages[i]);
 		if (addr >= page && addr < page + queue->pagesize) {
 			*q_offset = addr - page + i * queue->pagesize;
 			return 0;
@@ -242,10 +244,7 @@ int ipz_queue_ctor(struct ehca_pd *pd, struct ipz_queue *queue,
 ipz_queue_ctor_exit0:
 	ehca_gen_err("Couldn't alloc pages queue=%p "
 		 "nr_of_pages=%x",  queue, nr_of_pages);
-	if (is_vmalloc_addr(queue->queue_pages))
-		vfree(queue->queue_pages);
-	else
-		kfree(queue->queue_pages);
+	kvfree(queue->queue_pages);
 
 	return 0;
 }
@@ -267,10 +266,7 @@ int ipz_queue_dtor(struct ehca_pd *pd, struct ipz_queue *queue)
 			free_page((unsigned long)queue->queue_pages[i]);
 	}
 
-	if (is_vmalloc_addr(queue->queue_pages))
-		vfree(queue->queue_pages);
-	else
-		kfree(queue->queue_pages);
+	kvfree(queue->queue_pages);
 
 	return 1;
 }

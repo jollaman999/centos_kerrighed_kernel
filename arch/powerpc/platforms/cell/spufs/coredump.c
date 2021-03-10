@@ -24,8 +24,8 @@
 #include <linux/file.h>
 #include <linux/fdtable.h>
 #include <linux/fs.h>
+#include <linux/gfp.h>
 #include <linux/list.h>
-#include <linux/module.h>
 #include <linux/syscalls.h>
 
 #include <asm/uaccess.h>
@@ -54,7 +54,7 @@ static ssize_t do_coredump_read(int num, struct spu_context *ctx, void *buffer,
  */
 static int spufs_dump_write(struct file *file, const void *addr, int nr, loff_t *foffset)
 {
-	unsigned long limit = current->signal->rlim[RLIMIT_CORE].rlim_cur;
+	unsigned long limit = rlimit(RLIMIT_CORE);
 	ssize_t written;
 
 	if (*foffset + nr > limit)
@@ -106,6 +106,17 @@ static int spufs_ctx_note_size(struct spu_context *ctx, int dfd)
 	return total;
 }
 
+static int match_context(const void *v, struct file *file, unsigned fd)
+{
+	struct spu_context *ctx;
+	if (file->f_op != &spufs_context_fops)
+		return 0;
+	ctx = SPUFS_I(file_inode(file))->i_ctx;
+	if (ctx->flags & SPU_CREATE_NOSCHED)
+		return 0;
+	return fd + 1;
+}
+
 /*
  * The additional architecture-specific notes for Cell are various
  * context files in the spu context.
@@ -115,29 +126,18 @@ static int spufs_ctx_note_size(struct spu_context *ctx, int dfd)
  * internal functionality to dump them without needing to actually
  * open the files.
  */
+/*
+ * descriptor table is not shared, so files can't change or go away.
+ */
 static struct spu_context *coredump_next_context(int *fd)
 {
-	struct fdtable *fdt = files_fdtable(current->files);
 	struct file *file;
-	struct spu_context *ctx = NULL;
-
-	for (; *fd < fdt->max_fds; (*fd)++) {
-		if (!FD_ISSET(*fd, fdt->open_fds))
-			continue;
-
-		file = fcheck(*fd);
-
-		if (!file || file->f_op != &spufs_context_fops)
-			continue;
-
-		ctx = SPUFS_I(file->f_dentry->d_inode)->i_ctx;
-		if (ctx->flags & SPU_CREATE_NOSCHED)
-			continue;
-
-		break;
-	}
-
-	return ctx;
+	int n = iterate_fd(current->files, *fd, match_context, NULL);
+	if (!n)
+		return NULL;
+	*fd = n - 1;
+	file = fcheck(*fd);
+	return SPUFS_I(file_inode(file))->i_ctx;
 }
 
 int spufs_coredump_extra_notes_size(void)

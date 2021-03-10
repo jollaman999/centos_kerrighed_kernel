@@ -71,7 +71,7 @@ static void rts5227_fetch_vendor_settings(struct rtsx_pcr *pcr)
 	u32 reg;
 
 	rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG1, &reg);
-	dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
+	pcr_dbg(pcr, "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG1, reg);
 
 	if (!rtsx_vendor_setting_valid(reg))
 		return;
@@ -82,7 +82,7 @@ static void rts5227_fetch_vendor_settings(struct rtsx_pcr *pcr)
 	pcr->card_drive_sel |= rtsx_reg_to_card_drive_sel(reg);
 
 	rtsx_pci_read_config_dword(pcr, PCR_SETTING_REG2, &reg);
-	dev_dbg(&(pcr->pci->dev), "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG2, reg);
+	pcr_dbg(pcr, "Cfg 0x%x: 0x%x\n", PCR_SETTING_REG2, reg);
 	pcr->sd30_drive_sel_3v3 = rtsx_reg_to_sd30_drive_sel_3v3(reg);
 	if (rtsx_reg_check_reverse_socket(reg))
 		pcr->flags |= PCR_REVERSE_SOCKET;
@@ -109,6 +109,8 @@ static int rts5227_extra_init_hw(struct rtsx_pcr *pcr)
 
 	/* Configure GPIO as output */
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, GPIO_CTL, 0x02, 0x02);
+	/* Reset ASPM state to default value */
+	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, ASPM_FORCE_CTL, 0x3F, 0);
 	/* Switch LDO3318 source from DV33 to card_3v3 */
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, LDO_PWR_SEL, 0x03, 0x00);
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, LDO_PWR_SEL, 0x03, 0x01);
@@ -124,11 +126,9 @@ static int rts5227_extra_init_hw(struct rtsx_pcr *pcr)
 	rts5227_fill_driving(pcr, OUTPUT_3V3);
 	/* Configure force_clock_req */
 	if (pcr->flags & PCR_REVERSE_SOCKET)
-		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
-				AUTOLOAD_CFG_BASE + 3, 0xB8, 0xB8);
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, PETXCFG, 0xB8, 0xB8);
 	else
-		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD,
-				AUTOLOAD_CFG_BASE + 3, 0xB8, 0x88);
+		rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, PETXCFG, 0xB8, 0x88);
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, pcr->reg_pm_ctrl3, 0x10, 0x00);
 
 	return rtsx_pci_send_cmd(pcr, 100);
@@ -138,7 +138,7 @@ static int rts5227_optimize_phy(struct rtsx_pcr *pcr)
 {
 	int err;
 
-	err = rtsx_gops_pm_reset(pcr);
+	err = rtsx_pci_write_register(pcr, PM_CTRL3, D3_DELINK_MODE_EN, 0x00);
 	if (err < 0)
 		return err;
 
@@ -187,11 +187,7 @@ static int rts5227_card_power_on(struct rtsx_pcr *pcr, int card)
 			SD_POWER_MASK, SD_POWER_ON);
 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, PWR_GATE_CTRL,
 			LDO3318_PWR_MASK, 0x06);
-	err = rtsx_pci_send_cmd(pcr, 100);
-	if (err < 0)
-		return err;
-
-	return 0;
+	return rtsx_pci_send_cmd(pcr, 100);
 }
 
 static int rts5227_card_power_off(struct rtsx_pcr *pcr, int card)

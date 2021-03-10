@@ -25,10 +25,9 @@
 #include <linux/mm.h>
 #include <linux/uio.h>
 #include <linux/mutex.h>
-#include <linux/smp_lock.h>
+#include <linux/slab.h>
 #include <asm/io.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <asm/pgtable.h>
 #include <asm/sn/addrs.h>
 #include <asm/sn/intr.h>
@@ -41,6 +40,7 @@
 #else
 #define DBG(fmt...)
 #endif
+static DEFINE_MUTEX(mbcs_mutex);
 static int mbcs_major;
 
 static LIST_HEAD(soft_list);
@@ -384,19 +384,19 @@ static int mbcs_open(struct inode *ip, struct file *fp)
 	struct mbcs_soft *soft;
 	int minor;
 
-	lock_kernel();
+	mutex_lock(&mbcs_mutex);
 	minor = iminor(ip);
 
 	/* Nothing protects access to this list... */
 	list_for_each_entry(soft, &soft_list, list) {
 		if (soft->nasid == minor) {
 			fp->private_data = soft->cxdev;
-			unlock_kernel();
+			mutex_unlock(&mbcs_mutex);
 			return 0;
 		}
 	}
 
-	unlock_kernel();
+	mutex_unlock(&mbcs_mutex);
 	return -ENODEV;
 }
 
@@ -507,7 +507,7 @@ static int mbcs_gscr_mmap(struct file *fp, struct vm_area_struct *vma)
 
 	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
 
-	/* Remap-pfn-range will mark the range VM_IO and VM_RESERVED */
+	/* Remap-pfn-range will mark the range VM_IO */
 	if (remap_pfn_range(vma,
 			    vma->vm_start,
 			    __pa(soft->gscr_addr) >> PAGE_SHIFT,
@@ -799,7 +799,7 @@ static int mbcs_remove(struct cx_dev *dev)
 	return 0;
 }
 
-static const struct cx_device_id __devinitdata mbcs_id_table[] = {
+static const struct cx_device_id mbcs_id_table[] = {
 	{
 	 .part_num = MBCS_PART_NUM,
 	 .mfg_num = MBCS_MFG_NUM,

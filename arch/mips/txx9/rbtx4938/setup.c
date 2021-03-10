@@ -107,10 +107,10 @@ static void __init rbtx4938_pci_setup(void)
 /* SPI support */
 
 /* chip select for SPI devices */
-#define	SEEPROM1_CS	7	/* PIO7 */
-#define	SEEPROM2_CS	0	/* IOC */
-#define	SEEPROM3_CS	1	/* IOC */
-#define	SRTC_CS	2	/* IOC */
+#define SEEPROM1_CS	7	/* PIO7 */
+#define SEEPROM2_CS	0	/* IOC */
+#define SEEPROM3_CS	1	/* IOC */
+#define SRTC_CS 2	/* IOC */
 #define SPI_BUSNO	0
 
 static int __init rbtx4938_ethaddr_init(void)
@@ -153,7 +153,6 @@ static void __init rbtx4938_time_init(void)
 static void __init rbtx4938_mem_setup(void)
 {
 	unsigned long long pcfg;
-	char *argptr;
 
 	if (txx9_master_clock == 0)
 		txx9_master_clock = 25000000; /* 25MHz */
@@ -168,11 +167,6 @@ static void __init rbtx4938_mem_setup(void)
 #endif
 
 	tx4938_sio_init(7372800, 0);
-#ifdef CONFIG_SERIAL_TXX9_CONSOLE
-	argptr = prom_getcmdline();
-	if (!strstr(argptr, "console="))
-		strcat(argptr, " console=ttyS0,38400");
-#endif
 
 #ifdef CONFIG_TOSHIBA_RBTX4938_MPLEX_PIO58_61
 	pr_info("PIOSEL: disabling both ATA and NAND selection\n");

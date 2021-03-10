@@ -19,6 +19,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/slab.h>
 #include <sound/core.h>
 #include <sound/info.h>
 #include "pdaudiocf.h"
@@ -261,7 +262,7 @@ void snd_pdacf_powerdown(struct snd_pdacf *chip)
 
 #ifdef CONFIG_PM
 
-int snd_pdacf_suspend(struct snd_pdacf *chip, pm_message_t state)
+int snd_pdacf_suspend(struct snd_pdacf *chip)
 {
 	u16 val;
 	

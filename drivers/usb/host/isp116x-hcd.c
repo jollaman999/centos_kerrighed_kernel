@@ -60,8 +60,8 @@
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
 #include <linux/errno.h>
-#include <linux/init.h>
 #include <linux/list.h>
+#include <linux/slab.h>
 #include <linux/usb.h>
 #include <linux/usb/isp116x.h>
 #include <linux/usb/hcd.h>
@@ -69,7 +69,6 @@
 
 #include <asm/io.h>
 #include <asm/irq.h>
-#include <asm/system.h>
 #include <asm/byteorder.h>
 
 #include "isp116x.h"
@@ -1557,9 +1556,7 @@ static int isp116x_remove(struct platform_device *pdev)
 	return 0;
 }
 
-#define resource_len(r) (((r)->end - (r)->start) + 1)
-
-static int __devinit isp116x_probe(struct platform_device *pdev)
+static int isp116x_probe(struct platform_device *pdev)
 {
 	struct usb_hcd *hcd;
 	struct isp116x *isp116x;
@@ -1569,6 +1566,9 @@ static int __devinit isp116x_probe(struct platform_device *pdev)
 	int irq;
 	int ret = 0;
 	unsigned long irqflags;
+
+	if (usb_disabled())
+		return -ENODEV;
 
 	if (pdev->num_resources < 3) {
 		ret = -ENODEV;
@@ -1597,7 +1597,7 @@ static int __devinit isp116x_probe(struct platform_device *pdev)
 		ret = -EBUSY;
 		goto err1;
 	}
-	addr_reg = ioremap(addr->start, resource_len(addr));
+	addr_reg = ioremap(addr->start, resource_size(addr));
 	if (addr_reg == NULL) {
 		ret = -ENOMEM;
 		goto err2;
@@ -1606,7 +1606,7 @@ static int __devinit isp116x_probe(struct platform_device *pdev)
 		ret = -EBUSY;
 		goto err3;
 	}
-	data_reg = ioremap(data->start, resource_len(data));
+	data_reg = ioremap(data->start, resource_size(data));
 	if (data_reg == NULL) {
 		ret = -ENOMEM;
 		goto err4;
@@ -1640,7 +1640,7 @@ static int __devinit isp116x_probe(struct platform_device *pdev)
 		goto err6;
 	}
 
-	ret = usb_add_hcd(hcd, irq, irqflags | IRQF_DISABLED);
+	ret = usb_add_hcd(hcd, irq, irqflags);
 	if (ret)
 		goto err6;
 
@@ -1704,27 +1704,9 @@ static struct platform_driver isp116x_driver = {
 	.suspend = isp116x_suspend,
 	.resume = isp116x_resume,
 	.driver = {
-		.name = (char *)hcd_name,
+		.name = hcd_name,
 		.owner	= THIS_MODULE,
 	},
 };
 
-/*-----------------------------------------------------------------*/
-
-static int __init isp116x_init(void)
-{
-	if (usb_disabled())
-		return -ENODEV;
-
-	INFO("driver %s, %s\n", hcd_name, DRIVER_VERSION);
-	return platform_driver_register(&isp116x_driver);
-}
-
-module_init(isp116x_init);
-
-static void __exit isp116x_cleanup(void)
-{
-	platform_driver_unregister(&isp116x_driver);
-}
-
-module_exit(isp116x_cleanup);
+module_platform_driver(isp116x_driver);

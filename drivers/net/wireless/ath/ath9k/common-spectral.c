@@ -482,7 +482,7 @@ ath_cmn_is_fft_buf_full(struct ath_spec_scan_priv *spec_priv)
 	struct rchan *rc = spec_priv->rfs_chan_spec_scan;
 
 	for_each_online_cpu(i)
-		ret += relay_buf_full(rc->buf[i]);
+		ret += relay_buf_full(*per_cpu_ptr(rc->buf, i));
 
 	i = num_online_cpus();
 
@@ -527,6 +527,9 @@ int ath_cmn_process_fft(struct ath_spec_scan_priv *spec_priv, struct ieee80211_h
 	radar_info = ((struct ath_radar_info *)&vdata[len]) - 1;
 	if (!(radar_info->pulse_bw_info & SPECTRAL_SCAN_BITMASK))
 		return 0;
+
+	if (!spec_priv->rfs_chan_spec_scan)
+		return 1;
 
 	/* Output buffers are full, no need to process anything
 	 * since there is no space to put the result anyway
@@ -652,9 +655,7 @@ int ath_cmn_process_fft(struct ath_spec_scan_priv *spec_priv, struct ieee80211_h
 				/* Mix the received bins to the /dev/random
 				 * pool
 				 */
-#if 0 /* Not in RHEL */
 				add_device_randomness(sample_buf, num_bins);
-#endif
 			}
 
 			/* Process a normal frame */
@@ -665,9 +666,7 @@ int ath_cmn_process_fft(struct ath_spec_scan_priv *spec_priv, struct ieee80211_h
 				/* Mix the received bins to the /dev/random
 				 * pool
 				 */
-#if 0 /* Not in RHEL */
 				add_device_randomness(sample_start, num_bins);
-#endif
 			}
 
 			/* Short report processed, break out of the
@@ -735,13 +734,16 @@ void ath9k_cmn_spectral_scan_trigger(struct ath_common *common,
 	struct ath_hw *ah = spec_priv->ah;
 	u32 rxfilter;
 
-	if (config_enabled(CONFIG_ATH9K_TX99))
+	if (IS_ENABLED(CONFIG_ATH9K_TX99))
 		return;
 
 	if (!ath9k_hw_ops(ah)->spectral_scan_trigger) {
 		ath_err(common, "spectrum analyzer not implemented on this hardware\n");
 		return;
 	}
+
+	if (!spec_priv->spec_config.enabled)
+		return;
 
 	ath_ps_ops(common)->wakeup(common);
 	rxfilter = ath9k_hw_getrxfilter(ah);
@@ -810,7 +812,7 @@ static ssize_t write_file_spec_scan_ctl(struct file *file,
 	char buf[32];
 	ssize_t len;
 
-	if (config_enabled(CONFIG_ATH9K_TX99))
+	if (IS_ENABLED(CONFIG_ATH9K_TX99))
 		return -EOPNOTSUPP;
 
 	len = min(count, sizeof(buf) - 1);
@@ -1046,11 +1048,7 @@ static const struct file_operations fops_spectral_fft_period = {
 
 static struct dentry *create_buf_file_handler(const char *filename,
 					      struct dentry *parent,
-#if 0 /* Not in RHEL */
 					      umode_t mode,
-#else
-					      int mode,
-#endif
 					      struct rchan_buf *buf,
 					      int *is_global)
 {
@@ -1080,7 +1078,7 @@ static struct rchan_callbacks rfs_spec_scan_cb = {
 
 void ath9k_cmn_spectral_deinit_debug(struct ath_spec_scan_priv *spec_priv)
 {
-	if (config_enabled(CONFIG_ATH9K_DEBUGFS)) {
+	if (spec_priv->rfs_chan_spec_scan) {
 		relay_close(spec_priv->rfs_chan_spec_scan);
 		spec_priv->rfs_chan_spec_scan = NULL;
 	}
@@ -1094,6 +1092,9 @@ void ath9k_cmn_spectral_init_debug(struct ath_spec_scan_priv *spec_priv,
 					    debugfs_phy,
 					    1024, 256, &rfs_spec_scan_cb,
 					    NULL);
+	if (!spec_priv->rfs_chan_spec_scan)
+		return;
+
 	debugfs_create_file("spectral_scan_ctl",
 			    S_IRUSR | S_IWUSR,
 			    debugfs_phy, spec_priv,

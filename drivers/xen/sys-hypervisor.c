@@ -7,13 +7,16 @@
  *  published by the Free Software Foundation.
  */
 
+#include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/kobject.h>
+#include <linux/err.h>
 
 #include <asm/xen/hypervisor.h>
 #include <asm/xen/hypercall.h>
 
+#include <xen/xen.h>
 #include <xen/xenbus.h>
 #include <xen/interface/xen.h>
 #include <xen/interface/version.h>
@@ -95,7 +98,7 @@ static struct attribute *version_attrs[] = {
 	NULL
 };
 
-static struct attribute_group version_group = {
+static const struct attribute_group version_group = {
 	.name = "version",
 	.attrs = version_attrs,
 };
@@ -112,7 +115,7 @@ static void xen_sysfs_version_destroy(void)
 
 /* UUID */
 
-static ssize_t uuid_show(struct hyp_sysfs_attr *attr, char *buffer)
+static ssize_t uuid_show_fallback(struct hyp_sysfs_attr *attr, char *buffer)
 {
 	char *vm, *val;
 	int ret;
@@ -130,6 +133,17 @@ static ssize_t uuid_show(struct hyp_sysfs_attr *attr, char *buffer)
 		return PTR_ERR(val);
 	ret = sprintf(buffer, "%s\n", val);
 	kfree(val);
+	return ret;
+}
+
+static ssize_t uuid_show(struct hyp_sysfs_attr *attr, char *buffer)
+{
+	xen_domain_handle_t uuid;
+	int ret;
+	ret = HYPERVISOR_xen_version(XENVER_guest_handle, uuid);
+	if (ret)
+		return uuid_show_fallback(attr, buffer);
+	ret = sprintf(buffer, "%pU\n", uuid);
 	return ret;
 }
 
@@ -208,12 +222,12 @@ static struct attribute *xen_compile_attrs[] = {
 	NULL
 };
 
-static struct attribute_group xen_compilation_group = {
+static const struct attribute_group xen_compilation_group = {
 	.name = "compilation",
 	.attrs = xen_compile_attrs,
 };
 
-int __init static xen_compilation_init(void)
+static int __init xen_compilation_init(void)
 {
 	return sysfs_create_group(hypervisor_kobj, &xen_compilation_group);
 }
@@ -271,7 +285,8 @@ static ssize_t virtual_start_show(struct hyp_sysfs_attr *attr, char *buffer)
 		ret = HYPERVISOR_xen_version(XENVER_platform_parameters,
 					     parms);
 		if (!ret)
-			ret = sprintf(buffer, "%lx\n", parms->virt_start);
+			ret = sprintf(buffer, "%"PRI_xen_ulong"\n",
+				      parms->virt_start);
 		kfree(parms);
 	}
 
@@ -338,7 +353,7 @@ static struct attribute *xen_properties_attrs[] = {
 	NULL
 };
 
-static struct attribute_group xen_properties_group = {
+static const struct attribute_group xen_properties_group = {
 	.name = "properties",
 	.attrs = xen_properties_attrs,
 };

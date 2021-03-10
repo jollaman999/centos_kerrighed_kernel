@@ -43,6 +43,7 @@
  ********************************************************************/
 
 #include <linux/module.h>
+#include <linux/gfp.h>
 
 #include <linux/kernel.h>
 #include <linux/types.h>
@@ -50,8 +51,8 @@
 #include <linux/netdevice.h>
 #include <linux/ioport.h>
 #include <linux/delay.h>
-#include <linux/slab.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/rtnetlink.h>
 #include <linux/dma-mapping.h>
 #include <linux/pnp.h>
@@ -430,22 +431,20 @@ static int __init nsc_ircc_open(chipio_t *info)
 	/* Allocate memory if needed */
 	self->rx_buff.head =
 		dma_alloc_coherent(NULL, self->rx_buff.truesize,
-				   &self->rx_buff_dma, GFP_KERNEL);
+				   &self->rx_buff_dma, GFP_KERNEL | __GFP_ZERO);
 	if (self->rx_buff.head == NULL) {
 		err = -ENOMEM;
 		goto out2;
 
 	}
-	memset(self->rx_buff.head, 0, self->rx_buff.truesize);
 	
 	self->tx_buff.head =
 		dma_alloc_coherent(NULL, self->tx_buff.truesize,
-				   &self->tx_buff_dma, GFP_KERNEL);
+				   &self->tx_buff_dma, GFP_KERNEL | __GFP_ZERO);
 	if (self->tx_buff.head == NULL) {
 		err = -ENOMEM;
 		goto out3;
 	}
-	memset(self->tx_buff.head, 0, self->tx_buff.truesize);
 
 	self->rx_buff.in_frame = FALSE;
 	self->rx_buff.state = OUTSIDE_FRAME;
@@ -716,7 +715,7 @@ static int nsc_ircc_probe_338(nsc_chip_t *chip, chipio_t *info)
 	int reg, com = 0;
 	int pnp;
 
-	/* Read funtion enable register (FER) */
+	/* Read function enable register (FER) */
 	outb(CFG_338_FER, cfg_base);
 	reg = inb(cfg_base+1);
 
@@ -1348,7 +1347,7 @@ static __u8 nsc_ircc_change_speed(struct nsc_ircc_cb *self, __u32 speed)
 	outb(bank, iobase+BSR);
 
 	/* Make sure interrupt handlers keep the proper interrupt mask */
-	return(ier);
+	return ier;
 }
 
 /*
@@ -1397,7 +1396,7 @@ static netdev_tx_t nsc_ircc_hard_xmit_sir(struct sk_buff *skb,
 				 * to make sure packets gets through the
 				 * proper xmit handler - Jean II */
 			}
-			dev->trans_start = jiffies;
+			netif_trans_update(dev);
 			spin_unlock_irqrestore(&self->lock, flags);
 			dev_kfree_skb(skb);
 			return NETDEV_TX_OK;
@@ -1422,7 +1421,7 @@ static netdev_tx_t nsc_ircc_hard_xmit_sir(struct sk_buff *skb,
 	/* Restore bank register */
 	outb(bank, iobase+BSR);
 
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 	spin_unlock_irqrestore(&self->lock, flags);
 
 	dev_kfree_skb(skb);
@@ -1468,7 +1467,7 @@ static netdev_tx_t nsc_ircc_hard_xmit_fir(struct sk_buff *skb,
 				 * the speed change has been done.
 				 * Jean II */
 			}
-			dev->trans_start = jiffies;
+			netif_trans_update(dev);
 			spin_unlock_irqrestore(&self->lock, flags);
 			dev_kfree_skb(skb);
 			return NETDEV_TX_OK;
@@ -1554,7 +1553,7 @@ static netdev_tx_t nsc_ircc_hard_xmit_fir(struct sk_buff *skb,
 	/* Restore bank register */
 	outb(bank, iobase+BSR);
 
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 	spin_unlock_irqrestore(&self->lock, flags);
 	dev_kfree_skb(skb);
 
@@ -1663,7 +1662,7 @@ static int nsc_ircc_dma_xmit_complete(struct nsc_ircc_cb *self)
 	switch_bank(iobase, BANK0);
         outb(inb(iobase+MCR) & ~MCR_DMA_EN, iobase+MCR);
 	
-	/* Check for underrrun! */
+	/* Check for underrun! */
 	if (inb(iobase+ASCR) & ASCR_TXUR) {
 		self->netdev->stats.tx_errors++;
 		self->netdev->stats.tx_fifo_errors++;

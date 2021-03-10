@@ -60,7 +60,7 @@ static void o2_pci_led_enable(struct sdhci_pci_chip *chip)
 
 }
 
-void sdhci_pci_o2_fujin2_pci_init(struct sdhci_pci_chip *chip)
+static void sdhci_pci_o2_fujin2_pci_init(struct sdhci_pci_chip *chip)
 {
 	u32 scratch_32;
 	int ret;
@@ -384,8 +384,10 @@ int sdhci_pci_o2_probe(struct sdhci_pci_chip *chip)
 	return 0;
 }
 
+#ifdef CONFIG_PM_SLEEP
 int sdhci_pci_o2_resume(struct sdhci_pci_chip *chip)
 {
 	sdhci_pci_o2_probe(chip);
-	return 0;
+	return sdhci_pci_resume_host(chip);
 }
+#endif

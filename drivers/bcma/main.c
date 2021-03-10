@@ -12,11 +12,9 @@
 #include <linux/pci.h>
 #include <linux/bcma/bcma.h>
 #include <linux/slab.h>
-#if 0 /* Not in RHEL */
 #include <linux/of_address.h>
 #include <linux/of_irq.h>
 #include <linux/of_platform.h>
-#endif
 
 MODULE_DESCRIPTION("Broadcom's specific AMBA driver");
 MODULE_LICENSE("GPL");
@@ -37,39 +35,29 @@ static ssize_t manuf_show(struct device *dev, struct device_attribute *attr, cha
 	struct bcma_device *core = container_of(dev, struct bcma_device, dev);
 	return sprintf(buf, "0x%03X\n", core->id.manuf);
 }
-
-#if 0 /* Not in RHEL */
 static DEVICE_ATTR_RO(manuf);
-#endif
 
 static ssize_t id_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct bcma_device *core = container_of(dev, struct bcma_device, dev);
 	return sprintf(buf, "0x%03X\n", core->id.id);
 }
-#if 0 /* Not in RHEL */
 static DEVICE_ATTR_RO(id);
-#endif
 
 static ssize_t rev_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct bcma_device *core = container_of(dev, struct bcma_device, dev);
 	return sprintf(buf, "0x%02X\n", core->id.rev);
 }
-#if 0 /* Not in RHEL */
 static DEVICE_ATTR_RO(rev);
-#endif
 
 static ssize_t class_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct bcma_device *core = container_of(dev, struct bcma_device, dev);
 	return sprintf(buf, "0x%X\n", core->id.class);
 }
-#if 0 /* Not in RHEL */
 static DEVICE_ATTR_RO(class);
-#endif
 
-#if 0 /* Not in RHEL */
 static struct attribute *bcma_device_attrs[] = {
 	&dev_attr_manuf.attr,
 	&dev_attr_id.attr,
@@ -78,15 +66,6 @@ static struct attribute *bcma_device_attrs[] = {
 	NULL,
 };
 ATTRIBUTE_GROUPS(bcma_device);
-#else
-static struct device_attribute bcma_device_attrs[] = {
-	__ATTR_RO(manuf),
-	__ATTR_RO(id),
-	__ATTR_RO(rev),
-	__ATTR_RO(class),
-	__ATTR_NULL,
-};
-#endif
 
 static struct bus_type bcma_bus_type = {
 	.name		= "bcma",
@@ -94,12 +73,7 @@ static struct bus_type bcma_bus_type = {
 	.probe		= bcma_device_probe,
 	.remove		= bcma_device_remove,
 	.uevent		= bcma_device_uevent,
-
-#if 0 /* Not in RHEL */
 	.dev_groups	= bcma_device_groups,
-#else
-	.dev_attrs	= bcma_device_attrs,
-#endif
 };
 
 static u16 bcma_cc_core_id(struct bcma_bus *bus)
@@ -162,7 +136,7 @@ static bool bcma_is_core_needed_early(u16 core_id)
 	return false;
 }
 
-#if defined(CONFIG_OF) && defined(CONFIG_OF_ADDRESS)
+#if 0 /* Not in RHEL */
 static struct device_node *bcma_of_find_child_device(struct platform_device *parent,
 						     struct bcma_device *core)
 {
@@ -210,7 +184,7 @@ static unsigned int bcma_of_get_irq(struct platform_device *parent,
 	struct of_phandle_args out_irq;
 	int ret;
 
-	if (!parent || !parent->dev.of_node)
+	if (!IS_ENABLED(CONFIG_OF_IRQ) || !parent || !parent->dev.of_node)
 		return 0;
 
 	ret = bcma_of_irq_parse(parent, core, &out_irq, num);
@@ -228,12 +202,16 @@ static void bcma_of_fill_device(struct platform_device *parent,
 {
 	struct device_node *node;
 
+	if (!IS_ENABLED(CONFIG_OF_IRQ))
+		return;
+
 	node = bcma_of_find_child_device(parent, core);
 	if (node)
 		core->dev.of_node = node;
 
 	core->irq = bcma_of_get_irq(parent, core, 0);
 }
+
 #else
 static void bcma_of_fill_device(struct platform_device *parent,
 				struct bcma_device *core)
@@ -244,8 +222,7 @@ static inline unsigned int bcma_of_get_irq(struct platform_device *parent,
 {
 	return 0;
 }
-#endif /* CONFIG_OF */
-
+#endif
 unsigned int bcma_core_irq(struct bcma_device *core, int num)
 {
 	struct bcma_bus *bus = core->bus;
@@ -376,7 +353,7 @@ static int bcma_register_devices(struct bcma_bus *bus)
 		bcma_register_core(bus, core);
 	}
 
-#ifdef CONFIG_BCMA_DRIVER_MIPS
+#ifdef CONFIG_BCMA_PFLASH
 	if (bus->drv_cc.pflash.present) {
 		err = platform_device_register(&bcma_pflash_dev);
 		if (err)
@@ -438,7 +415,9 @@ int bcma_bus_register(struct bcma_bus *bus)
 {
 	int err;
 	struct bcma_device *core;
+#if 0 /* Not in RHEL */
 	struct device *dev;
+#endif
 
 	/* Scan for devices (cores) */
 	err = bcma_bus_scan(bus);
@@ -461,17 +440,12 @@ int bcma_bus_register(struct bcma_bus *bus)
 		bcma_core_pci_early_init(&bus->drv_pci[0]);
 	}
 
-	dev = bcma_bus_get_host_dev(bus);
-	/* TODO: remove check for IS_BUILTIN(CONFIG_BCMA) check when
-	 * of_default_bus_match_table is exported or in some other way
-	 * accessible. This is just a temporary workaround.
-	 */
-	if (IS_BUILTIN(CONFIG_BCMA) && dev) {
 #if 0 /* Not in RHEL */
-		of_platform_populate(dev->of_node, of_default_bus_match_table,
-				     NULL, dev);
-#endif
+	dev = bcma_bus_get_host_dev(bus);
+	if (dev) {
+		of_platform_default_populate(dev->of_node, NULL, dev);
 	}
+#endif
 
 	/* Cores providing flash access go before SPROM init */
 	list_for_each_entry(core, &bus->cores, list) {
@@ -701,11 +675,36 @@ static int bcma_device_uevent(struct device *dev, struct kobj_uevent_env *env)
 			      core->id.rev, core->id.class);
 }
 
+static unsigned int bcma_bus_registered;
+
+/*
+ * If built-in, bus has to be registered early, before any driver calls
+ * bcma_driver_register.
+ * Otherwise registering driver would trigger BUG in driver_register.
+ */
+static int __init bcma_init_bus_register(void)
+{
+	int err;
+
+	if (bcma_bus_registered)
+		return 0;
+
+	err = bus_register(&bcma_bus_type);
+	if (!err)
+		bcma_bus_registered = 1;
+
+	return err;
+}
+#ifndef MODULE
+fs_initcall(bcma_init_bus_register);
+#endif
+
+/* Main initialization has to be done with SPI/mtd/NAND/SPROM available */
 static int __init bcma_modinit(void)
 {
 	int err;
 
-	err = bus_register(&bcma_bus_type);
+	err = bcma_init_bus_register();
 	if (err)
 		return err;
 
@@ -724,7 +723,7 @@ static int __init bcma_modinit(void)
 
 	return err;
 }
-fs_initcall(bcma_modinit);
+module_init(bcma_modinit);
 
 static void __exit bcma_modexit(void)
 {

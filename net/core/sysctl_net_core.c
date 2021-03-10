@@ -10,19 +10,30 @@
 #include <linux/module.h>
 #include <linux/socket.h>
 #include <linux/netdevice.h>
+#include <linux/ratelimit.h>
 #include <linux/vmalloc.h>
 #include <linux/init.h>
+#include <linux/slab.h>
+#include <linux/kmemleak.h>
+
 #include <net/ip.h>
 #include <net/sock.h>
+#include <net/net_ratelimit.h>
 #include <net/busy_poll.h>
 #include <net/pkt_sched.h>
 
-static int rps_sock_flow_sysctl(ctl_table *table, int write,
+static int zero = 0;
+static int one = 1;
+static int two __maybe_unused = 2;
+static int ushort_max = USHRT_MAX;
+
+#ifdef CONFIG_RPS
+static int rps_sock_flow_sysctl(struct ctl_table *table, int write,
 				void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	unsigned int orig_size, size;
 	int ret, i;
-	ctl_table tmp = {
+	struct ctl_table tmp = {
 		.data = &size,
 		.maxlen = sizeof(size),
 		.mode = table->mode
@@ -32,7 +43,8 @@ static int rps_sock_flow_sysctl(ctl_table *table, int write,
 
 	mutex_lock(&sock_flow_mutex);
 
-	orig_sock_table = rps_sock_flow_table;
+	orig_sock_table = rcu_dereference_protected(rps_sock_flow_table,
+					lockdep_is_held(&sock_flow_mutex));
 	size = orig_size = orig_sock_table ? orig_sock_table->mask + 1 : 0;
 
 	ret = proc_dointvec(&tmp, write, buffer, lenp, ppos);
@@ -64,8 +76,13 @@ static int rps_sock_flow_sysctl(ctl_table *table, int write,
 
 		if (sock_table != orig_sock_table) {
 			rcu_assign_pointer(rps_sock_flow_table, sock_table);
-			synchronize_rcu();
-			vfree(orig_sock_table);
+			if (sock_table)
+				static_key_slow_inc(&rps_needed);
+			if (orig_sock_table) {
+				static_key_slow_dec(&rps_needed);
+				synchronize_rcu();
+				vfree(orig_sock_table);
+			}
 		}
 	}
 
@@ -73,18 +90,7 @@ static int rps_sock_flow_sysctl(ctl_table *table, int write,
 
 	return ret;
 }
-
-static int proc_do_rss_key(struct ctl_table *table, int write,
-			   void __user *buffer, size_t *lenp, loff_t *ppos)
-{
-	struct ctl_table fake_table;
-	char buf[NETDEV_RSS_KEY_LEN * 3];
-
-	snprintf(buf, sizeof(buf), "%*phC", NETDEV_RSS_KEY_LEN, netdev_rss_key);
-	fake_table.data = buf;
-	fake_table.maxlen = sizeof(buf);
-	return proc_dostring(&fake_table, write, buffer, lenp, ppos);
-}
+#endif /* CONFIG_RPS */
 
 #ifdef CONFIG_NET_SCHED
 static int set_default_qdisc(struct ctl_table *table, int write,
@@ -106,50 +112,89 @@ static int set_default_qdisc(struct ctl_table *table, int write,
 }
 #endif
 
+static int proc_do_dev_weight(struct ctl_table *table, int write,
+			   void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	int ret;
+
+	ret = proc_dointvec(table, write, buffer, lenp, ppos);
+	if (ret != 0)
+		return ret;
+
+	dev_rx_weight = weight_p * dev_weight_rx_bias;
+	dev_tx_weight = weight_p * dev_weight_tx_bias;
+
+	return ret;
+}
+
+static int proc_do_rss_key(struct ctl_table *table, int write,
+			   void __user *buffer, size_t *lenp, loff_t *ppos)
+{
+	struct ctl_table fake_table;
+	char buf[NETDEV_RSS_KEY_LEN * 3];
+
+	snprintf(buf, sizeof(buf), "%*phC", NETDEV_RSS_KEY_LEN, netdev_rss_key);
+	fake_table.data = buf;
+	fake_table.maxlen = sizeof(buf);
+	return proc_dostring(&fake_table, write, buffer, lenp, ppos);
+}
+
 static struct ctl_table net_core_table[] = {
 #ifdef CONFIG_NET
 	{
-		.ctl_name	= NET_CORE_WMEM_MAX,
 		.procname	= "wmem_max",
 		.data		= &sysctl_wmem_max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
 	},
 	{
-		.ctl_name	= NET_CORE_RMEM_MAX,
 		.procname	= "rmem_max",
 		.data		= &sysctl_rmem_max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
 	},
 	{
-		.ctl_name	= NET_CORE_WMEM_DEFAULT,
 		.procname	= "wmem_default",
 		.data		= &sysctl_wmem_default,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
 	},
 	{
-		.ctl_name	= NET_CORE_RMEM_DEFAULT,
 		.procname	= "rmem_default",
 		.data		= &sysctl_rmem_default,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &one,
 	},
 	{
-		.ctl_name	= NET_CORE_DEV_WEIGHT,
 		.procname	= "dev_weight",
 		.data		= &weight_p,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec
+		.proc_handler	= proc_do_dev_weight,
 	},
 	{
-		.ctl_name	= NET_CORE_MAX_BACKLOG,
+		.procname	= "dev_weight_rx_bias",
+		.data		= &dev_weight_rx_bias,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_do_dev_weight,
+	},
+	{
+		.procname	= "dev_weight_tx_bias",
+		.data		= &dev_weight_tx_bias,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_do_dev_weight,
+	},
+	{
 		.procname	= "netdev_max_backlog",
 		.data		= &netdev_max_backlog,
 		.maxlen		= sizeof(int),
@@ -163,17 +208,55 @@ static struct ctl_table net_core_table[] = {
 		.mode		= 0444,
 		.proc_handler	= proc_do_rss_key,
 	},
+#ifdef CONFIG_BPF_JIT
 	{
-		.ctl_name	= NET_CORE_MSG_COST,
+		.procname	= "bpf_jit_enable",
+		.data		= &bpf_jit_enable,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec_minmax,
+# ifdef CONFIG_BPF_JIT_ALWAYS_ON
+		.extra1		= &one,
+		.extra2		= &one,
+# else
+		.extra1		= &zero,
+		.extra2		= &two,
+# endif
+	},
+# ifdef CONFIG_HAVE_EBPF_JIT
+	{
+		.procname	= "bpf_jit_harden",
+		.data		= &bpf_jit_harden,
+		.maxlen		= sizeof(int),
+		.mode		= 0600,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &zero,
+		.extra2		= &two,
+	},
+	{
+		.procname	= "bpf_jit_kallsyms",
+		.data		= &bpf_jit_kallsyms,
+		.maxlen		= sizeof(int),
+		.mode		= 0600,
+		.proc_handler	= proc_dointvec,
+	},
+# endif
+#endif
+	{
+		.procname	= "netdev_tstamp_prequeue",
+		.data		= &netdev_tstamp_prequeue,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= proc_dointvec
+	},
+	{
 		.procname	= "message_cost",
 		.data		= &net_ratelimit_state.interval,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec_jiffies,
-		.strategy	= sysctl_jiffies,
 	},
 	{
-		.ctl_name	= NET_CORE_MSG_BURST,
 		.procname	= "message_burst",
 		.data		= &net_ratelimit_state.burst,
 		.maxlen		= sizeof(int),
@@ -181,19 +264,20 @@ static struct ctl_table net_core_table[] = {
 		.proc_handler	= proc_dointvec,
 	},
 	{
-		.ctl_name	= NET_CORE_OPTMEM_MAX,
 		.procname	= "optmem_max",
 		.data		= &sysctl_optmem_max,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
 	},
+#ifdef CONFIG_RPS
 	{
 		.procname	= "rps_sock_flow_entries",
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= rps_sock_flow_sysctl
 	},
+#endif
 #ifdef CONFIG_NET_RX_BUSY_POLL
 	{
 		.procname	= "busy_poll",
@@ -220,7 +304,6 @@ static struct ctl_table net_core_table[] = {
 #endif
 #endif /* CONFIG_NET */
 	{
-		.ctl_name	= NET_CORE_BUDGET,
 		.procname	= "netdev_budget",
 		.data		= &netdev_budget,
 		.maxlen		= sizeof(int),
@@ -228,32 +311,26 @@ static struct ctl_table net_core_table[] = {
 		.proc_handler	= proc_dointvec
 	},
 	{
-		.ctl_name	= NET_CORE_WARNINGS,
 		.procname	= "warnings",
 		.data		= &net_msg_warn,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.proc_handler	= proc_dointvec
 	},
-	{ .ctl_name = 0 }
+	{ }
 };
 
 static struct ctl_table netns_core_table[] = {
 	{
-		.ctl_name	= NET_CORE_SOMAXCONN,
 		.procname	= "somaxconn",
 		.data		= &init_net.core.sysctl_somaxconn,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec
+		.extra1		= &zero,
+		.extra2		= &ushort_max,
+		.proc_handler	= proc_dointvec_minmax
 	},
-	{ .ctl_name = 0 }
-};
-
-__net_initdata struct ctl_path net_core_path[] = {
-	{ .procname = "net", .ctl_name = CTL_NET, },
-	{ .procname = "core", .ctl_name = NET_CORE, },
-	{ },
+	{ }
 };
 
 static __net_init int sysctl_core_net_init(struct net *net)
@@ -263,16 +340,20 @@ static __net_init int sysctl_core_net_init(struct net *net)
 	net->core.sysctl_somaxconn = SOMAXCONN;
 
 	tbl = netns_core_table;
-	if (net != &init_net) {
+	if (!net_eq(net, &init_net)) {
 		tbl = kmemdup(tbl, sizeof(netns_core_table), GFP_KERNEL);
 		if (tbl == NULL)
 			goto err_dup;
 
 		tbl[0].data = &net->core.sysctl_somaxconn;
+
+		/* Don't export any sysctls to unprivileged users */
+		if (net->user_ns != &init_user_ns) {
+			tbl[0].procname = NULL;
+		}
 	}
 
-	net->core.sysctl_hdr = register_net_sysctl_table(net,
-			net_core_path, tbl);
+	net->core.sysctl_hdr = register_net_sysctl(net, "net/core", tbl);
 	if (net->core.sysctl_hdr == NULL)
 		goto err_reg;
 
@@ -302,10 +383,7 @@ static __net_initdata struct pernet_operations sysctl_core_ops = {
 
 static __init int sysctl_core_init(void)
 {
-	static struct ctl_table empty[1];
-
-	register_sysctl_paths(net_core_path, empty);
-	register_net_sysctl_rotable(net_core_path, net_core_table);
+	register_net_sysctl(&init_net, "net/core", net_core_table);
 	return register_pernet_subsys(&sysctl_core_ops);
 }
 

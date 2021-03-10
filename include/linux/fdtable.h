@@ -12,8 +12,9 @@
 #include <linux/nospec.h>
 #include <linux/types.h>
 #include <linux/init.h>
+#include <linux/fs.h>
 
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 
 /*
  * The default fd array needs to be at least BITS_PER_LONG,
@@ -21,22 +22,30 @@
  */
 #define NR_OPEN_DEFAULT BITS_PER_LONG
 
-/*
- * The embedded_fd_set is a small fd_set,
- * suitable for most tasks (which open <= BITS_PER_LONG files)
- */
-struct embedded_fd_set {
-	unsigned long fds_bits[1];
-};
-
 struct fdtable {
 	unsigned int max_fds;
-	struct file ** fd;      /* current fd array */
-	fd_set *close_on_exec;
-	fd_set *open_fds;
+	struct file __rcu **fd;      /* current fd array */
+	unsigned long *close_on_exec;
+	unsigned long *open_fds;
+#ifdef __GENKSYMS__
 	struct rcu_head rcu;
-	struct fdtable *next;
+#else
+	union {
+		struct rcu_head rcu;
+		unsigned long *full_fds_bits;
+	};
+#endif
 };
+
+static inline bool close_on_exec(int fd, const struct fdtable *fdt)
+{
+	return test_bit(fd, fdt->close_on_exec);
+}
+
+static inline bool fd_is_open(int fd, const struct fdtable *fdt)
+{
+	return test_bit(fd, fdt->open_fds);
+}
 
 /*
  * Open file table structure
@@ -46,32 +55,33 @@ struct files_struct {
    * read mostly part
    */
 	atomic_t count;
-	struct fdtable *fdt;
+	RH_KABI_FILL_HOLE(bool resize_in_progress)
+	struct fdtable __rcu *fdt;
 	struct fdtable fdtab;
   /*
    * written part on a separate cache line in SMP
    */
 	spinlock_t file_lock ____cacheline_aligned_in_smp;
 	int next_fd;
-	struct embedded_fd_set close_on_exec_init;
-	struct embedded_fd_set open_fds_init;
-	struct file * fd_array[NR_OPEN_DEFAULT];
+	unsigned long close_on_exec_init[1];
+	unsigned long open_fds_init[1];
+	struct file __rcu * fd_array[NR_OPEN_DEFAULT];
+	RH_KABI_EXTEND(unsigned long full_fds_bits_init[1])
+	RH_KABI_EXTEND(wait_queue_head_t resize_wait)
 };
 
-#define files_fdtable(files) (rcu_dereference((files)->fdt))
+#define rcu_dereference_check_fdtable(files, fdtfd) \
+	(rcu_dereference_check((fdtfd), \
+			       lockdep_is_held(&(files)->file_lock) || \
+			       atomic_read(&(files)->count) == 1 || \
+			       rcu_my_thread_group_empty()))
+
+#define files_fdtable(files) \
+		(rcu_dereference_check_fdtable((files), (files)->fdt))
 
 struct file_operations;
 struct vfsmount;
 struct dentry;
-
-extern int expand_files(struct files_struct *, int nr);
-extern void free_fdtable_rcu(struct rcu_head *rcu);
-extern void __init files_defer_init(void);
-
-static inline void free_fdtable(struct fdtable *fdt)
-{
-	call_rcu(&fdt->rcu, free_fdtable_rcu);
-}
 
 static inline struct file * fcheck_files(struct files_struct *files, unsigned int fd)
 {
@@ -80,7 +90,7 @@ static inline struct file * fcheck_files(struct files_struct *files, unsigned in
 
 	if (fd < fdt->max_fds) {
 		fd = array_index_nospec(fd, fdt->max_fds);
-		file = rcu_dereference(fdt->fd[fd]);
+		file = rcu_dereference_check_fdtable(files, fdt->fd[fd]);
 	}
 	return file;
 }
@@ -97,6 +107,17 @@ void put_files_struct(struct files_struct *fs);
 void reset_files_struct(struct files_struct *);
 int unshare_files(struct files_struct **);
 struct files_struct *dup_fd(struct files_struct *, int *);
+void do_close_on_exec(struct files_struct *);
+int iterate_fd(struct files_struct *, unsigned,
+		int (*)(const void *, struct file *, unsigned),
+		const void *);
+
+extern int __alloc_fd(struct files_struct *files,
+		      unsigned start, unsigned end, unsigned flags);
+extern void __fd_install(struct files_struct *files,
+		      unsigned int fd, struct file *file);
+extern int __close_fd(struct files_struct *files,
+		      unsigned int fd);
 
 extern struct kmem_cache *files_cachep;
 

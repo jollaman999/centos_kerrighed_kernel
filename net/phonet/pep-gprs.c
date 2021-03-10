@@ -5,7 +5,7 @@
  *
  * Copyright (C) 2008 Nokia Corporation.
  *
- * Author: Rémi Denis-Courmont <remi.denis-courmont@nokia.com>
+ * Author: Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -96,11 +96,11 @@ static int gprs_recv(struct gprs_dev *gp, struct sk_buff *skb)
 		goto drop;
 	}
 
-	if (likely(skb_headroom(skb) & 3)) {
+	if (skb_headroom(skb) & 3) {
 		struct sk_buff *rskb, *fs;
 		int flen = 0;
 
-		/* Phonet Pipe data header is misaligned (3 bytes),
+		/* Phonet Pipe data header may be misaligned (3 bytes),
 		 * so wrap the IP packet as a single fragment of an head-less
 		 * socket buffer. The network stack will pull what it needs,
 		 * but at least, the whole IP payload is not memcpy'd. */

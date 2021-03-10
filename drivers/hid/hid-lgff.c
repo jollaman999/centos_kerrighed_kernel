@@ -27,11 +27,11 @@
  * e-mail - mail your message to <johann.deneux@it.uu.se>
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/input.h>
-#include <linux/usb.h>
 #include <linux/hid.h>
 
-#include "usbhid/usbhid.h"
 #include "hid-lg.h"
 
 struct dev_type {
@@ -56,21 +56,14 @@ static const signed short ff_joystick_ac[] = {
 	-1
 };
 
-static const signed short ff_wheel[] = {
-	FF_CONSTANT,
-	FF_AUTOCENTER,
-	-1
-};
-
 static const struct dev_type devices[] = {
 	{ 0x046d, 0xc211, ff_rumble },
 	{ 0x046d, 0xc219, ff_rumble },
 	{ 0x046d, 0xc283, ff_joystick },
 	{ 0x046d, 0xc286, ff_joystick_ac },
+	{ 0x046d, 0xc287, ff_joystick_ac },
 	{ 0x046d, 0xc293, ff_joystick },
-	{ 0x046d, 0xc294, ff_wheel },
 	{ 0x046d, 0xc295, ff_joystick },
-	{ 0x046d, 0xca03, ff_wheel },
 };
 
 static int hid_lgff_play(struct input_dev *dev, void *data, struct ff_effect *effect)
@@ -94,7 +87,7 @@ static int hid_lgff_play(struct input_dev *dev, void *data, struct ff_effect *ef
 		report->field[0]->value[2] = x;
 		report->field[0]->value[3] = y;
 		dbg_hid("(x, y)=(%04x, %04x)\n", x, y);
-		usbhid_submit_report(hid, report, USB_DIR_OUT);
+		hid_hw_request(hid, report, HID_REQ_SET_REPORT);
 		break;
 
 	case FF_RUMBLE:
@@ -109,7 +102,7 @@ static int hid_lgff_play(struct input_dev *dev, void *data, struct ff_effect *ef
 		report->field[0]->value[2] = left;
 		report->field[0]->value[3] = right;
 		dbg_hid("(left, right)=(%04x, %04x)\n", left, right);
-		usbhid_submit_report(hid, report, USB_DIR_OUT);
+		hid_hw_request(hid, report, HID_REQ_SET_REPORT);
 		break;
 	}
 	return 0;
@@ -129,33 +122,20 @@ static void hid_lgff_set_autocenter(struct input_dev *dev, u16 magnitude)
 	*value++ = 0x80;
 	*value++ = 0x00;
 	*value = 0x00;
-	usbhid_submit_report(hid, report, USB_DIR_OUT);
+	hid_hw_request(hid, report, HID_REQ_SET_REPORT);
 }
 
 int lgff_init(struct hid_device* hid)
 {
 	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
-	struct list_head *report_list = &hid->report_enum[HID_OUTPUT_REPORT].report_list;
 	struct input_dev *dev = hidinput->input;
-	struct hid_report *report;
-	struct hid_field *field;
 	const signed short *ff_bits = ff_joystick;
 	int error;
 	int i;
 
-	/* Find the report to use */
-	if (list_empty(report_list)) {
-		err_hid("No output report found");
-		return -1;
-	}
-
 	/* Check that the report looks ok */
-	report = list_entry(report_list->next, struct hid_report, list);
-	field = report->field[0];
-	if (!field) {
-		err_hid("NULL field");
-		return -1;
-	}
+	if (!hid_validate_values(hid, HID_OUTPUT_REPORT, 0, 0, 7))
+		return -ENODEV;
 
 	for (i = 0; i < ARRAY_SIZE(devices); i++) {
 		if (dev->id.vendor == devices[i].idVendor &&
@@ -175,7 +155,7 @@ int lgff_init(struct hid_device* hid)
 	if ( test_bit(FF_AUTOCENTER, dev->ffbit) )
 		dev->ff->set_autocenter = hid_lgff_set_autocenter;
 
-	printk(KERN_INFO "Force feedback for Logitech force feedback devices by Johann Deneux <johann.deneux@it.uu.se>\n");
+	pr_info("Force feedback for Logitech force feedback devices by Johann Deneux <johann.deneux@it.uu.se>\n");
 
 	return 0;
 }

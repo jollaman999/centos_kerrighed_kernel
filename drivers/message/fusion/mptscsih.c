@@ -46,6 +46,7 @@
 
 #include <linux/module.h>
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/errno.h>
 #include <linux/kdev_t.h>
@@ -659,7 +660,6 @@ mptscsih_io_done(MPT_ADAPTER *ioc, MPT_FRAME_HDR *mf, MPT_FRAME_HDR *mr)
 		u16	 status;
 		u8	 scsi_state, scsi_status;
 		u32	 log_info;
-		u16 ioc_stat;
 
 		status = le16_to_cpu(pScsiReply->IOCStatus) & MPI_IOCSTATUS_MASK;
 
@@ -668,14 +668,6 @@ mptscsih_io_done(MPT_ADAPTER *ioc, MPT_FRAME_HDR *mf, MPT_FRAME_HDR *mr)
 		xfer_cnt = le32_to_cpu(pScsiReply->TransferCount);
 		scsi_set_resid(sc, scsi_bufflen(sc) - xfer_cnt);
 		log_info = le32_to_cpu(pScsiReply->IOCLogInfo);
-		vdevice = sc->device->hostdata;
-
-		ioc_stat = le16_to_cpu(pScsiReply->IOCStatus);
-		if (ioc_stat & MPI_IOCSTATUS_FLAG_LOG_INFO_AVAILABLE) {
-			printk("LSI Debug log info %x for channel %x id %x\n",
-			    log_info, vdevice->vtarget->channel,
-			    vdevice->vtarget->id);
-		}
 
 		/*
 		 *  if we get a data underrun indication, yet no data was
@@ -745,24 +737,36 @@ mptscsih_io_done(MPT_ADAPTER *ioc, MPT_FRAME_HDR *mf, MPT_FRAME_HDR *mr)
 
 		case MPI_IOCSTATUS_SCSI_IOC_TERMINATED:		/* 0x004B */
 			if ( ioc->bus_type == SAS ) {
-				u16 ioc_status = le16_to_cpu(pScsiReply->IOCStatus);
-				if (ioc_status & MPI_IOCSTATUS_FLAG_LOG_INFO_AVAILABLE) {
-					if ((log_info & SAS_LOGINFO_MASK)
-					    == SAS_LOGINFO_NEXUS_LOSS) {
-						VirtDevice *vdevice = sc->device->hostdata;
+				u16 ioc_status =
+				    le16_to_cpu(pScsiReply->IOCStatus);
+				if ((ioc_status &
+					MPI_IOCSTATUS_FLAG_LOG_INFO_AVAILABLE)
+					&&
+					((log_info & SAS_LOGINFO_MASK) ==
+					SAS_LOGINFO_NEXUS_LOSS)) {
+						VirtDevice *vdevice =
+						sc->device->hostdata;
 
-						/* flag the device as being in device
-						removal delay so we can notify the midlayer
-						to hold off on timeout eh */
-						if (vdevice && vdevice->vtarget && 
-						    vdevice->vtarget->raidVolume)
-							printk(KERN_INFO "Skipping Raid Volume for inDMD\n" );
-						else if (vdevice && vdevice->vtarget)
-							vdevice->vtarget->inDMD = 1;
+					    /* flag the device as being in
+					     * device removal delay so we can
+					     * notify the midlayer to hold off
+					     * on timeout eh */
+						if (vdevice && vdevice->
+							vtarget &&
+							vdevice->vtarget->
+							raidVolume)
+							printk(KERN_INFO
+							"Skipping Raid Volume"
+							"for inDMD\n");
+						else if (vdevice &&
+							vdevice->vtarget)
+							vdevice->vtarget->
+								inDMD = 1;
 
-						sc->result = (DID_TRANSPORT_DISRUPTED << 16);
-						break;
-					}
+					    sc->result =
+						    (DID_TRANSPORT_DISRUPTED
+						    << 16);
+					    break;
 				}
 			} else if (ioc->bus_type == FC) {
 				/*
@@ -786,6 +790,7 @@ mptscsih_io_done(MPT_ADAPTER *ioc, MPT_FRAME_HDR *mf, MPT_FRAME_HDR *mr)
 			 * than an unsolicited DID_ABORT.
 			 */
 			sc->result = DID_RESET << 16;
+			break;
 
 		case MPI_IOCSTATUS_SCSI_EXT_TERMINATED:		/* 0x004C */
 			if (ioc->bus_type == FC)
@@ -821,14 +826,11 @@ mptscsih_io_done(MPT_ADAPTER *ioc, MPT_FRAME_HDR *mf, MPT_FRAME_HDR *mr)
 				 * DID_SOFT_ERROR is set.
 				 */
 				if (ioc->bus_type == SPI) {
-					if ((pScsiReq->CDB[0] == READ_6  &&
-							((pScsiReq->CDB[1] & 0x02) == 0) &&
-							(sc->device->type == TYPE_TAPE) ) ||
-						pScsiReq->CDB[0] == READ_10 ||
-						pScsiReq->CDB[0] == READ_12 ||
-							(pScsiReq->CDB[0] == READ_16 &&
-							((pScsiReq->CDB[1] & 0x02) == 0) &&
-							(sc->device->type == TYPE_TAPE)) ||
+					if ((pScsiReq->CDB[0] == READ_6  && ((pScsiReq->CDB[1] & 0x02) == 0)) ||
+					    pScsiReq->CDB[0] == READ_10 ||
+					    pScsiReq->CDB[0] == READ_12 ||
+						(pScsiReq->CDB[0] == READ_16 &&
+						((pScsiReq->CDB[1] & 0x02) == 0)) ||
 					    pScsiReq->CDB[0] == VERIFY  ||
 					    pScsiReq->CDB[0] == VERIFY_16) {
 						if (scsi_bufflen(sc) !=
@@ -1022,7 +1024,7 @@ out:
  *
  *	Must be called while new I/Os are being queued.
  */
-static void
+void
 mptscsih_flush_running_cmds(MPT_SCSI_HOST *hd)
 {
 	MPT_ADAPTER *ioc = hd->ioc;
@@ -1053,6 +1055,7 @@ mptscsih_flush_running_cmds(MPT_SCSI_HOST *hd)
 		sc->scsi_done(sc);
 	}
 }
+EXPORT_SYMBOL(mptscsih_flush_running_cmds);
 
 /*
  *	mptscsih_search_running_cmds - Delete any commands associated
@@ -1171,8 +1174,6 @@ mptscsih_remove(struct pci_dev *pdev)
 	MPT_SCSI_HOST		*hd;
 	int sz1;
 
-	scsi_remove_host(host);
-
 	if((hd = shost_priv(host)) == NULL)
 		return;
 
@@ -1279,101 +1280,17 @@ mptscsih_info(struct Scsi_Host *SChost)
 	return h->info_kbuf;
 }
 
-struct info_str {
-	char *buffer;
-	int   length;
-	int   offset;
-	int   pos;
-};
-
-static void
-mptscsih_copy_mem_info(struct info_str *info, char *data, int len)
-{
-	if (info->pos + len > info->length)
-		len = info->length - info->pos;
-
-	if (info->pos + len < info->offset) {
-		info->pos += len;
-		return;
-	}
-
-	if (info->pos < info->offset) {
-	        data += (info->offset - info->pos);
-	        len  -= (info->offset - info->pos);
-	}
-
-	if (len > 0) {
-                memcpy(info->buffer + info->pos, data, len);
-                info->pos += len;
-	}
-}
-
-static int
-mptscsih_copy_info(struct info_str *info, char *fmt, ...)
-{
-	va_list args;
-	char buf[81];
-	int len;
-
-	va_start(args, fmt);
-	len = vsprintf(buf, fmt, args);
-	va_end(args);
-
-	mptscsih_copy_mem_info(info, buf, len);
-	return len;
-}
-
-static int
-mptscsih_host_info(MPT_ADAPTER *ioc, char *pbuf, off_t offset, int len)
-{
-	struct info_str info;
-
-	info.buffer	= pbuf;
-	info.length	= len;
-	info.offset	= offset;
-	info.pos	= 0;
-
-	mptscsih_copy_info(&info, "%s: %s, ", ioc->name, ioc->prod_name);
-	mptscsih_copy_info(&info, "%s%08xh, ", MPT_FW_REV_MAGIC_ID_STRING, ioc->facts.FWVersion.Word);
-	mptscsih_copy_info(&info, "Ports=%d, ", ioc->facts.NumberOfPorts);
-	mptscsih_copy_info(&info, "MaxQ=%d\n", ioc->req_depth);
-
-	return ((info.pos > info.offset) ? info.pos - info.offset : 0);
-}
-
-/*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
-/**
- *	mptscsih_proc_info - Return information about MPT adapter
- * 	@host:   scsi host struct
- * 	@buffer: if write, user data; if read, buffer for user
- *	@start: returns the buffer address
- * 	@offset: if write, 0; if read, the current offset into the buffer from
- * 		 the previous read.
- * 	@length: if write, return length;
- *	@func:   write = 1; read = 0
- *
- *	(linux scsi_host_template.info routine)
- */
-int
-mptscsih_proc_info(struct Scsi_Host *host, char *buffer, char **start, off_t offset,
-			int length, int func)
+int mptscsih_show_info(struct seq_file *m, struct Scsi_Host *host)
 {
 	MPT_SCSI_HOST	*hd = shost_priv(host);
 	MPT_ADAPTER	*ioc = hd->ioc;
-	int size = 0;
 
-	if (func) {
-		/*
-		 * write is not supported
-		 */
-	} else {
-		if (start)
-			*start = buffer;
+	seq_printf(m, "%s: %s, ", ioc->name, ioc->prod_name);
+	seq_printf(m, "%s%08xh, ", MPT_FW_REV_MAGIC_ID_STRING, ioc->facts.FWVersion.Word);
+	seq_printf(m, "Ports=%d, ", ioc->facts.NumberOfPorts);
+	seq_printf(m, "MaxQ=%d\n", ioc->req_depth);
 
-		size = mptscsih_host_info(ioc, buffer, offset, length);
-	}
-
-	return size;
+	return 0;
 }
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
@@ -1383,7 +1300,6 @@ mptscsih_proc_info(struct Scsi_Host *host, char *buffer, char **start, off_t off
 /**
  *	mptscsih_qcmd - Primary Fusion MPT SCSI initiator IO start routine.
  *	@SCpnt: Pointer to scsi_cmnd structure
- *	@done: Pointer SCSI mid-layer IO completion function
  *
  *	(linux scsi_host_template.queuecommand routine)
  *	This is the primary SCSI IO start routine.  Create a MPI SCSIIORequest
@@ -1392,7 +1308,7 @@ mptscsih_proc_info(struct Scsi_Host *host, char *buffer, char **start, off_t off
  *	Returns 0. (rtn value discarded by linux scsi mid-layer)
  */
 int
-mptscsih_qcmd(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd *))
+mptscsih_qcmd(struct scsi_cmnd *SCpnt)
 {
 	MPT_SCSI_HOST		*hd;
 	MPT_FRAME_HDR		*mf;
@@ -1408,10 +1324,9 @@ mptscsih_qcmd(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd *))
 
 	hd = shost_priv(SCpnt->device->host);
 	ioc = hd->ioc;
-	SCpnt->scsi_done = done;
 
-	dmfprintk(ioc, printk(MYIOC_s_DEBUG_FMT "qcmd: SCpnt=%p, done()=%p\n",
-		ioc->name, SCpnt, done));
+	dmfprintk(ioc, printk(MYIOC_s_DEBUG_FMT "qcmd: SCpnt=%p\n",
+		ioc->name, SCpnt));
 
 	if (ioc->taskmgmt_quiesce_io)
 		return SCSI_MLQUEUE_HOST_BUSY;
@@ -2601,9 +2516,7 @@ mptscsih_getclear_scsi_lookup(MPT_ADAPTER *ioc, int i)
 }
 
 /**
- * mptscsih_set_scsi_lookup
- *
- * writes a scmd entry into the ScsiLookup[] array list
+ * mptscsih_set_scsi_lookup - write a scmd entry into the ScsiLookup[] array list
  *
  * @ioc: Pointer to MPT_ADAPTER structure
  * @i: index into the array
@@ -2766,7 +2679,7 @@ mptscsih_scandv_complete(MPT_ADAPTER *ioc, MPT_FRAME_HDR *req,
 
 
 /**
- *	mptscsih_get_completion_code -
+ *	mptscsih_get_completion_code - get completion code from MPT request
  *	@ioc: Pointer to MPT_ADAPTER structure
  *	@req: Pointer to original MPT request frame
  *	@reply: Pointer to MPT reply frame (NULL if TurboReply)
@@ -3337,91 +3250,7 @@ struct device_attribute *mptscsih_host_attrs[] = {
 	NULL,
 };
 
-/* device attributes */
-
-/**
- * mptscsih_device_sas_address_show - sas address
- * @cdev - pointer to embedded class device
- * @buf - the buffer returned
- *
- * This is the sas address for the target
- *
- * A sysfs 'read-only' shost attribute.
- */
-static ssize_t
-mptscsih_device_sas_address_show(struct device *dev,
-	struct device_attribute *attr, char *buf)
-{
-	struct scsi_device *sdev = to_scsi_device(dev);
-	VirtDevice *vdevice = sdev->hostdata;
-
-	if (vdevice && vdevice->vtarget) {
-		return snprintf(buf, PAGE_SIZE, "0x%016llx\n",
-	    		(unsigned long long)vdevice->vtarget->sas_address);
-	} else
-		return snprintf(buf, PAGE_SIZE, "0x0\n");
-}
-static DEVICE_ATTR(sas_address, S_IRUGO, mptscsih_device_sas_address_show,
- 			NULL);
-
-/**
- * mptscsih_device_handle_show - device handle
- * @cdev - pointer to embedded class device
- * @buf - the buffer returned
- *
- * This is the firmware assigned device handle
- *
- * A sysfs 'read-only' shost attribute.
- */
-static ssize_t
-mptscsih_device_handle_show(struct device *dev, struct device_attribute *attr,
-    char *buf)
-{
-	struct scsi_device *sdev = to_scsi_device(dev);
-	VirtDevice *vdevice = sdev->hostdata;
-
-	if (vdevice && vdevice->vtarget)
-		return snprintf(buf, PAGE_SIZE, "0x%04x\n",
-		    vdevice->vtarget->handle);
-	else
-		return snprintf(buf, PAGE_SIZE, "0x0\n");
-}
-static DEVICE_ATTR(sas_device_handle, S_IRUGO, mptscsih_device_handle_show,
- 		NULL);
-/**
- * mptscsih_fw_id_show - device handle
- * @cdev - pointer to embedded class device
- * @buf - the buffer returned
- *
- * This is the firmware assigned id.
- *
- * A sysfs 'read-only' shost attribute.
- */
-static ssize_t
-mptscsih_device_fw_id_show(struct device *dev, struct device_attribute *attr,
-    char *buf)
-{
-	struct scsi_device *sdev = to_scsi_device(dev);
-	VirtDevice *vdevice = sdev->hostdata;
-
-	if (vdevice && vdevice->vtarget)
-		return snprintf(buf, PAGE_SIZE, "0x%04x\n",
-		    vdevice->vtarget->id);
-	else
-		return snprintf(buf, PAGE_SIZE, "0x0\n");
-}
-static DEVICE_ATTR(fw_id, S_IRUGO, mptscsih_device_fw_id_show,
- 		NULL);
-
-struct device_attribute *mptscsih_dev_attrs[] = {
-	&dev_attr_sas_address,
-	&dev_attr_sas_device_handle,
-	&dev_attr_fw_id,
-	NULL,
-};
-
 EXPORT_SYMBOL(mptscsih_host_attrs);
-EXPORT_SYMBOL(mptscsih_dev_attrs);
 
 EXPORT_SYMBOL(mptscsih_remove);
 EXPORT_SYMBOL(mptscsih_shutdown);
@@ -3429,7 +3258,7 @@ EXPORT_SYMBOL(mptscsih_shutdown);
 EXPORT_SYMBOL(mptscsih_suspend);
 EXPORT_SYMBOL(mptscsih_resume);
 #endif
-EXPORT_SYMBOL(mptscsih_proc_info);
+EXPORT_SYMBOL(mptscsih_show_info);
 EXPORT_SYMBOL(mptscsih_info);
 EXPORT_SYMBOL(mptscsih_qcmd);
 EXPORT_SYMBOL(mptscsih_slave_destroy);

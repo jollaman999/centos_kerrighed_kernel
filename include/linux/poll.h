@@ -1,17 +1,17 @@
 #ifndef _LINUX_POLL_H
 #define _LINUX_POLL_H
 
-#include <asm/poll.h>
-
-#ifdef __KERNEL__
 
 #include <linux/compiler.h>
 #include <linux/ktime.h>
 #include <linux/wait.h>
 #include <linux/string.h>
 #include <linux/fs.h>
+#include <linux/sysctl.h>
 #include <asm/uaccess.h>
+#include <uapi/linux/poll.h>
 
+extern struct ctl_table epoll_table[]; /* for sysctl */
 /* ~832 bytes of stack space used max in sys_select/sys_poll before allocating
    additional memory. */
 #define MAX_STACK_ALLOC 832
@@ -30,15 +30,19 @@ struct poll_table_struct;
  */
 typedef void (*poll_queue_proc)(struct file *, wait_queue_head_t *, struct poll_table_struct *);
 
+/*
+ * Do not touch the structure directly, use the access functions
+ * poll_does_not_wait() and poll_requested_events() instead.
+ */
 typedef struct poll_table_struct {
-	poll_queue_proc qproc;
-	unsigned long key;
+	poll_queue_proc _qproc;
+	unsigned long _key;
 } poll_table;
 
 static inline void poll_wait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p)
 {
-	if (p && wait_address)
-		p->qproc(filp, wait_address, p);
+	if (p && p->_qproc && wait_address)
+		p->_qproc(filp, wait_address, p);
 }
 
 /*
@@ -48,7 +52,7 @@ static inline void poll_wait(struct file * filp, wait_queue_head_t * wait_addres
  */
 static inline bool poll_does_not_wait(const poll_table *p)
 {
-	return p == NULL || p->qproc == NULL;
+	return p == NULL || p->_qproc == NULL;
 }
 
 /*
@@ -59,13 +63,13 @@ static inline bool poll_does_not_wait(const poll_table *p)
  */
 static inline unsigned long poll_requested_events(const poll_table *p)
 {
-	return p ? p->key : ~0UL;
+	return p ? p->_key : ~0UL;
 }
 
 static inline void init_poll_funcptr(poll_table *pt, poll_queue_proc qproc)
 {
-	pt->qproc = qproc;
-	pt->key   = ~0UL; /* all events enabled */
+	pt->_qproc = qproc;
+	pt->_key   = ~0UL; /* all events enabled */
 }
 
 struct poll_table_entry {
@@ -76,7 +80,7 @@ struct poll_table_entry {
 };
 
 /*
- * Structures and helpers for sys_poll/sys_poll
+ * Structures and helpers for select/poll syscall
  */
 struct poll_wqueues {
 	poll_table pt;
@@ -101,7 +105,7 @@ static inline int poll_schedule(struct poll_wqueues *pwq, int state)
 }
 
 /*
- * Scaleable version of the fd_set.
+ * Scalable version of the fd_set.
  */
 
 typedef struct {
@@ -156,7 +160,5 @@ extern int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp,
 			   fd_set __user *exp, struct timespec *end_time);
 
 extern int poll_select_set_timeout(struct timespec *to, long sec, long nsec);
-
-#endif /* KERNEL */
 
 #endif /* _LINUX_POLL_H */

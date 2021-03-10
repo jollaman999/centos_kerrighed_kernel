@@ -1,6 +1,10 @@
 #ifndef _ASM_X86_MSR_INDEX_H
 #define _ASM_X86_MSR_INDEX_H
 
+#ifndef BIT
+#define BIT(nr)		(1UL << (nr))
+#endif
+
 /* CPU model specific register (MSR) numbers */
 
 /* x86-64 specific MSRs */
@@ -20,6 +24,7 @@
 #define _EFER_LMA		10 /* Long mode active (read-only) */
 #define _EFER_NX		11 /* No execute enable */
 #define _EFER_SVME		12 /* Enable virtualization */
+#define _EFER_LMSLE		13 /* Long Mode Segment Limit Enable */
 #define _EFER_FFXSR		14 /* Enable Fast FXSAVE/FXRSTOR */
 
 #define EFER_SCE		(1<<_EFER_SCE)
@@ -27,74 +32,79 @@
 #define EFER_LMA		(1<<_EFER_LMA)
 #define EFER_NX			(1<<_EFER_NX)
 #define EFER_SVME		(1<<_EFER_SVME)
+#define EFER_LMSLE		(1<<_EFER_LMSLE)
 #define EFER_FFXSR		(1<<_EFER_FFXSR)
 
 /* Intel MSRs. Some also available on other CPUs */
 
 #define MSR_IA32_SPEC_CTRL		0x00000048 /* Speculation Control */
-#define SPEC_CTRL_IBRS			(1 << 0)   /* Indirect Branch Restricted Speculation */
-#define SPEC_CTRL_STIBP 		(1 << 1)   /* Single Thread Indirect Branch Predictors */
+#define SPEC_CTRL_IBRS			BIT(0)	   /* Indirect Branch Restricted Speculation */
+#define SPEC_CTRL_STIBP_SHIFT		1	   /* Single Thread Indirect Branch Predictor (STIBP) bit */
+#define SPEC_CTRL_STIBP			BIT(SPEC_CTRL_STIBP_SHIFT)	/* STIBP mask */
 #define SPEC_CTRL_SSBD_SHIFT		2	   /* Speculative Store Bypass Disable bit */
-#define SPEC_CTRL_SSBD			(1 << SPEC_CTRL_SSBD_SHIFT)   /* Speculative Store Bypass Disable */
+#define SPEC_CTRL_SSBD			BIT(SPEC_CTRL_SSBD_SHIFT)	/* Speculative Store Bypass Disable */
 
 #define MSR_IA32_PRED_CMD		0x00000049 /* Prediction Command */
-#define PRED_CMD_IBPB			(1 << 0)   /* Indirect Branch Prediction Barrier */
+#define PRED_CMD_IBPB			BIT(0)	   /* Indirect Branch Prediction Barrier */
+
+#define MSR_PPIN_CTL			0x0000004e
+#define MSR_PPIN			0x0000004f
 
 #define MSR_IA32_PERFCTR0		0x000000c1
 #define MSR_IA32_PERFCTR1		0x000000c2
 #define MSR_FSB_FREQ			0x000000cd
 #define MSR_NHM_PLATFORM_INFO		0x000000ce
 
-#define SNB_C1_AUTO_UNDEMOTE		(1UL << 27)
-#define SNB_C3_AUTO_UNDEMOTE		(1UL << 28)
-
 #define MSR_NHM_SNB_PKG_CST_CFG_CTL	0x000000e2
+#define MSR_PKG_CST_CONFIG_CONTROL	0x000000e2
 #define NHM_C3_AUTO_DEMOTE		(1UL << 25)
 #define NHM_C1_AUTO_DEMOTE		(1UL << 26)
 #define ATM_LNC_C6_AUTO_DEMOTE		(1UL << 25)
+#define SNB_C1_AUTO_UNDEMOTE		(1UL << 27)
+#define SNB_C3_AUTO_UNDEMOTE		(1UL << 28)
 
 #define MSR_PLATFORM_INFO		0x000000ce
 #define MSR_MTRRcap			0x000000fe
 
 #define MSR_IA32_ARCH_CAPABILITIES	0x0000010a
-#define ARCH_CAP_RDCL_NO		(1 << 0)   /* Not susceptible to Meltdown */
-#define ARCH_CAP_IBRS_ALL		(1 << 1)   /* Enhanced IBRS support */
-#define ARCH_CAP_SKIP_VMENTRY_L1DFLUSH	(1 << 3)   /* Skip L1D flush on vmentry */
-#define ARCH_CAP_SSB_NO 		(1 << 4)   /*
-						    * Not susceptible to Speculative Store Bypass
-						    * attack, so no Reduced Data Speculation control
-						    * required.
-						    */
-#define ARCH_CAP_MDS_NO			(1 << 5)   /*
-						   * Not susceptible to
-						   * Microarchitectural Data
-						   * Sampling (MDS) vulnerabilities.
-						   */
-#define ARCH_CAP_PSCHANGE_MC_NO		(1 << 6) /*
+#define ARCH_CAP_RDCL_NO		BIT(0)	/* Not susceptible to Meltdown */
+#define ARCH_CAP_IBRS_ALL		BIT(1)	/* Enhanced IBRS support */
+#define ARCH_CAP_SKIP_VMENTRY_L1DFLUSH	BIT(3)	/* Skip L1D flush on vmentry */
+#define ARCH_CAP_SSB_NO			BIT(4)	/*
+						 * Not susceptible to Speculative Store Bypass
+						 * attack, so no Speculative Store Bypass
+						 * control required.
+						 */
+#define ARCH_CAP_MDS_NO			BIT(5)   /*
+						  * Not susceptible to
+						  * Microarchitectural Data
+						  * Sampling (MDS) vulnerabilities.
+						  */
+#define ARCH_CAP_PSCHANGE_MC_NO		BIT(6)	 /*
 						  * The processor is not susceptible to a
 						  * machine check error due to modifying the
 						  * code page size along with either the
 						  * physical address or cache type
 						  * without TLB invalidation.
 						  */
-#define ARCH_CAP_TSX_CTRL_MSR		(1 << 7)   /* MSR for TSX control is available. */
-#define ARCH_CAP_TAA_NO			(1 << 8)   /*
-						    * Not susceptible to
-						    * TSX Async Abort (TAA) vulnerabilities.
-						    */
+#define ARCH_CAP_TSX_CTRL_MSR		BIT(7)	/* MSR for TSX control is available. */
+#define ARCH_CAP_TAA_NO			BIT(8)	/*
+						 * Not susceptible to
+						 * TSX Async Abort (TAA) vulnerabilities.
+						 */
 
 #define MSR_IA32_FLUSH_CMD		0x0000010b
-#define L1D_FLUSH			(1 << 0)   /*
-						    * Writeback and invalidate the
-						    * L1 data cache.
-						    */
+#define L1D_FLUSH			BIT(0)	/*
+						 * Writeback and invalidate the
+						 * L1 data cache.
+						 */
 
 #define MSR_IA32_BBL_CR_CTL		0x00000119
 #define MSR_IA32_BBL_CR_CTL3		0x0000011e
 
 #define MSR_IA32_TSX_CTRL		0x00000122
-#define TSX_CTRL_RTM_DISABLE		(1 << 0) /* Disable RTM feature */
-#define TSX_CTRL_CPUID_CLEAR		(1 << 1) /* Disable TSX enumeration */
+#define TSX_CTRL_RTM_DISABLE		BIT(0)	/* Disable RTM feature */
+#define TSX_CTRL_CPUID_CLEAR		BIT(1)	/* Disable TSX enumeration */
 
 /* SRBDS support */
 #define MSR_IA32_MCU_OPT_CTRL		0x00000123
@@ -107,6 +117,7 @@
 #define MSR_IA32_MCG_CAP		0x00000179
 #define MSR_IA32_MCG_STATUS		0x0000017a
 #define MSR_IA32_MCG_CTL		0x0000017b
+#define MSR_IA32_MCG_EXT_CTL		0x000004d0
 
 #define MSR_OFFCORE_RSP_0		0x000001a6
 #define MSR_OFFCORE_RSP_1		0x000001a7
@@ -130,9 +141,25 @@
 #define LBR_INFO_CYCLES			0xffff
 
 #define MSR_IA32_PEBS_ENABLE		0x000003f1
+#define MSR_PEBS_DATA_CFG		0x000003f2
 #define MSR_IA32_DS_AREA		0x00000600
 #define MSR_IA32_PERF_CAPABILITIES	0x00000345
 #define MSR_PEBS_LD_LAT_THRESHOLD	0x000003f6
+
+#define MSR_IA32_RTIT_CTL		0x00000570
+#define MSR_IA32_RTIT_STATUS		0x00000571
+#define MSR_IA32_RTIT_STATUS		0x00000571
+#define MSR_IA32_RTIT_ADDR0_A		0x00000580
+#define MSR_IA32_RTIT_ADDR0_B		0x00000581
+#define MSR_IA32_RTIT_ADDR1_A		0x00000582
+#define MSR_IA32_RTIT_ADDR1_B		0x00000583
+#define MSR_IA32_RTIT_ADDR2_A		0x00000584
+#define MSR_IA32_RTIT_ADDR2_B		0x00000585
+#define MSR_IA32_RTIT_ADDR3_A		0x00000586
+#define MSR_IA32_RTIT_ADDR3_B		0x00000587
+#define MSR_IA32_RTIT_CR3_MATCH		0x00000572
+#define MSR_IA32_RTIT_OUTPUT_BASE	0x00000560
+#define MSR_IA32_RTIT_OUTPUT_MASK	0x00000561
 
 #define MSR_MTRRfix64K_00000		0x00000250
 #define MSR_MTRRfix16K_80000		0x00000258
@@ -164,6 +191,11 @@
 #define DEBUGCTLMSR_BTS_OFF_OS		(1UL <<  9)
 #define DEBUGCTLMSR_BTS_OFF_USR		(1UL << 10)
 #define DEBUGCTLMSR_FREEZE_LBRS_ON_PMI	(1UL << 11)
+#define DEBUGCTLMSR_FREEZE_PERFMON_ON_PMI	(1UL << 12)
+#define DEBUGCTLMSR_FREEZE_IN_SMM_BIT	14
+#define DEBUGCTLMSR_FREEZE_IN_SMM	(1UL << DEBUGCTLMSR_FREEZE_IN_SMM_BIT)
+
+#define MSR_PEBS_FRONTEND		0x000003f7
 
 #define MSR_IA32_POWER_CTL		0x000001fc
 
@@ -175,6 +207,7 @@
 /* C-state Residency Counters */
 #define MSR_PKG_C3_RESIDENCY		0x000003f8
 #define MSR_PKG_C6_RESIDENCY		0x000003f9
+#define MSR_ATOM_PKG_C6_RESIDENCY	0x000003fa
 #define MSR_PKG_C7_RESIDENCY		0x000003fa
 #define MSR_CORE_C3_RESIDENCY		0x000003fc
 #define MSR_CORE_C6_RESIDENCY		0x000003fd
@@ -184,6 +217,14 @@
 #define MSR_PKG_C8_RESIDENCY		0x00000630
 #define MSR_PKG_C9_RESIDENCY		0x00000631
 #define MSR_PKG_C10_RESIDENCY		0x00000632
+
+/* Interrupt Response Limit */
+#define MSR_PKGC3_IRTL			0x0000060a
+#define MSR_PKGC6_IRTL			0x0000060b
+#define MSR_PKGC7_IRTL			0x0000060c
+#define MSR_PKGC8_IRTL			0x00000633
+#define MSR_PKGC9_IRTL			0x00000634
+#define MSR_PKGC10_IRTL			0x00000635
 
 /* Run Time Average Power Limiting (RAPL) Interface */
 
@@ -214,12 +255,18 @@
 #define MSR_CONFIG_TDP_CONTROL		0x0000064B
 #define MSR_TURBO_ACTIVATION_RATIO	0x0000064C
 
+#define MSR_PLATFORM_ENERGY_STATUS	0x0000064D
+
 #define MSR_PKG_WEIGHTED_CORE_C0_RES	0x00000658
 #define MSR_PKG_ANY_CORE_C0_RES		0x00000659
 #define MSR_PKG_ANY_GFXE_C0_RES		0x0000065A
 #define MSR_PKG_BOTH_CORE_GFXE_C0_RES	0x0000065B
 
 #define MSR_CORE_C1_RES			0x00000660
+#define MSR_MODULE_C6_RES_MS		0x00000664
+
+#define MSR_CC6_DEMOTION_POLICY_CONFIG	0x00000668
+#define MSR_MC6_DEMOTION_POLICY_CONFIG	0x00000669
 
 /* Config TDP MSRs */
 #define MSR_CONFIG_TDP_NOMINAL		0x00000648
@@ -227,10 +274,6 @@
 #define MSR_CONFIG_TDP_LEVEL2		0x0000064A
 #define MSR_CONFIG_TDP_CONTROL		0x0000064B
 #define MSR_TURBO_ACTIVATION_RATIO	0x0000064C
-
-#define MSR_CORE_PERF_LIMIT_REASONS	0x00000690
-#define MSR_GFX_PERF_LIMIT_REASONS	0x000006B0
-#define MSR_RING_PERF_LIMIT_REASONS	0x000006B1
 
 /* Hardware P state interface */
 #define MSR_PPERF			0x0000064e
@@ -260,6 +303,10 @@
 #define HWP_MAX_PERF(x) 		((x & 0xff) << 8)
 #define HWP_DESIRED_PERF(x)		((x & 0xff) << 16)
 #define HWP_ENERGY_PERF_PREFERENCE(x)	((x & 0xff) << 24)
+#define HWP_EPP_PERFORMANCE		0x00
+#define HWP_EPP_BALANCE_PERFORMANCE	0x80
+#define HWP_EPP_BALANCE_POWERSAVE	0xC0
+#define HWP_EPP_POWERSAVE		0xFF
 #define HWP_ACTIVITY_WINDOW(x)		((x & 0xff3) << 32)
 #define HWP_PACKAGE_CONTROL(x)		((x & 0x1) << 42)
 
@@ -289,6 +336,11 @@
 #define MSR_P6_EVNTSEL0			0x00000186
 #define MSR_P6_EVNTSEL1			0x00000187
 
+#define MSR_KNC_PERFCTR0               0x00000020
+#define MSR_KNC_PERFCTR1               0x00000021
+#define MSR_KNC_EVNTSEL0               0x00000028
+#define MSR_KNC_EVNTSEL1               0x00000029
+
 /* Alternative perfctr range with full access. */
 #define MSR_IA32_PMC0			0x000004c1
 
@@ -300,13 +352,16 @@
 #define MSR_AMD64_NB_CFG		0xc001001f
 #define MSR_AMD64_PATCH_LOADER		0xc0010020
 #define MSR_AMD64_VIRT_SPEC_CTRL	0xc001011f
-#define MSR_AMD64_DC_CFG		0xc0011022
 #define MSR_AMD64_OSVW_ID_LENGTH	0xc0010140
 #define MSR_AMD64_OSVW_STATUS		0xc0010141
 #define MSR_AMD64_LS_CFG		0xc0011020
+#define MSR_AMD64_DC_CFG		0xc0011022
+#define MSR_AMD64_BU_CFG2		0xc001102a
 #define MSR_AMD64_IBSFETCHCTL		0xc0011030
 #define MSR_AMD64_IBSFETCHLINAD		0xc0011031
 #define MSR_AMD64_IBSFETCHPHYSAD	0xc0011032
+#define MSR_AMD64_IBSFETCH_REG_COUNT	3
+#define MSR_AMD64_IBSFETCH_REG_MASK	((1UL<<MSR_AMD64_IBSFETCH_REG_COUNT)-1)
 #define MSR_AMD64_IBSOPCTL		0xc0011033
 #define MSR_AMD64_IBSOPRIP		0xc0011034
 #define MSR_AMD64_IBSOPDATA		0xc0011035
@@ -314,12 +369,23 @@
 #define MSR_AMD64_IBSOPDATA3		0xc0011037
 #define MSR_AMD64_IBSDCLINAD		0xc0011038
 #define MSR_AMD64_IBSDCPHYSAD		0xc0011039
+#define MSR_AMD64_IBSOP_REG_COUNT	7
+#define MSR_AMD64_IBSOP_REG_MASK	((1UL<<MSR_AMD64_IBSOP_REG_COUNT)-1)
 #define MSR_AMD64_IBSCTL		0xc001103a
 #define MSR_AMD64_IBSBRTARGET		0xc001103b
+#define MSR_AMD64_IBSOPDATA4		0xc001103d
+#define MSR_AMD64_IBS_REG_COUNT_MAX	8 /* includes MSR_AMD64_IBSBRTARGET */
+#define MSR_AMD64_SEV			0xc0010131
+#define MSR_AMD64_SEV_ENABLED_BIT	0
+#define MSR_AMD64_SEV_ENABLED		BIT_ULL(MSR_AMD64_SEV_ENABLED_BIT)
 
 /* Fam 16h MSRs */
 #define MSR_F16H_L2I_PERF_CTL		0xc0010230
 #define MSR_F16H_L2I_PERF_CTR		0xc0010231
+#define MSR_F16H_DR1_ADDR_MASK		0xc0011019
+#define MSR_F16H_DR2_ADDR_MASK		0xc001101a
+#define MSR_F16H_DR3_ADDR_MASK		0xc001101b
+#define MSR_F16H_DR0_ADDR_MASK		0xc0011027
 
 /* Fam 15h MSRs */
 #define MSR_F15H_PERF_CTL		0xc0010200
@@ -329,13 +395,14 @@
 #define MSR_F15H_PTSC			0xc0010280
 #define MSR_F15H_IC_CFG			0xc0011021
 #define MSR_F15H_IC_CFG_DIS_IND		BIT_ULL(14)
+#define MSR_F15H_EX_CFG			0xc001102c
 
 /* Fam 10h MSRs */
 #define MSR_FAM10H_MMIO_CONF_BASE	0xc0010058
 #define FAM10H_MMIO_CONF_ENABLE		(1<<0)
 #define FAM10H_MMIO_CONF_BUSRANGE_MASK	0xf
 #define FAM10H_MMIO_CONF_BUSRANGE_SHIFT 2
-#define FAM10H_MMIO_CONF_BASE_MASK	0xfffffff
+#define FAM10H_MMIO_CONF_BASE_MASK	0xfffffffULL
 #define FAM10H_MMIO_CONF_BASE_SHIFT	20
 #define MSR_FAM10H_NODE_ID		0xc001100c
 #define MSR_F10H_DECFG			0xc0011029
@@ -345,10 +412,13 @@
 #define MSR_K8_TOP_MEM1			0xc001001a
 #define MSR_K8_TOP_MEM2			0xc001001d
 #define MSR_K8_SYSCFG			0xc0010010
+#define MSR_K8_SYSCFG_MEM_ENCRYPT_BIT	23
+#define MSR_K8_SYSCFG_MEM_ENCRYPT	BIT_ULL(MSR_K8_SYSCFG_MEM_ENCRYPT_BIT)
 #define MSR_K8_INT_PENDING_MSG		0xc0010055
 /* C1E active bits in int pending message */
 #define K8_INTP_C1E_ACTIVE_MASK		0x18000000
 #define MSR_K8_TSEG_ADDR		0xc0010112
+#define MSR_K8_TSEG_MASK		0xc0010113
 #define K8_MTRRFIXRANGE_DRAM_ENABLE	0x00040000 /* MtrrFixDramEn bit    */
 #define K8_MTRRFIXRANGE_DRAM_MODIFY	0x00080000 /* MtrrFixDramModEn bit */
 #define K8_MTRR_RDMEM_WRMEM_MASK	0x18181818 /* Mask: RdMem|WrMem    */
@@ -368,8 +438,6 @@
 #define MSR_K7_FID_VID_STATUS		0xc0010042
 
 /* K6 MSRs */
-#define MSR_K6_EFER			0xc0000080
-#define MSR_K6_STAR			0xc0000081
 #define MSR_K6_WHCR			0xc0000082
 #define MSR_K6_UWCCR			0xc0000085
 #define MSR_K6_EPMR			0xc0000086
@@ -413,10 +481,17 @@
 #define MSR_EBC_FREQUENCY_ID		0x0000002c
 #define MSR_SMI_COUNT			0x00000034
 #define MSR_IA32_FEATURE_CONTROL        0x0000003a
+#define MSR_IA32_TSC_ADJUST             0x0000003b
+#define MSR_IA32_BNDCFGS		0x00000d90
+
+#define MSR_IA32_BNDCFGS_RSVD		0x00000ffc
+
+#define MSR_IA32_XSS			0x00000da0
 
 #define FEATURE_CONTROL_LOCKED				(1<<0)
 #define FEATURE_CONTROL_VMXON_ENABLED_INSIDE_SMX	(1<<1)
 #define FEATURE_CONTROL_VMXON_ENABLED_OUTSIDE_SMX	(1<<2)
+#define FEATURE_CONTROL_LMCE				(1<<20)
 
 #define MSR_IA32_APICBASE		0x0000001b
 #define MSR_IA32_APICBASE_BSP		(1<<8)
@@ -428,8 +503,14 @@
 #define MSR_IA32_UCODE_WRITE		0x00000079
 #define MSR_IA32_UCODE_REV		0x0000008b
 
+#define MSR_IA32_SMM_MONITOR_CTL	0x0000009b
+#define MSR_IA32_SMBASE			0x0000009e
+
 #define MSR_IA32_PERF_STATUS		0x00000198
 #define MSR_IA32_PERF_CTL		0x00000199
+#define MSR_AMD_PSTATE_DEF_BASE		0xc0010064
+#define MSR_AMD_PERF_STATUS		0xc0010063
+#define MSR_AMD_PERF_CTL		0xc0010062
 
 #define MSR_IA32_MPERF			0x000000e7
 #define MSR_IA32_APERF			0x000000e8
@@ -454,6 +535,7 @@
 
 #define MSR_IA32_TEMPERATURE_TARGET	0x000001a2
 
+#define MSR_MISC_FEATURE_CONTROL	0x000001a4
 #define MSR_MISC_PWR_MGMT		0x000001aa
 
 #define MSR_IA32_ENERGY_PERF_BIAS	0x000001b0
@@ -512,6 +594,19 @@
 #define MSR_IA32_MISC_ENABLE_DCU_PREF_DISABLE	(1ULL << 37)
 #define MSR_IA32_MISC_ENABLE_TURBO_DISABLE	(1ULL << 38)
 #define MSR_IA32_MISC_ENABLE_IP_PREF_DISABLE	(1ULL << 39)
+
+/* MISC_FEATURE_ENABLES non-architectural features */
+#define MSR_MISC_FEATURE_ENABLES	0x00000140
+
+#define MSR_MISC_FEATURE_ENABLES_RING3MWAIT_BIT		1
+
+#define MSR_IA32_TSC_DEADLINE		0x000006E0
+
+
+#define MSR_TSX_FORCE_ABORT		0x0000010F
+
+#define MSR_TFA_RTM_FORCE_ABORT_BIT	0
+#define MSR_TFA_RTM_FORCE_ABORT		BIT_ULL(MSR_TFA_RTM_FORCE_ABORT_BIT)
 
 /* P4/Xeon+ specific */
 #define MSR_IA32_MCG_EAX		0x00000180
@@ -639,11 +734,38 @@
 #define MSR_IA32_VMX_VMCS_ENUM          0x0000048a
 #define MSR_IA32_VMX_PROCBASED_CTLS2    0x0000048b
 #define MSR_IA32_VMX_EPT_VPID_CAP       0x0000048c
+#define MSR_IA32_VMX_TRUE_PINBASED_CTLS  0x0000048d
+#define MSR_IA32_VMX_TRUE_PROCBASED_CTLS 0x0000048e
+#define MSR_IA32_VMX_TRUE_EXIT_CTLS      0x0000048f
+#define MSR_IA32_VMX_TRUE_ENTRY_CTLS     0x00000490
+#define MSR_IA32_VMX_VMFUNC             0x00000491
 
+/* VMX_BASIC bits and bitmasks */
+#define VMX_BASIC_VMCS_SIZE_SHIFT	32
+#define VMX_BASIC_TRUE_CTLS		(1ULL << 55)
+#define VMX_BASIC_64		0x0001000000000000LLU
+#define VMX_BASIC_MEM_TYPE_SHIFT	50
+#define VMX_BASIC_MEM_TYPE_MASK	0x003c000000000000LLU
+#define VMX_BASIC_MEM_TYPE_WB	6LLU
+#define VMX_BASIC_INOUT		0x0040000000000000LLU
+
+/* MSR_IA32_VMX_MISC bits */
+#define MSR_IA32_VMX_MISC_VMWRITE_SHADOW_RO_FIELDS (1ULL << 29)
+#define MSR_IA32_VMX_MISC_PREEMPTION_TIMER_SCALE   0x1F
 /* AMD-V MSRs */
 
 #define MSR_VM_CR                       0xc0010114
 #define MSR_VM_IGNNE                    0xc0010115
 #define MSR_VM_HSAVE_PA                 0xc0010117
+
+#define MSR_ATOM_CORE_RATIOS		0x0000066a
+#define MSR_ATOM_CORE_VIDS		0x0000066b
+#define MSR_ATOM_CORE_TURBO_RATIOS	0x0000066c
+#define MSR_ATOM_CORE_TURBO_VIDS	0x0000066d
+
+
+#define MSR_CORE_PERF_LIMIT_REASONS	0x00000690
+#define MSR_GFX_PERF_LIMIT_REASONS	0x000006B0
+#define MSR_RING_PERF_LIMIT_REASONS	0x000006B1
 
 #endif /* _ASM_X86_MSR_INDEX_H */

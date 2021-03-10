@@ -41,7 +41,6 @@
 #include <linux/in.h>
 #include <linux/init.h>
 
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 
@@ -64,7 +63,6 @@ struct pcpu_lstats {
 	u64			packets;
 	u64			bytes;
 	struct u64_stats_sync	syncp;
-	unsigned long		drops;
 };
 
 /*
@@ -79,10 +77,15 @@ static netdev_tx_t loopback_xmit(struct sk_buff *skb,
 
 	skb_orphan(skb);
 
+	/* Before queueing this packet to netif_rx(),
+	 * make sure dst is refcounted.
+	 */
+	skb_dst_force(skb);
+
 	skb->protocol = eth_type_trans(skb, dev);
 
 	/* it's OK to use per_cpu_ptr() because BHs are off */
-	lb_stats = this_cpu_ptr((void __percpu __force *)dev->ml_priv);
+	lb_stats = this_cpu_ptr(dev->lstats);
 
 	len = skb->len;
 	if (likely(netif_rx(skb) == NET_RX_SUCCESS)) {
@@ -90,18 +93,16 @@ static netdev_tx_t loopback_xmit(struct sk_buff *skb,
 		lb_stats->bytes += len;
 		lb_stats->packets++;
 		u64_stats_update_end(&lb_stats->syncp);
-	} else
-		lb_stats->drops++;
+	}
 
 	return NETDEV_TX_OK;
 }
 
-static struct rtnl_link_stats64 *loopback_get_stats64(struct net_device *dev,
-						      struct rtnl_link_stats64 *stats)
+static void loopback_get_stats64(struct net_device *dev,
+				 struct rtnl_link_stats64 *stats)
 {
 	u64 bytes = 0;
 	u64 packets = 0;
-	u64 drops = 0;
 	int i;
 
 	for_each_possible_cpu(i) {
@@ -109,23 +110,19 @@ static struct rtnl_link_stats64 *loopback_get_stats64(struct net_device *dev,
 		u64 tbytes, tpackets;
 		unsigned int start;
 
-		lb_stats = per_cpu_ptr((void __percpu __force *)dev->ml_priv, i);
+		lb_stats = per_cpu_ptr(dev->lstats, i);
 		do {
 			start = u64_stats_fetch_begin_irq(&lb_stats->syncp);
 			tbytes = lb_stats->bytes;
 			tpackets = lb_stats->packets;
 		} while (u64_stats_fetch_retry_irq(&lb_stats->syncp, start));
-		drops   += lb_stats->drops;
 		bytes   += tbytes;
 		packets += tpackets;
 	}
 	stats->rx_packets = packets;
 	stats->tx_packets = packets;
-	stats->rx_dropped = drops;
-	stats->rx_errors  = drops;
 	stats->rx_bytes   = bytes;
 	stats->tx_bytes   = bytes;
-	return stats;
 }
 
 static u32 always_on(struct net_device *dev)
@@ -139,8 +136,8 @@ static const struct ethtool_ops loopback_ethtool_ops = {
 
 static int loopback_dev_init(struct net_device *dev)
 {
-	dev->ml_priv = (void __force *)alloc_percpu(struct pcpu_lstats);
-	if (!dev->ml_priv)
+	dev->lstats = alloc_percpu(struct pcpu_lstats);
+	if (!dev->lstats)
 		return -ENOMEM;
 
 	return 0;
@@ -148,18 +145,14 @@ static int loopback_dev_init(struct net_device *dev)
 
 static void loopback_dev_free(struct net_device *dev)
 {
-	free_percpu((void __percpu __force *)dev->ml_priv);
-	free_netdev(dev);
+	free_percpu(dev->lstats);
 }
 
 static const struct net_device_ops loopback_ops = {
 	.ndo_init      = loopback_dev_init,
 	.ndo_start_xmit= loopback_xmit,
-};
-
-static const struct net_device_ops_ext loopback_ops_ext = {
-	.size = sizeof(struct net_device_ops_ext),
 	.ndo_get_stats64 = loopback_get_stats64,
+	.ndo_set_mac_address = eth_mac_addr,
 };
 
 /*
@@ -171,16 +164,16 @@ static void loopback_setup(struct net_device *dev)
 	dev->mtu		= 64 * 1024;
 	dev->hard_header_len	= ETH_HLEN;	/* 14	*/
 	dev->addr_len		= ETH_ALEN;	/* 6	*/
-	dev->tx_queue_len	= 0;
 	dev->type		= ARPHRD_LOOPBACK;	/* 0x0001*/
 	dev->flags		= IFF_LOOPBACK;
-	dev->priv_flags	       &= ~IFF_XMIT_DST_RELEASE;
-	set_netdev_hw_features(dev, NETIF_F_ALL_TSO | NETIF_F_UFO);
+	dev->priv_flags		|= IFF_LIVE_ADDR_CHANGE | IFF_NO_QUEUE;
+	netif_keep_dst(dev);
+	dev->hw_features	= NETIF_F_GSO_SOFTWARE;
 	dev->features 		= NETIF_F_SG | NETIF_F_FRAGLIST
-		| NETIF_F_ALL_TSO
-		| NETIF_F_UFO
+		| NETIF_F_GSO_SOFTWARE
 		| NETIF_F_HW_CSUM
 		| NETIF_F_RXCSUM
+		| NETIF_F_SCTP_CRC
 		| NETIF_F_HIGHDMA
 		| NETIF_F_LLTX
 		| NETIF_F_NETNS_LOCAL
@@ -189,8 +182,8 @@ static void loopback_setup(struct net_device *dev)
 	dev->ethtool_ops	= &loopback_ethtool_ops;
 	dev->header_ops		= &eth_header_ops;
 	dev->netdev_ops		= &loopback_ops;
-	set_netdev_ops_ext(dev, &loopback_ops_ext);
-	dev->destructor		= loopback_dev_free;
+	dev->extended->needs_free_netdev	= true;
+	dev->extended->priv_destructor	= loopback_dev_free;
 }
 
 /* Setup and register the loopback device. */
@@ -209,6 +202,7 @@ static __net_init int loopback_net_init(struct net *net)
 	if (err)
 		goto out_free_netdev;
 
+	BUG_ON(dev->ifindex != LOOPBACK_IFINDEX);
 	net->loopback_dev = dev;
 	return 0;
 
@@ -216,20 +210,12 @@ static __net_init int loopback_net_init(struct net *net)
 out_free_netdev:
 	free_netdev(dev);
 out:
-	if (net == &init_net)
+	if (net_eq(net, &init_net))
 		panic("loopback: Failed to register netdevice: %d\n", err);
 	return err;
-}
-
-static __net_exit void loopback_net_exit(struct net *net)
-{
-	struct net_device *dev = net->loopback_dev;
-
-	unregister_netdev(dev);
 }
 
 /* Registered in net/core/dev.c */
 struct pernet_operations __net_initdata loopback_net_ops = {
        .init = loopback_net_init,
-       .exit = loopback_net_exit,
 };

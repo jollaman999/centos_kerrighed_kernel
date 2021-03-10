@@ -17,6 +17,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/slab.h>
 
 #include "prismcompat.h"
 #include "islpci_dev.h"
@@ -681,7 +682,7 @@ mgt_update_addr(islpci_private *priv)
 				     isl_oid[GEN_OID_MACADDRESS].size, &res);
 
 	if ((ret == 0) && res && (res->header->operation != PIMFOR_OP_ERROR))
-		memcpy(priv->ndev->dev_addr, res->data, 6);
+		memcpy(priv->ndev->dev_addr, res->data, ETH_ALEN);
 	else
 		ret = -EIO;
 	if (res)
@@ -692,8 +693,6 @@ mgt_update_addr(islpci_private *priv)
 	return ret;
 }
 
-#define VEC_SIZE(a) ARRAY_SIZE(a)
-
 int
 mgt_commit(islpci_private *priv)
 {
@@ -703,10 +702,10 @@ mgt_commit(islpci_private *priv)
 	if (islpci_get_state(priv) < PRV_STATE_INIT)
 		return 0;
 
-	rvalue = mgt_commit_list(priv, commit_part1, VEC_SIZE(commit_part1));
+	rvalue = mgt_commit_list(priv, commit_part1, ARRAY_SIZE(commit_part1));
 
 	if (priv->iw_mode != IW_MODE_MONITOR)
-		rvalue |= mgt_commit_list(priv, commit_part2, VEC_SIZE(commit_part2));
+		rvalue |= mgt_commit_list(priv, commit_part2, ARRAY_SIZE(commit_part2));
 
 	u = OID_INL_MODE;
 	rvalue |= mgt_commit_list(priv, &u, 1);
@@ -819,7 +818,7 @@ mgt_response_to_str(enum oid_num_t n, union oid_res_t *r, char *str)
 			k = snprintf(str, PRIV_STR_SIZE, "nr=%u\n", list->nr);
 			for (i = 0; i < list->nr; i++)
 				k += snprintf(str + k, PRIV_STR_SIZE - k,
-					      "bss[%u] : \nage=%u\nchannel=%u\n"
+					      "bss[%u] :\nage=%u\nchannel=%u\n"
 					      "capinfo=0x%X\nrates=0x%X\n"
 					      "basic_rates=0x%X\n",
 					      i, list->bsslist[i].age,

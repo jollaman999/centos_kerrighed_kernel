@@ -21,6 +21,7 @@
 #include <linux/interrupt.h>
 #include <linux/netdevice.h>
 #include <linux/workqueue.h>
+#include <linux/bitops.h>
 #include <scsi/libfc.h>
 #include <scsi/libfcoe.h>
 #include "fnic_io.h"
@@ -38,23 +39,21 @@
 
 #define DRV_NAME		"fnic"
 #define DRV_DESCRIPTION		"Cisco FCoE HBA Driver"
-#define DRV_VERSION		"1.6.0.21"
+#define DRV_VERSION		"1.6.0.47"
 #define PFX			DRV_NAME ": "
 #define DFX                     DRV_NAME "%d: "
 
 #define DESC_CLEAN_LOW_WATERMARK 8
 #define FNIC_UCSM_DFLT_THROTTLE_CNT_BLD	16 /* UCSM default throttle count */
 #define FNIC_MIN_IO_REQ			256 /* Min IO throttle count */
-#define FNIC_MAX_IO_REQ		1024 /* scsi_cmnd tag map entries */
-#define FNIC_DFLT_IO_REQ        256 /* Default scsi_cmnd tag map entries */
+#define FNIC_MAX_IO_REQ		2048 /* scsi_cmnd tag map entries */
 #define	FNIC_IO_LOCKS		64 /* IO locks: power of 2 */
-#define FNIC_DFLT_QUEUE_DEPTH	32
+#define FNIC_DFLT_QUEUE_DEPTH	256
 #define	FNIC_STATS_RATE_LIMIT	4 /* limit rate at which stats are pulled up */
 
 /*
  * Tag bits used for special requests.
  */
-#define BIT(nr)			(1UL << (nr))
 #define FNIC_TAG_ABORT		BIT(30)		/* tag bit indicating abort */
 #define FNIC_TAG_DEV_RST	BIT(29)		/* indicates device reset */
 #define FNIC_TAG_MASK		(BIT(24) - 1)	/* mask for lookup */
@@ -128,6 +127,7 @@
 	__fnic_set_state_flags(fnicp, st_flags, 1)
 
 extern unsigned int fnic_log_level;
+extern unsigned int io_completions;
 
 #define FNIC_MAIN_LOGGING 0x01
 #define FNIC_FCS_LOGGING 0x02
@@ -180,7 +180,7 @@ enum fnic_msix_intr_index {
 
 struct fnic_msix_entry {
 	int requested;
-	char devname[IFNAMSIZ];
+	char devname[IFNAMSIZ + 11];
 	irqreturn_t (*isr)(int, void *);
 	void *devid;
 };
@@ -196,6 +196,7 @@ enum fnic_state {
 #define FNIC_WQ_MAX 1
 #define FNIC_RQ_MAX 1
 #define FNIC_CQ_MAX (FNIC_WQ_COPY_MAX + FNIC_WQ_MAX + FNIC_RQ_MAX)
+#define FNIC_DFLT_IO_COMPLETIONS 256
 
 struct mempool;
 
@@ -217,7 +218,6 @@ struct fnic {
 	struct fcoe_ctlr ctlr;		/* FIP FCoE controller structure */
 	struct vnic_dev_bar bar0;
 
-	struct msix_entry msix_entry[FNIC_MSIX_INTR_MAX];
 	struct fnic_msix_entry msix[FNIC_MSIX_INTR_MAX];
 
 	struct vnic_stats *stats;
@@ -248,6 +248,7 @@ struct fnic {
 	struct completion *remove_wait; /* device remove thread blocks */
 
 	atomic_t in_flight;		/* io counter */
+	bool internal_reset_inprogress;
 	u32 _reserved;			/* fill hole */
 	unsigned long state_flags;	/* protected by host lock */
 	enum fnic_state state;
@@ -340,7 +341,7 @@ void fnic_set_port_id(struct fc_lport *, u32, struct fc_frame *);
 void fnic_update_mac(struct fc_lport *, u8 *new);
 void fnic_update_mac_locked(struct fnic *, u8 *new);
 
-int fnic_queuecommand(struct scsi_cmnd *, void (*done)(struct scsi_cmnd *));
+int fnic_queuecommand(struct Scsi_Host *, struct scsi_cmnd *);
 int fnic_abort_cmd(struct scsi_cmnd *);
 int fnic_device_reset(struct scsi_cmnd *);
 int fnic_host_reset(struct scsi_cmnd *);

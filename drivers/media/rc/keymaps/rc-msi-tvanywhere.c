@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /* MSI TV@nywhere MASTER remote */
 
@@ -29,7 +30,7 @@ static struct rc_map_table msi_tvanywhere[] = {
 
 	{ 0x0c, KEY_MUTE },
 	{ 0x0f, KEY_SCREEN },		/* Full Screen */
-	{ 0x10, KEY_FN },		/* Funtion */
+	{ 0x10, KEY_FN },		/* Function */
 	{ 0x11, KEY_TIME },		/* Time shift */
 	{ 0x12, KEY_POWER },
 	{ 0x13, KEY_MEDIA },		/* MTS */

@@ -23,6 +23,7 @@
 #include "seq_oss_timer.h"
 #include "seq_oss_event.h"
 #include <sound/seq_oss_legacy.h>
+#include <linux/slab.h>
 
 /*
  */
@@ -91,7 +92,7 @@ snd_seq_oss_process_timer_event(struct seq_oss_timer *rec, union evrec *ev)
 		case TMR_WAIT_REL:
 			parm += rec->cur_tick;
 			rec->realtime = 0;
-			/* continue to next */
+			/* fall through */
 		case TMR_WAIT_ABS:
 			if (parm == 0) {
 				rec->realtime = 1;

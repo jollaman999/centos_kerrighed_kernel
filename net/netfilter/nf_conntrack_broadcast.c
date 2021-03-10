@@ -33,7 +33,7 @@ int nf_conntrack_broadcast_help(struct sk_buff *skb,
 	__be32 mask = 0;
 
 	/* we're only interested in locally generated packets */
-	if (skb->sk == NULL)
+	if (skb->sk == NULL || !net_eq(nf_ct_net(ct), sock_net(skb->sk)))
 		goto out;
 	if (rt == NULL || !(rt->rt_flags & RTCF_BROADCAST))
 		goto out;
@@ -41,7 +41,7 @@ int nf_conntrack_broadcast_help(struct sk_buff *skb,
 		goto out;
 
 	rcu_read_lock();
-	in_dev = __in_dev_get_rcu(rt->u.dst.dev);
+	in_dev = __in_dev_get_rcu(rt->dst.dev);
 	if (in_dev != NULL) {
 		for_primary_ifa(in_dev) {
 			if (ifa->ifa_broadcast == iph->daddr) {

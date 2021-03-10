@@ -11,48 +11,63 @@
  * ----------------------------------------------------------------------
  * |             Level            |   Last Value Used  |     Holes	|
  * ----------------------------------------------------------------------
- * | Module Init and Probe        |       0x017f       | 0x0146         |
- * |                              |                    | 0x015b-0x0160	|
- * |                              |                    | 0x016e-0x0170  |
- * | Mailbox commands             |       0x118d       | 0x1115-0x1116	|
- * |                              |                    | 0x111a-0x111b  |
- * | Device Discovery             |       0x2016       | 0x2020-0x2022, |
+ * | Module Init and Probe        |       0x0193       | 0x0146         |
+ * | Mailbox commands             |       0x1206       | 0x1018-0x1019	|
+ * |                              |                    | 0x1155-0x1158  |
+ * |                              |                    | 0x1018-0x1019  |
+ * |                              |                    | 0x1115-0x1116  |
+ * |                              |                    | 0x10ca,0x1193  |
+ * | Device Discovery             |       0x2134       | 0x2016         |
+ * |                              |                    | 0x2020-0x2022, |
  * |                              |                    | 0x2011-0x2012, |
  * |                              |                    | 0x2099-0x20a4  |
- * | Queue Command and IO tracing |       0x3075       | 0x300b         |
+ * | Queue Command and IO tracing |       0x3074       | 0x300b         |
  * |                              |                    | 0x3027-0x3028  |
  * |                              |                    | 0x303d-0x3041  |
  * |                              |                    | 0x302d,0x3033  |
  * |                              |                    | 0x3036,0x3038  |
  * |                              |                    | 0x303a		|
  * | DPC Thread                   |       0x4023       | 0x4002,0x4013  |
- * | Async Events                 |       0x508a       | 0x502b-0x502f  |
- * |                              |                    | 0x5047		|
+ * | Async Events                 |       0x5089       | 0x502b-0x502f  |
  * |                              |                    | 0x5084,0x5075	|
  * |                              |                    | 0x503d,0x5044  |
- * |                              |                    | 0x507b,0x505f	|
+ * |                              |                    | 0x505f		|
  * | Timer Routines               |       0x6012       |                |
- * | User Space Interactions      |       0x70e2       | 0x7018,0x702e  |
+ * | User Space Interactions      |       0x70e65      | 0x7018,0x702e  |
  * |				  |		       | 0x7020,0x7024  |
  * |                              |                    | 0x7039,0x7045  |
  * |                              |                    | 0x7073-0x7075  |
  * |                              |                    | 0x70a5-0x70a6  |
  * |                              |                    | 0x70a8,0x70ab  |
  * |                              |                    | 0x70ad-0x70ae  |
+ * |                              |                    | 0x70d0-0x70d6	|
  * |                              |                    | 0x70d7-0x70db  |
- * |                              |                    | 0x70de-0x70df  |
- * | Task Management              |       0x803d       | 0x8025-0x8026  |
- * |                              |                    | 0x800b,0x8039  |
+ * | Task Management              |       0x8042       | 0x8000         |
+ * |                              |                    | 0x8019         |
+ * |                              |                    | 0x8025,0x8026  |
+ * |                              |                    | 0x8031,0x8032  |
+ * |                              |                    | 0x8039,0x803c  |
  * | AER/EEH                      |       0x9011       |		|
  * | Virtual Port                 |       0xa007       |		|
  * | ISP82XX Specific             |       0xb157       | 0xb002,0xb024  |
- * | MultiQ                       |       0xc00c       |		|
- * | Misc                         |       0xd300       | 0xd016-0xd017	|
- * |                              |                    | 0xd021,0xd024	|
- * |                              |                    | 0xd025,0xd029	|
- * |                              |                    | 0xd02a,0xd02e	|
- * |                              |                    | 0xd031-0xd0ff	|
+ * |                              |                    | 0xb09e,0xb0ae  |
+ * |				  |		       | 0xb0c3,0xb0c6  |
+ * |                              |                    | 0xb0e0-0xb0ef  |
+ * |                              |                    | 0xb085,0xb0dc  |
+ * |                              |                    | 0xb107,0xb108  |
+ * |                              |                    | 0xb111,0xb11e  |
+ * |                              |                    | 0xb12c,0xb12d  |
+ * |                              |                    | 0xb13a,0xb142  |
+ * |                              |                    | 0xb13c-0xb140  |
+ * |                              |                    | 0xb149		|
+ * | MultiQ                       |       0xc010       |		|
+ * | Misc                         |       0xd303       | 0xd031-0xd0ff	|
  * |                              |                    | 0xd101-0xd1fe	|
+ * |                              |                    | 0xd214-0xd2fe	|
+ * | Target Mode		  |	  0xe081       |		|
+ * | Target Mode Management	  |	  0xf09b       | 0xf002		|
+ * |                              |                    | 0xf046-0xf049  |
+ * | Target Mode Task Management  |	  0x1000b      |		|
  * ----------------------------------------------------------------------
  */
 
@@ -97,30 +112,25 @@ int
 qla27xx_dump_mpi_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 	uint32_t ram_dwords, void **nxt)
 {
-	int rval;
-	uint32_t cnt, stat, timer, dwords, idx;
-	uint16_t mb0, mb1;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	dma_addr_t dump_dma = ha->gid_list_dma;
-	uint32_t *dump = (uint32_t *)ha->gid_list;
+	uint32_t *chunk = (void *)ha->gid_list;
+	uint32_t dwords = qla2x00_gid_list_size(ha) / 4;
+	uint32_t stat;
+	ulong i, j, timer = 6000000;
+	int rval = QLA_FUNCTION_FAILED;
 
-	rval = QLA_SUCCESS;
-	mb0 = 0;
-
-	WRT_REG_WORD(&reg->mailbox0, MBC_LOAD_DUMP_MPI_RAM);
 	clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags);
+	for (i = 0; i < ram_dwords; i += dwords, addr += dwords) {
+		if (i + dwords > ram_dwords)
+			dwords = ram_dwords - i;
 
-	dwords = qla2x00_gid_list_size(ha) / 4;
-	for (cnt = 0; cnt < ram_dwords && rval == QLA_SUCCESS;
-	    cnt += dwords, addr += dwords) {
-		if (cnt + dwords > ram_dwords)
-			dwords = ram_dwords - cnt;
-
+		WRT_REG_WORD(&reg->mailbox0, MBC_LOAD_DUMP_MPI_RAM);
 		WRT_REG_WORD(&reg->mailbox1, LSW(addr));
 		WRT_REG_WORD(&reg->mailbox8, MSW(addr));
 
-		WRT_REG_WORD(&reg->mailbox2, MSW(dump_dma));
-		WRT_REG_WORD(&reg->mailbox3, LSW(dump_dma));
+		WRT_REG_WORD(&reg->mailbox2, MSW(LSD(dump_dma)));
+		WRT_REG_WORD(&reg->mailbox3, LSW(LSD(dump_dma)));
 		WRT_REG_WORD(&reg->mailbox6, MSW(MSD(dump_dma)));
 		WRT_REG_WORD(&reg->mailbox7, LSW(MSD(dump_dma)));
 
@@ -131,76 +141,76 @@ qla27xx_dump_mpi_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 		WRT_REG_DWORD(&reg->hccr, HCCRX_SET_HOST_INT);
 
 		ha->flags.mbox_int = 0;
-		for (timer = 6000000; timer; timer--) {
-			/* Check for pending interrupts. */
+		while (timer--) {
+			udelay(5);
+
 			stat = RD_REG_DWORD(&reg->host_status);
-			if (stat & HSRX_RISC_INT) {
-				stat &= 0xff;
+			/* Check for pending interrupts. */
+			if (!(stat & HSRX_RISC_INT))
+				continue;
 
-				if (stat == 0x1 || stat == 0x2 ||
-				    stat == 0x10 || stat == 0x11) {
-					set_bit(MBX_INTERRUPT,
-					    &ha->mbx_cmd_flags);
-
-					mb0 = RD_REG_WORD(&reg->mailbox0);
-					mb1 = RD_REG_WORD(&reg->mailbox1);
-
-					WRT_REG_DWORD(&reg->hccr,
-					    HCCRX_CLR_RISC_INT);
-					RD_REG_DWORD(&reg->hccr);
-					break;
-				}
+			stat &= 0xff;
+			if (stat != 0x1 && stat != 0x2 &&
+			    stat != 0x10 && stat != 0x11) {
 
 				/* Clear this intr; it wasn't a mailbox intr */
 				WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_INT);
 				RD_REG_DWORD(&reg->hccr);
+				continue;
 			}
-			udelay(5);
+
+			set_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags);
+			rval = RD_REG_WORD(&reg->mailbox0) & MBS_MASK;
+			WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_INT);
+			RD_REG_DWORD(&reg->hccr);
+			break;
 		}
 		ha->flags.mbox_int = 1;
+		*nxt = ram + i;
 
-		if (test_and_clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags)) {
-			rval = mb0 & MBS_MASK;
-			for (idx = 0; idx < dwords; idx++)
-				ram[cnt + idx] = IS_QLA27XX(ha) ?
-				    le32_to_cpu(dump[idx]) : swab32(dump[idx]);
-		} else {
-			rval = QLA_FUNCTION_FAILED;
+		if (!test_and_clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags)) {
+			/* no interrupt, timed out*/
+			return rval;
+		}
+		if (rval) {
+			/* error completion status */
+			return rval;
+		}
+		for (j = 0; j < dwords; j++) {
+			ram[i + j] =
+			    (IS_QLA27XX(ha) || IS_QLA28XX(ha)) ?
+			    chunk[j] : swab32(chunk[j]);
 		}
 	}
 
-	*nxt = rval == QLA_SUCCESS ? &ram[cnt] : NULL;
-	return rval;
+	*nxt = ram + i;
+	return QLA_SUCCESS;
 }
 
 int
 qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
     uint32_t ram_dwords, void **nxt)
 {
-	int rval;
-	uint32_t cnt, stat, timer, dwords, idx;
-	uint16_t mb0;
+	int rval = QLA_FUNCTION_FAILED;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	dma_addr_t dump_dma = ha->gid_list_dma;
-	uint32_t *dump = (uint32_t *)ha->gid_list;
+	uint32_t *chunk = (void *)ha->gid_list;
+	uint32_t dwords = qla2x00_gid_list_size(ha) / 4;
+	uint32_t stat;
+	ulong i, j, timer = 6000000;
 
-	rval = QLA_SUCCESS;
-	mb0 = 0;
-
-	WRT_REG_WORD(&reg->mailbox0, MBC_DUMP_RISC_RAM_EXTENDED);
 	clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags);
 
-	dwords = qla2x00_gid_list_size(ha) / 4;
-	for (cnt = 0; cnt < ram_dwords && rval == QLA_SUCCESS;
-	    cnt += dwords, addr += dwords) {
-		if (cnt + dwords > ram_dwords)
-			dwords = ram_dwords - cnt;
+	for (i = 0; i < ram_dwords; i += dwords, addr += dwords) {
+		if (i + dwords > ram_dwords)
+			dwords = ram_dwords - i;
 
+		WRT_REG_WORD(&reg->mailbox0, MBC_DUMP_RISC_RAM_EXTENDED);
 		WRT_REG_WORD(&reg->mailbox1, LSW(addr));
 		WRT_REG_WORD(&reg->mailbox8, MSW(addr));
 
-		WRT_REG_WORD(&reg->mailbox2, MSW(dump_dma));
-		WRT_REG_WORD(&reg->mailbox3, LSW(dump_dma));
+		WRT_REG_WORD(&reg->mailbox2, MSW(LSD(dump_dma)));
+		WRT_REG_WORD(&reg->mailbox3, LSW(LSD(dump_dma)));
 		WRT_REG_WORD(&reg->mailbox6, MSW(MSD(dump_dma)));
 		WRT_REG_WORD(&reg->mailbox7, LSW(MSD(dump_dma)));
 
@@ -209,45 +219,48 @@ qla24xx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint32_t *ram,
 		WRT_REG_DWORD(&reg->hccr, HCCRX_SET_HOST_INT);
 
 		ha->flags.mbox_int = 0;
-		for (timer = 6000000; timer; timer--) {
-			/* Check for pending interrupts. */
+		while (timer--) {
+			udelay(5);
 			stat = RD_REG_DWORD(&reg->host_status);
-			if (stat & HSRX_RISC_INT) {
-				stat &= 0xff;
 
-				if (stat == 0x1 || stat == 0x2 ||
-				    stat == 0x10 || stat == 0x11) {
-					set_bit(MBX_INTERRUPT,
-					    &ha->mbx_cmd_flags);
+			/* Check for pending interrupts. */
+			if (!(stat & HSRX_RISC_INT))
+				continue;
 
-					mb0 = RD_REG_WORD(&reg->mailbox0);
-
-					WRT_REG_DWORD(&reg->hccr,
-					    HCCRX_CLR_RISC_INT);
-					RD_REG_DWORD(&reg->hccr);
-					break;
-				}
-
-				/* Clear this intr; it wasn't a mailbox intr */
+			stat &= 0xff;
+			if (stat != 0x1 && stat != 0x2 &&
+			    stat != 0x10 && stat != 0x11) {
 				WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_INT);
 				RD_REG_DWORD(&reg->hccr);
+				continue;
 			}
-			udelay(5);
+
+			set_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags);
+			rval = RD_REG_WORD(&reg->mailbox0) & MBS_MASK;
+			WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_INT);
+			RD_REG_DWORD(&reg->hccr);
+			break;
 		}
 		ha->flags.mbox_int = 1;
+		*nxt = ram + i;
 
-		if (test_and_clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags)) {
-			rval = mb0 & MBS_MASK;
-			for (idx = 0; idx < dwords; idx++)
-				ram[cnt + idx] = IS_QLA27XX(ha) ?
-				    le32_to_cpu(dump[idx]) : swab32(dump[idx]);
-		} else {
-			rval = QLA_FUNCTION_FAILED;
+		if (!test_and_clear_bit(MBX_INTERRUPT, &ha->mbx_cmd_flags)) {
+			/* no interrupt, timed out*/
+			return rval;
+		}
+		if (rval) {
+			/* error completion status */
+			return rval;
+		}
+		for (j = 0; j < dwords; j++) {
+			ram[i + j] =
+			    (IS_QLA27XX(ha) || IS_QLA28XX(ha)) ?
+			    chunk[j] : swab32(chunk[j]);
 		}
 	}
 
-	*nxt = rval == QLA_SUCCESS ? &ram[cnt]: NULL;
-	return rval;
+	*nxt = ram + i;
+	return QLA_SUCCESS;
 }
 
 static int
@@ -280,13 +293,13 @@ qla24xx_read_window(struct device_reg_24xx __iomem *reg, uint32_t iobase,
 
 	WRT_REG_DWORD(&reg->iobase_addr, iobase);
 	dmp_reg = &reg->iobase_window;
-	while (count--)
-		*buf++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for ( ; count--; dmp_reg++)
+		*buf++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	return buf;
 }
 
-int
+void
 qla24xx_pause_risc(struct device_reg_24xx __iomem *reg, struct qla_hw_data *ha)
 {
 	WRT_REG_DWORD(&reg->hccr, HCCRX_SET_RISC_PAUSE);
@@ -295,8 +308,6 @@ qla24xx_pause_risc(struct device_reg_24xx __iomem *reg, struct qla_hw_data *ha)
 	udelay(100);
 	if (RD_REG_DWORD(&reg->host_status) & HSRX_RISC_PAUSED)
 		set_bit(RISC_PAUSE_CMPL, &ha->fw_dump_cap_flags);
-
-	return 0;
 }
 
 int
@@ -355,7 +366,7 @@ qla24xx_soft_reset(struct qla_hw_data *ha)
 	return rval;
 }
 
-int
+static int
 qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint16_t *ram,
     uint32_t ram_words, void **nxt)
 {
@@ -435,7 +446,7 @@ qla2xxx_dump_ram(struct qla_hw_data *ha, uint32_t addr, uint16_t *ram,
 		}
 	}
 
-	*nxt = rval == QLA_SUCCESS ? &ram[cnt]: NULL;
+	*nxt = rval == QLA_SUCCESS ? &ram[cnt] : NULL;
 	return rval;
 }
 
@@ -445,8 +456,8 @@ qla2xxx_read_window(struct device_reg_2xxx __iomem *reg, uint32_t count,
 {
 	uint16_t __iomem *dmp_reg = &reg->u.isp2300.fb_cmd;
 
-	while (count--)
-		*buf++ = htons(RD_REG_WORD(dmp_reg++));
+	for ( ; count--; dmp_reg++)
+		*buf++ = htons(RD_REG_WORD(dmp_reg));
 }
 
 static inline void *
@@ -470,7 +481,7 @@ qla25xx_copy_fce(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 		return ptr;
 
 	*last_chain = &fcec->type;
-	fcec->type = __constant_htonl(DUMP_CHAIN_FCE);
+	fcec->type = htonl(DUMP_CHAIN_FCE);
 	fcec->chain_size = htonl(sizeof(struct qla2xxx_fce_chain) +
 	    fce_calc_size(ha->fce_bufs));
 	fcec->size = htonl(fce_calc_size(ha->fce_bufs));
@@ -483,7 +494,99 @@ qla25xx_copy_fce(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 
 	memcpy(iter_reg, ha->fce, ntohl(fcec->size));
 
-	return (void *)iter_reg + ntohl(fcec->size);
+	return (char *)iter_reg + ntohl(fcec->size);
+}
+
+static inline void *
+qla25xx_copy_exlogin(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
+{
+	struct qla2xxx_offld_chain *c = ptr;
+
+	if (!ha->exlogin_buf)
+		return ptr;
+
+	*last_chain = &c->type;
+
+	c->type = cpu_to_be32(DUMP_CHAIN_EXLOGIN);
+	c->chain_size = cpu_to_be32(sizeof(struct qla2xxx_offld_chain) +
+	    ha->exlogin_size);
+	c->size = cpu_to_be32(ha->exlogin_size);
+	c->addr = cpu_to_be64(ha->exlogin_buf_dma);
+
+	ptr += sizeof(struct qla2xxx_offld_chain);
+	memcpy(ptr, ha->exlogin_buf, ha->exlogin_size);
+
+	return (char *)ptr + cpu_to_be32(c->size);
+}
+
+static inline void *
+qla81xx_copy_exchoffld(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
+{
+	struct qla2xxx_offld_chain *c = ptr;
+
+	if (!ha->exchoffld_buf)
+		return ptr;
+
+	*last_chain = &c->type;
+
+	c->type = cpu_to_be32(DUMP_CHAIN_EXCHG);
+	c->chain_size = cpu_to_be32(sizeof(struct qla2xxx_offld_chain) +
+	    ha->exchoffld_size);
+	c->size = cpu_to_be32(ha->exchoffld_size);
+	c->addr = cpu_to_be64(ha->exchoffld_buf_dma);
+
+	ptr += sizeof(struct qla2xxx_offld_chain);
+	memcpy(ptr, ha->exchoffld_buf, ha->exchoffld_size);
+
+	return (char *)ptr + cpu_to_be32(c->size);
+}
+
+static inline void *
+qla2xxx_copy_atioqueues(struct qla_hw_data *ha, void *ptr,
+	uint32_t **last_chain)
+{
+	struct qla2xxx_mqueue_chain *q;
+	struct qla2xxx_mqueue_header *qh;
+	uint32_t num_queues;
+	int que;
+	struct {
+		int length;
+		void *ring;
+	} aq, *aqp;
+
+	if (!ha->tgt.atio_ring)
+		return ptr;
+
+	num_queues = 1;
+	aqp = &aq;
+	aqp->length = ha->tgt.atio_q_length;
+	aqp->ring = ha->tgt.atio_ring;
+
+	for (que = 0; que < num_queues; que++) {
+		/* aqp = ha->atio_q_map[que]; */
+		q = ptr;
+		*last_chain = &q->type;
+		q->type = htonl(DUMP_CHAIN_QUEUE);
+		q->chain_size = htonl(
+		    sizeof(struct qla2xxx_mqueue_chain) +
+		    sizeof(struct qla2xxx_mqueue_header) +
+		    (aqp->length * sizeof(request_t)));
+		ptr += sizeof(struct qla2xxx_mqueue_chain);
+
+		/* Add header. */
+		qh = ptr;
+		qh->queue = htonl(TYPE_ATIO_QUEUE);
+		qh->number = htonl(que);
+		qh->size = htonl(aqp->length * sizeof(request_t));
+		ptr += sizeof(struct qla2xxx_mqueue_header);
+
+		/* Add data. */
+		memcpy(ptr, aqp->ring, aqp->length * sizeof(request_t));
+
+		ptr += aqp->length * sizeof(request_t);
+	}
+
+	return ptr;
 }
 
 static inline void *
@@ -507,7 +610,7 @@ qla25xx_copy_mqueues(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 		/* Add chain. */
 		q = ptr;
 		*last_chain = &q->type;
-		q->type = __constant_htonl(DUMP_CHAIN_QUEUE);
+		q->type = htonl(DUMP_CHAIN_QUEUE);
 		q->chain_size = htonl(
 		    sizeof(struct qla2xxx_mqueue_chain) +
 		    sizeof(struct qla2xxx_mqueue_header) +
@@ -516,7 +619,7 @@ qla25xx_copy_mqueues(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 
 		/* Add header. */
 		qh = ptr;
-		qh->queue = __constant_htonl(TYPE_REQUEST_QUEUE);
+		qh->queue = htonl(TYPE_REQUEST_QUEUE);
 		qh->number = htonl(que);
 		qh->size = htonl(req->length * sizeof(request_t));
 		ptr += sizeof(struct qla2xxx_mqueue_header);
@@ -535,7 +638,7 @@ qla25xx_copy_mqueues(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 		/* Add chain. */
 		q = ptr;
 		*last_chain = &q->type;
-		q->type = __constant_htonl(DUMP_CHAIN_QUEUE);
+		q->type = htonl(DUMP_CHAIN_QUEUE);
 		q->chain_size = htonl(
 		    sizeof(struct qla2xxx_mqueue_chain) +
 		    sizeof(struct qla2xxx_mqueue_header) +
@@ -544,7 +647,7 @@ qla25xx_copy_mqueues(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 
 		/* Add header. */
 		qh = ptr;
-		qh->queue = __constant_htonl(TYPE_RESPONSE_QUEUE);
+		qh->queue = htonl(TYPE_RESPONSE_QUEUE);
 		qh->number = htonl(que);
 		qh->size = htonl(rsp->length * sizeof(response_t));
 		ptr += sizeof(struct qla2xxx_mqueue_header);
@@ -565,13 +668,14 @@ qla25xx_copy_mq(struct qla_hw_data *ha, void *ptr, uint32_t **last_chain)
 	struct qla2xxx_mq_chain *mq = ptr;
 	device_reg_t *reg;
 
-	if (!ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha))
+	if (!ha->mqenable || IS_QLA83XX(ha) || IS_QLA27XX(ha) ||
+	    IS_QLA28XX(ha))
 		return ptr;
 
 	mq = ptr;
 	*last_chain = &mq->type;
-	mq->type = __constant_htonl(DUMP_CHAIN_MQ);
-	mq->chain_size = __constant_htonl(sizeof(struct qla2xxx_mq_chain));
+	mq->type = htonl(DUMP_CHAIN_MQ);
+	mq->chain_size = htonl(sizeof(struct qla2xxx_mq_chain));
 
 	que_cnt = ha->max_req_queues > ha->max_rsp_queues ?
 		ha->max_req_queues : ha->max_rsp_queues;
@@ -613,7 +717,7 @@ qla2xxx_dump_post_process(scsi_qla_host_t *vha, int rval)
 
 /**
  * qla2300_fw_dump() - Dumps binary data from the 2300 firmware.
- * @ha: HA context
+ * @vha: HA context
  * @hardware_locked: Called with the hardware_lock
  */
 void
@@ -631,8 +735,10 @@ qla2300_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	flags = 0;
 
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_lock_irqsave(&ha->hardware_lock, flags);
+#endif
 
 	if (!ha->fw_dump) {
 		ql_log(ql_log_warn, vha, 0xd002,
@@ -671,16 +777,18 @@ qla2300_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	if (rval == QLA_SUCCESS) {
 		dmp_reg = &reg->flash_address;
-		for (cnt = 0; cnt < sizeof(fw->pbiu_reg) / 2; cnt++)
-			fw->pbiu_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+		for (cnt = 0; cnt < sizeof(fw->pbiu_reg) / 2; cnt++, dmp_reg++)
+			fw->pbiu_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 
 		dmp_reg = &reg->u.isp2300.req_q_in;
-		for (cnt = 0; cnt < sizeof(fw->risc_host_reg) / 2; cnt++)
-			fw->risc_host_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+		for (cnt = 0; cnt < sizeof(fw->risc_host_reg) / 2;
+		    cnt++, dmp_reg++)
+			fw->risc_host_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 
 		dmp_reg = &reg->u.isp2300.mailbox0;
-		for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++)
-			fw->mailbox_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+		for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2;
+		    cnt++, dmp_reg++)
+			fw->mailbox_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 
 		WRT_REG_WORD(&reg->ctrl_status, 0x40);
 		qla2xxx_read_window(reg, 32, fw->resp_dma_reg);
@@ -690,8 +798,9 @@ qla2300_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 		WRT_REG_WORD(&reg->ctrl_status, 0x00);
 		dmp_reg = &reg->risc_hw;
-		for (cnt = 0; cnt < sizeof(fw->risc_hdw_reg) / 2; cnt++)
-			fw->risc_hdw_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+		for (cnt = 0; cnt < sizeof(fw->risc_hdw_reg) / 2;
+		    cnt++, dmp_reg++)
+			fw->risc_hdw_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 
 		WRT_REG_WORD(&reg->pcr, 0x2000);
 		qla2xxx_read_window(reg, 16, fw->risc_gp0_reg);
@@ -768,13 +877,17 @@ qla2300_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	qla2xxx_dump_post_process(base_vha, rval);
 
 qla2300_fw_dump_failed:
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+#else
+	;
+#endif
 }
 
 /**
  * qla2100_fw_dump() - Dumps binary data from the 2100/2200 firmware.
- * @ha: HA context
+ * @vha: HA context
  * @hardware_locked: Called with the hardware_lock
  */
 void
@@ -795,8 +908,10 @@ qla2100_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	mb0 = mb2 = 0;
 	flags = 0;
 
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_lock_irqsave(&ha->hardware_lock, flags);
+#endif
 
 	if (!ha->fw_dump) {
 		ql_log(ql_log_warn, vha, 0xd004,
@@ -828,25 +943,25 @@ qla2100_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	}
 	if (rval == QLA_SUCCESS) {
 		dmp_reg = &reg->flash_address;
-		for (cnt = 0; cnt < sizeof(fw->pbiu_reg) / 2; cnt++)
-			fw->pbiu_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+		for (cnt = 0; cnt < sizeof(fw->pbiu_reg) / 2; cnt++, dmp_reg++)
+			fw->pbiu_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 
 		dmp_reg = &reg->u.isp2100.mailbox0;
-		for (cnt = 0; cnt < ha->mbx_count; cnt++) {
+		for (cnt = 0; cnt < ha->mbx_count; cnt++, dmp_reg++) {
 			if (cnt == 8)
 				dmp_reg = &reg->u_end.isp2200.mailbox8;
 
-			fw->mailbox_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+			fw->mailbox_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 		}
 
 		dmp_reg = &reg->u.isp2100.unused_2[0];
-		for (cnt = 0; cnt < sizeof(fw->dma_reg) / 2; cnt++)
-			fw->dma_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+		for (cnt = 0; cnt < sizeof(fw->dma_reg) / 2; cnt++, dmp_reg++)
+			fw->dma_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 
 		WRT_REG_WORD(&reg->ctrl_status, 0x00);
 		dmp_reg = &reg->risc_hw;
-		for (cnt = 0; cnt < sizeof(fw->risc_hdw_reg) / 2; cnt++)
-			fw->risc_hdw_reg[cnt] = htons(RD_REG_WORD(dmp_reg++));
+		for (cnt = 0; cnt < sizeof(fw->risc_hdw_reg) / 2; cnt++, dmp_reg++)
+			fw->risc_hdw_reg[cnt] = htons(RD_REG_WORD(dmp_reg));
 
 		WRT_REG_WORD(&reg->pcr, 0x2000);
 		qla2xxx_read_window(reg, 16, fw->risc_gp0_reg);
@@ -966,8 +1081,12 @@ qla2100_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	qla2xxx_dump_post_process(base_vha, rval);
 
 qla2100_fw_dump_failed:
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+#else
+	;
+#endif
 }
 
 void
@@ -975,7 +1094,6 @@ qla24xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 {
 	int		rval;
 	uint32_t	cnt;
-	uint32_t	risc_address;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	uint32_t __iomem *dmp_reg;
@@ -983,19 +1101,21 @@ qla24xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	uint16_t __iomem *mbx_reg;
 	unsigned long	flags;
 	struct qla24xx_fw_dump *fw;
-	uint32_t	ext_mem_cnt;
 	void		*nxt;
+	void		*nxt_chain;
+	uint32_t	*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
-	if (IS_QLA82XX(ha))
+	if (IS_P3P_TYPE(ha))
 		return;
 
-	risc_address = ext_mem_cnt = 0;
 	flags = 0;
 	ha->fw_dump_cap_flags = 0;
 
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_lock_irqsave(&ha->hardware_lock, flags);
+#endif
 
 	if (!ha->fw_dump) {
 		ql_log(ql_log_warn, vha, 0xd006,
@@ -1010,6 +1130,7 @@ qla24xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 		    ha->fw_dump);
 		goto qla24xx_fw_dump_failed;
 	}
+	QLA_FW_STOPPED(ha);
 	fw = &ha->fw_dump->isp.isp24;
 	qla2xxx_prep_dump(ha, ha->fw_dump);
 
@@ -1023,8 +1144,8 @@ qla24xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Host interface registers. */
 	dmp_reg = &reg->flash_addr;
-	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++)
-		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++, dmp_reg++)
+		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Disable interrupts. */
 	WRT_REG_DWORD(&reg->ictrl, 0);
@@ -1056,8 +1177,8 @@ qla24xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Mailbox registers. */
 	mbx_reg = &reg->mailbox0;
-	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++)
-		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg++));
+	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++, dmp_reg++)
+		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg));
 
 	/* Transfer sequence registers. */
 	iter_reg = fw->xseq_gp_reg;
@@ -1095,20 +1216,20 @@ qla24xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	iter_reg = fw->req0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7200, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->resp0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7300, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->req1_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7400, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Transmit DMA registers. */
 	iter_reg = fw->xmt0_dma_reg;
@@ -1205,12 +1326,26 @@ qla24xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	qla24xx_copy_eft(ha, nxt);
 
+	nxt_chain = (void *)ha->fw_dump + ha->chain_offset;
+	nxt_chain = qla2xxx_copy_atioqueues(ha, nxt_chain, &last_chain);
+	if (last_chain) {
+		ha->fw_dump->version |= htonl(DUMP_CHAIN_VARIANT);
+		*last_chain |= htonl(DUMP_CHAIN_LAST);
+	}
+
+	/* Adjust valid length. */
+	ha->fw_dump_len = (nxt_chain - (void *)ha->fw_dump);
+
 qla24xx_fw_dump_failed_0:
 	qla2xxx_dump_post_process(base_vha, rval);
 
 qla24xx_fw_dump_failed:
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+#else
+	;
+#endif
 }
 
 void
@@ -1218,7 +1353,6 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 {
 	int		rval;
 	uint32_t	cnt;
-	uint32_t	risc_address;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	uint32_t __iomem *dmp_reg;
@@ -1226,17 +1360,17 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	uint16_t __iomem *mbx_reg;
 	unsigned long	flags;
 	struct qla25xx_fw_dump *fw;
-	uint32_t	ext_mem_cnt;
 	void		*nxt, *nxt_chain;
 	uint32_t	*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
-	risc_address = ext_mem_cnt = 0;
 	flags = 0;
 	ha->fw_dump_cap_flags = 0;
 
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_lock_irqsave(&ha->hardware_lock, flags);
+#endif
 
 	if (!ha->fw_dump) {
 		ql_log(ql_log_warn, vha, 0xd008,
@@ -1251,9 +1385,10 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 		    ha->fw_dump);
 		goto qla25xx_fw_dump_failed;
 	}
+	QLA_FW_STOPPED(ha);
 	fw = &ha->fw_dump->isp.isp25;
 	qla2xxx_prep_dump(ha, ha->fw_dump);
-	ha->fw_dump->version = __constant_htonl(2);
+	ha->fw_dump->version = htonl(2);
 
 	fw->host_status = htonl(RD_REG_DWORD(&reg->host_status));
 
@@ -1273,8 +1408,10 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	RD_REG_DWORD(&reg->iobase_addr);
 	WRT_REG_DWORD(&reg->iobase_window, 0x01);
 	dmp_reg = &reg->iobase_c4;
-	fw->pcie_regs[0] = htonl(RD_REG_DWORD(dmp_reg++));
-	fw->pcie_regs[1] = htonl(RD_REG_DWORD(dmp_reg++));
+	fw->pcie_regs[0] = htonl(RD_REG_DWORD(dmp_reg));
+	dmp_reg++;
+	fw->pcie_regs[1] = htonl(RD_REG_DWORD(dmp_reg));
+	dmp_reg++;
 	fw->pcie_regs[2] = htonl(RD_REG_DWORD(dmp_reg));
 	fw->pcie_regs[3] = htonl(RD_REG_DWORD(&reg->iobase_window));
 
@@ -1283,8 +1420,8 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Host interface registers. */
 	dmp_reg = &reg->flash_addr;
-	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++)
-		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++, dmp_reg++)
+		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Disable interrupts. */
 	WRT_REG_DWORD(&reg->ictrl, 0);
@@ -1332,8 +1469,8 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Mailbox registers. */
 	mbx_reg = &reg->mailbox0;
-	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++)
-		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg++));
+	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++, mbx_reg++)
+		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg));
 
 	/* Transfer sequence registers. */
 	iter_reg = fw->xseq_gp_reg;
@@ -1396,20 +1533,20 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	iter_reg = fw->req0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7200, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->resp0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7300, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->req1_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7400, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Transmit DMA registers. */
 	iter_reg = fw->xmt0_dma_reg;
@@ -1515,9 +1652,11 @@ qla25xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	/* Chain entries -- started with MQ. */
 	nxt_chain = qla25xx_copy_fce(ha, nxt_chain, &last_chain);
 	nxt_chain = qla25xx_copy_mqueues(ha, nxt_chain, &last_chain);
+	nxt_chain = qla2xxx_copy_atioqueues(ha, nxt_chain, &last_chain);
+	nxt_chain = qla25xx_copy_exlogin(ha, nxt_chain, &last_chain);
 	if (last_chain) {
-		ha->fw_dump->version |= __constant_htonl(DUMP_CHAIN_VARIANT);
-		*last_chain |= __constant_htonl(DUMP_CHAIN_LAST);
+		ha->fw_dump->version |= htonl(DUMP_CHAIN_VARIANT);
+		*last_chain |= htonl(DUMP_CHAIN_LAST);
 	}
 
 	/* Adjust valid length. */
@@ -1527,8 +1666,12 @@ qla25xx_fw_dump_failed_0:
 	qla2xxx_dump_post_process(base_vha, rval);
 
 qla25xx_fw_dump_failed:
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+#else
+	;
+#endif
 }
 
 void
@@ -1536,7 +1679,6 @@ qla81xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 {
 	int		rval;
 	uint32_t	cnt;
-	uint32_t	risc_address;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	uint32_t __iomem *dmp_reg;
@@ -1544,17 +1686,17 @@ qla81xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	uint16_t __iomem *mbx_reg;
 	unsigned long	flags;
 	struct qla81xx_fw_dump *fw;
-	uint32_t	ext_mem_cnt;
 	void		*nxt, *nxt_chain;
 	uint32_t	*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
-	risc_address = ext_mem_cnt = 0;
 	flags = 0;
 	ha->fw_dump_cap_flags = 0;
 
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_lock_irqsave(&ha->hardware_lock, flags);
+#endif
 
 	if (!ha->fw_dump) {
 		ql_log(ql_log_warn, vha, 0xd00a,
@@ -1590,8 +1732,10 @@ qla81xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	RD_REG_DWORD(&reg->iobase_addr);
 	WRT_REG_DWORD(&reg->iobase_window, 0x01);
 	dmp_reg = &reg->iobase_c4;
-	fw->pcie_regs[0] = htonl(RD_REG_DWORD(dmp_reg++));
-	fw->pcie_regs[1] = htonl(RD_REG_DWORD(dmp_reg++));
+	fw->pcie_regs[0] = htonl(RD_REG_DWORD(dmp_reg));
+	dmp_reg++;
+	fw->pcie_regs[1] = htonl(RD_REG_DWORD(dmp_reg));
+	dmp_reg++;
 	fw->pcie_regs[2] = htonl(RD_REG_DWORD(dmp_reg));
 	fw->pcie_regs[3] = htonl(RD_REG_DWORD(&reg->iobase_window));
 
@@ -1600,8 +1744,8 @@ qla81xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Host interface registers. */
 	dmp_reg = &reg->flash_addr;
-	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++)
-		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++, dmp_reg++)
+		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Disable interrupts. */
 	WRT_REG_DWORD(&reg->ictrl, 0);
@@ -1649,8 +1793,8 @@ qla81xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Mailbox registers. */
 	mbx_reg = &reg->mailbox0;
-	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++)
-		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg++));
+	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++, mbx_reg++)
+		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg));
 
 	/* Transfer sequence registers. */
 	iter_reg = fw->xseq_gp_reg;
@@ -1713,20 +1857,20 @@ qla81xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	iter_reg = fw->req0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7200, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->resp0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7300, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->req1_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7400, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Transmit DMA registers. */
 	iter_reg = fw->xmt0_dma_reg;
@@ -1835,9 +1979,12 @@ qla81xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	/* Chain entries -- started with MQ. */
 	nxt_chain = qla25xx_copy_fce(ha, nxt_chain, &last_chain);
 	nxt_chain = qla25xx_copy_mqueues(ha, nxt_chain, &last_chain);
+	nxt_chain = qla2xxx_copy_atioqueues(ha, nxt_chain, &last_chain);
+	nxt_chain = qla25xx_copy_exlogin(ha, nxt_chain, &last_chain);
+	nxt_chain = qla81xx_copy_exchoffld(ha, nxt_chain, &last_chain);
 	if (last_chain) {
-		ha->fw_dump->version |= __constant_htonl(DUMP_CHAIN_VARIANT);
-		*last_chain |= __constant_htonl(DUMP_CHAIN_LAST);
+		ha->fw_dump->version |= htonl(DUMP_CHAIN_VARIANT);
+		*last_chain |= htonl(DUMP_CHAIN_LAST);
 	}
 
 	/* Adjust valid length. */
@@ -1847,16 +1994,19 @@ qla81xx_fw_dump_failed_0:
 	qla2xxx_dump_post_process(base_vha, rval);
 
 qla81xx_fw_dump_failed:
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+#else
+	;
+#endif
 }
 
 void
 qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 {
 	int		rval;
-	uint32_t	cnt, reg_data;
-	uint32_t	risc_address;
+	uint32_t	cnt;
 	struct qla_hw_data *ha = vha->hw;
 	struct device_reg_24xx __iomem *reg = &ha->iobase->isp24;
 	uint32_t __iomem *dmp_reg;
@@ -1864,17 +2014,17 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	uint16_t __iomem *mbx_reg;
 	unsigned long	flags;
 	struct qla83xx_fw_dump *fw;
-	uint32_t	ext_mem_cnt;
 	void		*nxt, *nxt_chain;
 	uint32_t	*last_chain = NULL;
 	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
 
-	risc_address = ext_mem_cnt = 0;
 	flags = 0;
 	ha->fw_dump_cap_flags = 0;
 
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_lock_irqsave(&ha->hardware_lock, flags);
+#endif
 
 	if (!ha->fw_dump) {
 		ql_log(ql_log_warn, vha, 0xd00c,
@@ -1888,6 +2038,7 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 		    "request...\n", ha->fw_dump);
 		goto qla83xx_fw_dump_failed;
 	}
+	QLA_FW_STOPPED(ha);
 	fw = &ha->fw_dump->isp.isp83;
 	qla2xxx_prep_dump(ha, ha->fw_dump);
 
@@ -1901,22 +2052,22 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	WRT_REG_DWORD(&reg->iobase_addr, 0x6000);
 	dmp_reg = &reg->iobase_window;
-	reg_data = RD_REG_DWORD(dmp_reg);
+	RD_REG_DWORD(dmp_reg);
 	WRT_REG_DWORD(dmp_reg, 0);
 
 	dmp_reg = &reg->unused_4_1[0];
-	reg_data = RD_REG_DWORD(dmp_reg);
+	RD_REG_DWORD(dmp_reg);
 	WRT_REG_DWORD(dmp_reg, 0);
 
 	WRT_REG_DWORD(&reg->iobase_addr, 0x6010);
 	dmp_reg = &reg->unused_4_1[2];
-	reg_data = RD_REG_DWORD(dmp_reg);
+	RD_REG_DWORD(dmp_reg);
 	WRT_REG_DWORD(dmp_reg, 0);
 
-	// select PCR and disable ecc checking and correction
+	/* select PCR and disable ecc checking and correction */
 	WRT_REG_DWORD(&reg->iobase_addr, 0x0F70);
 	RD_REG_DWORD(&reg->iobase_addr);
-	WRT_REG_DWORD(&reg->iobase_select, 0x60000000);	// write to F0h = PCR
+	WRT_REG_DWORD(&reg->iobase_select, 0x60000000);	/* write to F0h = PCR */
 
 	/* Host/Risc registers. */
 	iter_reg = fw->host_risc_reg;
@@ -1929,8 +2080,10 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	RD_REG_DWORD(&reg->iobase_addr);
 	WRT_REG_DWORD(&reg->iobase_window, 0x01);
 	dmp_reg = &reg->iobase_c4;
-	fw->pcie_regs[0] = htonl(RD_REG_DWORD(dmp_reg++));
-	fw->pcie_regs[1] = htonl(RD_REG_DWORD(dmp_reg++));
+	fw->pcie_regs[0] = htonl(RD_REG_DWORD(dmp_reg));
+	dmp_reg++;
+	fw->pcie_regs[1] = htonl(RD_REG_DWORD(dmp_reg));
+	dmp_reg++;
 	fw->pcie_regs[2] = htonl(RD_REG_DWORD(dmp_reg));
 	fw->pcie_regs[3] = htonl(RD_REG_DWORD(&reg->iobase_window));
 
@@ -1939,8 +2092,8 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Host interface registers. */
 	dmp_reg = &reg->flash_addr;
-	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++)
-		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < sizeof(fw->host_reg) / 4; cnt++, dmp_reg++)
+		fw->host_reg[cnt] = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Disable interrupts. */
 	WRT_REG_DWORD(&reg->ictrl, 0);
@@ -1988,8 +2141,8 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 
 	/* Mailbox registers. */
 	mbx_reg = &reg->mailbox0;
-	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++)
-		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg++));
+	for (cnt = 0; cnt < sizeof(fw->mailbox_reg) / 2; cnt++, dmp_reg++)
+		fw->mailbox_reg[cnt] = htons(RD_REG_WORD(mbx_reg));
 
 	/* Transfer sequence registers. */
 	iter_reg = fw->xseq_gp_reg;
@@ -2084,20 +2237,20 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 	iter_reg = fw->req0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7200, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->resp0_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7300, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	iter_reg = fw->req1_dma_reg;
 	iter_reg = qla24xx_read_window(reg, 0x7400, 8, iter_reg);
 	dmp_reg = &reg->iobase_q;
-	for (cnt = 0; cnt < 7; cnt++)
-		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg++));
+	for (cnt = 0; cnt < 7; cnt++, dmp_reg++)
+		*iter_reg++ = htonl(RD_REG_DWORD(dmp_reg));
 
 	/* Transmit DMA registers. */
 	iter_reg = fw->xmt0_dma_reg;
@@ -2312,9 +2465,8 @@ qla83xx_fw_dump(scsi_qla_host_t *vha, int hardware_locked)
 		WRT_REG_DWORD(&reg->hccr, HCCRX_CLR_RISC_RESET);
 		RD_REG_DWORD(&reg->hccr);
 
-		for (cnt = 30000; cnt && (RD_REG_WORD(&reg->mailbox0)); cnt--) {
+		for (cnt = 30000; cnt && (RD_REG_WORD(&reg->mailbox0)); cnt--)
 			udelay(5);
-		}
 
 		if (!cnt) {
 			nxt = fw->code_ram;
@@ -2341,9 +2493,12 @@ copy_queue:
 	/* Chain entries -- started with MQ. */
 	nxt_chain = qla25xx_copy_fce(ha, nxt_chain, &last_chain);
 	nxt_chain = qla25xx_copy_mqueues(ha, nxt_chain, &last_chain);
+	nxt_chain = qla2xxx_copy_atioqueues(ha, nxt_chain, &last_chain);
+	nxt_chain = qla25xx_copy_exlogin(ha, nxt_chain, &last_chain);
+	nxt_chain = qla81xx_copy_exchoffld(ha, nxt_chain, &last_chain);
 	if (last_chain) {
-		ha->fw_dump->version |= __constant_htonl(DUMP_CHAIN_VARIANT);
-		*last_chain |= __constant_htonl(DUMP_CHAIN_LAST);
+		ha->fw_dump->version |= htonl(DUMP_CHAIN_VARIANT);
+		*last_chain |= htonl(DUMP_CHAIN_LAST);
 	}
 
 	/* Adjust valid length. */
@@ -2353,21 +2508,17 @@ qla83xx_fw_dump_failed_0:
 	qla2xxx_dump_post_process(base_vha, rval);
 
 qla83xx_fw_dump_failed:
+#ifndef __CHECKER__
 	if (!hardware_locked)
 		spin_unlock_irqrestore(&ha->hardware_lock, flags);
+#else
+	;
+#endif
 }
 
 /****************************************************************************/
 /*                         Driver Debug Functions.                          */
 /****************************************************************************/
-
-static inline int
-ql_mask_match(uint32_t level)
-{
-	if (ql2xextended_error_logging == 1)
-		ql2xextended_error_logging = QL_DBG_DEFAULT1_MASK;
-	return (level & ql2xextended_error_logging) == level;
-}
 
 /*
  * This function is for formatting and logging debug information.
@@ -2383,27 +2534,30 @@ ql_mask_match(uint32_t level)
  * msg:   The message to be displayed.
  */
 void
-ql_dbg(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
+ql_dbg(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
 {
 	va_list va;
+	struct va_format vaf;
 
 	if (!ql_mask_match(level))
 		return;
 
 	va_start(va, fmt);
 
+	vaf.fmt = fmt;
+	vaf.va = &va;
+
 	if (vha != NULL) {
 		const struct pci_dev *pdev = vha->hw->pdev;
 		/* <module-name> <pci-name> <msg-id>:<host> Message */
-		pr_warning("%s [%s]-%04x:%ld: ",
+		pr_warn("%s [%s]-%04x:%ld: %pV",
 			QL_MSGHDR, dev_name(&(pdev->dev)), id + ql_dbg_offset,
-			vha->host_no);
+			vha->host_no, &vaf);
 	} else {
-		pr_warning("%s [%s]-%04x: ",
-			QL_MSGHDR, "0000:00:00.0", id + ql_dbg_offset);
+		pr_warn("%s [%s]-%04x: : %pV",
+			QL_MSGHDR, "0000:00:00.0", id + ql_dbg_offset, &vaf);
 	}
 
-	vprintk(fmt, va);
 	va_end(va);
 
 }
@@ -2423,10 +2577,10 @@ ql_dbg(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
  * msg:   The message to be displayed.
  */
 void
-ql_dbg_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
-	   const char *fmt, ...)
+ql_dbg_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
 {
 	va_list va;
+	struct va_format vaf;
 
 	if (pdev == NULL)
 		return;
@@ -2435,11 +2589,13 @@ ql_dbg_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
 
 	va_start(va, fmt);
 
-	/* <module-name> <dev-name>:<msg-id> Message */
-	pr_warning("%s [%s]-%04x: ",
-		QL_MSGHDR, dev_name(&(pdev->dev)), id + ql_dbg_offset);
+	vaf.fmt = fmt;
+	vaf.va = &va;
 
-	vprintk(fmt, va);
+	/* <module-name> <dev-name>:<msg-id> Message */
+	pr_warn("%s [%s]-%04x: : %pV",
+		QL_MSGHDR, dev_name(&(pdev->dev)), id + ql_dbg_offset, &vaf);
+
 	va_end(va);
 }
 
@@ -2457,9 +2613,10 @@ ql_dbg_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
  * msg:   The message to be displayed.
  */
 void
-ql_log(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
+ql_log(uint level, scsi_qla_host_t *vha, uint id, const char *fmt, ...)
 {
 	va_list va;
+	struct va_format vaf;
 	char pbuf[128];
 
 	if (level > ql_errlev)
@@ -2471,29 +2628,31 @@ ql_log(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
 		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x:%ld: ",
 			QL_MSGHDR, dev_name(&(pdev->dev)), id, vha->host_no);
 	} else {
-		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: ",
+		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: : ",
 			QL_MSGHDR, "0000:00:00.0", id);
 	}
 	pbuf[sizeof(pbuf) - 1] = 0;
 
 	va_start(va, fmt);
 
+	vaf.fmt = fmt;
+	vaf.va = &va;
+
 	switch (level) {
 	case ql_log_fatal: /* FATAL LOG */
-		pr_crit("%s", pbuf);
+		pr_crit("%s%pV", pbuf, &vaf);
 		break;
 	case ql_log_warn:
-		pr_err("%s", pbuf);
+		pr_err("%s%pV", pbuf, &vaf);
 		break;
 	case ql_log_info:
-		pr_warning("%s", pbuf);
+		pr_warn("%s%pV", pbuf, &vaf);
 		break;
 	default:
-		pr_info("%s", pbuf);
+		pr_info("%s%pV", pbuf, &vaf);
 		break;
 	}
 
-	vprintk(fmt, va);
 	va_end(va);
 }
 
@@ -2512,43 +2671,47 @@ ql_log(uint32_t level, scsi_qla_host_t *vha, int32_t id, const char *fmt, ...)
  * msg:   The message to be displayed.
  */
 void
-ql_log_pci(uint32_t level, struct pci_dev *pdev, int32_t id,
-	  const char *fmt, ...)
+ql_log_pci(uint level, struct pci_dev *pdev, uint id, const char *fmt, ...)
 {
 	va_list va;
+	struct va_format vaf;
 	char pbuf[128];
 
+	if (pdev == NULL)
+		return;
 	if (level > ql_errlev)
 		return;
 
 	/* <module-name> <dev-name>:<msg-id> Message */
-	snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: ",
+	snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: : ",
 		 QL_MSGHDR, dev_name(&(pdev->dev)), id);
 	pbuf[sizeof(pbuf) - 1] = 0;
 
 	va_start(va, fmt);
 
+	vaf.fmt = fmt;
+	vaf.va = &va;
+
 	switch (level) {
 	case ql_log_fatal: /* FATAL LOG */
-		pr_crit("%s", pbuf);
+		pr_crit("%s%pV", pbuf, &vaf);
 		break;
 	case ql_log_warn:
-		pr_err("%s", pbuf);
+		pr_err("%s%pV", pbuf, &vaf);
 		break;
 	case ql_log_info:
-		pr_warning("%s", pbuf);
+		pr_warn("%s%pV", pbuf, &vaf);
 		break;
 	default:
-		pr_info("%s", pbuf);
+		pr_info("%s%pV", pbuf, &vaf);
 		break;
 	}
 
-	vprintk(fmt, va);
 	va_end(va);
 }
 
 void
-ql_dump_regs(uint32_t level, scsi_qla_host_t *vha, int32_t id)
+ql_dump_regs(uint level, scsi_qla_host_t *vha, uint id)
 {
 	int i;
 	struct qla_hw_data *ha = vha->hw;
@@ -2560,7 +2723,7 @@ ql_dump_regs(uint32_t level, scsi_qla_host_t *vha, int32_t id)
 	if (!ql_mask_match(level))
 		return;
 
-	if (IS_QLA82XX(ha))
+	if (IS_P3P_TYPE(ha))
 		mbx_reg = &reg82->mailbox_in[0];
 	else if (IS_FWI2_CAPABLE(ha))
 		mbx_reg = &reg24->mailbox0;
@@ -2568,37 +2731,128 @@ ql_dump_regs(uint32_t level, scsi_qla_host_t *vha, int32_t id)
 		mbx_reg = MAILBOX_REG(ha, reg, 0);
 
 	ql_dbg(level, vha, id, "Mailbox registers:\n");
-	for (i = 0; i < 6; i++)
+	for (i = 0; i < 6; i++, mbx_reg++)
 		ql_dbg(level, vha, id,
-		    "mbox[%d] 0x%04x\n", i, RD_REG_WORD(mbx_reg++));
+		    "mbox[%d] %#04x\n", i, RD_REG_WORD(mbx_reg));
 }
 
 
 void
-ql_dump_buffer(uint32_t level, scsi_qla_host_t *vha, int32_t id,
-	uint8_t *b, uint32_t size)
+ql_dump_buffer(uint level, scsi_qla_host_t *vha, uint id, void *buf, uint size)
 {
-	uint32_t cnt;
-	uint8_t c;
+	uint cnt;
 
 	if (!ql_mask_match(level))
 		return;
 
-	ql_dbg(level, vha, id, " 0   1   2   3   4   5   6   7   8   "
-	    "9  Ah  Bh  Ch  Dh  Eh  Fh\n");
-	ql_dbg(level, vha, id, "----------------------------------"
-	    "----------------------------\n");
-
-	ql_dbg(level, vha, id, " ");
-	for (cnt = 0; cnt < size;) {
-		c = *b++;
-		printk("%02x", (uint32_t) c);
-		cnt++;
-		if (!(cnt % 16))
-			printk("\n");
-		else
-			printk("  ");
+	ql_dbg(level, vha, id,
+	    "%-+5d  0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F\n", size);
+	ql_dbg(level, vha, id,
+	    "----- -----------------------------------------------\n");
+	for (cnt = 0; cnt < size; cnt += 16) {
+		ql_dbg(level, vha, id, "%04x: ", cnt);
+		print_hex_dump(KERN_CONT, "", DUMP_PREFIX_NONE, 16, 1,
+			       buf + cnt, min(16U, size - cnt), false);
 	}
-	if (cnt % 16)
-		ql_dbg(level, vha, id, "\n");
+}
+
+/*
+ * This function is for formatting and logging log messages.
+ * It is to be used when vha is available. It formats the message
+ * and logs it to the messages file. All the messages will be logged
+ * irrespective of value of ql2xextended_error_logging.
+ * parameters:
+ * level: The level of the log messages to be printed in the
+ *        messages file.
+ * vha:   Pointer to the scsi_qla_host_t
+ * id:    This is a unique id for the level. It identifies the
+ *        part of the code from where the message originated.
+ * msg:   The message to be displayed.
+ */
+void
+ql_log_qp(uint32_t level, struct qla_qpair *qpair, int32_t id,
+    const char *fmt, ...)
+{
+	va_list va;
+	struct va_format vaf;
+	char pbuf[128];
+
+	if (level > ql_errlev)
+		return;
+
+	if (qpair != NULL) {
+		const struct pci_dev *pdev = qpair->pdev;
+		/* <module-name> <msg-id>:<host> Message */
+		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: ",
+			QL_MSGHDR, dev_name(&(pdev->dev)), id);
+	} else {
+		snprintf(pbuf, sizeof(pbuf), "%s [%s]-%04x: : ",
+			QL_MSGHDR, "0000:00:00.0", id);
+	}
+	pbuf[sizeof(pbuf) - 1] = 0;
+
+	va_start(va, fmt);
+
+	vaf.fmt = fmt;
+	vaf.va = &va;
+
+	switch (level) {
+	case ql_log_fatal: /* FATAL LOG */
+		pr_crit("%s%pV", pbuf, &vaf);
+		break;
+	case ql_log_warn:
+		pr_err("%s%pV", pbuf, &vaf);
+		break;
+	case ql_log_info:
+		pr_warn("%s%pV", pbuf, &vaf);
+		break;
+	default:
+		pr_info("%s%pV", pbuf, &vaf);
+		break;
+	}
+
+	va_end(va);
+}
+
+/*
+ * This function is for formatting and logging debug information.
+ * It is to be used when vha is available. It formats the message
+ * and logs it to the messages file.
+ * parameters:
+ * level: The level of the debug messages to be printed.
+ *        If ql2xextended_error_logging value is correctly set,
+ *        this message will appear in the messages file.
+ * vha:   Pointer to the scsi_qla_host_t.
+ * id:    This is a unique identifier for the level. It identifies the
+ *        part of the code from where the message originated.
+ * msg:   The message to be displayed.
+ */
+void
+ql_dbg_qp(uint32_t level, struct qla_qpair *qpair, int32_t id,
+    const char *fmt, ...)
+{
+	va_list va;
+	struct va_format vaf;
+
+	if (!ql_mask_match(level))
+		return;
+
+	va_start(va, fmt);
+
+	vaf.fmt = fmt;
+	vaf.va = &va;
+
+	if (qpair != NULL) {
+		const struct pci_dev *pdev = qpair->pdev;
+		/* <module-name> <pci-name> <msg-id>:<host> Message */
+		pr_warn("%s [%s]-%04x: %pV",
+		    QL_MSGHDR, dev_name(&(pdev->dev)), id + ql_dbg_offset,
+		    &vaf);
+	} else {
+		pr_warn("%s [%s]-%04x: : %pV",
+			QL_MSGHDR, "0000:00:00.0", id + ql_dbg_offset, &vaf);
+	}
+
+	va_end(va);
+
 }

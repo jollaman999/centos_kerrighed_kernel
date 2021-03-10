@@ -4,10 +4,15 @@ __NR_acct,
 __NR_swapon,
 #endif
 __NR_quotactl,
+#ifdef __NR_truncate
 __NR_truncate,
+#endif
 #ifdef __NR_truncate64
 __NR_truncate64,
 #endif
 #ifdef __NR_bind
 __NR_bind,		/* bind can affect fs object only in one way... */
+#endif
+#ifdef __NR_fallocate
+__NR_fallocate,
 #endif

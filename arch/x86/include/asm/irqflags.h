@@ -5,7 +5,11 @@
 
 #ifndef __ASSEMBLY__
 
+#include <linux/static_key.h>
 #include <asm/nospec-branch.h>
+
+/* Provide __cpuidle; we can't safely include <linux/cpu.h> */
+#define __cpuidle __attribute__((__section__(".cpuidle.text")))
 
 /*
  * Interrupt control:
@@ -47,13 +51,13 @@ static inline void native_irq_enable(void)
 	asm volatile("sti": : :"memory");
 }
 
-static inline void native_safe_halt(void)
+static inline __cpuidle void native_safe_halt(void)
 {
 	mds_idle_clear_cpu_buffers();
 	asm volatile("sti; hlt": : :"memory");
 }
 
-static inline void native_halt(void)
+static inline __cpuidle void native_halt(void)
 {
 	mds_idle_clear_cpu_buffers();
 	asm volatile("hlt": : :"memory");
@@ -65,23 +69,24 @@ static inline void native_halt(void)
 #include <asm/paravirt.h>
 #else
 #ifndef __ASSEMBLY__
+#include <linux/types.h>
 
-static inline unsigned long __raw_local_save_flags(void)
+static inline notrace unsigned long arch_local_save_flags(void)
 {
 	return native_save_fl();
 }
 
-static inline void raw_local_irq_restore(unsigned long flags)
+static inline notrace void arch_local_irq_restore(unsigned long flags)
 {
 	native_restore_fl(flags);
 }
 
-static inline void raw_local_irq_disable(void)
+static inline notrace void arch_local_irq_disable(void)
 {
 	native_irq_disable();
 }
 
-static inline void raw_local_irq_enable(void)
+static inline notrace void arch_local_irq_enable(void)
 {
 	native_irq_enable();
 }
@@ -90,7 +95,7 @@ static inline void raw_local_irq_enable(void)
  * Used in the idle loop; sti takes one instruction cycle
  * to complete:
  */
-static inline void raw_safe_halt(void)
+static inline __cpuidle void arch_safe_halt(void)
 {
 	native_safe_halt();
 }
@@ -99,7 +104,7 @@ static inline void raw_safe_halt(void)
  * Used when interrupts are already enabled or to
  * shutdown the processor:
  */
-static inline void halt(void)
+static inline __cpuidle void halt(void)
 {
 	native_halt();
 }
@@ -107,12 +112,10 @@ static inline void halt(void)
 /*
  * For spinlocks, etc:
  */
-static inline unsigned long __raw_local_irq_save(void)
+static inline notrace unsigned long arch_local_irq_save(void)
 {
-	unsigned long flags = __raw_local_save_flags();
-
-	raw_local_irq_disable();
-
+	unsigned long flags = arch_local_save_flags();
+	arch_local_irq_disable();
 	return flags;
 }
 #else
@@ -158,22 +161,16 @@ static inline unsigned long __raw_local_irq_save(void)
 #endif /* CONFIG_PARAVIRT */
 
 #ifndef __ASSEMBLY__
-#define raw_local_save_flags(flags)				\
-	do { (flags) = __raw_local_save_flags(); } while (0)
-
-#define raw_local_irq_save(flags)				\
-	do { (flags) = __raw_local_irq_save(); } while (0)
-
-static inline int raw_irqs_disabled_flags(unsigned long flags)
+static inline int arch_irqs_disabled_flags(unsigned long flags)
 {
 	return !(flags & X86_EFLAGS_IF);
 }
 
-static inline int raw_irqs_disabled(void)
+static inline int arch_irqs_disabled(void)
 {
-	unsigned long flags = __raw_local_save_flags();
+	unsigned long flags = arch_local_save_flags();
 
-	return raw_irqs_disabled_flags(flags);
+	return arch_irqs_disabled_flags(flags);
 }
 
 #else

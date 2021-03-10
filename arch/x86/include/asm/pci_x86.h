@@ -7,9 +7,13 @@
 #undef DEBUG
 
 #ifdef DEBUG
-#define DBG(x...) printk(x)
+#define DBG(fmt, ...) printk(fmt, ##__VA_ARGS__)
 #else
-#define DBG(x...)
+#define DBG(fmt, ...)				\
+do {						\
+	if (0)					\
+		printk(fmt, ##__VA_ARGS__);	\
+} while (0)
 #endif
 
 #define PCI_PROBE_BIOS		0x0001
@@ -44,9 +48,8 @@ enum pci_bf_sort_state {
 
 /* pci-i386.c */
 
-extern unsigned int pcibios_max_latency;
-
 void pcibios_resource_survey(void);
+void pcibios_set_cache_line_size(void);
 
 /* pci-pc.c */
 
@@ -85,11 +88,12 @@ struct irq_routing_table {
 
 extern unsigned int pcibios_irq_mask;
 
-extern int pcibios_scanned;
-extern spinlock_t pci_config_lock;
+extern raw_spinlock_t pci_config_lock;
 
 extern int (*pcibios_enable_irq)(struct pci_dev *dev);
 extern void (*pcibios_disable_irq)(struct pci_dev *dev);
+
+extern bool mp_should_keep_irq(struct device *dev);
 
 struct pci_raw_ops {
 	int (*read)(unsigned int domain, unsigned int bus, unsigned int devfn,
@@ -98,41 +102,62 @@ struct pci_raw_ops {
 						int reg, int len, u32 val);
 };
 
-extern struct pci_raw_ops *raw_pci_ops;
-extern struct pci_raw_ops *raw_pci_ext_ops;
+extern const struct pci_raw_ops *raw_pci_ops;
+extern const struct pci_raw_ops *raw_pci_ext_ops;
 
-extern struct pci_raw_ops pci_direct_conf1;
+extern const struct pci_raw_ops pci_mmcfg;
+extern const struct pci_raw_ops pci_direct_conf1;
 extern bool port_cf9_safe;
 
 /* arch_initcall level */
 extern int pci_direct_probe(void);
 extern void pci_direct_init(int type);
 extern void pci_pcbios_init(void);
-extern int pci_olpc_init(void);
 extern void __init dmi_check_pciprobe(void);
 extern void __init dmi_check_skip_isa_align(void);
 
 /* some common used subsys_initcalls */
 extern int __init pci_acpi_init(void);
-extern int __init pcibios_irq_init(void);
-extern int __init pci_visws_init(void);
-extern int __init pci_numaq_init(void);
+extern void __init pcibios_irq_init(void);
 extern int __init pcibios_init(void);
+extern int pci_legacy_init(void);
+extern void pcibios_fixup_irqs(void);
 
 /* pci-mmconfig.c */
 
+/* "PCI MMCONFIG %04x [bus %02x-%02x]" */
+#define PCI_MMCFG_RESOURCE_NAME_LEN (22 + 4 + 2 + 2)
+
+struct pci_mmcfg_region {
+	struct list_head list;
+	struct resource res;
+	u64 address;
+	char __iomem *virt;
+	u16 segment;
+	u8 start_bus;
+	u8 end_bus;
+	char name[PCI_MMCFG_RESOURCE_NAME_LEN];
+};
+
 extern int __init pci_mmcfg_arch_init(void);
 extern void __init pci_mmcfg_arch_free(void);
+extern int pci_mmcfg_arch_map(struct pci_mmcfg_region *cfg);
+extern void pci_mmcfg_arch_unmap(struct pci_mmcfg_region *cfg);
+extern int pci_mmconfig_insert(struct device *dev, u16 seg, u8 start, u8 end,
+			       phys_addr_t addr);
+extern int pci_mmconfig_delete(u16 seg, u8 start, u8 end);
+extern struct pci_mmcfg_region *pci_mmconfig_lookup(int segment, int bus);
 
-extern struct acpi_mcfg_allocation *pci_mmcfg_config;
-extern int pci_mmcfg_config_num;
+extern struct list_head pci_mmcfg_list;
+
+#define PCI_MMCFG_BUS_OFFSET(bus)      ((bus) << 20)
 
 /*
- * AMD Fam10h CPUs are buggy, and cannot access MMIO config space
- * on their northbrige except through the * %eax register. As such, you MUST
- * NOT use normal IOMEM accesses, you need to only use the magic mmio-config
- * accessor functions.
- * In fact just use pci_config_*, nothing else please.
+ * On AMD Fam10h CPUs, all PCI MMIO configuration space accesses must use
+ * %eax.  No other source or target registers may be used.  The following
+ * mmio_config_* accessors enforce this.  See "BIOS and Kernel Developer's
+ * Guide (BKDG) For AMD Family 10h Processors", rev. 3.48, sec 2.11.1,
+ * "MMIO Configuration Coding Requirements".
  */
 static inline unsigned char mmio_config_readb(void __iomem *pos)
 {
@@ -169,3 +194,17 @@ static inline void mmio_config_writel(void __iomem *pos, u32 val)
 {
 	asm volatile("movl %%eax,(%1)" : : "a" (val), "r" (pos) : "memory");
 }
+
+#ifdef CONFIG_PCI
+# ifdef CONFIG_ACPI
+#  define x86_default_pci_init		pci_acpi_init
+# else
+#  define x86_default_pci_init		pci_legacy_init
+# endif
+# define x86_default_pci_init_irq	pcibios_irq_init
+# define x86_default_pci_fixup_irqs	pcibios_fixup_irqs
+#else
+# define x86_default_pci_init		NULL
+# define x86_default_pci_init_irq	NULL
+# define x86_default_pci_fixup_irqs	NULL
+#endif

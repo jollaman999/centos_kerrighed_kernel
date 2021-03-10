@@ -10,6 +10,7 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/sunrpc/clnt.h>
+#include <linux/slab.h>
 #include <linux/nfs.h>
 #include <linux/nfs3.h>
 #include <linux/nfs_fs.h>
@@ -20,6 +21,7 @@
 
 #include "iostat.h"
 #include "internal.h"
+#include "nfs3_fs.h"
 
 #define NFSDBG_FACILITY		NFSDBG_PROC
 
@@ -32,7 +34,7 @@ nfs3_rpc_wrapper(struct rpc_clnt *clnt, struct rpc_message *msg, int flags)
 		res = rpc_call_sync(clnt, msg, flags);
 		if (res != -EJUKEBOX)
 			break;
-		freezable_schedule_timeout_killable(NFS_JUKEBOX_RETRY_TIME);
+		freezable_schedule_timeout_killable_unsafe(NFS_JUKEBOX_RETRY_TIME);
 		res = -ERESTARTSYS;
 	} while (!fatal_signal_pending(current));
 	return res;
@@ -68,7 +70,7 @@ do_proc_get_root(struct rpc_clnt *client, struct nfs_fh *fhandle,
 	nfs_fattr_init(info->fattr);
 	status = rpc_call_sync(client, &msg, 0);
 	dprintk("%s: reply fsinfo: %d\n", __func__, status);
-	if (!(info->fattr->valid & NFS_ATTR_FATTR)) {
+	if (status == 0 && !(info->fattr->valid & NFS_ATTR_FATTR)) {
 		msg.rpc_proc = &nfs3_procedures[NFS3PROC_GETATTR];
 		msg.rpc_resp = info->fattr;
 		status = rpc_call_sync(client, &msg, 0);
@@ -97,7 +99,7 @@ nfs3_proc_get_root(struct nfs_server *server, struct nfs_fh *fhandle,
  */
 static int
 nfs3_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
-		struct nfs_fattr *fattr)
+		struct nfs_fattr *fattr, struct nfs4_label *label)
 {
 	struct rpc_message msg = {
 		.rpc_proc	= &nfs3_procedures[NFS3PROC_GETATTR],
@@ -135,14 +137,15 @@ nfs3_proc_setattr(struct dentry *dentry, struct nfs_fattr *fattr,
 	nfs_fattr_init(fattr);
 	status = rpc_call_sync(NFS_CLIENT(inode), &msg, 0);
 	if (status == 0)
-		nfs_setattr_update_inode(inode, sattr);
+		nfs_setattr_update_inode(inode, sattr, fattr);
 	dprintk("NFS reply setattr: %d\n", status);
 	return status;
 }
 
 static int
-nfs3_proc_lookup(struct rpc_clnt *clnt, struct inode *dir, struct qstr *name,
-		 struct nfs_fh *fhandle, struct nfs_fattr *fattr)
+nfs3_proc_lookup(struct inode *dir, struct qstr *name,
+		 struct nfs_fh *fhandle, struct nfs_fattr *fattr,
+		 struct nfs4_label *label)
 {
 	struct nfs3_diropargs	arg = {
 		.fh		= NFS_FH(dir),
@@ -299,7 +302,7 @@ static int nfs3_do_create(struct inode *dir, struct dentry *dentry, struct nfs3_
 	status = rpc_call_sync(NFS_CLIENT(dir), &data->msg, 0);
 	nfs_post_op_update_inode(dir, data->res.dir_attr);
 	if (status == 0)
-		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr);
+		status = nfs_instantiate(dentry, data->res.fh, data->res.fattr, NULL);
 	return status;
 }
 
@@ -313,13 +316,13 @@ static void nfs3_free_createdata(struct nfs3_createdata *data)
  */
 static int
 nfs3_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
-		 int flags, struct nfs_open_context *ctx)
+		 int flags)
 {
 	struct nfs3_createdata *data;
-	mode_t mode = sattr->ia_mode;
+	umode_t mode = sattr->ia_mode;
 	int status = -ENOMEM;
 
-	dprintk("NFS call  create %s\n", dentry->d_name.name);
+	dprintk("NFS call  create %pd\n", dentry);
 
 	data = nfs3_alloc_createdata();
 	if (data == NULL)
@@ -334,8 +337,8 @@ nfs3_proc_create(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
 	data->arg.create.createmode = NFS3_CREATE_UNCHECKED;
 	if (flags & O_EXCL) {
 		data->arg.create.createmode  = NFS3_CREATE_EXCLUSIVE;
-		data->arg.create.verifier[0] = jiffies;
-		data->arg.create.verifier[1] = current->pid;
+		data->arg.create.verifier[0] = cpu_to_be32(jiffies);
+		data->arg.create.verifier[1] = cpu_to_be32(current->pid);
 	}
 
 	sattr->ia_mode &= ~current_umask();
@@ -397,8 +400,7 @@ nfs3_proc_remove(struct inode *dir, struct qstr *name)
 {
 	struct nfs_removeargs arg = {
 		.fh = NFS_FH(dir),
-		.name.len = name->len,
-		.name.name = name->name,
+		.name = *name,
 	};
 	struct nfs_removeres res;
 	struct rpc_message msg = {
@@ -427,6 +429,11 @@ nfs3_proc_unlink_setup(struct rpc_message *msg, struct inode *dir)
 	msg->rpc_proc = &nfs3_procedures[NFS3PROC_REMOVE];
 }
 
+static void nfs3_proc_unlink_rpc_prepare(struct rpc_task *task, struct nfs_unlinkdata *data)
+{
+	rpc_call_start(task);
+}
+
 static int
 nfs3_proc_unlink_done(struct rpc_task *task, struct inode *dir)
 {
@@ -444,6 +451,11 @@ nfs3_proc_rename_setup(struct rpc_message *msg, struct inode *dir)
 	msg->rpc_proc = &nfs3_procedures[NFS3PROC_RENAME];
 }
 
+static void nfs3_proc_rename_rpc_prepare(struct rpc_task *task, struct nfs_renamedata *data)
+{
+	rpc_call_start(task);
+}
+
 static int
 nfs3_proc_rename_done(struct rpc_task *task, struct inode *old_dir,
 		      struct inode *new_dir)
@@ -457,41 +469,6 @@ nfs3_proc_rename_done(struct rpc_task *task, struct inode *old_dir,
 	nfs_post_op_update_inode(old_dir, res->old_fattr);
 	nfs_post_op_update_inode(new_dir, res->new_fattr);
 	return 1;
-}
-
-static int
-nfs3_proc_rename(struct inode *old_dir, struct qstr *old_name,
-		 struct inode *new_dir, struct qstr *new_name)
-{
-	struct nfs_renameargs	arg = {
-		.old_dir	= NFS_FH(old_dir),
-		.old_name	= old_name,
-		.new_dir	= NFS_FH(new_dir),
-		.new_name	= new_name,
-	};
-	struct nfs_renameres res;
-	struct rpc_message msg = {
-		.rpc_proc	= &nfs3_procedures[NFS3PROC_RENAME],
-		.rpc_argp	= &arg,
-		.rpc_resp	= &res,
-	};
-	int status = -ENOMEM;
-
-	dprintk("NFS call  rename %s -> %s\n", old_name->name, new_name->name);
-
-	res.old_fattr = nfs_alloc_fattr();
-	res.new_fattr = nfs_alloc_fattr();
-	if (res.old_fattr == NULL || res.new_fattr == NULL)
-		goto out;
-
-	status = rpc_call_sync(NFS_CLIENT(old_dir), &msg, 0);
-	nfs_post_op_update_inode(old_dir, res.old_fattr);
-	nfs_post_op_update_inode(new_dir, res.new_fattr);
-out:
-	nfs_free_fattr(res.old_fattr);
-	nfs_free_fattr(res.new_fattr);
-	dprintk("NFS reply rename: %d\n", status);
-	return status;
 }
 
 static int
@@ -537,7 +514,7 @@ nfs3_proc_symlink(struct inode *dir, struct dentry *dentry, struct page *page,
 	if (len > NFS3_MAXPATHLEN)
 		return -ENAMETOOLONG;
 
-	dprintk("NFS call  symlink %s\n", dentry->d_name.name);
+	dprintk("NFS call  symlink %pd\n", dentry);
 
 	data = nfs3_alloc_createdata();
 	if (data == NULL)
@@ -562,10 +539,10 @@ static int
 nfs3_proc_mkdir(struct inode *dir, struct dentry *dentry, struct iattr *sattr)
 {
 	struct nfs3_createdata *data;
-	int mode = sattr->ia_mode;
+	umode_t mode = sattr->ia_mode;
 	int status = -ENOMEM;
 
-	dprintk("NFS call  mkdir %s\n", dentry->d_name.name);
+	dprintk("NFS call  mkdir %pd\n", dentry);
 
 	sattr->ia_mode &= ~current_umask();
 
@@ -681,10 +658,10 @@ nfs3_proc_mknod(struct inode *dir, struct dentry *dentry, struct iattr *sattr,
 		dev_t rdev)
 {
 	struct nfs3_createdata *data;
-	mode_t mode = sattr->ia_mode;
+	umode_t mode = sattr->ia_mode;
 	int status = -ENOMEM;
 
-	dprintk("NFS call  mknod %s %u:%u\n", dentry->d_name.name,
+	dprintk("NFS call  mknod %pd %u:%u\n", dentry,
 			MAJOR(rdev), MINOR(rdev));
 
 	sattr->ia_mode &= ~current_umask();
@@ -798,49 +775,52 @@ nfs3_proc_pathconf(struct nfs_server *server, struct nfs_fh *fhandle,
 	return status;
 }
 
-static int nfs3_read_done(struct rpc_task *task, struct nfs_read_data *data)
+static int nfs3_read_done(struct rpc_task *task, struct nfs_pgio_header *hdr)
 {
-	struct inode *inode = data->header->inode;
+	struct inode *inode = hdr->inode;
+
+	if (hdr->pgio_done_cb != NULL)
+		return hdr->pgio_done_cb(task, hdr);
 
 	if (nfs3_async_handle_jukebox(task, inode))
 		return -EAGAIN;
 
 	nfs_invalidate_atime(inode);
-	nfs_refresh_inode(inode, &data->fattr);
+	nfs_refresh_inode(inode, &hdr->fattr);
 	return 0;
 }
 
-static void nfs3_proc_read_setup(struct nfs_read_data *data, struct rpc_message *msg)
+static void nfs3_proc_read_setup(struct nfs_pgio_header *hdr,
+				 struct rpc_message *msg)
 {
 	msg->rpc_proc = &nfs3_procedures[NFS3PROC_READ];
 }
 
-static int nfs3_proc_read_rpc_prepare(struct rpc_task *task, struct nfs_read_data *data)
+static int nfs3_proc_pgio_rpc_prepare(struct rpc_task *task,
+				      struct nfs_pgio_header *hdr)
 {
 	rpc_call_start(task);
 	return 0;
 }
 
-static int nfs3_write_done(struct rpc_task *task, struct nfs_write_data *data)
+static int nfs3_write_done(struct rpc_task *task, struct nfs_pgio_header *hdr)
 {
-	struct inode *inode = data->header->inode;
+	struct inode *inode = hdr->inode;
+
+	if (hdr->pgio_done_cb != NULL)
+		return hdr->pgio_done_cb(task, hdr);
 
 	if (nfs3_async_handle_jukebox(task, inode))
 		return -EAGAIN;
 	if (task->tk_status >= 0)
-		nfs_post_op_update_inode_force_wcc(inode, data->res.fattr);
+		nfs_writeback_update_inode(hdr);
 	return 0;
 }
 
-static void nfs3_proc_write_setup(struct nfs_write_data *data, struct rpc_message *msg)
+static void nfs3_proc_write_setup(struct nfs_pgio_header *hdr,
+				  struct rpc_message *msg)
 {
 	msg->rpc_proc = &nfs3_procedures[NFS3PROC_WRITE];
-}
-
-static int nfs3_proc_write_rpc_prepare(struct rpc_task *task, struct nfs_write_data *data)
-{
-	rpc_call_start(task);
-	return 0;
 }
 
 static void nfs3_proc_commit_rpc_prepare(struct rpc_task *task, struct nfs_commit_data *data)
@@ -850,6 +830,9 @@ static void nfs3_proc_commit_rpc_prepare(struct rpc_task *task, struct nfs_commi
 
 static int nfs3_commit_done(struct rpc_task *task, struct nfs_commit_data *data)
 {
+	if (data->commit_done_cb != NULL)
+		return data->commit_done_cb(task, data);
+
 	if (nfs3_async_handle_jukebox(task, data->inode))
 		return -EAGAIN;
 	nfs_refresh_inode(data->inode, data->res.fattr);
@@ -861,13 +844,104 @@ static void nfs3_proc_commit_setup(struct nfs_commit_data *data, struct rpc_mess
 	msg->rpc_proc = &nfs3_procedures[NFS3PROC_COMMIT];
 }
 
+void nfs3_nlm_alloc_call(void *data)
+{
+	struct nfs_lock_context *l_ctx = data;
+	if (l_ctx && test_bit(NFS_CONTEXT_UNLOCK, &l_ctx->open_context->flags)) {
+		get_nfs_open_context(l_ctx->open_context);
+		nfs_get_lock_context(l_ctx->open_context);
+	}
+}
+
+bool nfs3_nlm_unlock_prepare(struct rpc_task *task, void *data)
+{
+	struct nfs_lock_context *l_ctx = data;
+	if (l_ctx && test_bit(NFS_CONTEXT_UNLOCK, &l_ctx->open_context->flags))
+		return nfs_async_iocounter_wait(task, l_ctx);
+	return false;
+
+}
+
+void nfs3_nlm_release_call(void *data)
+{
+	struct nfs_lock_context *l_ctx = data;
+	struct nfs_open_context *ctx;
+	if (l_ctx && test_bit(NFS_CONTEXT_UNLOCK, &l_ctx->open_context->flags)) {
+		ctx = l_ctx->open_context;
+		nfs_put_lock_context(l_ctx);
+		put_nfs_open_context(ctx);
+	}
+}
+
+const struct nlmclnt_operations nlmclnt_fl_close_lock_ops = {
+	.nlmclnt_alloc_call = nfs3_nlm_alloc_call,
+	.nlmclnt_unlock_prepare = nfs3_nlm_unlock_prepare,
+	.nlmclnt_release_call = nfs3_nlm_release_call,
+};
+
 static int
 nfs3_proc_lock(struct file *filp, int cmd, struct file_lock *fl)
 {
-	struct inode *inode = filp->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(filp);
+	struct nfs_lock_context *l_ctx = NULL;
+	struct nfs_open_context *ctx = nfs_file_open_context(filp);
+	int status;
 
-	return nlmclnt_proc(NFS_SERVER(inode)->nlm_host, cmd, fl);
+	if (fl->fl_flags & FL_CLOSE) {
+		l_ctx = nfs_get_lock_context(ctx);
+		if (IS_ERR(l_ctx))
+			l_ctx = NULL;
+		else
+			set_bit(NFS_CONTEXT_UNLOCK, &ctx->flags);
+	}
+
+	status = nlmclnt_proc(NFS_SERVER(inode)->nlm_host, cmd, fl, l_ctx);
+
+	if (l_ctx)
+		nfs_put_lock_context(l_ctx);
+
+	return status;
 }
+
+static int nfs3_have_delegation(struct inode *inode, fmode_t flags)
+{
+	return 0;
+}
+
+static int nfs3_return_delegation(struct inode *inode)
+{
+	nfs_wb_all(inode);
+	return 0;
+}
+
+static const struct inode_operations nfs3_dir_inode_operations = {
+	.create		= nfs_create,
+	.lookup		= nfs_lookup,
+	.link		= nfs_link,
+	.unlink		= nfs_unlink,
+	.symlink	= nfs_symlink,
+	.mkdir		= nfs_mkdir,
+	.rmdir		= nfs_rmdir,
+	.mknod		= nfs_mknod,
+	.rename		= nfs_rename,
+	.permission	= nfs_permission,
+	.getattr	= nfs_getattr,
+	.setattr	= nfs_setattr,
+	.listxattr	= nfs3_listxattr,
+	.getxattr	= nfs3_getxattr,
+	.setxattr	= nfs3_setxattr,
+	.removexattr	= nfs3_removexattr,
+};
+
+static const struct inode_operations nfs3_file_inode_operations = {
+	.permission	= nfs_permission,
+	.getattr	= nfs_getattr,
+	.setattr	= nfs_setattr,
+	.listxattr	= nfs3_listxattr,
+	.getxattr	= nfs3_getxattr,
+	.setxattr	= nfs3_setxattr,
+	.removexattr	= nfs3_removexattr,
+};
 
 const struct nfs_rpc_ops nfs_v3_clientops = {
 	.version	= 3,			/* protocol version */
@@ -875,7 +949,10 @@ const struct nfs_rpc_ops nfs_v3_clientops = {
 	.dir_inode_ops	= &nfs3_dir_inode_operations,
 	.file_inode_ops	= &nfs3_file_inode_operations,
 	.file_ops	= &nfs_file_operations,
+	.nlmclnt_ops	= &nlmclnt_fl_close_lock_ops,
 	.getroot	= nfs3_proc_get_root,
+	.submount	= nfs_submount,
+	.try_mount	= nfs_try_mount,
 	.getattr	= nfs3_proc_getattr,
 	.setattr	= nfs3_proc_setattr,
 	.lookup		= nfs3_proc_lookup,
@@ -884,9 +961,10 @@ const struct nfs_rpc_ops nfs_v3_clientops = {
 	.create		= nfs3_proc_create,
 	.remove		= nfs3_proc_remove,
 	.unlink_setup	= nfs3_proc_unlink_setup,
+	.unlink_rpc_prepare = nfs3_proc_unlink_rpc_prepare,
 	.unlink_done	= nfs3_proc_unlink_done,
-	.rename		= nfs3_proc_rename,
 	.rename_setup	= nfs3_proc_rename_setup,
+	.rename_rpc_prepare = nfs3_proc_rename_rpc_prepare,
 	.rename_done	= nfs3_proc_rename_done,
 	.link		= nfs3_proc_link,
 	.symlink	= nfs3_proc_symlink,
@@ -898,13 +976,10 @@ const struct nfs_rpc_ops nfs_v3_clientops = {
 	.fsinfo		= nfs3_proc_fsinfo,
 	.pathconf	= nfs3_proc_pathconf,
 	.decode_dirent	= nfs3_decode_dirent,
+	.pgio_rpc_prepare = nfs3_proc_pgio_rpc_prepare,
 	.read_setup	= nfs3_proc_read_setup,
-	.read_pageio_init = nfs_pageio_init_read,
-	.read_rpc_prepare = nfs3_proc_read_rpc_prepare,
 	.read_done	= nfs3_read_done,
 	.write_setup	= nfs3_proc_write_setup,
-	.write_pageio_init = nfs_pageio_init_write,
-	.write_rpc_prepare = nfs3_proc_write_rpc_prepare,
 	.write_done	= nfs3_write_done,
 	.commit_setup	= nfs3_proc_commit_setup,
 	.commit_rpc_prepare = nfs3_proc_commit_rpc_prepare,
@@ -912,5 +987,11 @@ const struct nfs_rpc_ops nfs_v3_clientops = {
 	.lock		= nfs3_proc_lock,
 	.clear_acl_cache = nfs3_forget_cached_acls,
 	.close_context	= nfs_close_context,
+	.have_delegation = nfs3_have_delegation,
+	.return_delegation = nfs3_return_delegation,
+	.alloc_client	= nfs_alloc_client,
 	.init_client	= nfs_init_client,
+	.free_client	= nfs_free_client,
+	.create_server	= nfs3_create_server,
+	.clone_server	= nfs3_clone_server,
 };

@@ -729,7 +729,7 @@ struct addr_ctrl_blk {
 
 struct init_fw_ctrl_blk {
 	struct addr_ctrl_blk pri;
-	struct addr_ctrl_blk sec;
+/*	struct addr_ctrl_blk sec;*/
 };
 
 #define PRIMARI_ACB		0

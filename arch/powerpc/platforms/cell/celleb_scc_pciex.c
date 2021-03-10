@@ -23,6 +23,7 @@
 #include <linux/kernel.h>
 #include <linux/pci.h>
 #include <linux/string.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/bootmem.h>
 #include <linux/delay.h>
@@ -399,8 +400,8 @@ static int scc_pciex_write_config(struct pci_bus *bus, unsigned int devfn,
 }
 
 static struct pci_ops scc_pciex_pci_ops = {
-	scc_pciex_read_config,
-	scc_pciex_write_config,
+	.read = scc_pciex_read_config,
+	.write = scc_pciex_write_config,
 };
 
 static void pciex_clear_intr_all(unsigned int __iomem *base)
@@ -493,7 +494,7 @@ static __init int celleb_setup_pciex(struct device_node *node,
 		pr_err("PCIEXC:Failed to get config resource.\n");
 		return 1;
 	}
-	phb->cfg_addr = ioremap(r.start, r.end - r.start + 1);
+	phb->cfg_addr = ioremap(r.start, resource_size(&r));
 	if (!phb->cfg_addr) {
 		pr_err("PCIEXC:Failed to remap SMMIO region.\n");
 		return 1;
@@ -513,7 +514,7 @@ static __init int celleb_setup_pciex(struct device_node *node,
 	virq = irq_create_of_mapping(oirq.controller, oirq.specifier,
 				     oirq.size);
 	if (request_irq(virq, pciex_handle_internal_irq,
-			IRQF_DISABLED, "pciex", (void *)phb)) {
+			0, "pciex", (void *)phb)) {
 		pr_err("PCIEXC:Failed to request irq\n");
 		goto error;
 	}

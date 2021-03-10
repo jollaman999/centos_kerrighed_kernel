@@ -38,6 +38,8 @@
  * be incorporated into the next SCTP release.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/kernel.h>
 #include <net/sctp/sctp.h>
 
@@ -101,7 +103,7 @@ static void sctp_objcnt_seq_stop(struct seq_file *seq, void *v)
 {
 }
 
-static void * sctp_objcnt_seq_next(struct seq_file *seq, void *v, loff_t *pos)
+static void *sctp_objcnt_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
 	++*pos;
 	return (*pos >= ARRAY_SIZE(sctp_dbg_objcnt)) ? NULL : (void *)pos;
@@ -127,21 +129,20 @@ static const struct file_operations sctp_objcnt_ops = {
 };
 
 /* Initialize the objcount in the proc filesystem.  */
-void sctp_dbg_objcnt_init(void)
+void sctp_dbg_objcnt_init(struct net *net)
 {
 	struct proc_dir_entry *ent;
 
 	ent = proc_create("sctp_dbg_objcnt", 0,
-			  proc_net_sctp, &sctp_objcnt_ops);
+			  net->sctp.proc_net_sctp, &sctp_objcnt_ops);
 	if (!ent)
-		printk(KERN_WARNING
-			"sctp_dbg_objcnt: Unable to create /proc entry.\n");
+		pr_warn("sctp_dbg_objcnt: Unable to create /proc entry.\n");
 }
 
 /* Cleanup the objcount entry in the proc filesystem.  */
-void sctp_dbg_objcnt_exit(void)
+void sctp_dbg_objcnt_exit(struct net *net)
 {
-	remove_proc_entry("sctp_dbg_objcnt", proc_net_sctp);
+	remove_proc_entry("sctp_dbg_objcnt", net->sctp.proc_net_sctp);
 }
 
 

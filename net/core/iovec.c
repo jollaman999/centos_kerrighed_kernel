@@ -20,7 +20,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
-#include <linux/slab.h>
 #include <linux/net.h>
 #include <linux/in6.h>
 #include <asm/uaccess.h>
@@ -36,14 +35,15 @@
  *	in any case.
  */
 
-long verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr *address, int mode)
+int verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr_storage *address, int mode)
 {
-	int size, ct;
-	long err;
+	int size, ct, err;
 
-	if (m->msg_namelen) {
+	if (m->msg_name && m->msg_namelen) {
 		if (mode == VERIFY_READ) {
-			err = move_addr_to_kernel(m->msg_name, m->msg_namelen,
+			void __user *namep;
+			namep = (void __user __force *) m->msg_name;
+			err = move_addr_to_kernel(namep, m->msg_namelen,
 						  address);
 			if (err < 0)
 				return err;
@@ -51,10 +51,11 @@ long verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr *address,
 		m->msg_name = address;
 	} else {
 		m->msg_name = NULL;
+		m->msg_namelen = 0;
 	}
 
 	size = m->msg_iovlen * sizeof(struct iovec);
-	if (copy_from_user(iov, m->msg_iov, size))
+	if (copy_from_user(iov, (void __user __force *) m->msg_iov, size))
 		return -EFAULT;
 
 	m->msg_iov = iov;
@@ -71,30 +72,6 @@ long verify_iovec(struct msghdr *m, struct iovec *iov, struct sockaddr *address,
 	}
 
 	return err;
-}
-
-/*
- *	Copy kernel to iovec. Returns -EFAULT on error.
- *
- *	Note: this modifies the original iovec.
- */
-
-int memcpy_toiovec(struct iovec *iov, unsigned char *kdata, int len)
-{
-	while (len > 0) {
-		if (iov->iov_len) {
-			int copy = min_t(unsigned int, iov->iov_len, len);
-			if (copy_to_user(iov->iov_base, kdata, copy))
-				return -EFAULT;
-			kdata += copy;
-			len -= copy;
-			iov->iov_len -= copy;
-			iov->iov_base += copy;
-		}
-		iov++;
-	}
-
-	return 0;
 }
 
 /*
@@ -121,30 +98,63 @@ int memcpy_toiovecend(const struct iovec *iov, unsigned char *kdata,
 
 	return 0;
 }
+EXPORT_SYMBOL(memcpy_toiovecend);
 
-/*
- *	Copy iovec to kernel. Returns -EFAULT on error.
- *
- *	Note: this modifies the original iovec.
- */
-
-int memcpy_fromiovec(unsigned char *kdata, struct iovec *iov, int len)
+int memcpy_toiovecend_partial(const struct iovec *iov, unsigned char *kdata,
+			      int offset, int len)
 {
-	while (len > 0) {
-		if (iov->iov_len) {
-			int copy = min_t(unsigned int, len, iov->iov_len);
-			if (copy_from_user(kdata, iov->iov_base, copy))
-				return -EFAULT;
-			len -= copy;
-			kdata += copy;
-			iov->iov_base += copy;
-			iov->iov_len -= copy;
+	int copy, orig_len = len;
+	for (; len > 0; ++iov) {
+		/* Skip over the finished iovecs */
+		if (unlikely(offset >= iov->iov_len)) {
+			offset -= iov->iov_len;
+			continue;
 		}
-		iov++;
+		copy = min_t(unsigned int, iov->iov_len - offset, len);
+		if (copy_to_user(iov->iov_base + offset, kdata, copy))
+			return orig_len - len;
+		offset = 0;
+		kdata += copy;
+		len -= copy;
 	}
 
-	return 0;
+	return orig_len - len;
 }
+EXPORT_SYMBOL(memcpy_toiovecend_partial);
+
+#ifdef CONFIG_ARCH_HAS_UACCESS_MCSAFE
+static int copyout_mcsafe(void __user *to, const void *from, size_t n)
+{
+	if (access_ok(VERIFY_WRITE, to, n))
+		n = copy_to_user_mcsafe((__force void *) to, from, n);
+	return n;
+}
+
+int memcpy_toiovecend_partial_mcsafe(const struct iovec *iov,
+		unsigned char *kdata, int offset, int len)
+{
+	int copy, rem, orig_len = len;
+	for (; len > 0; ++iov) {
+		/* Skip over the finished iovecs */
+		if (unlikely(offset >= iov->iov_len)) {
+			offset -= iov->iov_len;
+			continue;
+		}
+		copy = min_t(unsigned int, iov->iov_len - offset, len);
+		rem = copyout_mcsafe(iov->iov_base + offset, kdata, copy);
+		if (rem != 0) {
+			copy -= rem;
+			return orig_len - len + copy;
+		}
+		offset = 0;
+		kdata += copy;
+		len -= copy;
+	}
+
+	return orig_len - len;
+}
+EXPORT_SYMBOL_GPL(memcpy_toiovecend_partial_mcsafe);
+#endif /* CONFIG_ARCH_HAS_UACCESS_MCSAFE */
 
 /*
  *	Copy iovec from kernel. Returns -EFAULT on error.
@@ -154,7 +164,7 @@ int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 			int offset, int len)
 {
 	/* Skip over the finished iovecs */
-	while (offset >= iov->iov_len) {
+	while (offset && offset >= iov->iov_len) {
 		offset -= iov->iov_len;
 		iov++;
 	}
@@ -173,6 +183,69 @@ int memcpy_fromiovecend(unsigned char *kdata, const struct iovec *iov,
 
 	return 0;
 }
+EXPORT_SYMBOL(memcpy_fromiovecend);
+
+#ifdef CONFIG_ARCH_HAS_UACCESS_FLUSHCACHE
+int memcpy_fromiovecend_partial_flushcache(unsigned char *kdata,
+				const struct iovec *iov, int offset, int len)
+{
+	int orig_len = len;
+
+	/* Skip over the finished iovecs */
+	while (offset && offset >= iov->iov_len) {
+		offset -= iov->iov_len;
+		iov++;
+	}
+
+	while (len > 0) {
+		u8 __user *base = iov->iov_base + offset;
+		int copy = min_t(unsigned int, len, iov->iov_len - offset);
+
+		offset = 0;
+		if (__copy_from_user_flushcache(kdata, base, copy))
+			return orig_len - len;
+		len -= copy;
+		kdata += copy;
+		iov++;
+	}
+
+	return orig_len - len;
+}
+#else
+int memcpy_fromiovecend_partial_flushcache(unsigned char *kdata,
+				const struct iovec *iov, int offset, int len)
+{
+	return memcpy_fromiovecend_partial_nocache(kdata, iov, offset, len);
+}
+#endif
+EXPORT_SYMBOL(memcpy_fromiovecend_partial_flushcache);
+
+int memcpy_fromiovecend_partial_nocache(unsigned char *kdata,
+				const struct iovec *iov, int offset, int len)
+{
+	int orig_len = len;
+
+	/* Skip over the finished iovecs */
+	while (offset && offset >= iov->iov_len) {
+		offset -= iov->iov_len;
+		iov++;
+	}
+
+	while (len > 0) {
+		u8 __user *base = iov->iov_base + offset;
+		int copy = min_t(unsigned int, len, iov->iov_len - offset);
+
+		offset = 0;
+		if (__copy_from_user_nocache(kdata, base, copy))
+			return orig_len - len;
+		len -= copy;
+		kdata += copy;
+		iov++;
+	}
+
+	return orig_len - len;
+}
+EXPORT_SYMBOL(memcpy_fromiovecend_partial_nocache);
 
 /*
  *	And now for the all-in-one: copy and checksum from a user iovec
@@ -189,7 +262,7 @@ int csum_partial_copy_fromiovecend(unsigned char *kdata, struct iovec *iov,
 	int partial_cnt = 0, err = 0;
 
 	/* Skip over the finished iovecs */
-	while (offset >= iov->iov_len) {
+	while (offset && offset >= iov->iov_len) {
 		offset -= iov->iov_len;
 		iov++;
 	}
@@ -257,9 +330,4 @@ out_fault:
 	err = -EFAULT;
 	goto out;
 }
-
 EXPORT_SYMBOL(csum_partial_copy_fromiovecend);
-EXPORT_SYMBOL(memcpy_fromiovec);
-EXPORT_SYMBOL(memcpy_fromiovecend);
-EXPORT_SYMBOL(memcpy_toiovec);
-EXPORT_SYMBOL(memcpy_toiovecend);

@@ -28,6 +28,21 @@ struct tty_struct;
 #define VT100ID "\033[?1;2c"
 #define VT102ID "\033[?6c"
 
+enum con_scroll {
+	SM_UP,
+	SM_DOWN,
+};
+
+/**
+ * struct consw - callbacks for consoles
+ *
+ * @con_scroll: move lines from @top to @bottom in direction @dir by @lines.
+ *		Return true if no generic handling should be done.
+ *		Invoked by csi_M and printing to the console.
+ * @con_set_palette: sets the palette of the console to @table (optional)
+ * @con_scrolldelta: the contents of the console should be scrolled by @lines.
+ *		     Invoked by user. (optional)
+ */
 struct consw {
 	struct module *owner;
 	const char *(*con_startup)(void);
@@ -37,8 +52,9 @@ struct consw {
 	void	(*con_putc)(struct vc_data *, int, int, int);
 	void	(*con_putcs)(struct vc_data *, const unsigned short *, int, int, int);
 	void	(*con_cursor)(struct vc_data *, int);
-	int	(*con_scroll)(struct vc_data *, int, int, int, int);
-	void	(*con_bmove)(struct vc_data *, int, int, int, int, int, int);
+	bool	(*con_scroll)(struct vc_data *, unsigned int top,
+			unsigned int bottom, enum con_scroll dir,
+			unsigned int lines);
 	int	(*con_switch)(struct vc_data *);
 	int	(*con_blank)(struct vc_data *, int, int);
 	int	(*con_font_set)(struct vc_data *, struct console_font *, unsigned);
@@ -47,14 +63,25 @@ struct consw {
 	int	(*con_font_copy)(struct vc_data *, int);
 	int     (*con_resize)(struct vc_data *, unsigned int, unsigned int,
 			       unsigned int);
-	int	(*con_set_palette)(struct vc_data *, unsigned char *);
-	int	(*con_scrolldelta)(struct vc_data *, int);
+	void	(*con_set_palette)(struct vc_data *,
+			const unsigned char *table);
+	void	(*con_scrolldelta)(struct vc_data *, int lines);
 	int	(*con_set_origin)(struct vc_data *);
 	void	(*con_save_screen)(struct vc_data *);
 	u8	(*con_build_attr)(struct vc_data *, u8, u8, u8, u8, u8, u8);
 	void	(*con_invert_region)(struct vc_data *, u16 *, int);
 	u16    *(*con_screen_pos)(struct vc_data *, int);
 	unsigned long (*con_getxy)(struct vc_data *, unsigned long, int *, int *);
+	/*
+	 * Prepare the console for the debugger.  This includes, but is not
+	 * limited to, unblanking the console, loading an appropriate
+	 * palette, and allowing debugger generated output.
+	 */
+	int	(*con_debug_enter)(struct vc_data *);
+	/*
+	 * Restore the console to its pre-debug state as closely as possible.
+	 */
+	int	(*con_debug_leave)(struct vc_data *);
 };
 
 extern const struct consw *conswitchp;
@@ -71,9 +98,19 @@ int do_unregister_con_driver(const struct consw *csw);
 int take_over_console(const struct consw *sw, int first, int last, int deflt);
 int do_take_over_console(const struct consw *sw, int first, int last, int deflt);
 void give_up_console(const struct consw *sw);
-/* scroll */
-#define SM_UP       (1)
-#define SM_DOWN     (2)
+#ifdef CONFIG_HW_CONSOLE
+int con_debug_enter(struct vc_data *vc);
+int con_debug_leave(void);
+#else
+static inline int con_debug_enter(struct vc_data *vc)
+{
+	return 0;
+}
+static inline int con_debug_leave(void)
+{
+	return 0;
+}
+#endif
 
 /* cursor */
 #define CM_DRAW     (1)
@@ -110,16 +147,23 @@ struct console {
 	struct	 console *next;
 };
 
+/*
+ * for_each_console() allows you to iterate on each console
+ */
+#define for_each_console(con) \
+	for (con = console_drivers; con != NULL; con = con->next)
+
 extern int console_set_on_cmdline;
+extern struct console *early_console;
 
 extern int add_preferred_console(char *name, int idx, char *options);
 extern int update_console_cmdline(char *name, int idx, char *name_new, int idx_new, char *options);
 extern void register_console(struct console *);
 extern int unregister_console(struct console *);
 extern struct console *console_drivers;
-extern void acquire_console_sem(void);
-extern int try_acquire_console_sem(void);
-extern void release_console_sem(void);
+extern void console_lock(void);
+extern int console_trylock(void);
+extern void console_unlock(void);
 extern void console_conditional_schedule(void);
 extern void console_unblank(void);
 extern struct tty_driver *console_device(int *);
@@ -129,8 +173,13 @@ extern int is_console_locked(void);
 extern int braille_register_console(struct console *, int index,
 		char *console_options, char *braille_options);
 extern int braille_unregister_console(struct console *);
-
-extern int console_suspend_enabled;
+#ifdef CONFIG_TTY
+extern void console_sysfs_notify(void);
+#else
+static inline void console_sysfs_notify(void)
+{ }
+#endif
+extern bool console_suspend_enabled;
 
 /* Suspend and resume console messages over PM events */
 extern void suspend_console(void);
@@ -157,6 +206,8 @@ void vcs_remove_sysfs(int index);
 
 #ifdef CONFIG_VGA_CONSOLE
 extern bool vgacon_text_force(void);
+#else
+static inline bool vgacon_text_force(void) { return false; }
 #endif
 
 #endif /* _LINUX_CONSOLE_H */

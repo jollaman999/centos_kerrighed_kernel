@@ -20,7 +20,7 @@
 #include <linux/uio.h>
 #include <linux/idr.h>
 #include <linux/bsg.h>
-#include <linux/smp_lock.h>
+#include <linux/slab.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_ioctl.h>
@@ -182,7 +182,7 @@ static int blk_fill_sgv4_hdr_rq(struct request_queue *q, struct request *rq,
 			return -ENOMEM;
 	}
 
-	if (copy_from_user(rq->cmd, (void *)(unsigned long)hdr->request,
+	if (copy_from_user(rq->cmd, (void __user *)(unsigned long)hdr->request,
 			   hdr->request_len))
 		return -EFAULT;
 
@@ -196,7 +196,6 @@ static int blk_fill_sgv4_hdr_rq(struct request_queue *q, struct request *rq,
 	 * fill in request structure
 	 */
 	rq->cmd_len = hdr->request_len;
-	rq->cmd_type = REQ_TYPE_BLOCK_PC;
 
 	rq->timeout = msecs_to_jiffies(hdr->timeout);
 	if (!rq->timeout)
@@ -249,7 +248,7 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 	struct request *rq, *next_rq = NULL;
 	int ret, rw;
 	unsigned int dxfer_len;
-	void *dxferp = NULL;
+	void __user *dxferp = NULL;
 	struct bsg_class_device *bcd = &q->bsg_dev;
 
 	/* if the LLD has been removed then the bsg_unregister_queue will
@@ -268,11 +267,13 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 		return ERR_PTR(ret);
 
 	/*
-	 * map scatter-gather elements seperately and string them to request
+	 * map scatter-gather elements separately and string them to request
 	 */
 	rq = blk_get_request(q, rw, GFP_KERNEL);
-	if (!rq)
-		return ERR_PTR(-ENODEV);
+	if (IS_ERR(rq))
+		return rq;
+	blk_rq_set_block_pc(rq);
+
 	ret = blk_fill_sgv4_hdr_rq(q, rq, hdr, bd, has_write_perm);
 	if (ret)
 		goto out;
@@ -284,14 +285,15 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 		}
 
 		next_rq = blk_get_request(q, READ, GFP_KERNEL);
-		if (!next_rq) {
-			ret = -ENODEV;
+		if (IS_ERR(next_rq)) {
+			ret = PTR_ERR(next_rq);
+			next_rq = NULL;
 			goto out;
 		}
 		rq->next_rq = next_rq;
 		next_rq->cmd_type = rq->cmd_type;
 
-		dxferp = (void*)(unsigned long)hdr->din_xferp;
+		dxferp = (void __user *)(unsigned long)hdr->din_xferp;
 		ret =  blk_rq_map_user(q, next_rq, NULL, dxferp,
 				       hdr->din_xfer_len, GFP_KERNEL);
 		if (ret)
@@ -300,10 +302,10 @@ bsg_map_hdr(struct bsg_device *bd, struct sg_io_v4 *hdr, fmode_t has_write_perm,
 
 	if (hdr->dout_xfer_len) {
 		dxfer_len = hdr->dout_xfer_len;
-		dxferp = (void*)(unsigned long)hdr->dout_xferp;
+		dxferp = (void __user *)(unsigned long)hdr->dout_xferp;
 	} else if (hdr->din_xfer_len) {
 		dxfer_len = hdr->din_xfer_len;
-		dxferp = (void*)(unsigned long)hdr->din_xferp;
+		dxferp = (void __user *)(unsigned long)hdr->din_xferp;
 	} else
 		dxfer_len = 0;
 
@@ -433,7 +435,7 @@ static int blk_complete_sgv4_hdr_rq(struct request *rq, struct sg_io_v4 *hdr,
 	/*
 	 * fill in all the output members
 	 */
-	hdr->device_status = status_byte(rq->errors);
+	hdr->device_status = rq->errors & 0xff;
 	hdr->transport_status = host_byte(rq->errors);
 	hdr->driver_status = driver_byte(rq->errors);
 	hdr->info = 0;
@@ -445,7 +447,7 @@ static int blk_complete_sgv4_hdr_rq(struct request *rq, struct sg_io_v4 *hdr,
 		int len = min_t(unsigned int, hdr->max_response_len,
 					rq->sense_len);
 
-		ret = copy_to_user((void*)(unsigned long)hdr->response,
+		ret = copy_to_user((void __user *)(unsigned long)hdr->response,
 				   rq->sense, len);
 		if (!ret)
 			hdr->response_len = len;
@@ -606,7 +608,7 @@ bsg_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 	ret = __bsg_read(buf, count, bd, NULL, &bytes_read);
 	*ppos = bytes_read;
 
-	if (!bytes_read || (bytes_read && err_block_err(ret)))
+	if (!bytes_read || err_block_err(ret))
 		bytes_read = ret;
 
 	return bytes_read;
@@ -689,7 +691,7 @@ bsg_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 	/*
 	 * return bytes written on non-fatal errors
 	 */
-	if (!bytes_written || (bytes_written && err_block_err(ret)))
+	if (!bytes_written || err_block_err(ret))
 		bytes_written = ret;
 
 	dprintk("%s: returning %Zd\n", bd->name, bytes_written);
@@ -775,7 +777,7 @@ static struct bsg_device *bsg_add_device(struct inode *inode,
 #ifdef BSG_DEBUG
 	unsigned char buf[32];
 #endif
-	if (!blk_get_request_queue(rq))
+	if (!blk_get_queue(rq))
 		return ERR_PTR(-ENXIO);
 
 	bd = bsg_alloc_device();
@@ -803,11 +805,10 @@ static struct bsg_device *bsg_add_device(struct inode *inode,
 static struct bsg_device *__bsg_get_device(int minor, struct request_queue *q)
 {
 	struct bsg_device *bd;
-	struct hlist_node *entry;
 
 	mutex_lock(&bsg_mutex);
 
-	hlist_for_each_entry(bd, entry, bsg_dev_idx_hash(minor), dev_list) {
+	hlist_for_each_entry(bd, bsg_dev_idx_hash(minor), dev_list) {
 		if (bd->queue == q) {
 			atomic_inc(&bd->ref_count);
 			goto found;
@@ -851,9 +852,7 @@ static int bsg_open(struct inode *inode, struct file *file)
 {
 	struct bsg_device *bd;
 
-	lock_kernel();
 	bd = bsg_get_device(inode, file);
-	unlock_kernel();
 
 	if (IS_ERR(bd))
 		return PTR_ERR(bd);
@@ -881,7 +880,7 @@ static unsigned int bsg_poll(struct file *file, poll_table *wait)
 	spin_lock_irq(&bd->lock);
 	if (!list_empty(&bd->done_list))
 		mask |= POLLIN | POLLRDNORM;
-	if (bd->queued_cmds >= bd->max_queue)
+	if (bd->queued_cmds < bd->max_queue)
 		mask |= POLLOUT;
 	spin_unlock_irq(&bd->lock);
 
@@ -976,6 +975,7 @@ static const struct file_operations bsg_fops = {
 	.release	=	bsg_release,
 	.unlocked_ioctl	=	bsg_ioctl,
 	.owner		=	THIS_MODULE,
+	.llseek		=	default_llseek,
 };
 
 void bsg_unregister_queue(struct request_queue *q)
@@ -987,7 +987,8 @@ void bsg_unregister_queue(struct request_queue *q)
 
 	mutex_lock(&bsg_mutex);
 	idr_remove(&bsg_minor_idr, bcd->minor);
-	sysfs_remove_link(&q->kobj, "bsg");
+	if (q->kobj.sd)
+		sysfs_remove_link(&q->kobj, "bsg");
 	device_unregister(bcd->class_dev);
 	bcd->class_dev = NULL;
 	kref_put(&bcd->ref, bsg_kref_release_function);
@@ -1000,7 +1001,7 @@ int bsg_register_queue(struct request_queue *q, struct device *parent,
 {
 	struct bsg_class_device *bcd;
 	dev_t dev;
-	int ret, minor;
+	int ret;
 	struct device *class_dev = NULL;
 	const char *devname;
 
@@ -1012,7 +1013,7 @@ int bsg_register_queue(struct request_queue *q, struct device *parent,
 	/*
 	 * we need a proper transport to send commands, not a stacked device
 	 */
-	if (!q->request_fn)
+	if (!queue_is_rq_based(q))
 		return 0;
 
 	bcd = &q->bsg_dev;
@@ -1020,23 +1021,16 @@ int bsg_register_queue(struct request_queue *q, struct device *parent,
 
 	mutex_lock(&bsg_mutex);
 
-	ret = idr_pre_get(&bsg_minor_idr, GFP_KERNEL);
-	if (!ret) {
-		ret = -ENOMEM;
+	ret = idr_alloc(&bsg_minor_idr, bcd, 0, BSG_MAX_DEVS, GFP_KERNEL);
+	if (ret < 0) {
+		if (ret == -ENOSPC) {
+			printk(KERN_ERR "bsg: too many bsg devices\n");
+			ret = -EINVAL;
+		}
 		goto unlock;
 	}
 
-	ret = idr_get_new(&bsg_minor_idr, bcd, &minor);
-	if (ret < 0)
-		goto unlock;
-
-	if (minor >= BSG_MAX_DEVS) {
-		printk(KERN_ERR "bsg: too many bsg devices\n");
-		ret = -EINVAL;
-		goto remove_idr;
-	}
-
-	bcd->minor = minor;
+	bcd->minor = ret;
 	bcd->queue = q;
 	bcd->parent = get_device(parent);
 	bcd->release = release;
@@ -1062,8 +1056,7 @@ unregister_class_dev:
 	device_unregister(class_dev);
 put_dev:
 	put_device(parent);
-remove_idr:
-	idr_remove(&bsg_minor_idr, minor);
+	idr_remove(&bsg_minor_idr, bcd->minor);
 unlock:
 	mutex_unlock(&bsg_mutex);
 	return ret;
@@ -1072,7 +1065,7 @@ EXPORT_SYMBOL_GPL(bsg_register_queue);
 
 static struct cdev bsg_cdev;
 
-static char *bsg_devnode(struct device *dev, mode_t *mode)
+static char *bsg_devnode(struct device *dev, umode_t *mode)
 {
 	return kasprintf(GFP_KERNEL, "bsg/%s", dev_name(dev));
 }

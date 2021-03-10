@@ -46,7 +46,7 @@
 #define K8_NOP5_ATOMIC 0x66,K8_NOP4
 
 /* K7 nops
-   uses eax dependencies (arbitary choice)
+   uses eax dependencies (arbitrary choice)
    1: nop
    2: movl %eax,%eax
    3: leal (,%eax,1),%eax

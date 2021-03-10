@@ -3,6 +3,13 @@
 
 #include <asm-generic/module.h>
 
+#ifdef CONFIG_DWARF_UNWINDER
+struct mod_arch_specific {
+	struct list_head fde_list;
+	struct list_head cie_list;
+};
+#endif
+
 #ifdef CONFIG_CPU_LITTLE_ENDIAN
 # ifdef CONFIG_CPU_SH2
 #  define MODULE_PROC_FAMILY "SH2LE "

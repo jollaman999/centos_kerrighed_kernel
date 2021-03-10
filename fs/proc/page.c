@@ -8,12 +8,14 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/hugetlb.h>
+#include <linux/page_idle.h>
 #include <linux/kernel-page-flags.h>
 #include <asm/uaccess.h>
 #include "internal.h"
 
 #define KPMSIZE sizeof(u64)
 #define KPMMASK (KPMSIZE - 1)
+#define KPMBITS (KPMSIZE * BITS_PER_BYTE)
 
 /* /proc/kpagecount - an array exposing page counts
  *
@@ -40,7 +42,7 @@ static ssize_t kpagecount_read(struct file *file, char __user *buf,
 			ppage = pfn_to_page(pfn);
 		else
 			ppage = NULL;
-		if (!ppage)
+		if (!ppage || PageSlab(ppage))
 			pcount = 0;
 		else
 			pcount = page_mapcount(ppage);
@@ -53,6 +55,8 @@ static ssize_t kpagecount_read(struct file *file, char __user *buf,
 		pfn++;
 		out++;
 		count -= KPMSIZE;
+
+		cond_resched();
 	}
 
 	*ppos += (char __user *)out - buf;
@@ -115,16 +119,33 @@ u64 stable_page_flags(struct page *page)
 		u |= 1 << KPF_COMPOUND_TAIL;
 	if (PageHuge(page))
 		u |= 1 << KPF_HUGE;
+	/*
+	 * PageTransCompound can be true for non-huge compound pages (slab
+	 * pages or pages allocated by drivers with __GFP_COMP) because it
+	 * just checks PG_head/PG_tail, so we need to check PageLRU/PageAnon
+	 * to make sure a given page is a thp, not a non-huge compound page.
+	 */
+	else if (PageTransCompound(page) && (PageLRU(compound_head(page)) ||
+					     PageAnon(compound_head(page))))
+		u |= 1 << KPF_THP;
+
+	/*
+	 * Caveats on high order pages: page->_count will only be set
+	 * -1 on the head page; SLUB/SLQB do the same for PG_slab;
+	 * SLOB won't set PG_slab at all on compound pages.
+	 */
+	if (PageBuddy(page))
+		u |= 1 << KPF_BUDDY;
+
+	if (PageOffline(page))
+		u |= 1 << KPF_OFFLINE;
+
+	if (page_is_idle(page))
+		u |= 1 << KPF_IDLE;
 
 	u |= kpf_copy_bit(k, KPF_LOCKED,	PG_locked);
 
-	/*
-	 * Caveats on high order pages:
-	 * PG_buddy will only be set on the head page; SLUB/SLQB do the same
-	 * for PG_slab; SLOB won't set PG_slab at all on compound pages.
-	 */
 	u |= kpf_copy_bit(k, KPF_SLAB,		PG_slab);
-	u |= kpf_copy_bit(k, KPF_BUDDY,		PG_buddy);
 
 	u |= kpf_copy_bit(k, KPF_ERROR,		PG_error);
 	u |= kpf_copy_bit(k, KPF_DIRTY,		PG_dirty);
@@ -146,7 +167,7 @@ u64 stable_page_flags(struct page *page)
 	u |= kpf_copy_bit(k, KPF_HWPOISON,	PG_hwpoison);
 #endif
 
-#ifdef CONFIG_IA64_UNCACHED_ALLOCATOR
+#ifdef CONFIG_ARCH_USES_PG_UNCACHED
 	u |= kpf_copy_bit(k, KPF_UNCACHED,	PG_uncached);
 #endif
 
@@ -188,6 +209,8 @@ static ssize_t kpageflags_read(struct file *file, char __user *buf,
 		pfn++;
 		out++;
 		count -= KPMSIZE;
+
+		cond_resched();
 	}
 
 	*ppos += (char __user *)out - buf;

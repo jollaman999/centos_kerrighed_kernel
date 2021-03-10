@@ -20,9 +20,6 @@
 #include <asm/page.h>
 #include <asm/ppc_asm.h>
 
-#define STACKFRAMESIZE	256
-#define STK_REG(i)	(112 + ((i)-14)*8)
-
 _GLOBAL(copypage_power7)
 	/*
 	 * We prefetch both the source and destination using enhanced touch
@@ -31,13 +28,14 @@ _GLOBAL(copypage_power7)
 	 * aligned we don't need to clear the bottom 7 bits of either
 	 * address.
 	 */
-	ori	r9,r3,1		/* stream=1 */
+	ori	r9,r3,1		/* stream=1 => to */
 
 #ifdef CONFIG_PPC_64K_PAGES
-	lis	r7,0x0E01	/* depth=7, units=512 */
+	lis	r7,0x0E01	/* depth=7
+				 * units/cachelines=512 */
 #else
 	lis	r7,0x0E00	/* depth=7 */
-	ori	r7,r7,0x1000	/* units=32 */
+	ori	r7,r7,0x1000	/* units/cachelines=32 */
 #endif
 	ori	r10,r7,1	/* stream=1 */
 
@@ -46,25 +44,27 @@ _GLOBAL(copypage_power7)
 
 .machine push
 .machine "power4"
-	dcbt	r0,r4,0b01000
-	dcbt	r0,r7,0b01010
-	dcbtst	r0,r9,0b01000
-	dcbtst	r0,r10,0b01010
+	/* setup read stream 0  */
+	dcbt	r0,r4,0b01000  	/* addr from */
+	dcbt	r0,r7,0b01010   /* length and depth from */
+	/* setup write stream 1 */
+	dcbtst	r0,r9,0b01000   /* addr to */
+	dcbtst	r0,r10,0b01010  /* length and depth to */
 	eieio
-	dcbt	r0,r8,0b01010	/* GO */
+	dcbt	r0,r8,0b01010	/* all streams GO */
 .machine pop
 
 #ifdef CONFIG_ALTIVEC
 	mflr	r0
-	std	r3,48(r1)
-	std	r4,56(r1)
+	std	r3,-STACKFRAMESIZE+STK_REG(R31)(r1)
+	std	r4,-STACKFRAMESIZE+STK_REG(R30)(r1)
 	std	r0,16(r1)
 	stdu	r1,-STACKFRAMESIZE(r1)
-	bl	.enter_vmx_copy
+	bl	enter_vmx_copy
 	cmpwi	r3,0
 	ld	r0,STACKFRAMESIZE+16(r1)
-	ld	r3,STACKFRAMESIZE+48(r1)
-	ld	r4,STACKFRAMESIZE+56(r1)
+	ld	r3,STK_REG(R31)(r1)
+	ld	r4,STK_REG(R30)(r1)
 	mtlr	r0
 
 	li	r0,(PAGE_SIZE/128)
@@ -103,7 +103,7 @@ _GLOBAL(copypage_power7)
 	addi	r3,r3,128
 	bdnz	1b
 
-	b	.exit_vmx_copy		/* tail call optimise */
+	b	exit_vmx_copy		/* tail call optimise */
 
 #else
 	li	r0,(PAGE_SIZE/128)
@@ -113,13 +113,13 @@ _GLOBAL(copypage_power7)
 #endif
 
 .Lnonvmx_copy:
-	std	r14,STK_REG(r14)(r1)
-	std	r15,STK_REG(r15)(r1)
-	std	r16,STK_REG(r16)(r1)
-	std	r17,STK_REG(r17)(r1)
-	std	r18,STK_REG(r18)(r1)
-	std	r19,STK_REG(r19)(r1)
-	std	r20,STK_REG(r20)(r1)
+	std	r14,STK_REG(R14)(r1)
+	std	r15,STK_REG(R15)(r1)
+	std	r16,STK_REG(R16)(r1)
+	std	r17,STK_REG(R17)(r1)
+	std	r18,STK_REG(R18)(r1)
+	std	r19,STK_REG(R19)(r1)
+	std	r20,STK_REG(R20)(r1)
 
 1:	ld	r0,0(r4)
 	ld	r5,8(r4)
@@ -157,12 +157,12 @@ _GLOBAL(copypage_power7)
 	addi	r3,r3,128
 	bdnz	1b
 
-	ld	r14,STK_REG(r14)(r1)
-	ld	r15,STK_REG(r15)(r1)
-	ld	r16,STK_REG(r16)(r1)
-	ld	r17,STK_REG(r17)(r1)
-	ld	r18,STK_REG(r18)(r1)
-	ld	r19,STK_REG(r19)(r1)
-	ld	r20,STK_REG(r20)(r1)
+	ld	r14,STK_REG(R14)(r1)
+	ld	r15,STK_REG(R15)(r1)
+	ld	r16,STK_REG(R16)(r1)
+	ld	r17,STK_REG(R17)(r1)
+	ld	r18,STK_REG(R18)(r1)
+	ld	r19,STK_REG(R19)(r1)
+	ld	r20,STK_REG(R20)(r1)
 	addi	r1,r1,STACKFRAMESIZE
 	blr

@@ -1,6 +1,7 @@
 #ifndef __PERF_THREAD_H
 #define __PERF_THREAD_H
 
+#include <linux/refcount.h>
 #include <linux/rbtree.h>
 #include <linux/list.h>
 #include <unistd.h>
@@ -8,8 +9,10 @@
 #include "symbol.h"
 #include <strlist.h>
 #include <intlist.h>
+#include "rwsem.h"
 
 struct thread_stack;
+struct unwind_libunwind_ops;
 
 struct thread {
 	union {
@@ -21,16 +24,22 @@ struct thread {
 	pid_t			tid;
 	pid_t			ppid;
 	int			cpu;
-	int			refcnt;
-	char			shortname[3];
+	refcount_t		refcnt;
 	bool			comm_set;
+	int			comm_len;
 	bool			dead; /* if set thread has exited */
 	struct list_head	comm_list;
-	int			comm_len;
+	struct rw_semaphore	comm_lock;
 	u64			db_id;
 
 	void			*priv;
 	struct thread_stack	*ts;
+#ifdef HAVE_LIBUNWIND_SUPPORT
+	void				*addr_space;
+	struct unwind_libunwind_ops	*unwind_libunwind_ops;
+#endif
+	bool			filter;
+	int			filter_entry_depth;
 };
 
 struct machine;
@@ -64,24 +73,25 @@ static inline int thread__set_comm(struct thread *thread, const char *comm,
 	return __thread__set_comm(thread, comm, timestamp, false);
 }
 
+int thread__set_comm_from_proc(struct thread *thread);
+
 int thread__comm_len(struct thread *thread);
 struct comm *thread__comm(const struct thread *thread);
 struct comm *thread__exec_comm(const struct thread *thread);
 const char *thread__comm_str(const struct thread *thread);
-void thread__insert_map(struct thread *thread, struct map *map);
-int thread__fork(struct thread *thread, struct thread *parent, u64 timestamp);
+int thread__insert_map(struct thread *thread, struct map *map);
+int thread__fork(struct thread *thread, struct thread *parent, u64 timestamp, bool do_maps_clone);
 size_t thread__fprintf(struct thread *thread, FILE *fp);
 
-void thread__find_addr_map(struct thread *thread,
-			   u8 cpumode, enum map_type type, u64 addr,
-			   struct addr_location *al);
+struct thread *thread__main_thread(struct machine *machine, struct thread *thread);
 
-void thread__find_addr_location(struct thread *thread,
-				u8 cpumode, enum map_type type, u64 addr,
-				struct addr_location *al);
+struct map *thread__find_map(struct thread *thread, u8 cpumode, u64 addr,
+			     struct addr_location *al);
 
-void thread__find_cpumode_addr_location(struct thread *thread,
-					enum map_type type, u64 addr,
+struct symbol *thread__find_symbol(struct thread *thread, u8 cpumode,
+				   u64 addr, struct addr_location *al);
+
+void thread__find_cpumode_addr_location(struct thread *thread, u64 addr,
 					struct addr_location *al);
 
 static inline void *thread__priv(struct thread *thread)

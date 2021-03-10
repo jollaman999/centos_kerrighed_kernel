@@ -6,12 +6,11 @@
 
 #include <linux/syscalls.h>
 #include <linux/mm.h>
-#include <linux/smp_lock.h>
 #include <linux/capability.h>
 #include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/security.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/uaccess.h>
 #include <linux/writeback.h>
 #include <linux/buffer_head.h>
@@ -29,7 +28,6 @@
  * @arg:	command-specific argument for ioctl
  *
  * Invokes filesystem specific ->unlocked_ioctl, if one exists; otherwise
- * invokes filesystem specific ->ioctl method.  If neither method exists,
  * returns -ENOTTY.
  *
  * Returns 0 on success, -errno on error.
@@ -39,21 +37,12 @@ static long vfs_ioctl(struct file *filp, unsigned int cmd,
 {
 	int error = -ENOTTY;
 
-	if (!filp->f_op)
+	if (!filp->f_op || !filp->f_op->unlocked_ioctl)
 		goto out;
 
-	if (filp->f_op->unlocked_ioctl) {
-		error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
-		if (error == -ENOIOCTLCMD)
-			error = -EINVAL;
-		goto out;
-	} else if (filp->f_op->ioctl) {
-		lock_kernel();
-		error = filp->f_op->ioctl(filp->f_path.dentry->d_inode,
-					  filp, cmd, arg);
-		unlock_kernel();
-	}
-
+	error = filp->f_op->unlocked_ioctl(filp, cmd, arg);
+	if (error == -ENOIOCTLCMD)
+		error = -ENOTTY;
  out:
 	return error;
 }
@@ -97,7 +86,7 @@ int fiemap_fill_next_extent(struct fiemap_extent_info *fieinfo, u64 logical,
 			    u64 phys, u64 len, u32 flags)
 {
 	struct fiemap_extent extent;
-	struct fiemap_extent *dest = fieinfo->fi_extents_start;
+	struct fiemap_extent __user *dest = fieinfo->fi_extents_start;
 
 	/* only count the extents */
 	if (fieinfo->fi_extents_max == 0) {
@@ -184,8 +173,9 @@ static int fiemap_check_ranges(struct super_block *sb,
 static int ioctl_fiemap(struct file *filp, unsigned long arg)
 {
 	struct fiemap fiemap;
+	struct fiemap __user *ufiemap = (struct fiemap __user *) arg;
 	struct fiemap_extent_info fieinfo = { 0, };
-	struct inode *inode = filp->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 	struct super_block *sb = inode->i_sb;
 	u64 len;
 	int error;
@@ -193,8 +183,7 @@ static int ioctl_fiemap(struct file *filp, unsigned long arg)
 	if (!inode->i_op->fiemap)
 		return -EOPNOTSUPP;
 
-	if (copy_from_user(&fiemap, (struct fiemap __user *)arg,
-			   sizeof(struct fiemap)))
+	if (copy_from_user(&fiemap, ufiemap, sizeof(fiemap)))
 		return -EFAULT;
 
 	if (fiemap.fm_extent_count > FIEMAP_MAX_EXTENTS)
@@ -207,7 +196,7 @@ static int ioctl_fiemap(struct file *filp, unsigned long arg)
 
 	fieinfo.fi_flags = fiemap.fm_flags;
 	fieinfo.fi_extents_max = fiemap.fm_extent_count;
-	fieinfo.fi_extents_start = (struct fiemap_extent *)(arg + sizeof(fiemap));
+	fieinfo.fi_extents_start = ufiemap->fm_extents;
 
 	if (fiemap.fm_extent_count != 0 &&
 	    !access_ok(VERIFY_WRITE, fieinfo.fi_extents_start,
@@ -220,10 +209,37 @@ static int ioctl_fiemap(struct file *filp, unsigned long arg)
 	error = inode->i_op->fiemap(inode, &fieinfo, fiemap.fm_start, len);
 	fiemap.fm_flags = fieinfo.fi_flags;
 	fiemap.fm_mapped_extents = fieinfo.fi_extents_mapped;
-	if (copy_to_user((char *)arg, &fiemap, sizeof(fiemap)))
+	if (copy_to_user(ufiemap, &fiemap, sizeof(fiemap)))
 		error = -EFAULT;
 
 	return error;
+}
+
+static long ioctl_file_clone(struct file *dst_file, unsigned long srcfd,
+			     u64 off, u64 olen, u64 destoff)
+{
+	struct fd src_file = fdget(srcfd);
+	int ret;
+
+	if (!src_file.file)
+		return -EBADF;
+	ret = -EXDEV;
+	if (src_file.file->f_path.mnt != dst_file->f_path.mnt)
+		goto fdput;
+	ret = vfs_clone_file_range(src_file.file, off, dst_file, destoff, olen);
+fdput:
+	fdput(src_file);
+	return ret;
+}
+
+static long ioctl_file_clone_range(struct file *file, void __user *argp)
+{
+	struct file_clone_range args;
+
+	if (copy_from_user(&args, argp, sizeof(args)))
+		return -EFAULT;
+	return ioctl_file_clone(file, args.src_fd, args.src_offset,
+				args.src_length, args.dest_offset);
 }
 
 #ifdef CONFIG_BLOCK
@@ -435,7 +451,7 @@ EXPORT_SYMBOL(generic_block_fiemap);
  */
 int ioctl_preallocate(struct file *filp, void __user *argp)
 {
-	struct inode *inode = filp->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 	struct space_resv sr;
 
 	if (copy_from_user(&sr, argp, sizeof(sr)))
@@ -454,13 +470,13 @@ int ioctl_preallocate(struct file *filp, void __user *argp)
 		return -EINVAL;
 	}
 
-	return do_fallocate(filp, FALLOC_FL_KEEP_SIZE, sr.l_start, sr.l_len);
+	return vfs_fallocate(filp, FALLOC_FL_KEEP_SIZE, sr.l_start, sr.l_len);
 }
 
 static int file_ioctl(struct file *filp, unsigned int cmd,
 		unsigned long arg)
 {
-	struct inode *inode = filp->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 	int __user *p = (int __user *)arg;
 
 	switch (cmd) {
@@ -523,39 +539,28 @@ static int ioctl_fioasync(unsigned int fd, struct file *filp,
 
 static int ioctl_fsfreeze(struct file *filp)
 {
-	struct super_block *sb = filp->f_path.dentry->d_inode->i_sb;
+	struct super_block *sb = file_inode(filp)->i_sb;
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
 
 	/* If filesystem doesn't support freeze feature, return. */
 	if (sb->s_op->freeze_fs == NULL)
 		return -EOPNOTSUPP;
 
-	/* If a blockdevice-backed filesystem isn't specified, return. */
-	if (sb->s_bdev == NULL)
-		return -EINVAL;
-
 	/* Freeze */
-	sb = freeze_bdev(sb->s_bdev);
-	if (IS_ERR(sb))
-		return PTR_ERR(sb);
-	return 0;
+	return freeze_super(sb);
 }
 
 static int ioctl_fsthaw(struct file *filp)
 {
-	struct super_block *sb = filp->f_path.dentry->d_inode->i_sb;
+	struct super_block *sb = file_inode(filp)->i_sb;
 
-	if (!capable(CAP_SYS_ADMIN))
+	if (!ns_capable(sb->s_user_ns, CAP_SYS_ADMIN))
 		return -EPERM;
 
-	/* If a blockdevice-backed filesystem isn't specified, return EINVAL. */
-	if (sb->s_bdev == NULL)
-		return -EINVAL;
-
 	/* Thaw */
-	return thaw_bdev(sb->s_bdev, sb);
+	return thaw_super(sb);
 }
 
 /*
@@ -570,6 +575,7 @@ int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
 {
 	int error = 0;
 	int __user *argp = (int __user *)arg;
+	struct inode *inode = file_inode(filp);
 
 	switch (cmd) {
 	case FIOCLEX:
@@ -589,13 +595,11 @@ int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
 		break;
 
 	case FIOQSIZE:
-		if (S_ISDIR(filp->f_path.dentry->d_inode->i_mode) ||
-		    S_ISREG(filp->f_path.dentry->d_inode->i_mode) ||
-		    S_ISLNK(filp->f_path.dentry->d_inode->i_mode)) {
-			loff_t res =
-				inode_get_bytes(filp->f_path.dentry->d_inode);
-			error = copy_to_user((loff_t __user *)arg, &res,
-					     sizeof(res)) ? -EFAULT : 0;
+		if (S_ISDIR(inode->i_mode) || S_ISREG(inode->i_mode) ||
+		    S_ISLNK(inode->i_mode)) {
+			loff_t res = inode_get_bytes(inode);
+			error = copy_to_user(argp, &res, sizeof(res)) ?
+					-EFAULT : 0;
 		} else
 			error = -ENOTTY;
 		break;
@@ -612,14 +616,16 @@ int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
 		return ioctl_fiemap(filp, arg);
 
 	case FIGETBSZ:
-	{
-		struct inode *inode = filp->f_path.dentry->d_inode;
-		int __user *p = (int __user *)arg;
-		return put_user(inode->i_sb->s_blocksize, p);
-	}
+		return put_user(inode->i_sb->s_blocksize, argp);
+
+	case FICLONE:
+		return ioctl_file_clone(filp, arg, 0, 0, 0);
+
+	case FICLONERANGE:
+		return ioctl_file_clone_range(filp, argp);
 
 	default:
-		if (S_ISREG(filp->f_path.dentry->d_inode->i_mode))
+		if (S_ISREG(inode->i_mode))
 			error = file_ioctl(filp, cmd, arg);
 		else
 			error = vfs_ioctl(filp, cmd, arg);
@@ -630,21 +636,14 @@ int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
 
 SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
 {
-	struct file *filp;
-	int error = -EBADF;
-	int fput_needed;
+	int error;
+	struct fd f = fdget(fd);
 
-	filp = fget_light(fd, &fput_needed);
-	if (!filp)
-		goto out;
-
-	error = security_file_ioctl(filp, cmd, arg);
-	if (error)
-		goto out_fput;
-
-	error = do_vfs_ioctl(filp, fd, cmd, arg);
- out_fput:
-	fput_light(filp, fput_needed);
- out:
+	if (!f.file)
+		return -EBADF;
+	error = security_file_ioctl(f.file, cmd, arg);
+	if (!error)
+		error = do_vfs_ioctl(f.file, fd, cmd, arg);
+	fdput(f);
 	return error;
 }

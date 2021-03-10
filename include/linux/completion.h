@@ -10,7 +10,7 @@
 
 #include <linux/wait.h>
 
-/**
+/*
  * struct completion - structure used to maintain state for a "completion"
  *
  * This is the opaque structure used to maintain the state for a "completion".
@@ -34,7 +34,7 @@ struct completion {
 	({ init_completion(&work); work; })
 
 /**
- * DECLARE_COMPLETION: - declare and initialize a completion structure
+ * DECLARE_COMPLETION - declare and initialize a completion structure
  * @work:  identifier for the completion structure
  *
  * This macro declares and initializes a completion structure. Generally used
@@ -50,7 +50,7 @@ struct completion {
  * are on the kernel stack:
  */
 /**
- * DECLARE_COMPLETION_ONSTACK: - declare and initialize a completion structure
+ * DECLARE_COMPLETION_ONSTACK - declare and initialize a completion structure
  * @work:  identifier for the completion structure
  *
  * This macro declares and initializes a completion structure on the kernel
@@ -89,14 +89,17 @@ static inline void reinit_completion(struct completion *x)
 }
 
 extern void wait_for_completion(struct completion *);
+extern void wait_for_completion_io(struct completion *);
 extern int wait_for_completion_interruptible(struct completion *x);
 extern int wait_for_completion_killable(struct completion *x);
 extern unsigned long wait_for_completion_timeout(struct completion *x,
 						   unsigned long timeout);
-extern unsigned long wait_for_completion_interruptible_timeout(
-			struct completion *x, unsigned long timeout);
-extern unsigned long wait_for_completion_killable_timeout(
-			struct completion *x, unsigned long timeout);
+extern unsigned long wait_for_completion_io_timeout(struct completion *x,
+						    unsigned long timeout);
+extern long wait_for_completion_interruptible_timeout(
+	struct completion *x, unsigned long timeout);
+extern long wait_for_completion_killable_timeout(
+	struct completion *x, unsigned long timeout);
 extern bool try_wait_for_completion(struct completion *x);
 extern bool completion_done(struct completion *x);
 
@@ -104,7 +107,7 @@ extern void complete(struct completion *);
 extern void complete_all(struct completion *);
 
 /**
- * INIT_COMPLETION: - reinitialize a completion structure
+ * INIT_COMPLETION - reinitialize a completion structure
  * @x:  completion structure to be reinitialized
  *
  * This macro should be used to reinitialize a completion structure so it can

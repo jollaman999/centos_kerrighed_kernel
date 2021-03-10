@@ -32,13 +32,13 @@ MODULE_AUTHOR("Open-FCoE.org");
 MODULE_DESCRIPTION("FIP discovery protocol and FCoE transport for FCoE HBAs");
 MODULE_LICENSE("GPL v2");
 
-int fcoe_transport_create(const char *, struct kernel_param *);
-int fcoe_transport_destroy(const char *, struct kernel_param *);
-static int fcoe_transport_show(char *buffer, struct kernel_param *kp);
+static int fcoe_transport_create(const char *, struct kernel_param *);
+static int fcoe_transport_destroy(const char *, struct kernel_param *);
+static int fcoe_transport_show(char *buffer, const struct kernel_param *kp);
 static struct fcoe_transport *fcoe_transport_lookup(struct net_device *device);
 static struct fcoe_transport *fcoe_netdev_map_lookup(struct net_device *device);
-int fcoe_transport_enable(const char *, struct kernel_param *);
-int fcoe_transport_disable(const char *, struct kernel_param *);
+static int fcoe_transport_enable(const char *, struct kernel_param *);
+static int fcoe_transport_disable(const char *, struct kernel_param *);
 static int libfcoe_device_notification(struct notifier_block *notifier,
 				    ulong event, void *ptr);
 
@@ -83,6 +83,41 @@ static struct notifier_block libfcoe_notifier = {
 	.notifier_call = libfcoe_device_notification,
 };
 
+static const struct {
+	u32 fc_port_speed;
+#define SPEED_2000	2000
+#define SPEED_4000	4000
+#define SPEED_8000	8000
+#define SPEED_16000	16000
+#define SPEED_32000	32000
+	u32 eth_port_speed;
+} fcoe_port_speed_mapping[] = {
+	{ FC_PORTSPEED_1GBIT,   SPEED_1000   },
+	{ FC_PORTSPEED_2GBIT,   SPEED_2000   },
+	{ FC_PORTSPEED_4GBIT,   SPEED_4000   },
+	{ FC_PORTSPEED_8GBIT,   SPEED_8000   },
+	{ FC_PORTSPEED_10GBIT,  SPEED_10000  },
+	{ FC_PORTSPEED_16GBIT,  SPEED_16000  },
+	{ FC_PORTSPEED_20GBIT,  SPEED_20000  },
+	{ FC_PORTSPEED_25GBIT,  SPEED_25000  },
+	{ FC_PORTSPEED_32GBIT,  SPEED_32000  },
+	{ FC_PORTSPEED_40GBIT,  SPEED_40000  },
+	{ FC_PORTSPEED_50GBIT,  SPEED_50000  },
+	{ FC_PORTSPEED_100GBIT, SPEED_100000 },
+};
+
+static inline u32 eth2fc_speed(u32 eth_port_speed)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(fcoe_port_speed_mapping); i++) {
+		if (fcoe_port_speed_mapping[i].eth_port_speed == eth_port_speed)
+			return fcoe_port_speed_mapping[i].fc_port_speed;
+	}
+
+	return FC_PORTSPEED_UNKNOWN;
+}
+
 /**
  * fcoe_link_speed_update() - Update the supported and actual link speeds
  * @lport: The local port to update speeds for
@@ -93,52 +128,40 @@ static struct notifier_block libfcoe_notifier = {
 int fcoe_link_speed_update(struct fc_lport *lport)
 {
 	struct net_device *netdev = fcoe_get_netdev(lport);
-	struct ethtool_cmd ecmd = { ETHTOOL_GSET };
+	struct ethtool_link_ksettings ecmd;
 
-	if (!dev_ethtool_get_settings(netdev, &ecmd)) {
+	if (!__ethtool_get_link_ksettings(netdev, &ecmd)) {
 		lport->link_supported_speeds &= ~(FC_PORTSPEED_1GBIT  |
 		                                  FC_PORTSPEED_10GBIT |
 		                                  FC_PORTSPEED_20GBIT |
 		                                  FC_PORTSPEED_40GBIT);
 
-		if (ecmd.supported & (SUPPORTED_1000baseT_Half |
-		                      SUPPORTED_1000baseT_Full |
-		                      SUPPORTED_1000baseKX_Full))
+		if (ecmd.link_modes.supported[0] & (
+			    SUPPORTED_1000baseT_Half |
+			    SUPPORTED_1000baseT_Full |
+			    SUPPORTED_1000baseKX_Full))
 			lport->link_supported_speeds |= FC_PORTSPEED_1GBIT;
 
-		if (ecmd.supported & (SUPPORTED_10000baseT_Full   |
-		                      SUPPORTED_10000baseKX4_Full |
-		                      SUPPORTED_10000baseKR_Full  |
-		                      SUPPORTED_10000baseR_FEC))
+		if (ecmd.link_modes.supported[0] & (
+			    SUPPORTED_10000baseT_Full   |
+			    SUPPORTED_10000baseKX4_Full |
+			    SUPPORTED_10000baseKR_Full  |
+			    SUPPORTED_10000baseR_FEC))
 			lport->link_supported_speeds |= FC_PORTSPEED_10GBIT;
 
-		if (ecmd.supported & (SUPPORTED_20000baseMLD2_Full |
-		                      SUPPORTED_20000baseKR2_Full))
+		if (ecmd.link_modes.supported[0] & (
+			    SUPPORTED_20000baseMLD2_Full |
+			    SUPPORTED_20000baseKR2_Full))
 			lport->link_supported_speeds |= FC_PORTSPEED_20GBIT;
 
-		if (ecmd.supported & (SUPPORTED_40000baseKR4_Full |
-		                      SUPPORTED_40000baseCR4_Full |
-		                      SUPPORTED_40000baseSR4_Full |
-		                      SUPPORTED_40000baseLR4_Full))
+		if (ecmd.link_modes.supported[0] & (
+			    SUPPORTED_40000baseKR4_Full |
+			    SUPPORTED_40000baseCR4_Full |
+			    SUPPORTED_40000baseSR4_Full |
+			    SUPPORTED_40000baseLR4_Full))
 			lport->link_supported_speeds |= FC_PORTSPEED_40GBIT;
 
-		switch (ethtool_cmd_speed(&ecmd)) {
-		case SPEED_1000:
-			lport->link_speed = FC_PORTSPEED_1GBIT;
-			break;
-		case SPEED_10000:
-			lport->link_speed = FC_PORTSPEED_10GBIT;
-			break;
-		case 20000:
-			lport->link_speed = FC_PORTSPEED_20GBIT;
-			break;
-		case 40000:
-			lport->link_speed = FC_PORTSPEED_40GBIT;
-			break;
-		default:
-			lport->link_speed = FC_PORTSPEED_UNKNOWN;
-			break;
-		}
+		lport->link_speed = eth2fc_speed(ecmd.base.speed);
 		return 0;
 	}
 	return -1;
@@ -179,7 +202,7 @@ void __fcoe_get_lesb(struct fc_lport *lport,
 	lesb->lesb_vlink_fail = htonl(vlfc);
 	lesb->lesb_miss_fka = htonl(mdac);
 	lesb->lesb_fcs_error =
-			htonl(dev_get_stats64(netdev, &temp)->rx_crc_errors);
+			htonl(dev_get_stats(netdev, &temp)->rx_crc_errors);
 }
 EXPORT_SYMBOL_GPL(__fcoe_get_lesb);
 
@@ -292,12 +315,10 @@ EXPORT_SYMBOL_GPL(fcoe_validate_vport_create);
  */
 int fcoe_get_wwn(struct net_device *netdev, u64 *wwn, int type)
 {
-#if defined(CONFIG_FCOE) || defined(CONFIG_FCOE_MODULE)
 	const struct net_device_ops *ops = netdev->netdev_ops;
 
 	if (ops->ndo_fcoe_get_wwn)
 		return ops->ndo_fcoe_get_wwn(netdev, wwn, type);
-#endif
 	return -EINVAL;
 }
 EXPORT_SYMBOL_GPL(fcoe_get_wwn);
@@ -324,14 +345,13 @@ u32 fcoe_fc_crc(struct fc_frame *fp)
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
 		frag = &skb_shinfo(skb)->frags[i];
 		off = frag->page_offset;
-		len = frag->size;
+		len = skb_frag_size(frag);
 		while (len > 0) {
 			clen = min(len, PAGE_SIZE - (off & ~PAGE_MASK));
 			data = kmap_atomic(
-				skb_frag_page(frag) + (off >> PAGE_SHIFT),
-				KM_SKB_DATA_SOFTIRQ);
+				skb_frag_page(frag) + (off >> PAGE_SHIFT));
 			crc = crc32(crc, data + (off & ~PAGE_MASK), clen);
-			kunmap_atomic(data, KM_SKB_DATA_SOFTIRQ);
+			kunmap_atomic(data);
 			off += clen;
 			len -= clen;
 		}
@@ -597,7 +617,7 @@ out_attach:
 }
 EXPORT_SYMBOL(fcoe_transport_detach);
 
-static int fcoe_transport_show(char *buffer, struct kernel_param *kp)
+static int fcoe_transport_show(char *buffer, const struct kernel_param *kp)
 {
 	int i, j;
 	struct fcoe_transport *ft = NULL;
@@ -617,7 +637,7 @@ static int fcoe_transport_show(char *buffer, struct kernel_param *kp)
 
 static int __init fcoe_transport_init(void)
 {
-	register_netdevice_notifier(&libfcoe_notifier);
+	register_netdevice_notifier_rh(&libfcoe_notifier);
 	return 0;
 }
 
@@ -625,7 +645,7 @@ static int fcoe_transport_exit(void)
 {
 	struct fcoe_transport *ft;
 
-	unregister_netdevice_notifier(&libfcoe_notifier);
+	unregister_netdevice_notifier_rh(&libfcoe_notifier);
 	mutex_lock(&ft_mutex);
 	list_for_each_entry(ft, &fcoe_transports, list)
 		printk(KERN_ERR "FCoE transport %s is still attached!\n",
@@ -734,7 +754,7 @@ static struct net_device *fcoe_if_to_netdev(const char *buffer)
 static int libfcoe_device_notification(struct notifier_block *notifier,
 				    ulong event, void *ptr)
 {
-	struct net_device *netdev = ptr;
+	struct net_device *netdev = netdev_notifier_info_to_dev(ptr);
 
 	switch (event) {
 	case NETDEV_UNREGISTER:
@@ -861,7 +881,7 @@ EXPORT_SYMBOL(fcoe_ctlr_destroy_store);
  *
  * Returns: 0 for success
  */
-int fcoe_transport_create(const char *buffer, struct kernel_param *kp)
+static int fcoe_transport_create(const char *buffer, struct kernel_param *kp)
 {
 	int rc = -ENODEV;
 	struct net_device *netdev = NULL;
@@ -915,7 +935,6 @@ out_nodev:
 	mutex_unlock(&ft_mutex);
 	return rc;
 }
-EXPORT_SYMBOL_GPL(fcoe_transport_create);
 
 /**
  * fcoe_transport_destroy() - Destroy a FCoE interface
@@ -927,7 +946,7 @@ EXPORT_SYMBOL_GPL(fcoe_transport_create);
  *
  * Returns: 0 for success
  */
-int fcoe_transport_destroy(const char *buffer, struct kernel_param *kp)
+static int fcoe_transport_destroy(const char *buffer, struct kernel_param *kp)
 {
 	int rc = -ENODEV;
 	struct net_device *netdev = NULL;
@@ -961,7 +980,6 @@ out_nodev:
 	mutex_unlock(&ft_mutex);
 	return rc;
 }
-EXPORT_SYMBOL_GPL(fcoe_transport_destroy);
 
 /**
  * fcoe_transport_disable() - Disables a FCoE interface
@@ -972,7 +990,7 @@ EXPORT_SYMBOL_GPL(fcoe_transport_destroy);
  *
  * Returns: 0 for success
  */
-int fcoe_transport_disable(const char *buffer, struct kernel_param *kp)
+static int fcoe_transport_disable(const char *buffer, struct kernel_param *kp)
 {
 	int rc = -ENODEV;
 	struct net_device *netdev = NULL;
@@ -996,7 +1014,6 @@ out_nodev:
 	mutex_unlock(&ft_mutex);
 	return rc;
 }
-EXPORT_SYMBOL_GPL(fcoe_transport_disable);
 
 /**
  * fcoe_transport_enable() - Enables a FCoE interface
@@ -1007,7 +1024,7 @@ EXPORT_SYMBOL_GPL(fcoe_transport_disable);
  *
  * Returns: 0 for success
  */
-int fcoe_transport_enable(const char *buffer, struct kernel_param *kp)
+static int fcoe_transport_enable(const char *buffer, struct kernel_param *kp)
 {
 	int rc = -ENODEV;
 	struct net_device *netdev = NULL;
@@ -1031,7 +1048,6 @@ out_nodev:
 	mutex_unlock(&ft_mutex);
 	return rc;
 }
-EXPORT_SYMBOL_GPL(fcoe_transport_enable);
 
 /**
  * libfcoe_init() - Initialization routine for libfcoe.ko

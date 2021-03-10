@@ -52,12 +52,10 @@
 #include <linux/pci.h>
 #include <linux/init.h>
 #include <linux/console.h>
-#include <linux/nospec.h>
 
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/pgtable.h>
-#include <asm/system.h>
 
 #ifdef CONFIG_MTRR
 #include <asm/mtrr.h>
@@ -71,7 +69,7 @@
 /* --------------------------------------------------------------------- */
 
 
-static char *mode_option __devinitdata = NULL;
+static char *mode_option = NULL;
 
 #ifdef MODULE
 
@@ -329,7 +327,9 @@ SavageSetup2DEngine(struct savagefb_par  *par)
 		savage_out32(0x48C18, savage_in32(0x48C18, par) | 0x0C, par);
 		break;
 	case S3_SAVAGE4:
+	case S3_TWISTER:
 	case S3_PROSAVAGE:
+	case S3_PROSAVAGEDDR:
 	case S3_SUPERSAVAGE:
 		/* Disable BCI */
 		savage_out32(0x48C18, savage_in32(0x48C18, par) & 0x3FF0, par);
@@ -386,7 +386,7 @@ SavageSetup2DEngine(struct savagefb_par  *par)
 	BCI_SEND(GlobalBitmapDescriptor);
 
 	/*
-	 * I don't know why, sending this twice fixes the intial black screen,
+	 * I don't know why, sending this twice fixes the initial black screen,
 	 * prevents X from crashing at least in Toshiba laptops with SavageIX.
 	 * --Tony
 	 */
@@ -662,7 +662,7 @@ static void savage_get_default_par(struct savagefb_par *par, struct savage_reg *
 	vga_out8(0x3c4, 0x18, par);
 	reg->SR18 = vga_in8(0x3c5, par);
 
-	/* Save flat panel expansion regsters. */
+	/* Save flat panel expansion registers. */
 	if (par->chip == S3_SAVAGE_MX) {
 		int i;
 
@@ -815,7 +815,7 @@ static void savage_set_default_par(struct savagefb_par *par,
 	vga_out8(0x3c4, 0x18, par);
 	vga_out8(0x3c5, reg->SR18, par);
 
-	/* Save flat panel expansion regsters. */
+	/* Save flat panel expansion registers. */
 	if (par->chip == S3_SAVAGE_MX) {
 		int i;
 
@@ -1212,7 +1212,6 @@ static int savagefb_setcolreg(unsigned        regno,
 
 	if (regno >= NR_PALETTE)
 		return -EINVAL;
-	regno = array_index_nospec(regno, NR_PALETTE);
 
 	par->palette[regno].red    = red;
 	par->palette[regno].green  = green;
@@ -1229,33 +1228,27 @@ static int savagefb_setcolreg(unsigned        regno,
 		break;
 
 	case 16:
-		if (regno < 16) {
-			regno = array_index_nospec(regno, 16);
+		if (regno < 16)
 			((u32 *)info->pseudo_palette)[regno] =
 				((red   & 0xf800)      ) |
 				((green & 0xfc00) >>  5) |
 				((blue  & 0xf800) >> 11);
-		}
 		break;
 
 	case 24:
-		if (regno < 16) {
-			regno = array_index_nospec(regno, 16);
+		if (regno < 16)
 			((u32 *)info->pseudo_palette)[regno] =
 				((red    & 0xff00) <<  8) |
 				((green  & 0xff00)      ) |
 				((blue   & 0xff00) >>  8);
-		}
 		break;
 	case 32:
-		if (regno < 16) {
-			regno = array_index_nospec(regno, 16);
+		if (regno < 16)
 			((u32 *)info->pseudo_palette)[regno] =
 				((transp & 0xff00) << 16) |
 				((red    & 0xff00) <<  8) |
 				((green  & 0xff00)      ) |
 				((blue   & 0xff00) >>  8);
-		}
 		break;
 
 	default:
@@ -1325,7 +1318,7 @@ static void savagefb_set_par_int(struct savagefb_par  *par, struct savage_reg *r
 	vga_out8(0x3c4, 0x15, par);
 	vga_out8(0x3c5, reg->SR15, par);
 
-	/* Restore flat panel expansion regsters. */
+	/* Restore flat panel expansion registers. */
 	if (par->chip == S3_SAVAGE_MX) {
 		int i;
 
@@ -1358,7 +1351,7 @@ static void savagefb_set_par_int(struct savagefb_par  *par, struct savage_reg *r
 	/* following part not present in X11 driver */
 	cr67 = vga_in8(0x3d5, par) & 0xf;
 	vga_out8(0x3d5, 0x50 | cr67, par);
-	udelay(10000);
+	mdelay(10);
 	vga_out8(0x3d4, 0x67, par);
 	/* end of part */
 	vga_out8(0x3d5, reg->CR67 & ~0x0c, par);
@@ -1483,15 +1476,9 @@ static void savagefb_set_par_int(struct savagefb_par  *par, struct savage_reg *r
 	vgaHWProtect(par, 0);
 }
 
-static void savagefb_update_start(struct savagefb_par      *par,
-				  struct fb_var_screeninfo *var)
+static void savagefb_update_start(struct savagefb_par *par, int base)
 {
-	int base;
-
-	base = ((var->yoffset * var->xres_virtual + (var->xoffset & ~1))
-		* ((var->bits_per_pixel+7) / 8)) >> 2;
-
-	/* now program the start address registers */
+	/* program the start address registers */
 	vga_out16(0x3d4, (base & 0x00ff00) | 0x0c, par);
 	vga_out16(0x3d4, ((base & 0x00ff) << 8) | 0x0d, par);
 	vga_out8(0x3d4, 0x69, par);
@@ -1556,8 +1543,12 @@ static int savagefb_pan_display(struct fb_var_screeninfo *var,
 				struct fb_info           *info)
 {
 	struct savagefb_par *par = info->par;
+	int base;
 
-	savagefb_update_start(par, var);
+	base = (var->yoffset * info->fix.line_length
+	     + (var->xoffset & ~1) * ((info->var.bits_per_pixel+7) / 8)) >> 2;
+
+	savagefb_update_start(par, base);
 	return 0;
 }
 
@@ -1673,7 +1664,7 @@ static struct fb_ops savagefb_ops = {
 
 /* --------------------------------------------------------------------- */
 
-static struct fb_var_screeninfo __devinitdata savagefb_var800x600x8 = {
+static struct fb_var_screeninfo savagefb_var800x600x8 = {
 	.accel_flags =	FB_ACCELF_TEXT,
 	.xres =		800,
 	.yres =		600,
@@ -1724,7 +1715,7 @@ static void savage_disable_mmio(struct savagefb_par *par)
 }
 
 
-static int __devinit savage_map_mmio(struct fb_info *info)
+static int savage_map_mmio(struct fb_info *info)
 {
 	struct savagefb_par *par = info->par;
 	DBG("savage_map_mmio");
@@ -1770,8 +1761,7 @@ static void savage_unmap_mmio(struct fb_info *info)
 	}
 }
 
-static int __devinit savage_map_video(struct fb_info *info,
-				      int video_len)
+static int savage_map_video(struct fb_info *info, int video_len)
 {
 	struct savagefb_par *par = info->par;
 	int resource;
@@ -1894,6 +1884,8 @@ static int savage_init_hw(struct savagefb_par *par)
 		break;
 
 	case S3_PROSAVAGE:
+	case S3_PROSAVAGEDDR:
+	case S3_TWISTER:
 		videoRam = RamSavageNB[(config1 & 0xE0) >> 5] * 1024;
 		break;
 
@@ -1911,11 +1903,11 @@ static int savage_init_hw(struct savagefb_par *par)
 	vga_out8(0x3d4, 0x66, par);
 	cr66 = vga_in8(0x3d5, par);
 	vga_out8(0x3d5, cr66 | 0x02, par);
-	udelay(10000);
+	mdelay(10);
 
 	vga_out8(0x3d4, 0x66, par);
 	vga_out8(0x3d5, cr66 & ~0x02, par);	/* clear reset flag */
-	udelay(10000);
+	mdelay(10);
 
 
 	/*
@@ -1925,11 +1917,11 @@ static int savage_init_hw(struct savagefb_par *par)
 	vga_out8(0x3d4, 0x3f, par);
 	cr3f = vga_in8(0x3d5, par);
 	vga_out8(0x3d5, cr3f | 0x08, par);
-	udelay(10000);
+	mdelay(10);
 
 	vga_out8(0x3d4, 0x3f, par);
 	vga_out8(0x3d5, cr3f & ~0x08, par);	/* clear reset flags */
-	udelay(10000);
+	mdelay(10);
 
 	/* Savage ramdac speeds */
 	par->numClocks = 4;
@@ -1971,7 +1963,8 @@ static int savage_init_hw(struct savagefb_par *par)
 		}
 	}
 
-	if (S3_SAVAGE_MOBILE_SERIES(par->chip) && !par->crtonly)
+	if ((S3_SAVAGE_MOBILE_SERIES(par->chip) ||
+	     S3_MOBILE_TWISTER_SERIES(par->chip)) && !par->crtonly)
 		par->display_type = DISP_LCD;
 	else if (dvi || (par->chip == S3_SAVAGE4 && par->dvi))
 		par->display_type = DISP_DFP;
@@ -2058,9 +2051,8 @@ static int savage_init_hw(struct savagefb_par *par)
 	return videoRambytes;
 }
 
-static int __devinit savage_init_fb_info(struct fb_info *info,
-					 struct pci_dev *dev,
-					 const struct pci_device_id *id)
+static int savage_init_fb_info(struct fb_info *info, struct pci_dev *dev,
+			       const struct pci_device_id *id)
 {
 	struct savagefb_par *par = info->par;
 	int err = 0;
@@ -2119,19 +2111,19 @@ static int __devinit savage_init_fb_info(struct fb_info *info,
 		snprintf(info->fix.id, 16, "ProSavageKM");
 		break;
 	case FB_ACCEL_S3TWISTER_P:
-		par->chip = S3_PROSAVAGE;
+		par->chip = S3_TWISTER;
 		snprintf(info->fix.id, 16, "TwisterP");
 		break;
 	case FB_ACCEL_S3TWISTER_K:
-		par->chip = S3_PROSAVAGE;
+		par->chip = S3_TWISTER;
 		snprintf(info->fix.id, 16, "TwisterK");
 		break;
 	case FB_ACCEL_PROSAVAGE_DDR:
-		par->chip = S3_PROSAVAGE;
+		par->chip = S3_PROSAVAGEDDR;
 		snprintf(info->fix.id, 16, "ProSavageDDR");
 		break;
 	case FB_ACCEL_PROSAVAGE_DDRK:
-		par->chip = S3_PROSAVAGE;
+		par->chip = S3_PROSAVAGEDDR;
 		snprintf(info->fix.id, 16, "ProSavage8");
 		break;
 	}
@@ -2184,8 +2176,7 @@ static int __devinit savage_init_fb_info(struct fb_info *info,
 
 /* --------------------------------------------------------------------- */
 
-static int __devinit savagefb_probe(struct pci_dev* dev,
-				    const struct pci_device_id* id)
+static int savagefb_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct fb_info *info;
 	struct savagefb_par *par;
@@ -2219,7 +2210,7 @@ static int __devinit savagefb_probe(struct pci_dev* dev,
 		goto failed_mmio;
 
 	video_len = savage_init_hw(par);
-	/* FIXME: cant be negative */
+	/* FIXME: can't be negative */
 	if (video_len < 0) {
 		err = video_len;
 		goto failed_mmio;
@@ -2240,6 +2231,22 @@ static int __devinit savagefb_probe(struct pci_dev* dev,
 				 &info->modelist);
 #endif
 	info->var = savagefb_var800x600x8;
+	/* if a panel was detected, default to a CVT mode instead */
+	if (par->SavagePanelWidth) {
+		struct fb_videomode cvt_mode;
+
+		memset(&cvt_mode, 0, sizeof(cvt_mode));
+		cvt_mode.xres = par->SavagePanelWidth;
+		cvt_mode.yres = par->SavagePanelHeight;
+		cvt_mode.refresh = 60;
+		/* FIXME: if we know there is only the panel
+		 * we can enable reduced blanking as well */
+		if (fb_find_mode_cvt(&cvt_mode, 0, 0))
+			printk(KERN_WARNING "No CVT mode found for panel\n");
+		else if (fb_find_mode(&info->var, info, NULL, NULL, 0,
+				      &cvt_mode, 0) != 3)
+			info->var = savagefb_var800x600x8;
+	}
 
 	if (mode_option) {
 		fb_find_mode(&info->var, info, mode_option,
@@ -2256,8 +2263,10 @@ static int __devinit savagefb_probe(struct pci_dev* dev,
 	lpitch = info->var.xres_virtual*((info->var.bits_per_pixel + 7) >> 3);
 	info->var.yres_virtual = info->fix.smem_len/lpitch;
 
-	if (info->var.yres_virtual < info->var.yres)
+	if (info->var.yres_virtual < info->var.yres) {
+		err = -ENOMEM;
 		goto failed;
+	}
 
 #if defined(CONFIG_FB_SAVAGE_ACCEL)
 	/*
@@ -2328,7 +2337,7 @@ static int __devinit savagefb_probe(struct pci_dev* dev,
 	return err;
 }
 
-static void __devexit savagefb_remove(struct pci_dev *dev)
+static void savagefb_remove(struct pci_dev *dev)
 {
 	struct fb_info *info = pci_get_drvdata(dev);
 
@@ -2381,7 +2390,7 @@ static int savagefb_suspend(struct pci_dev *dev, pm_message_t mesg)
 	if (mesg.event == PM_EVENT_FREEZE)
 		return 0;
 
-	acquire_console_sem();
+	console_lock();
 	fb_set_suspend(info, 1);
 
 	if (info->fbops->fb_sync)
@@ -2393,7 +2402,7 @@ static int savagefb_suspend(struct pci_dev *dev, pm_message_t mesg)
 	pci_save_state(dev);
 	pci_disable_device(dev);
 	pci_set_power_state(dev, pci_choose_state(dev, mesg));
-	release_console_sem();
+	console_unlock();
 
 	return 0;
 }
@@ -2417,7 +2426,7 @@ static int savagefb_resume(struct pci_dev* dev)
 		return 0;
 	}
 
-	acquire_console_sem();
+	console_lock();
 
 	pci_set_power_state(dev, PCI_D0);
 	pci_restore_state(dev);
@@ -2431,13 +2440,13 @@ static int savagefb_resume(struct pci_dev* dev)
 	savagefb_set_par(info);
 	fb_set_suspend(info, 0);
 	savagefb_blank(FB_BLANK_UNBLANK, info);
-	release_console_sem();
+	console_unlock();
 
 	return 0;
 }
 
 
-static struct pci_device_id savagefb_devices[] __devinitdata = {
+static struct pci_device_id savagefb_devices[] = {
 	{PCI_VENDOR_ID_S3, PCI_CHIP_SUPSAV_MX128,
 	 PCI_ANY_ID, PCI_ANY_ID, 0, 0, FB_ACCEL_SUPERSAVAGE},
 
@@ -2518,7 +2527,7 @@ static struct pci_driver savagefb_driver = {
 	.probe =    savagefb_probe,
 	.suspend =  savagefb_suspend,
 	.resume =   savagefb_resume,
-	.remove =   __devexit_p(savagefb_remove)
+	.remove =   savagefb_remove,
 };
 
 /* **************************** exit-time only **************************** */

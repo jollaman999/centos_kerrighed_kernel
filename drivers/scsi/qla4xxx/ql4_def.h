@@ -161,14 +161,13 @@
 #define QL4_SESS_RECOVERY_TMO		120	/* iSCSI session */
 						/* recovery timeout */
 
-#define QL4_SCSI_ADAPTER_RESET		1
-#define QL4_SCSI_FIRMWARE_RESET		2
-
 #define LSDW(x) ((u32)((u64)(x)))
 #define MSDW(x) ((u32)((((u64)(x)) >> 16) >> 16))
 
 #define DEV_DB_NON_PERSISTENT	0
 #define DEV_DB_PERSISTENT	1
+
+#define QL4_ISP_REG_DISCONNECT 0xffffffffU
 
 #define COPY_ISID(dst_isid, src_isid) {			\
 	int i, j;					\
@@ -206,9 +205,9 @@
 #define RELOGIN_TOV			18
 #define ISNS_DEREG_TOV			5
 #define HBA_ONLINE_TOV			30
-#define LOGIN_TOV			12
 #define DISABLE_ACB_TOV			30
 #define IP_CONFIG_TOV			30
+#define LOGIN_TOV			12
 #define BOOT_LOGIN_RESP_TOV		60
 
 #define MAX_RESET_HA_RETRIES		2
@@ -272,12 +271,12 @@ struct mrb {
  * Asynchronous Event Queue structure
  */
 struct aen {
-	uint32_t mbox_sts[MBOX_AEN_REG_COUNT];
+        uint32_t mbox_sts[MBOX_AEN_REG_COUNT];
 };
 
 struct ql4_aen_log {
-	int count;
-	struct aen entry[MAX_AEN_ENTRIES];
+        int count;
+        struct aen entry[MAX_AEN_ENTRIES];
 };
 
 /*
@@ -806,11 +805,11 @@ struct scsi_qla_host {
 	uint16_t phy_port_cnt;
 	uint16_t iscsi_pci_func_cnt;
 	uint8_t model_name[16];
+	struct completion disable_acb_comp;
 	struct dma_pool *fw_ddb_dma_pool;
 #define DDB_DMA_BLOCK_SIZE 512
 	uint16_t pri_ddb_idx;
 	uint16_t sec_ddb_idx;
-	struct completion disable_acb_comp;
 	int is_reset;
 	uint16_t temperature;
 

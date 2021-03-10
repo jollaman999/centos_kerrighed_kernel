@@ -69,7 +69,6 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/ioport.h>
-#include <linux/slab.h>
 #include <linux/dma-mapping.h>
 
 #include <asm/io.h>
@@ -417,7 +416,7 @@ static u8 orc_load_firmware(struct orc_host * host)
 	/* Go back and check they match */
 
 	outb(PRGMRST | DOWNLOAD, host->base + ORC_RISCCTL);	/* Reset program count 0 */
-	bios_addr -= 0x1000;	/* Reset the BIOS adddress      */
+	bios_addr -= 0x1000;	/* Reset the BIOS address */
 	for (i = 0, data32_ptr = (u8 *) & data32;	/* Check the code       */
 	     i < 0x1000;	/* Firmware code size = 4K      */
 	     i++, bios_addr++) {
@@ -492,7 +491,7 @@ static void init_alloc_map(struct orc_host * host)
  *	init_orchid		-	initialise the host adapter
  *	@host:host adapter to initialise
  *
- *	Initialise the controller and if neccessary load the firmware.
+ *	Initialise the controller and if necessary load the firmware.
  *
  *	Returns -1 if the initialisation fails.
  */
@@ -912,7 +911,7 @@ static int inia100_build_scb(struct orc_host * host, struct orc_scb * scb, struc
  *	queue the command down to the controller
  */
 
-static int inia100_queue(struct scsi_cmnd * cmd, void (*done) (struct scsi_cmnd *))
+static int inia100_queue_lck(struct scsi_cmnd * cmd, void (*done) (struct scsi_cmnd *))
 {
 	struct orc_scb *scb;
 	struct orc_host *host;		/* Point to Host adapter control block */
@@ -930,6 +929,8 @@ static int inia100_queue(struct scsi_cmnd * cmd, void (*done) (struct scsi_cmnd 
 	orc_exec_scb(host, scb);	/* Start execute SCB            */
 	return 0;
 }
+
+static DEF_SCSI_QCMD(inia100_queue)
 
 /*****************************************************************************
  Function name  : inia100_abort
@@ -1081,8 +1082,8 @@ static struct scsi_host_template inia100_template = {
 	.use_clustering		= ENABLE_CLUSTERING,
 };
 
-static int __devinit inia100_probe_one(struct pci_dev *pdev,
-		const struct pci_device_id *id)
+static int inia100_probe_one(struct pci_dev *pdev,
+			     const struct pci_device_id *id)
 {
 	struct Scsi_Host *shost;
 	struct orc_host *host;
@@ -1196,7 +1197,7 @@ out:
 	return error;
 }
 
-static void __devexit inia100_remove_one(struct pci_dev *pdev)
+static void inia100_remove_one(struct pci_dev *pdev)
 {
 	struct Scsi_Host *shost = pci_get_drvdata(pdev);
 	struct orc_host *host = (struct orc_host *)shost->hostdata;
@@ -1223,7 +1224,7 @@ static struct pci_driver inia100_pci_driver = {
 	.name		= "inia100",
 	.id_table	= inia100_pci_tbl,
 	.probe		= inia100_probe_one,
-	.remove		= __devexit_p(inia100_remove_one),
+	.remove		= inia100_remove_one,
 };
 
 static int __init inia100_init(void)

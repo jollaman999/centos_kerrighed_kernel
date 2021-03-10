@@ -30,54 +30,25 @@
 #ifndef __CONTROL_H__
 #define __CONTROL_H__
 
-#include "ttype.h"
 #include "device.h"
 #include "usbpipe.h"
 
-/*---------------------  Export Definitions -------------------------*/
+#define CONTROLnsRequestOut(Device, Request, Value, Index, Length, Buffer) \
+	PIPEnsControlOut(Device, Request, Value, Index, Length, Buffer)
 
+#define CONTROLnsRequestOutAsyn(Device, Request, Value, Index, Length, Buffer) \
+	PIPEnsControlOutAsyn(Device, Request, Value, Index, Length, Buffer)
 
-#define CONTROLnsRequestOut( Device,Request,Value,Index,Length,Buffer) \
-        PIPEnsControlOut( Device,Request,Value,Index,Length,Buffer)
+#define CONTROLnsRequestIn(Device, Request, Value, Index, Length, Buffer) \
+	PIPEnsControlIn(Device, Request, Value, Index, Length, Buffer)
 
-#define CONTROLnsRequestOutAsyn( Device,Request,Value,Index,Length,Buffer) \
-        PIPEnsControlOutAsyn( Device,Request,Value,Index,Length,Buffer)
+void ControlvWriteByte(struct vnt_private *pDevice, u8 reg, u8 reg_off,
+			u8 data);
 
-#define CONTROLnsRequestIn( Device,Request,Value,Index,Length,Buffer) \
-        PIPEnsControlIn( Device,Request,Value,Index,Length,Buffer)
+void ControlvReadByte(struct vnt_private *pDevice, u8 reg, u8 reg_off,
+			u8 *data);
 
+void ControlvMaskByte(struct vnt_private *pDevice, u8 reg_type, u8 reg_off,
+			u8 reg_mask, u8 data);
 
-/*---------------------  Export Classes  ----------------------------*/
-
-/*---------------------  Export Variables  --------------------------*/
-
-/*---------------------  Export Functions  --------------------------*/
-
-void ControlvWriteByte(
-    IN PSDevice pDevice,
-    IN BYTE byRegType,
-    IN BYTE byRegOfs,
-    IN BYTE byData
-    );
-
-
-void ControlvReadByte(
-    IN PSDevice pDevice,
-    IN BYTE byRegType,
-    IN BYTE byRegOfs,
-    IN PBYTE pbyData
-    );
-
-
-void ControlvMaskByte(
-    IN PSDevice pDevice,
-    IN BYTE byRegType,
-    IN BYTE byRegOfs,
-    IN BYTE byMask,
-    IN BYTE byData
-    );
-
-#endif // __RCV_H__
-
-
-
+#endif /* __CONTROL_H__ */

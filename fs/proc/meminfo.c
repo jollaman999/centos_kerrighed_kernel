@@ -1,38 +1,24 @@
 #include <linux/fs.h>
-#include <linux/hugetlb.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/hugetlb.h>
 #include <linux/mman.h>
 #include <linux/mmzone.h>
 #include <linux/proc_fs.h>
+#include <linux/percpu.h>
 #include <linux/quicklist.h>
 #include <linux/seq_file.h>
 #include <linux/swap.h>
 #include <linux/vmstat.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
+#include <linux/vmalloc.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include "internal.h"
 
 void __attribute__((weak)) arch_report_meminfo(struct seq_file *m)
 {
-}
-
-/*
- * RHEL6 bz1032702
- * It was backported from upstream a new entry for /proc/meminfo
- * in order to report an estimate of available memory for starting
- * applications without risking an overcommitment & swapping scenario.
- * In order to keep backward compatibility with legacy 2.6.32 layout,
- * we're making this new entry appearance conditional to explicitly
- * disabling the following sysctl by user.
- */
-unsigned int sysctl_meminfo_legacy_layout __read_mostly = 1;
-int meminfo_legacy_layout_sysctl_handler(ctl_table *table, int write,
-			void __user *buffer, size_t *length, loff_t *ppos)
-{
-        return proc_dointvec(table, write, buffer, length, ppos);
 }
 
 static int meminfo_proc_show(struct seq_file *m, void *v)
@@ -42,10 +28,7 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 	struct vmalloc_info vmi;
 	long cached;
 	long available;
-	unsigned long pagecache;
-	unsigned long wmark_low = 0;
 	unsigned long pages[NR_LRU_LISTS];
-	struct zone *zone;
 	int lru;
 
 /*
@@ -57,7 +40,7 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 	committed = percpu_counter_read_positive(&vm_committed_as);
 
 	cached = global_page_state(NR_FILE_PAGES) -
-			total_swapcache_pages - i.bufferram;
+			total_swapcache_pages() - i.bufferram;
 	if (cached < 0)
 		cached = 0;
 
@@ -66,36 +49,7 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 	for (lru = LRU_BASE; lru < NR_LRU_LISTS; lru++)
 		pages[lru] = global_page_state(NR_LRU_BASE + lru);
 
-	for_each_zone(zone)
-		wmark_low += zone->watermark[WMARK_LOW];
-
-	/*
-	 * Estimate the amount of memory available for userspace allocations,
-	 * without causing swapping.
-	 *
-	 * Free memory cannot be taken below the low watermark, before the
-	 * system starts swapping.
-	 */
-	available = i.freeram - wmark_low;
-
-	/*
-	 * Not all the page cache can be freed, otherwise the system will
-	 * start swapping. Assume at least half of the page cache, or the
-	 * low watermark worth of cache, needs to stay.
-	 */
-	pagecache = pages[LRU_ACTIVE_FILE] + pages[LRU_INACTIVE_FILE];
-	pagecache -= min(pagecache / 2, wmark_low);
-	available += pagecache;
-
-	/*
-	 * Part of the reclaimable swap consists of items that are in use,
-	 * and cannot be freed. Cap this estimate at the low watermark.
-	 */
-	available += global_page_state(NR_SLAB_RECLAIMABLE) -
-		     min(global_page_state(NR_SLAB_RECLAIMABLE) / 2, wmark_low);
-
-	if (available < 0)
-		available = 0;
+	available = si_mem_available();
 
 	/*
 	 * Tagged format, for easy grepping and expansion.
@@ -103,6 +57,7 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 	seq_printf(m,
 		"MemTotal:       %8lu kB\n"
 		"MemFree:        %8lu kB\n"
+		"MemAvailable:   %8lu kB\n"
 		"Buffers:        %8lu kB\n"
 		"Cached:         %8lu kB\n"
 		"SwapCached:     %8lu kB\n"
@@ -146,18 +101,24 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 		"VmallocTotal:   %8lu kB\n"
 		"VmallocUsed:    %8lu kB\n"
 		"VmallocChunk:   %8lu kB\n"
+		"Percpu:         %8lu kB\n"
 #ifdef CONFIG_MEMORY_FAILURE
 		"HardwareCorrupted: %5lu kB\n"
 #endif
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 		"AnonHugePages:  %8lu kB\n"
 #endif
+#ifdef CONFIG_CMA
+		"CmaTotal:       %8lu kB\n"
+		"CmaFree:        %8lu kB\n"
+#endif
 		,
 		K(i.totalram),
 		K(i.freeram),
+		K(available),
 		K(i.bufferram),
 		K(cached),
-		K(total_swapcache_pages),
+		K(total_swapcache_pages()),
 		K(pages[LRU_ACTIVE_ANON]   + pages[LRU_ACTIVE_FILE]),
 		K(pages[LRU_INACTIVE_ANON] + pages[LRU_INACTIVE_FILE]),
 		K(pages[LRU_ACTIVE_ANON]),
@@ -179,12 +140,13 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 		K(i.freeswap),
 		K(global_page_state(NR_FILE_DIRTY)),
 		K(global_page_state(NR_WRITEBACK)),
-		K(global_page_state(NR_ANON_PAGES)
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
+		K(global_page_state(NR_ANON_PAGES)
 		  + global_page_state(NR_ANON_TRANSPARENT_HUGEPAGES) *
-		  HPAGE_PMD_NR
+		  HPAGE_PMD_NR),
+#else
+		K(global_page_state(NR_ANON_PAGES)),
 #endif
-		  ),
 		K(global_page_state(NR_FILE_MAPPED)),
 		K(global_page_state(NR_SHMEM)),
 		K(global_page_state(NR_SLAB_RECLAIMABLE) +
@@ -203,27 +165,24 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 		K(committed),
 		(unsigned long)VMALLOC_TOTAL >> 10,
 		vmi.used >> 10,
-		vmi.largest_chunk >> 10
+		vmi.largest_chunk >> 10,
+		K(pcpu_nr_pages())
 #ifdef CONFIG_MEMORY_FAILURE
-		,atomic_long_read(&num_poisoned_pages) << (PAGE_SHIFT - 10)
+		, atomic_long_read(&num_poisoned_pages) << (PAGE_SHIFT - 10)
 #endif
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
-		,K(global_page_state(NR_ANON_TRANSPARENT_HUGEPAGES) *
+		, K(global_page_state(NR_ANON_TRANSPARENT_HUGEPAGES) *
 		   HPAGE_PMD_NR)
+#endif
+#ifdef CONFIG_CMA
+		, K(totalcma_pages)
+		, K(global_page_state(NR_FREE_CMA_PAGES))
 #endif
 		);
 
 	hugetlb_report_meminfo(m);
 
 	arch_report_meminfo(m);
-
-	/*
-	 * RHEL6 bz1032702
-	 * if backwards compatibility with legacy meminfo interface layout
-	 * is not required, include the new entries at the end of report
-	 */
-	if (!sysctl_meminfo_legacy_layout)
-		seq_printf(m, "MemAvailable:   %8lu kB\n", K(available));
 
 	return 0;
 #undef K

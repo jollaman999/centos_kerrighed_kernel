@@ -20,16 +20,15 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
-#include <linux/init.h>
+#include <linux/slab.h>
 #include <linux/debugfs.h>
 #include <linux/spinlock.h>
 #include <asm/smp.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <asm/firmware.h>
 #include <asm/lppaca.h>
-
-#include "plpar_wrappers.h"
+#include <asm/debug.h>
+#include <asm/plpar_wrappers.h>
 
 struct dtl {
 	struct dtl_entry	*buf;
@@ -39,7 +38,7 @@ struct dtl {
 	u64			last_idx;
 	spinlock_t		lock;
 };
-static DEFINE_PER_CPU(struct dtl, dtl);
+static DEFINE_PER_CPU(struct dtl, cpu_dtl);
 
 /*
  * Dispatch trace log event mask:
@@ -51,12 +50,12 @@ static u8 dtl_event_mask = 0x7;
 
 
 /*
- * Size of per-cpu log buffers. Default is just under 16 pages worth.
+ * Size of per-cpu log buffers. Firmware requires that the buffer does
+ * not cross a 4k boundary.
  */
-static int dtl_buf_entries = (16 * 85);
+static int dtl_buf_entries = N_DISPATCH_LOG;
 
-
-#ifdef CONFIG_VIRT_CPU_ACCOUNTING
+#ifdef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
 struct dtl_ring {
 	u64	write_index;
 	struct dtl_entry *write_ptr;
@@ -86,7 +85,7 @@ static void consume_dtle(struct dtl_entry *dtle, u64 index)
 	barrier();
 
 	/* check for hypervisor ring buffer overflow, ignore this entry if so */
-	if (index + N_DISPATCH_LOG < vpa->dtl_idx)
+	if (index + N_DISPATCH_LOG < be64_to_cpu(vpa->dtl_idx))
 		return;
 
 	++wp;
@@ -112,8 +111,8 @@ static int dtl_start(struct dtl *dtl)
 	dtlr->write_ptr = dtl->buf;
 
 	/* enable event logging */
-	dtlr->saved_dtl_mask = lppaca[dtl->cpu].dtl_enable_mask;
-	lppaca[dtl->cpu].dtl_enable_mask |= dtl_event_mask;
+	dtlr->saved_dtl_mask = lppaca_of(dtl->cpu).dtl_enable_mask;
+	lppaca_of(dtl->cpu).dtl_enable_mask |= dtl_event_mask;
 
 	dtl_consumer = consume_dtle;
 	atomic_inc(&dtl_count);
@@ -130,7 +129,7 @@ static void dtl_stop(struct dtl *dtl)
 	dtlr->buf = NULL;
 
 	/* restore dtl_enable_mask */
-	lppaca[dtl->cpu].dtl_enable_mask = dtlr->saved_dtl_mask;
+	lppaca_of(dtl->cpu).dtl_enable_mask = dtlr->saved_dtl_mask;
 
 	if (atomic_dec_and_test(&dtl_count))
 		dtl_consumer = NULL;
@@ -141,7 +140,7 @@ static u64 dtl_current_index(struct dtl *dtl)
 	return per_cpu(dtl_rings, dtl->cpu).write_index;
 }
 
-#else /* CONFIG_VIRT_CPU_ACCOUNTING */
+#else /* CONFIG_VIRT_CPU_ACCOUNTING_NATIVE */
 
 static int dtl_start(struct dtl *dtl)
 {
@@ -150,7 +149,7 @@ static int dtl_start(struct dtl *dtl)
 
 	/* Register our dtl buffer with the hypervisor. The HV expects the
 	 * buffer size to be passed in the second word of the buffer */
-	((u32 *)dtl->buf)[1] = dtl->buf_entries * sizeof(struct dtl_entry);
+	((u32 *)dtl->buf)[1] = DISPATCH_LOG_BYTES;
 
 	hwcpu = get_hard_smp_processor_id(dtl->cpu);
 	addr = __pa(dtl->buf);
@@ -162,14 +161,14 @@ static int dtl_start(struct dtl *dtl)
 	}
 
 	/* set our initial buffer indices */
-	lppaca[dtl->cpu].dtl_idx = 0;
+	lppaca_of(dtl->cpu).dtl_idx = 0;
 
 	/* ensure that our updates to the lppaca fields have occurred before
 	 * we actually enable the logging */
 	smp_wmb();
 
 	/* enable event logging */
-	lppaca[dtl->cpu].dtl_enable_mask = dtl_event_mask;
+	lppaca_of(dtl->cpu).dtl_enable_mask = dtl_event_mask;
 
 	return 0;
 }
@@ -178,16 +177,16 @@ static void dtl_stop(struct dtl *dtl)
 {
 	int hwcpu = get_hard_smp_processor_id(dtl->cpu);
 
-	lppaca[dtl->cpu].dtl_enable_mask = 0x0;
+	lppaca_of(dtl->cpu).dtl_enable_mask = 0x0;
 
 	unregister_dtl(hwcpu);
 }
 
 static u64 dtl_current_index(struct dtl *dtl)
 {
-	return lppaca[dtl->cpu].dtl_idx;
+	return lppaca_of(dtl->cpu).dtl_idx;
 }
-#endif /* CONFIG_VIRT_CPU_ACCOUNTING */
+#endif /* CONFIG_VIRT_CPU_ACCOUNTING_NATIVE */
 
 static int dtl_enable(struct dtl *dtl)
 {
@@ -195,13 +194,15 @@ static int dtl_enable(struct dtl *dtl)
 	long int rc;
 	struct dtl_entry *buf = NULL;
 
+	if (!dtl_cache)
+		return -ENOMEM;
+
 	/* only allow one reader */
 	if (dtl->buf)
 		return -EBUSY;
 
 	n_entries = dtl_buf_entries;
-	buf = kmalloc_node(n_entries * sizeof(struct dtl_entry),
-			GFP_KERNEL, cpu_to_node(dtl->cpu));
+	buf = kmem_cache_alloc_node(dtl_cache, GFP_KERNEL, cpu_to_node(dtl->cpu));
 	if (!buf) {
 		printk(KERN_WARNING "%s: buffer alloc failed for cpu %d\n",
 				__func__, dtl->cpu);
@@ -222,7 +223,7 @@ static int dtl_enable(struct dtl *dtl)
 	spin_unlock(&dtl->lock);
 
 	if (rc)
-		kfree(buf);
+		kmem_cache_free(dtl_cache, buf);
 	return rc;
 }
 
@@ -230,8 +231,7 @@ static void dtl_disable(struct dtl *dtl)
 {
 	spin_lock(&dtl->lock);
 	dtl_stop(dtl);
-
-	kfree(dtl->buf);
+	kmem_cache_free(dtl_cache, dtl->buf);
 	dtl->buf = NULL;
 	dtl->buf_entries = 0;
 	spin_unlock(&dtl->lock);
@@ -350,6 +350,9 @@ static int dtl_init(void)
 	struct dentry *event_mask_file, *buf_entries_file;
 	int rc, i;
 
+	if (!firmware_has_feature(FW_FEATURE_SPLPAR))
+		return -ENODEV;
+
 	/* set up common debugfs structure */
 
 	rc = -ENOMEM;
@@ -362,7 +365,7 @@ static int dtl_init(void)
 
 	event_mask_file = debugfs_create_x8("dtl_event_mask", 0600,
 				dtl_dir, &dtl_event_mask);
-	buf_entries_file = debugfs_create_u32("dtl_buf_entries", 0600,
+	buf_entries_file = debugfs_create_u32("dtl_buf_entries", 0400,
 				dtl_dir, &dtl_buf_entries);
 
 	if (!event_mask_file || !buf_entries_file) {
@@ -372,7 +375,7 @@ static int dtl_init(void)
 
 	/* set up the per-cpu log structures */
 	for_each_possible_cpu(i) {
-		struct dtl *dtl = &per_cpu(dtl, i);
+		struct dtl *dtl = &per_cpu(cpu_dtl, i);
 		spin_lock_init(&dtl->lock);
 		dtl->cpu = i;
 

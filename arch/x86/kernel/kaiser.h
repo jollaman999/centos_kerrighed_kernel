@@ -7,9 +7,6 @@
 #define KAISER_SWITCH_MASK (1<<PAGE_SHIFT)
 #define KAISER_SWITCH_MASK_PCID (KAISER_SWITCH_MASK | KAISER_SHADOW_PCID_ASID)
 
-/*
- * PCID doesn't work in x86-32.
- */
 .macro ADJUST_KERNEL_CR3 reg:req
 	/* Clear "KAISER bit", point CR3 at kernel pagetables: */
 	andq	$(~KAISER_SWITCH_MASK), \reg
@@ -39,7 +36,6 @@
 	movq    %rax, PER_CPU_VAR(kaiser_scratch)
 	movq	%cr3, %rax
 
-#ifdef CONFIG_X86_64
 	testl   $KAISER_PCP_PCID, PER_CPU_VAR(kaiser_enabled_pcp)
 	jz      .Lkaiser_nopcid_\@
 
@@ -49,7 +45,6 @@
 	jmp      .Lnokaiser_\@
 
 .Lkaiser_nopcid_\@:
-#endif
 	ADJUST_KERNEL_CR3 %rax
 	movq	%rax, %cr3
 	movq	PER_CPU_VAR(kaiser_scratch), %rax
@@ -64,7 +59,6 @@
 	movq    %rax, PER_CPU_VAR(kaiser_scratch)
 	movq	%cr3, %rax
 
-#ifdef CONFIG_X86_64
 	testl   $KAISER_PCP_PCID, PER_CPU_VAR(kaiser_enabled_pcp)
 	jz      .Lkaiser_nopcid_\@
 
@@ -74,7 +68,6 @@
 	jmp      .Lnokaiser_\@
 
 .Lkaiser_nopcid_\@:
-#endif
 	ADJUST_USER_CR3 %rax
 	movq	%rax, %cr3
 	movq	PER_CPU_VAR(kaiser_scratch), %rax
@@ -96,7 +89,6 @@
 	testq	$KAISER_SWITCH_MASK, \scratch_reg
 	jz	.Lnokaiser_\@
 
-#ifdef CONFIG_X86_64
 	testl   $KAISER_PCP_PCID, PER_CPU_VAR(kaiser_enabled_pcp)
 	jz      .Lkaiser_nopcid_\@
 
@@ -104,7 +96,6 @@
 	jmp      .Ldone_\@
 
 .Lkaiser_nopcid_\@:
-#endif
 	ADJUST_KERNEL_CR3 \scratch_reg
 .Ldone_\@:
 	movq	\scratch_reg, %cr3
@@ -119,12 +110,10 @@
 	movq	%cr3, \scratch_reg
 	testq \save_reg, \scratch_reg
 	je .Lnokaiser_\@
-#ifdef CONFIG_X86_64
 	testl   $KAISER_PCP_PCID, PER_CPU_VAR(kaiser_enabled_pcp)
 	jz      .Lkaiser_nopcid_\@
 	bts	$X86_CR3_PCID_NOFLUSH_BIT, \save_reg
 .Lkaiser_nopcid_\@:
-#endif
 	movq	\save_reg, %cr3
 
 .Lnokaiser_\@:

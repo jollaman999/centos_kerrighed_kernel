@@ -89,7 +89,7 @@ static ssize_t mmio_nvram_write(char *buf, size_t count, loff_t *index)
 	return count;
 }
 
-void mmio_nvram_write_val(int addr, unsigned char val)
+static void mmio_nvram_write_val(int addr, unsigned char val)
 {
 	unsigned long flags;
 
@@ -115,6 +115,8 @@ int __init mmio_nvram_init(void)
 	int ret;
 
 	nvram_node = of_find_node_by_type(NULL, "nvram");
+	if (!nvram_node)
+		nvram_node = of_find_compatible_node(NULL, NULL, "nvram");
 	if (!nvram_node) {
 		printk(KERN_WARNING "nvram: no node found in device-tree\n");
 		return -ENODEV;
@@ -127,7 +129,7 @@ int __init mmio_nvram_init(void)
 		goto out;
 	}
 	nvram_addr = r.start;
-	mmio_nvram_len = r.end - r.start + 1;
+	mmio_nvram_len = resource_size(&r);
 	if ( (!mmio_nvram_len) || (!nvram_addr) ) {
 		printk(KERN_WARNING "nvram: address or length is 0\n");
 		ret = -EIO;

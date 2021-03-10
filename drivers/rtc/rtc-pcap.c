@@ -17,6 +17,7 @@
 #include <linux/init.h>
 #include <linux/mfd/ezx-pcap.h>
 #include <linux/rtc.h>
+#include <linux/slab.h>
 #include <linux/platform_device.h>
 
 struct pcap_rtc {
@@ -130,94 +131,69 @@ static int pcap_rtc_alarm_irq_enable(struct device *dev, unsigned int en)
 	return pcap_rtc_irq_enable(dev, PCAP_IRQ_TODA, en);
 }
 
-static int pcap_rtc_update_irq_enable(struct device *dev, unsigned int en)
-{
-	return pcap_rtc_irq_enable(dev, PCAP_IRQ_1HZ, en);
-}
-
 static const struct rtc_class_ops pcap_rtc_ops = {
 	.read_time = pcap_rtc_read_time,
 	.read_alarm = pcap_rtc_read_alarm,
 	.set_alarm = pcap_rtc_set_alarm,
 	.set_mmss = pcap_rtc_set_mmss,
 	.alarm_irq_enable = pcap_rtc_alarm_irq_enable,
-	.update_irq_enable = pcap_rtc_update_irq_enable,
 };
 
-static int __devinit pcap_rtc_probe(struct platform_device *pdev)
+static int __init pcap_rtc_probe(struct platform_device *pdev)
 {
 	struct pcap_rtc *pcap_rtc;
 	int timer_irq, alarm_irq;
 	int err = -ENOMEM;
 
-	pcap_rtc = kmalloc(sizeof(struct pcap_rtc), GFP_KERNEL);
+	pcap_rtc = devm_kzalloc(&pdev->dev, sizeof(struct pcap_rtc),
+				GFP_KERNEL);
 	if (!pcap_rtc)
 		return err;
 
 	pcap_rtc->pcap = dev_get_drvdata(pdev->dev.parent);
 
-	pcap_rtc->rtc = rtc_device_register("pcap", &pdev->dev,
-				  &pcap_rtc_ops, THIS_MODULE);
+	platform_set_drvdata(pdev, pcap_rtc);
+
+	pcap_rtc->rtc = devm_rtc_device_register(&pdev->dev, "pcap",
+					&pcap_rtc_ops, THIS_MODULE);
 	if (IS_ERR(pcap_rtc->rtc)) {
 		err = PTR_ERR(pcap_rtc->rtc);
-		goto fail_rtc;
+		goto fail;
 	}
-
-	platform_set_drvdata(pdev, pcap_rtc);
 
 	timer_irq = pcap_to_irq(pcap_rtc->pcap, PCAP_IRQ_1HZ);
 	alarm_irq = pcap_to_irq(pcap_rtc->pcap, PCAP_IRQ_TODA);
 
-	err = request_irq(timer_irq, pcap_rtc_irq, 0, "RTC Timer", pcap_rtc);
+	err = devm_request_irq(&pdev->dev, timer_irq, pcap_rtc_irq, 0,
+				"RTC Timer", pcap_rtc);
 	if (err)
-		goto fail_timer;
+		goto fail;
 
-	err = request_irq(alarm_irq, pcap_rtc_irq, 0, "RTC Alarm", pcap_rtc);
+	err = devm_request_irq(&pdev->dev, alarm_irq, pcap_rtc_irq, 0,
+				"RTC Alarm", pcap_rtc);
 	if (err)
-		goto fail_alarm;
+		goto fail;
 
 	return 0;
-fail_alarm:
-	free_irq(timer_irq, pcap_rtc);
-fail_timer:
-	rtc_device_unregister(pcap_rtc->rtc);
-fail_rtc:
-	kfree(pcap_rtc);
+fail:
+	platform_set_drvdata(pdev, NULL);
 	return err;
 }
 
-static int __devexit pcap_rtc_remove(struct platform_device *pdev)
+static int __exit pcap_rtc_remove(struct platform_device *pdev)
 {
-	struct pcap_rtc *pcap_rtc = platform_get_drvdata(pdev);
-
-	free_irq(pcap_to_irq(pcap_rtc->pcap, PCAP_IRQ_1HZ), pcap_rtc);
-	free_irq(pcap_to_irq(pcap_rtc->pcap, PCAP_IRQ_TODA), pcap_rtc);
-	rtc_device_unregister(pcap_rtc->rtc);
-	kfree(pcap_rtc);
-
 	return 0;
 }
 
 static struct platform_driver pcap_rtc_driver = {
-	.remove = __devexit_p(pcap_rtc_remove),
+	.remove = __exit_p(pcap_rtc_remove),
 	.driver = {
 		.name  = "pcap-rtc",
 		.owner = THIS_MODULE,
 	},
 };
 
-static int __init rtc_pcap_init(void)
-{
-	return platform_driver_probe(&pcap_rtc_driver, pcap_rtc_probe);
-}
-
-static void __exit rtc_pcap_exit(void)
-{
-	platform_driver_unregister(&pcap_rtc_driver);
-}
-
-module_init(rtc_pcap_init);
-module_exit(rtc_pcap_exit);
+module_platform_driver_probe(pcap_rtc_driver, pcap_rtc_probe);
 
 MODULE_DESCRIPTION("Motorola pcap rtc driver");
 MODULE_AUTHOR("guiming zhuo <gmzhuo@gmail.com>");

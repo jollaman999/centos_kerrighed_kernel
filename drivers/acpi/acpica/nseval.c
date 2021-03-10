@@ -5,7 +5,7 @@
  ******************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -59,11 +59,11 @@ acpi_ns_exec_module_code(union acpi_operand_object *method_obj,
  *
  * FUNCTION:    acpi_ns_evaluate
  *
- * PARAMETERS:  Info            - Evaluation info block, contains:
+ * PARAMETERS:  info            - Evaluation info block, contains:
  *                  prefix_node     - Prefix or Method/Object Node to execute
- *                  Pathname        - Name of method to execute, If NULL, the
+ *                  relative_path   - Name of method to execute, If NULL, the
  *                                    Node is the object to execute
- *                  Parameters      - List of parameters to pass to the method,
+ *                  parameters      - List of parameters to pass to the method,
  *                                    terminated by NULL. Params itself may be
  *                                    NULL if no parameters are being passed.
  *                  return_object   - Where to put method's return value (if
@@ -71,10 +71,7 @@ acpi_ns_exec_module_code(union acpi_operand_object *method_obj,
  *                  parameter_type  - Type of Parameter list
  *                  return_object   - Where to put method's return value (if
  *                                    any). If NULL, no value is returned.
- *                  Flags           - ACPI_IGNORE_RETURN_VALUE to delete return
- *                                  - ACPI_INTERPRETER_ENTERED (RHEL6-ONLY)
- *                                    Interpreter already entered. Don't enter
- *                                    and exit interpreter.
+ *                  flags           - ACPI_IGNORE_RETURN_VALUE to delete return
  *
  * RETURN:      Status
  *
@@ -85,10 +82,9 @@ acpi_ns_exec_module_code(union acpi_operand_object *method_obj,
  *
  ******************************************************************************/
 
-acpi_status acpi_ns_evaluate(struct acpi_evaluate_info * info)
+acpi_status acpi_ns_evaluate(struct acpi_evaluate_info *info)
 {
 	acpi_status status;
-	struct acpi_namespace_node *node;
 
 	ACPI_FUNCTION_TRACE(ns_evaluate);
 
@@ -96,79 +92,138 @@ acpi_status acpi_ns_evaluate(struct acpi_evaluate_info * info)
 		return_ACPI_STATUS(AE_BAD_PARAMETER);
 	}
 
-	/* Initialize the return value to an invalid object */
+	if (!info->node) {
+		/*
+		 * Get the actual namespace node for the target object if we
+		 * need to. Handles these cases:
+		 *
+		 * 1) Null node, valid pathname from root (absolute path)
+		 * 2) Node and valid pathname (path relative to Node)
+		 * 3) Node, Null pathname
+		 */
+		status =
+		    acpi_ns_get_node(info->prefix_node, info->relative_pathname,
+				     ACPI_NS_NO_UPSEARCH, &info->node);
+		if (ACPI_FAILURE(status)) {
+			return_ACPI_STATUS(status);
+		}
+	}
+
+	/*
+	 * For a method alias, we must grab the actual method node so that
+	 * proper scoping context will be established before execution.
+	 */
+	if (acpi_ns_get_type(info->node) == ACPI_TYPE_LOCAL_METHOD_ALIAS) {
+		info->node =
+		    ACPI_CAST_PTR(struct acpi_namespace_node,
+				  info->node->object);
+	}
+
+	/* Complete the info block initialization */
 
 	info->return_object = NULL;
+	info->node_flags = info->node->flags;
+	info->obj_desc = acpi_ns_get_attached_object(info->node);
+
+	ACPI_DEBUG_PRINT((ACPI_DB_NAMES, "%s [%p] Value %p\n",
+			  info->relative_pathname, info->node,
+			  acpi_ns_get_attached_object(info->node)));
+
+	/* Get info if we have a predefined name (_HID, etc.) */
+
+	info->predefined =
+	    acpi_ut_match_predefined_method(info->node->name.ascii);
+
+	/* Get the full pathname to the object, for use in warning messages */
+
+	info->full_pathname = acpi_ns_get_external_pathname(info->node);
+	if (!info->full_pathname) {
+		return_ACPI_STATUS(AE_NO_MEMORY);
+	}
+
+	/* Count the number of arguments being passed in */
+
 	info->param_count = 0;
+	if (info->parameters) {
+		while (info->parameters[info->param_count]) {
+			info->param_count++;
+		}
 
-	/*
-	 * Get the actual namespace node for the target object. Handles these cases:
-	 *
-	 * 1) Null node, Pathname (absolute path)
-	 * 2) Node, Pathname (path relative to Node)
-	 * 3) Node, Null Pathname
-	 */
-	status = acpi_ns_get_node(info->prefix_node, info->pathname,
-				  ACPI_NS_NO_UPSEARCH, &info->resolved_node);
-	if (ACPI_FAILURE(status)) {
-		return_ACPI_STATUS(status);
+		/* Warn on impossible argument count */
+
+		if (info->param_count > ACPI_METHOD_NUM_ARGS) {
+			ACPI_WARN_PREDEFINED((AE_INFO, info->full_pathname,
+					      ACPI_WARN_ALWAYS,
+					      "Excess arguments (%u) - using only %u",
+					      info->param_count,
+					      ACPI_METHOD_NUM_ARGS));
+
+			info->param_count = ACPI_METHOD_NUM_ARGS;
+		}
 	}
 
 	/*
-	 * For a method alias, we must grab the actual method node so that proper
-	 * scoping context will be established before execution.
+	 * For predefined names: Check that the declared argument count
+	 * matches the ACPI spec -- otherwise this is a BIOS error.
 	 */
-	if (acpi_ns_get_type(info->resolved_node) ==
-	    ACPI_TYPE_LOCAL_METHOD_ALIAS) {
-		info->resolved_node =
-		    ACPI_CAST_PTR(struct acpi_namespace_node,
-				  info->resolved_node->object);
-	}
-
-	ACPI_DEBUG_PRINT((ACPI_DB_NAMES, "%s [%p] Value %p\n", info->pathname,
-			  info->resolved_node,
-			  acpi_ns_get_attached_object(info->resolved_node)));
-
-	node = info->resolved_node;
+	acpi_ns_check_acpi_compliance(info->full_pathname, info->node,
+				      info->predefined);
 
 	/*
-	 * Two major cases here:
-	 *
-	 * 1) The object is a control method -- execute it
-	 * 2) The object is not a method -- just return it's current value
+	 * For all names: Check that the incoming argument count for
+	 * this method/object matches the actual ASL/AML definition.
 	 */
-	if (acpi_ns_get_type(info->resolved_node) == ACPI_TYPE_METHOD) {
+	acpi_ns_check_argument_count(info->full_pathname, info->node,
+				     info->param_count, info->predefined);
+
+	/* For predefined names: Typecheck all incoming arguments */
+
+	acpi_ns_check_argument_types(info);
+
+	/*
+	 * Three major evaluation cases:
+	 *
+	 * 1) Object types that cannot be evaluated by definition
+	 * 2) The object is a control method -- execute it
+	 * 3) The object is not a method -- just return it's current value
+	 */
+	switch (acpi_ns_get_type(info->node)) {
+	case ACPI_TYPE_DEVICE:
+	case ACPI_TYPE_EVENT:
+	case ACPI_TYPE_MUTEX:
+	case ACPI_TYPE_REGION:
+	case ACPI_TYPE_THERMAL:
+	case ACPI_TYPE_LOCAL_SCOPE:
 		/*
-		 * 1) Object is a control method - execute it
+		 * 1) Disallow evaluation of certain object types. For these,
+		 *    object evaluation is undefined and not supported.
+		 */
+		ACPI_ERROR((AE_INFO,
+			    "%s: Evaluation of object type [%s] is not supported",
+			    info->full_pathname,
+			    acpi_ut_get_type_name(info->node->type)));
+
+		status = AE_TYPE;
+		goto cleanup;
+
+	case ACPI_TYPE_METHOD:
+		/*
+		 * 2) Object is a control method - execute it
 		 */
 
 		/* Verify that there is a method object associated with this node */
 
-		info->obj_desc =
-		    acpi_ns_get_attached_object(info->resolved_node);
 		if (!info->obj_desc) {
 			ACPI_ERROR((AE_INFO,
-				    "Control method has no attached sub-object"));
-			return_ACPI_STATUS(AE_NULL_OBJECT);
+				    "%s: Method has no attached sub-object",
+				    info->full_pathname));
+			status = AE_NULL_OBJECT;
+			goto cleanup;
 		}
-
-		/* Count the number of arguments being passed to the method */
-
-		if (info->parameters) {
-			while (info->parameters[info->param_count]) {
-				if (info->param_count > ACPI_METHOD_MAX_ARG) {
-					return_ACPI_STATUS(AE_LIMIT);
-				}
-				info->param_count++;
-			}
-		}
-
-
-		ACPI_DUMP_PATHNAME(info->resolved_node, "ACPI: Execute Method",
-				   ACPI_LV_INFO, _COMPONENT);
 
 		ACPI_DEBUG_PRINT((ACPI_DB_EXEC,
-				  "Method at AML address %p Length %X\n",
+				  "**** Execute method [%s] at AML address %p length %X\n",
+				  info->full_pathname,
 				  info->obj_desc->method.aml_start + 1,
 				  info->obj_desc->method.aml_length - 1));
 
@@ -177,114 +232,67 @@ acpi_status acpi_ns_evaluate(struct acpi_evaluate_info * info)
 		 * interpreter locks to ensure that no thread is using the portion of
 		 * the namespace that is being deleted.
 		 *
-		 * Execute the method via the interpreter. The interpreter
-		 * must be locked before calling into the AML parser.
-		 *
-		 * RHEL6-ONLY: To prevent a mutex deadlock, if the caller
-		 * indicates that the interpreter has already been entered,
-		 * don't attempt to enter it again.
+		 * Execute the method via the interpreter. The interpreter is locked
+		 * here before calling into the AML parser
 		 */
-		if (!(info->flags & ACPI_INTERPRETER_ENTERED)) {
-			acpi_ex_enter_interpreter();
-		}
-
+		acpi_ex_enter_interpreter();
 		status = acpi_ps_execute_method(info);
+		acpi_ex_exit_interpreter();
+		break;
 
+	default:
 		/*
-		 * RHEL6-ONLY: Do not exit from the interpreter if we didn't
-		 * enter it.
+		 * 3) All other non-method objects -- get the current object value
 		 */
-		if (!(info->flags & ACPI_INTERPRETER_ENTERED)) {
-			acpi_ex_exit_interpreter();
-		}
-	} else {
-		/*
-		 * 2) Object is not a method, return its current value
-		 *
-		 * Disallow certain object types. For these, "evaluation" is undefined.
-		 */
-		switch (info->resolved_node->type) {
-		case ACPI_TYPE_DEVICE:
-		case ACPI_TYPE_EVENT:
-		case ACPI_TYPE_MUTEX:
-		case ACPI_TYPE_REGION:
-		case ACPI_TYPE_THERMAL:
-		case ACPI_TYPE_LOCAL_SCOPE:
-
-			ACPI_ERROR((AE_INFO,
-				    "[%4.4s] Evaluation of object type [%s] is not supported",
-				    info->resolved_node->name.ascii,
-				    acpi_ut_get_type_name(info->resolved_node->
-							  type)));
-
-			return_ACPI_STATUS(AE_TYPE);
-
-		default:
-			break;
-		}
 
 		/*
-		 * Objects require additional resolution steps (e.g., the Node may be
-		 * a field that must be read, etc.) -- we can't just grab the object
-		 * out of the node.
+		 * Some objects require additional resolution steps (e.g., the Node
+		 * may be a field that must be read, etc.) -- we can't just grab
+		 * the object out of the node.
 		 *
 		 * Use resolve_node_to_value() to get the associated value.
 		 *
 		 * NOTE: we can get away with passing in NULL for a walk state because
-		 * resolved_node is guaranteed to not be a reference to either a method
+		 * the Node is guaranteed to not be a reference to either a method
 		 * local or a method argument (because this interface is never called
 		 * from a running method.)
 		 *
 		 * Even though we do not directly invoke the interpreter for object
-		 * resolution, we must lock it because we could access an opregion.
-		 * The opregion access code assumes that the interpreter is locked.
-		 *
-		 * RHEL6-ONLY: To prevent a mutex deadlock, if the caller
-		 * indicates that the interpreter has already been entered,
-		 * don't attempt to enter it again.
+		 * resolution, we must lock it because we could access an op_region.
+		 * The op_region access code assumes that the interpreter is locked.
 		 */
-		if (!(info->flags & ACPI_INTERPRETER_ENTERED)) {
-			acpi_ex_enter_interpreter();
-		}
+		acpi_ex_enter_interpreter();
 
-		/* Function has a strange interface */
+		/* TBD: resolve_node_to_value has a strange interface, fix */
+
+		info->return_object =
+		    ACPI_CAST_PTR(union acpi_operand_object, info->node);
 
 		status =
-		    acpi_ex_resolve_node_to_value(&info->resolved_node, NULL);
+		    acpi_ex_resolve_node_to_value(ACPI_CAST_INDIRECT_PTR
+						  (struct acpi_namespace_node,
+						   &info->return_object), NULL);
+		acpi_ex_exit_interpreter();
 
-		/*
-		 * RHEL6-ONLY: Do not exit from the interpreter if we didn't
-		 * enter it.
-		 */
-		if (!(info->flags & ACPI_INTERPRETER_ENTERED)) {
-			acpi_ex_exit_interpreter();
+		if (ACPI_FAILURE(status)) {
+			goto cleanup;
 		}
 
-		/*
-		 * If acpi_ex_resolve_node_to_value() succeeded, the return value was placed
-		 * in resolved_node.
-		 */
-		if (ACPI_SUCCESS(status)) {
-			status = AE_CTRL_RETURN_VALUE;
-			info->return_object =
-			    ACPI_CAST_PTR(union acpi_operand_object,
-					  info->resolved_node);
+		ACPI_DEBUG_PRINT((ACPI_DB_NAMES, "Returned object %p [%s]\n",
+				  info->return_object,
+				  acpi_ut_get_object_type_name(info->
+							       return_object)));
 
-			ACPI_DEBUG_PRINT((ACPI_DB_NAMES,
-					  "Returning object %p [%s]\n",
-					  info->return_object,
-					  acpi_ut_get_object_type_name(info->
-								       return_object)));
-		}
+		status = AE_CTRL_RETURN_VALUE;	/* Always has a "return value" */
+		break;
 	}
 
 	/*
-	 * Check input argument count against the ASL-defined count for a method.
-	 * Also check predefined names: argument count and return value against
-	 * the ACPI specification. Some incorrect return value types are repaired.
+	 * For predefined names, check the return value against the ACPI
+	 * specification. Some incorrect return value types are repaired.
 	 */
-	(void)acpi_ns_check_predefined_names(node, info->param_count,
-		status, &info->return_object);
+	(void)acpi_ns_check_return_value(info->node, info, info->param_count,
+					 status, &info->return_object);
 
 	/* Check if there is a return value that must be dealt with */
 
@@ -300,16 +308,27 @@ acpi_status acpi_ns_evaluate(struct acpi_evaluate_info * info)
 		/* Map AE_CTRL_RETURN_VALUE to AE_OK, we are done with it */
 
 		status = AE_OK;
+	} else if (ACPI_FAILURE(status)) {
+
+		/* If return_object exists, delete it */
+
+		if (info->return_object) {
+			acpi_ut_remove_reference(info->return_object);
+			info->return_object = NULL;
+		}
 	}
 
 	ACPI_DEBUG_PRINT((ACPI_DB_NAMES,
 			  "*** Completed evaluation of object %s ***\n",
-			  info->pathname));
+			  info->relative_pathname));
 
+ cleanup:
 	/*
 	 * Namespace was unlocked by the handling acpi_ns* function, so we
-	 * just return
+	 * just free the pathname and return
 	 */
+	ACPI_FREE(info->full_pathname);
+	info->full_pathname = NULL;
 	return_ACPI_STATUS(status);
 }
 
@@ -381,7 +400,7 @@ void acpi_ns_exec_module_code_list(void)
  * FUNCTION:    acpi_ns_exec_module_code
  *
  * PARAMETERS:  method_obj          - Object container for the module-level code
- *              Info                - Info block for method evaluation
+ *              info                - Info block for method evaluation
  *
  * RETURN:      None. Exceptions during method execution are ignored, since
  *              we cannot abort a table load.
@@ -411,13 +430,25 @@ acpi_ns_exec_module_code(union acpi_operand_object *method_obj,
 				    method_obj->method.next_object);
 	type = acpi_ns_get_type(parent_node);
 
+	/*
+	 * Get the region handler and save it in the method object. We may need
+	 * this if an operation region declaration causes a _REG method to be run.
+	 *
+	 * We can't do this in acpi_ps_link_module_code because
+	 * acpi_gbl_root_node->Object is NULL at PASS1.
+	 */
+	if ((type == ACPI_TYPE_DEVICE) && parent_node->object) {
+		method_obj->method.dispatch.handler =
+		    parent_node->object->device.handler;
+	}
+
 	/* Must clear next_object (acpi_ns_attach_object needs the field) */
 
 	method_obj->method.next_object = NULL;
 
 	/* Initialize the evaluation information block */
 
-	ACPI_MEMSET(info, 0, sizeof(struct acpi_evaluate_info));
+	memset(info, 0, sizeof(struct acpi_evaluate_info));
 	info->prefix_node = parent_node;
 
 	/*
@@ -436,24 +467,6 @@ acpi_ns_exec_module_code(union acpi_operand_object *method_obj,
 				       ACPI_TYPE_METHOD);
 	if (ACPI_FAILURE(status)) {
 		goto exit;
-	}
-
-	/*
-	 * RHEL6-ONLY
-	 * Now that the method object is attached to the parent node and
-	 * the parent object has been detached, check if the method object
-	 * has exactly the same object list as the parent object. If left
-	 * unaltered, this case will result in a circular object list when
-	 * this parent object is reattached back to the parent node later on
-	 * in this routine. Therefore, such an object list is removed from
-	 * the currently detached parent object. In particular, this case
-	 * will occur if ACPI_TYPE_LOCAL_DATA objects are already attached
-	 * to the parent node prior to entry to this routine.
-	 */
-	if (method_obj->method.next_object &&
-	    parent_obj &&
-	    parent_obj->common.next_object == method_obj->method.next_object) {
-		parent_obj->common.next_object = NULL;
 	}
 
 	/* Execute the parent node as a control method */

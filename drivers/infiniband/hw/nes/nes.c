@@ -44,7 +44,7 @@
 #include <linux/init.h>
 #include <linux/if_arp.h>
 #include <linux/highmem.h>
-#include <linux/nospec.h>
+#include <linux/slab.h>
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/byteorder.h>
@@ -63,9 +63,7 @@
 MODULE_AUTHOR("NetEffect");
 MODULE_DESCRIPTION("NetEffect RNIC Low-level iWARP Driver");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_VERSION(DRV_VERSION);
 
-int max_mtu = 9000;
 int interrupt_mod_interval = 0;
 
 /* Interoperability */
@@ -77,11 +75,6 @@ MODULE_PARM_DESC(mpa_version, "MPA version to be used int MPA Req/Resp (0 or 1)"
 int disable_mpa_crc = 0;
 module_param(disable_mpa_crc, int, 0644);
 MODULE_PARM_DESC(disable_mpa_crc, "Disable checking of MPA CRC");
-
-unsigned int send_first = 0;
-module_param(send_first, int, 0644);
-MODULE_PARM_DESC(send_first, "Send RDMA Message First on Active Connection");
-
 
 unsigned int nes_drv_opt = NES_DRV_OPT_DISABLE_INT_MOD | NES_DRV_OPT_ENABLE_PAU;
 module_param(nes_drv_opt, int, 0644);
@@ -95,7 +88,7 @@ unsigned int wqm_quanta = 0x10000;
 module_param(wqm_quanta, int, 0644);
 MODULE_PARM_DESC(wqm_quanta, "WQM quanta");
 
-static unsigned int limit_maxrdreqsz;
+static bool limit_maxrdreqsz;
 module_param(limit_maxrdreqsz, bool, 0644);
 MODULE_PARM_DESC(limit_maxrdreqsz, "Limit max read request size to 256 Bytes");
 
@@ -108,24 +101,13 @@ static unsigned int ee_flsh_adapter;
 static unsigned int sysfs_nonidx_addr;
 static unsigned int sysfs_idx_addr;
 
-static struct pci_device_id nes_pci_table[] = {
+static const struct pci_device_id nes_pci_table[] = {
 	{ PCI_VDEVICE(NETEFFECT, PCI_DEVICE_ID_NETEFFECT_NE020), },
 	{ PCI_VDEVICE(NETEFFECT, PCI_DEVICE_ID_NETEFFECT_NE020_KR), },
 	{0}
 };
 
 MODULE_DEVICE_TABLE(pci, nes_pci_table);
-
-/* registered nes netlink callbacks */
-static struct ibnl_client_cbs nes_nl_cb_table[] = {
-	[RDMA_NL_IWPM_REG_PID] = {.dump = iwpm_register_pid_cb},
-	[RDMA_NL_IWPM_ADD_MAPPING] = {.dump = iwpm_add_mapping_cb},
-	[RDMA_NL_IWPM_QUERY_MAPPING] = {.dump = iwpm_add_and_query_mapping_cb},
-	[RDMA_NL_IWPM_REMOTE_INFO] = {.dump = iwpm_remote_info_cb},
-	[RDMA_NL_IWPM_HANDLE_ERR] = {.dump = iwpm_mapping_error_cb},
-	[RDMA_NL_IWPM_MAPINFO] = {.dump = iwpm_mapping_info_cb},
-	[RDMA_NL_IWPM_MAPINFO_NUM] = {.dump = iwpm_ack_mapping_info_cb}
-};
 
 static int nes_inetaddr_event(struct notifier_block *, unsigned long, void *);
 static int nes_net_event(struct notifier_block *, unsigned long, void *);
@@ -150,6 +132,7 @@ static int nes_inetaddr_event(struct notifier_block *notifier,
 	struct net_device *event_netdev = ifa->ifa_dev->dev;
 	struct nes_device *nesdev;
 	struct net_device *netdev;
+	struct net_device *upper_dev;
 	struct nes_vnic *nesvnic;
 	unsigned int is_bonded;
 
@@ -160,7 +143,9 @@ static int nes_inetaddr_event(struct notifier_block *notifier,
 				nesdev, nesdev->netdev[0]->name);
 		netdev = nesdev->netdev[0];
 		nesvnic = netdev_priv(netdev);
-		is_bonded = (netdev->master == event_netdev);
+		upper_dev = netdev_master_upper_dev_get(netdev);
+		is_bonded = netif_is_bond_slave(netdev) &&
+			    (upper_dev == event_netdev);
 		if ((netdev == event_netdev) || is_bonded) {
 			if (nesvnic->rdma_enabled == 0) {
 				nes_debug(NES_DBG_NETDEV, "Returning without processing event for %s since"
@@ -193,11 +178,16 @@ static int nes_inetaddr_event(struct notifier_block *notifier,
 					/* fall through */
 				case NETDEV_CHANGEADDR:
 					/* Add the address to the IP table */
-					if (netdev->master)
-						nesvnic->local_ipaddr =
-							((struct in_device *)netdev->master->ip_ptr)->ifa_list->ifa_address;
-					else
+					if (upper_dev) {
+						struct in_device *in;
+
+						rcu_read_lock();
+						in = __in_dev_get_rcu(upper_dev);
+						nesvnic->local_ipaddr = in->ifa_list->ifa_address;
+						rcu_read_unlock();
+					} else {
 						nesvnic->local_ipaddr = ifa->ifa_address;
+					}
 
 					nes_write_indexed(nesdev,
 							NES_IDX_DST_IP_ADDR+(0x10*PCI_FUNC(nesdev->pcidev->devfn)),
@@ -366,13 +356,11 @@ struct ib_qp *nes_get_qp(struct ib_device *device, int qpn)
 	struct nes_vnic *nesvnic = to_nesvnic(device);
 	struct nes_device *nesdev = nesvnic->nesdev;
 	struct nes_adapter *nesadapter = nesdev->nesadapter;
-	int idx;
 
 	if ((qpn < NES_FIRST_QPN) || (qpn >= (NES_FIRST_QPN + nesadapter->max_qp)))
 		return NULL;
 
-	idx = array_index_nospec(qpn - NES_FIRST_QPN, nesadapter->max_qp);
-	return &nesadapter->qp_table[idx]->ibqp;
+	return &nesadapter->qp_table[qpn - NES_FIRST_QPN]->ibqp;
 }
 
 
@@ -460,16 +448,13 @@ static irqreturn_t nes_interrupt(int irq, void *dev_id)
 /**
  * nes_probe - Device initialization
  */
-static int __devinit nes_probe(struct pci_dev *pcidev, const struct pci_device_id *ent)
+static int nes_probe(struct pci_dev *pcidev, const struct pci_device_id *ent)
 {
 	struct net_device *netdev = NULL;
 	struct nes_device *nesdev = NULL;
 	int ret = 0;
 	void __iomem *mmio_regs = NULL;
 	u8 hw_rev;
-
-	assert(pcidev != NULL);
-	assert(ent != NULL);
 
 	printk(KERN_INFO PFX "NetEffect RNIC driver v%s loading. (%s)\n",
 			DRV_VERSION, pci_name(pcidev));
@@ -531,7 +516,6 @@ static int __devinit nes_probe(struct pci_dev *pcidev, const struct pci_device_i
 	/* Allocate hardware structure */
 	nesdev = kzalloc(sizeof(struct nes_device), GFP_KERNEL);
 	if (!nesdev) {
-		printk(KERN_ERR PFX "%s: Unable to alloc hardware struct\n", pci_name(pcidev));
 		ret = -ENOMEM;
 		goto bail2;
 	}
@@ -686,22 +670,14 @@ static int __devinit nes_probe(struct pci_dev *pcidev, const struct pci_device_i
 	}
 	nes_notifiers_registered++;
 
-	if (ibnl_add_client(RDMA_NL_NES, RDMA_NL_IWPM_NUM_OPS, nes_nl_cb_table))
-		printk(KERN_ERR PFX "%s[%u]: Failed to add netlink callback\n",
-			__func__, __LINE__);
-
-	ret = iwpm_init(RDMA_NL_NES);
-	if (ret) {
-		printk(KERN_ERR PFX "%s: port mapper initialization failed\n",
-				pci_name(pcidev));
-		goto bail7;
-	}
-
 	INIT_DELAYED_WORK(&nesdev->work, nes_recheck_link_status);
 
 	/* Initialize network devices */
-	if ((netdev = nes_netdev_init(nesdev, mmio_regs)) == NULL)
+	netdev = nes_netdev_init(nesdev, mmio_regs);
+	if (netdev == NULL) {
+		ret = -ENOMEM;
 		goto bail7;
+	}
 
 	/* Register network device */
 	ret = register_netdev(netdev);
@@ -732,7 +708,6 @@ static int __devinit nes_probe(struct pci_dev *pcidev, const struct pci_device_i
 
 	nes_debug(NES_DBG_INIT, "netdev_count=%d, nesadapter->netdev_count=%d\n",
 			nesdev->netdev_count, nesdev->nesadapter->netdev_count);
-	ibnl_remove_client(RDMA_NL_NES);
 
 	nes_notifiers_registered--;
 	if (nes_notifiers_registered == 0) {
@@ -777,27 +752,25 @@ static int __devinit nes_probe(struct pci_dev *pcidev, const struct pci_device_i
 /**
  * nes_remove - unload from kernel
  */
-static void __devexit nes_remove(struct pci_dev *pcidev)
+static void nes_remove(struct pci_dev *pcidev)
 {
 	struct nes_device *nesdev = pci_get_drvdata(pcidev);
 	struct net_device *netdev;
 	int netdev_index = 0;
 	unsigned long flags;
 
-		if (nesdev->netdev_count) {
-			netdev = nesdev->netdev[netdev_index];
-			if (netdev) {
-				netif_stop_queue(netdev);
-				unregister_netdev(netdev);
-				nes_netdev_destroy(netdev);
+	if (nesdev->netdev_count) {
+		netdev = nesdev->netdev[netdev_index];
+		if (netdev) {
+			netif_stop_queue(netdev);
+			unregister_netdev(netdev);
+			nes_netdev_destroy(netdev);
 
-				nesdev->netdev[netdev_index] = NULL;
-				nesdev->netdev_count--;
-				nesdev->nesadapter->netdev_count--;
-			}
+			nesdev->netdev[netdev_index] = NULL;
+			nesdev->netdev_count--;
+			nesdev->nesadapter->netdev_count--;
 		}
-	ibnl_remove_client(RDMA_NL_NES);
-	iwpm_exit(RDMA_NL_NES);
+	}
 
 	nes_notifiers_registered--;
 	if (nes_notifiers_registered == 0) {
@@ -840,10 +813,10 @@ static struct pci_driver nes_pci_driver = {
 	.name = DRV_NAME,
 	.id_table = nes_pci_table,
 	.probe = nes_probe,
-	.remove = __devexit_p(nes_remove),
+	.remove = nes_remove,
 };
 
-static ssize_t nes_show_adapter(struct device_driver *ddp, char *buf)
+static ssize_t adapter_show(struct device_driver *ddp, char *buf)
 {
 	unsigned int  devfn = 0xffffffff;
 	unsigned char bus_number = 0xff;
@@ -862,7 +835,7 @@ static ssize_t nes_show_adapter(struct device_driver *ddp, char *buf)
 	return snprintf(buf, PAGE_SIZE, "%x:%x\n", bus_number, devfn);
 }
 
-static ssize_t nes_store_adapter(struct device_driver *ddp,
+static ssize_t adapter_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -871,7 +844,7 @@ static ssize_t nes_store_adapter(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_ee_cmd(struct device_driver *ddp, char *buf)
+static ssize_t eeprom_cmd_show(struct device_driver *ddp, char *buf)
 {
 	u32 eeprom_cmd = 0xdead;
 	u32 i = 0;
@@ -887,7 +860,7 @@ static ssize_t nes_show_ee_cmd(struct device_driver *ddp, char *buf)
 	return snprintf(buf, PAGE_SIZE, "0x%x\n", eeprom_cmd);
 }
 
-static ssize_t nes_store_ee_cmd(struct device_driver *ddp,
+static ssize_t eeprom_cmd_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -908,7 +881,7 @@ static ssize_t nes_store_ee_cmd(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_ee_data(struct device_driver *ddp, char *buf)
+static ssize_t eeprom_data_show(struct device_driver *ddp, char *buf)
 {
 	u32 eeprom_data = 0xdead;
 	u32 i = 0;
@@ -925,7 +898,7 @@ static ssize_t nes_show_ee_data(struct device_driver *ddp, char *buf)
 	return  snprintf(buf, PAGE_SIZE, "0x%x\n", eeprom_data);
 }
 
-static ssize_t nes_store_ee_data(struct device_driver *ddp,
+static ssize_t eeprom_data_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -946,7 +919,7 @@ static ssize_t nes_store_ee_data(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_flash_cmd(struct device_driver *ddp, char *buf)
+static ssize_t flash_cmd_show(struct device_driver *ddp, char *buf)
 {
 	u32 flash_cmd = 0xdead;
 	u32 i = 0;
@@ -963,7 +936,7 @@ static ssize_t nes_show_flash_cmd(struct device_driver *ddp, char *buf)
 	return  snprintf(buf, PAGE_SIZE, "0x%x\n", flash_cmd);
 }
 
-static ssize_t nes_store_flash_cmd(struct device_driver *ddp,
+static ssize_t flash_cmd_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -984,7 +957,7 @@ static ssize_t nes_store_flash_cmd(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_flash_data(struct device_driver *ddp, char *buf)
+static ssize_t flash_data_show(struct device_driver *ddp, char *buf)
 {
 	u32 flash_data = 0xdead;
 	u32 i = 0;
@@ -1001,7 +974,7 @@ static ssize_t nes_show_flash_data(struct device_driver *ddp, char *buf)
 	return  snprintf(buf, PAGE_SIZE, "0x%x\n", flash_data);
 }
 
-static ssize_t nes_store_flash_data(struct device_driver *ddp,
+static ssize_t flash_data_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -1022,12 +995,12 @@ static ssize_t nes_store_flash_data(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_nonidx_addr(struct device_driver *ddp, char *buf)
+static ssize_t nonidx_addr_show(struct device_driver *ddp, char *buf)
 {
 	return  snprintf(buf, PAGE_SIZE, "0x%x\n", sysfs_nonidx_addr);
 }
 
-static ssize_t nes_store_nonidx_addr(struct device_driver *ddp,
+static ssize_t nonidx_addr_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -1038,7 +1011,7 @@ static ssize_t nes_store_nonidx_addr(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_nonidx_data(struct device_driver *ddp, char *buf)
+static ssize_t nonidx_data_show(struct device_driver *ddp, char *buf)
 {
 	u32 nonidx_data = 0xdead;
 	u32 i = 0;
@@ -1055,7 +1028,7 @@ static ssize_t nes_show_nonidx_data(struct device_driver *ddp, char *buf)
 	return  snprintf(buf, PAGE_SIZE, "0x%x\n", nonidx_data);
 }
 
-static ssize_t nes_store_nonidx_data(struct device_driver *ddp,
+static ssize_t nonidx_data_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -1076,12 +1049,12 @@ static ssize_t nes_store_nonidx_data(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_idx_addr(struct device_driver *ddp, char *buf)
+static ssize_t idx_addr_show(struct device_driver *ddp, char *buf)
 {
 	return  snprintf(buf, PAGE_SIZE, "0x%x\n", sysfs_idx_addr);
 }
 
-static ssize_t nes_store_idx_addr(struct device_driver *ddp,
+static ssize_t idx_addr_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -1092,7 +1065,7 @@ static ssize_t nes_store_idx_addr(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static ssize_t nes_show_idx_data(struct device_driver *ddp, char *buf)
+static ssize_t idx_data_show(struct device_driver *ddp, char *buf)
 {
 	u32 idx_data = 0xdead;
 	u32 i = 0;
@@ -1109,7 +1082,7 @@ static ssize_t nes_show_idx_data(struct device_driver *ddp, char *buf)
 	return  snprintf(buf, PAGE_SIZE, "0x%x\n", idx_data);
 }
 
-static ssize_t nes_store_idx_data(struct device_driver *ddp,
+static ssize_t idx_data_store(struct device_driver *ddp,
 	const char *buf, size_t count)
 {
 	char *p = (char *)buf;
@@ -1130,11 +1103,7 @@ static ssize_t nes_store_idx_data(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-
-/**
- * nes_show_wqm_quanta
- */
-static ssize_t nes_show_wqm_quanta(struct device_driver *ddp, char *buf)
+static ssize_t wqm_quanta_show(struct device_driver *ddp, char *buf)
 {
 	u32 wqm_quanta_value = 0xdead;
 	u32 i = 0;
@@ -1151,19 +1120,15 @@ static ssize_t nes_show_wqm_quanta(struct device_driver *ddp, char *buf)
 	return  snprintf(buf, PAGE_SIZE, "0x%X\n", wqm_quanta_value);
 }
 
-
-/**
- * nes_store_wqm_quanta
- */
-static ssize_t nes_store_wqm_quanta(struct device_driver *ddp,
-					const char *buf, size_t count)
+static ssize_t wqm_quanta_store(struct device_driver *ddp, const char *buf,
+				size_t count)
 {
 	unsigned long wqm_quanta_value;
 	u32 wqm_config1;
 	u32 i = 0;
 	struct nes_device *nesdev;
 
-	if (strict_strtoul(buf, 0, &wqm_quanta_value) < 0)
+	if (kstrtoul(buf, 0, &wqm_quanta_value) < 0)
 		return -EINVAL;
 
 	list_for_each_entry(nesdev, &nes_dev_list, list) {
@@ -1181,26 +1146,16 @@ static ssize_t nes_store_wqm_quanta(struct device_driver *ddp,
 	return strnlen(buf, count);
 }
 
-static DRIVER_ATTR(adapter, S_IRUSR | S_IWUSR,
-		   nes_show_adapter, nes_store_adapter);
-static DRIVER_ATTR(eeprom_cmd, S_IRUSR | S_IWUSR,
-		   nes_show_ee_cmd, nes_store_ee_cmd);
-static DRIVER_ATTR(eeprom_data, S_IRUSR | S_IWUSR,
-		   nes_show_ee_data, nes_store_ee_data);
-static DRIVER_ATTR(flash_cmd, S_IRUSR | S_IWUSR,
-		   nes_show_flash_cmd, nes_store_flash_cmd);
-static DRIVER_ATTR(flash_data, S_IRUSR | S_IWUSR,
-		   nes_show_flash_data, nes_store_flash_data);
-static DRIVER_ATTR(nonidx_addr, S_IRUSR | S_IWUSR,
-		   nes_show_nonidx_addr, nes_store_nonidx_addr);
-static DRIVER_ATTR(nonidx_data, S_IRUSR | S_IWUSR,
-		   nes_show_nonidx_data, nes_store_nonidx_data);
-static DRIVER_ATTR(idx_addr, S_IRUSR | S_IWUSR,
-		   nes_show_idx_addr, nes_store_idx_addr);
-static DRIVER_ATTR(idx_data, S_IRUSR | S_IWUSR,
-		   nes_show_idx_data, nes_store_idx_data);
-static DRIVER_ATTR(wqm_quanta, S_IRUSR | S_IWUSR,
-		   nes_show_wqm_quanta, nes_store_wqm_quanta);
+static DRIVER_ATTR_RW(adapter);
+static DRIVER_ATTR_RW(eeprom_cmd);
+static DRIVER_ATTR_RW(eeprom_data);
+static DRIVER_ATTR_RW(flash_cmd);
+static DRIVER_ATTR_RW(flash_data);
+static DRIVER_ATTR_RW(nonidx_addr);
+static DRIVER_ATTR_RW(nonidx_data);
+static DRIVER_ATTR_RW(idx_addr);
+static DRIVER_ATTR_RW(idx_data);
+static DRIVER_ATTR_RW(wqm_quanta);
 
 static int nes_create_driver_sysfs(struct pci_driver *drv)
 {

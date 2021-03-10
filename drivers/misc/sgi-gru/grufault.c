@@ -33,7 +33,7 @@
 #include <linux/io.h>
 #include <linux/uaccess.h>
 #include <linux/security.h>
-#include <linux/nospec.h>
+#include <linux/prefetch.h>
 #include <asm/pgtable.h>
 #include "gru.h"
 #include "grutables.h"
@@ -876,8 +876,7 @@ int gru_set_context_option(unsigned long arg)
 	switch (req.op) {
 	case sco_blade_chiplet:
 		/* Select blade/chiplet for GRU context */
-		if (req.val1 < -1 || req.val1 >= GRU_MAX_BLADES ||
-		    !gru_base[array_index_nospec(req.val1, GRU_MAX_BLADES)] ||
+		if (req.val1 < -1 || req.val1 >= GRU_MAX_BLADES || !gru_base[req.val1] ||
 		    req.val0 < -1 || req.val0 >= GRU_CHIPLETS_PER_HUB) {
 			ret = -EINVAL;
 		} else {
@@ -887,11 +886,11 @@ int gru_set_context_option(unsigned long arg)
 		}
 		break;
 	case sco_gseg_owner:
-		/* Register the current task as the GSEG owner */
+ 		/* Register the current task as the GSEG owner */
 		gts->ts_tgid_owner = current->tgid;
 		break;
 	case sco_cch_req_slice:
-		/* Set the CCH slice option */
+ 		/* Set the CCH slice option */
 		gts->ts_cch_req_slice = req.val1 & 3;
 		break;
 	default:

@@ -77,7 +77,8 @@ typedef struct {
 	int action;
 } sctp_sm_command_t;
 
-typedef sctp_disposition_t (sctp_state_fn_t) (const struct sctp_endpoint *,
+typedef sctp_disposition_t (sctp_state_fn_t) (struct net *,
+					      const struct sctp_endpoint *,
 					      const struct sctp_association *,
 					      const sctp_subtype_t type,
 					      void *arg,
@@ -178,7 +179,8 @@ sctp_state_fn_t sctp_sf_autoclose_timer_expire;
 
 /* Prototypes for utility support functions.  */
 __u8 sctp_get_chunk_type(struct sctp_chunk *chunk);
-const sctp_sm_table_entry_t *sctp_sm_lookup_event(sctp_event_t,
+const sctp_sm_table_entry_t *sctp_sm_lookup_event(struct net *,
+					    sctp_event_t,
 					    sctp_state_t,
 					    sctp_subtype_t);
 int sctp_chunk_iif(const struct sctp_chunk *);
@@ -206,7 +208,7 @@ struct sctp_chunk *sctp_make_cwr(const struct sctp_association *,
 struct sctp_chunk * sctp_make_datafrag_empty(struct sctp_association *,
 					const struct sctp_sndrcvinfo *sinfo,
 					int len, const __u8 flags,
-					__u16 ssn);
+					__u16 ssn, gfp_t gfp);
 struct sctp_chunk *sctp_make_ecne(const struct sctp_association *,
 				  const __u32);
 struct sctp_chunk *sctp_make_sack(const struct sctp_association *);
@@ -224,7 +226,7 @@ struct sctp_chunk *sctp_make_abort_no_data(const struct sctp_association *,
 				      const struct sctp_chunk *,
 				      __u32 tsn);
 struct sctp_chunk *sctp_make_abort_user(const struct sctp_association *,
-					const struct msghdr *, size_t msg_len);
+					struct msghdr *, size_t msg_len);
 struct sctp_chunk *sctp_make_abort_violation(const struct sctp_association *,
 				   const struct sctp_chunk *,
 				   const __u8 *,
@@ -235,9 +237,7 @@ struct sctp_chunk *sctp_make_violation_paramlen(const struct sctp_association *,
 struct sctp_chunk *sctp_make_violation_max_retrans(const struct sctp_association *,
 						   const struct sctp_chunk *);
 struct sctp_chunk *sctp_make_heartbeat(const struct sctp_association *,
-				  const struct sctp_transport *,
-				  const void *payload,
-				  const size_t paylen);
+				  const struct sctp_transport *);
 struct sctp_chunk *sctp_make_heartbeat_ack(const struct sctp_association *,
 				      const struct sctp_chunk *,
 				      const void *payload,
@@ -272,7 +272,7 @@ void sctp_chunk_assign_ssn(struct sctp_chunk *);
 
 /* Prototypes for statetable processing. */
 
-int sctp_do_sm(sctp_event_t event_type, sctp_subtype_t subtype,
+int sctp_do_sm(struct net *net, sctp_event_t event_type, sctp_subtype_t subtype,
 	       sctp_state_t state,
                struct sctp_endpoint *,
                struct sctp_association *asoc,
@@ -348,12 +348,12 @@ enum {
 
 static inline int TSN_lt(__u32 s, __u32 t)
 {
-	return (((s) - (t)) & TSN_SIGN_BIT);
+	return ((s) - (t)) & TSN_SIGN_BIT;
 }
 
 static inline int TSN_lte(__u32 s, __u32 t)
 {
-	return (((s) == (t)) || (((s) - (t)) & TSN_SIGN_BIT));
+	return ((s) == (t)) || (((s) - (t)) & TSN_SIGN_BIT);
 }
 
 /* Compare two SSNs */
@@ -372,12 +372,12 @@ enum {
 
 static inline int SSN_lt(__u16 s, __u16 t)
 {
-	return (((s) - (t)) & SSN_SIGN_BIT);
+	return ((s) - (t)) & SSN_SIGN_BIT;
 }
 
 static inline int SSN_lte(__u16 s, __u16 t)
 {
-	return (((s) == (t)) || (((s) - (t)) & SSN_SIGN_BIT));
+	return ((s) == (t)) || (((s) - (t)) & SSN_SIGN_BIT);
 }
 
 /*
@@ -389,9 +389,9 @@ enum {
 	ADDIP_SERIAL_SIGN_BIT = (1<<31)
 };
 
-static inline int ADDIP_SERIAL_gte(__u16 s, __u16 t)
+static inline int ADDIP_SERIAL_gte(__u32 s, __u32 t)
 {
-	return (((s) == (t)) || (((t) - (s)) & ADDIP_SERIAL_SIGN_BIT));
+	return ((s) == (t)) || (((t) - (s)) & ADDIP_SERIAL_SIGN_BIT);
 }
 
 /* Check VTAG of the packet matches the sender's own tag. */

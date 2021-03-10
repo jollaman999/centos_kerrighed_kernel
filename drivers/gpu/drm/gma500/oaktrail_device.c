@@ -26,7 +26,6 @@
 #include "psb_drv.h"
 #include "psb_reg.h"
 #include "psb_intel_reg.h"
-#include <asm/intel-mid.h>
 #include <asm/intel_scu_ipc.h>
 #include "mid_bios.h"
 #include "intel_bios.h"
@@ -568,6 +567,8 @@ const struct psb_ops oaktrail_chip_ops = {
 
 	.save_regs = oaktrail_save_display_registers,
 	.restore_regs = oaktrail_restore_display_registers,
+	.save_crtc = gma_crtc_save,
+	.restore_crtc = gma_crtc_restore,
 	.power_down = oaktrail_power_down,
 	.power_up = oaktrail_power_up,
 

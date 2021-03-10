@@ -22,6 +22,7 @@
 #include <linux/jbd.h>
 #include <linux/errno.h>
 #include <linux/slab.h>
+#include <linux/blkdev.h>
 #include <trace/events/jbd.h>
 
 /*
@@ -257,9 +258,12 @@ static void
 __flush_batch(journal_t *journal, struct buffer_head **bhs, int *batch_count)
 {
 	int i;
+	struct blk_plug plug;
 
+	blk_start_plug(&plug);
 	for (i = 0; i < *batch_count; i++)
-		write_dirty_buffer(bhs[i], WRITE);
+		write_dirty_buffer(bhs[i], WRITE_SYNC);
+	blk_finish_plug(&plug);
 
 	for (i = 0; i < *batch_count; i++) {
 		struct buffer_head *bh = bhs[i];
@@ -287,7 +291,7 @@ static int __process_buffer(journal_t *journal, struct journal_head *jh,
 	int ret = 0;
 
 	if (buffer_locked(bh)) {
-		atomic_inc(&bh->b_count);
+		get_bh(bh);
 		spin_unlock(&journal->j_list_lock);
 		jbd_unlock_bh_state(bh);
 		wait_on_buffer(bh);
@@ -449,8 +453,6 @@ out:
  *
  * Return <0 on error, 0 on success, 1 if there was nothing to clean up.
  *
- * Called with the journal lock held.
- *
  * This is the only part of the journaling code which really needs to be
  * aware of transaction aborts.  Checkpointing involves writing to the
  * main filesystem area rather than to the journal, so it can proceed
@@ -468,13 +470,14 @@ int cleanup_journal_tail(journal_t *journal)
 	if (is_journal_aborted(journal))
 		return 1;
 
-	/* OK, work out the oldest transaction remaining in the log, and
+	/*
+	 * OK, work out the oldest transaction remaining in the log, and
 	 * the log block it starts at.
 	 *
 	 * If the log is now empty, we need to work out which is the
 	 * next transaction ID we will write, and where it will
-	 * start. */
-
+	 * start.
+	 */
 	spin_lock(&journal->j_state_lock);
 	spin_lock(&journal->j_list_lock);
 	transaction = journal->j_checkpoint_transactions;
@@ -500,7 +503,24 @@ int cleanup_journal_tail(journal_t *journal)
 		spin_unlock(&journal->j_state_lock);
 		return 1;
 	}
+	spin_unlock(&journal->j_state_lock);
 
+	/*
+	 * We need to make sure that any blocks that were recently written out
+	 * --- perhaps by log_do_checkpoint() --- are flushed out before we
+	 * drop the transactions from the journal. Similarly we need to be sure
+	 * superblock makes it to disk before next transaction starts reusing
+	 * freed space (otherwise we could replay some blocks of the new
+	 * transaction thinking they belong to the old one). So we use
+	 * WRITE_FLUSH_FUA. It's unlikely this will be necessary, especially
+	 * with an appropriately sized journal, but we need this to guarantee
+	 * correctness.  Fortunately cleanup_journal_tail() doesn't get called
+	 * all that often.
+	 */
+	journal_update_sb_log_tail(journal, first_tid, blocknr,
+				   WRITE_FLUSH_FUA);
+
+	spin_lock(&journal->j_state_lock);
 	/* OK, update the superblock to recover the freed space.
 	 * Physical blocks come first: have we wrapped beyond the end of
 	 * the log?  */
@@ -518,8 +538,6 @@ int cleanup_journal_tail(journal_t *journal)
 	journal->j_tail_sequence = first_tid;
 	journal->j_tail = blocknr;
 	spin_unlock(&journal->j_state_lock);
-	if (!(journal->j_flags & JFS_ABORT))
-		journal_update_superblock(journal, 1);
 	return 0;
 }
 
@@ -533,7 +551,7 @@ int cleanup_journal_tail(journal_t *journal)
  * them.
  *
  * Called with j_list_lock held.
- * Returns number of bufers reaped (for debug)
+ * Returns number of buffers reaped (for debug)
  */
 
 static int journal_clean_one_cp_list(struct journal_head *jh, int *released)

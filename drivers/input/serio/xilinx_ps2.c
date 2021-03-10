@@ -19,10 +19,11 @@
 #include <linux/serio.h>
 #include <linux/interrupt.h>
 #include <linux/errno.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/io.h>
-
+#include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_platform.h>
 
@@ -72,7 +73,8 @@ struct xps2data {
 	spinlock_t lock;
 	void __iomem *base_address;	/* virt. address of control registers */
 	unsigned int flags;
-	struct serio serio;		/* serio */
+	struct serio *serio;		/* serio */
+	struct device *dev;
 };
 
 /************************************/
@@ -118,7 +120,7 @@ static irqreturn_t xps2_interrupt(int irq, void *dev_id)
 
 	/* Check which interrupt is active */
 	if (intr_sr & XPS2_IPIXR_RX_OVF)
-		dev_warn(drvdata->serio.dev.parent, "receive overrun error\n");
+		dev_warn(drvdata->dev, "receive overrun error\n");
 
 	if (intr_sr & XPS2_IPIXR_RX_ERR)
 		drvdata->flags |= SERIO_PARITY;
@@ -131,10 +133,10 @@ static irqreturn_t xps2_interrupt(int irq, void *dev_id)
 
 		/* Error, if a byte is not received */
 		if (status) {
-			dev_err(drvdata->serio.dev.parent,
+			dev_err(drvdata->dev,
 				"wrong rcvd byte count (%d)\n", status);
 		} else {
-			serio_interrupt(&drvdata->serio, c, drvdata->flags);
+			serio_interrupt(drvdata->serio, c, drvdata->flags);
 			drvdata->flags = 0;
 		}
 	}
@@ -192,7 +194,7 @@ static int sxps2_open(struct serio *pserio)
 	error = request_irq(drvdata->irq, &xps2_interrupt, 0,
 				DRIVER_NAME, drvdata);
 	if (error) {
-		dev_err(drvdata->serio.dev.parent,
+		dev_err(drvdata->dev,
 			"Couldn't allocate interrupt %d\n", drvdata->irq);
 		return error;
 	}
@@ -224,15 +226,14 @@ static void sxps2_close(struct serio *pserio)
 /**
  * xps2_of_probe - probe method for the PS/2 device.
  * @of_dev:	pointer to OF device structure
- * @match:	pointer to the stucture used for matching a device
+ * @match:	pointer to the structure used for matching a device
  *
  * This function probes the PS/2 device in the device tree.
  * It initializes the driver data structure and the hardware.
  * It returns 0, if the driver is bound to the PS/2 device, or a negative
  * value if there is an error.
  */
-static int __devinit xps2_of_probe(struct of_device *ofdev,
-				   const struct of_device_id *match)
+static int xps2_of_probe(struct platform_device *ofdev)
 {
 	struct resource r_irq; /* Interrupt resources */
 	struct resource r_mem; /* IO mem resources */
@@ -243,34 +244,35 @@ static int __devinit xps2_of_probe(struct of_device *ofdev,
 	int error;
 
 	dev_info(dev, "Device Tree Probing \'%s\'\n",
-			ofdev->node->name);
+			ofdev->dev.of_node->name);
 
 	/* Get iospace for the device */
-	error = of_address_to_resource(ofdev->node, 0, &r_mem);
+	error = of_address_to_resource(ofdev->dev.of_node, 0, &r_mem);
 	if (error) {
 		dev_err(dev, "invalid address\n");
 		return error;
 	}
 
 	/* Get IRQ for the device */
-	if (of_irq_to_resource(ofdev->node, 0, &r_irq) == NO_IRQ) {
+	if (!of_irq_to_resource(ofdev->dev.of_node, 0, &r_irq)) {
 		dev_err(dev, "no IRQ found\n");
 		return -ENODEV;
 	}
 
 	drvdata = kzalloc(sizeof(struct xps2data), GFP_KERNEL);
-	if (!drvdata) {
-		dev_err(dev, "Couldn't allocate device private record\n");
-		return -ENOMEM;
+	serio = kzalloc(sizeof(struct serio), GFP_KERNEL);
+	if (!drvdata || !serio) {
+		error = -ENOMEM;
+		goto failed1;
 	}
-
-	dev_set_drvdata(dev, drvdata);
 
 	spin_lock_init(&drvdata->lock);
 	drvdata->irq = r_irq.start;
+	drvdata->serio = serio;
+	drvdata->dev = dev;
 
 	phys_addr = r_mem.start;
-	remap_size = r_mem.end - r_mem.start + 1;
+	remap_size = resource_size(&r_mem);
 	if (!request_mem_region(phys_addr, remap_size, DRIVER_NAME)) {
 		dev_err(dev, "Couldn't lock memory region at 0x%08llX\n",
 			(unsigned long long)phys_addr);
@@ -298,7 +300,6 @@ static int __devinit xps2_of_probe(struct of_device *ofdev,
 		 (unsigned long long)phys_addr, drvdata->base_address,
 		 drvdata->irq);
 
-	serio = &drvdata->serio;
 	serio->id.type = SERIO_8042;
 	serio->write = sxps2_write;
 	serio->open = sxps2_open;
@@ -312,13 +313,14 @@ static int __devinit xps2_of_probe(struct of_device *ofdev,
 
 	serio_register_port(serio);
 
+	platform_set_drvdata(ofdev, drvdata);
 	return 0;		/* success */
 
 failed2:
 	release_mem_region(phys_addr, remap_size);
 failed1:
+	kfree(serio);
 	kfree(drvdata);
-	dev_set_drvdata(dev, NULL);
 
 	return error;
 }
@@ -331,54 +333,44 @@ failed1:
  * if the driver module is being unloaded. It frees any resources allocated to
  * the device.
  */
-static int __devexit xps2_of_remove(struct of_device *of_dev)
+static int xps2_of_remove(struct platform_device *of_dev)
 {
-	struct device *dev = &of_dev->dev;
-	struct xps2data *drvdata = dev_get_drvdata(dev);
+	struct xps2data *drvdata = platform_get_drvdata(of_dev);
 	struct resource r_mem; /* IO mem resources */
 
-	serio_unregister_port(&drvdata->serio);
+	serio_unregister_port(drvdata->serio);
 	iounmap(drvdata->base_address);
 
 	/* Get iospace of the device */
-	if (of_address_to_resource(of_dev->node, 0, &r_mem))
-		dev_err(dev, "invalid address\n");
+	if (of_address_to_resource(of_dev->dev.of_node, 0, &r_mem))
+		dev_err(drvdata->dev, "invalid address\n");
 	else
-		release_mem_region(r_mem.start, r_mem.end - r_mem.start + 1);
+		release_mem_region(r_mem.start, resource_size(&r_mem));
 
 	kfree(drvdata);
 
-	dev_set_drvdata(dev, NULL);
+	platform_set_drvdata(of_dev, NULL);
 
 	return 0;
 }
 
 /* Match table for of_platform binding */
-static struct of_device_id xps2_of_match[] __devinitdata = {
+static const struct of_device_id xps2_of_match[] = {
 	{ .compatible = "xlnx,xps-ps2-1.00.a", },
 	{ /* end of list */ },
 };
 MODULE_DEVICE_TABLE(of, xps2_of_match);
 
-static struct of_platform_driver xps2_of_driver = {
-	.name		= DRIVER_NAME,
-	.match_table	= xps2_of_match,
+static struct platform_driver xps2_of_driver = {
+	.driver = {
+		.name = DRIVER_NAME,
+		.owner = THIS_MODULE,
+		.of_match_table = xps2_of_match,
+	},
 	.probe		= xps2_of_probe,
-	.remove		= __devexit_p(xps2_of_remove),
+	.remove		= xps2_of_remove,
 };
-
-static int __init xps2_init(void)
-{
-	return of_register_platform_driver(&xps2_of_driver);
-}
-
-static void __exit xps2_cleanup(void)
-{
-	of_unregister_platform_driver(&xps2_of_driver);
-}
-
-module_init(xps2_init);
-module_exit(xps2_cleanup);
+module_platform_driver(xps2_of_driver);
 
 MODULE_AUTHOR("Xilinx, Inc.");
 MODULE_DESCRIPTION("Xilinx XPS PS/2 driver");

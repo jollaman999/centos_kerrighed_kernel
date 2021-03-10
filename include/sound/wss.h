@@ -22,11 +22,11 @@
  *
  */
 
-#include "control.h"
-#include "pcm.h"
-#include "timer.h"
+#include <sound/control.h>
+#include <sound/pcm.h>
+#include <sound/timer.h>
 
-#include "cs4231-regs.h"
+#include <sound/cs4231-regs.h>
 
 /* defines for codec.mode */
 
@@ -154,7 +154,6 @@ int snd_wss_create(struct snd_card *card,
 		      unsigned short hardware,
 		      unsigned short hwshare,
 		      struct snd_wss **rchip);
-int snd_wss_free(struct snd_wss *chip);
 int snd_wss_pcm(struct snd_wss *chip, int device, struct snd_pcm **rpcm);
 int snd_wss_timer(struct snd_wss *chip, int device, struct snd_timer **rtimer);
 int snd_wss_mixer(struct snd_wss *chip);

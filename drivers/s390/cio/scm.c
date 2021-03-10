@@ -5,7 +5,6 @@
  * Author(s): Sebastian Ott <sebott@linux.vnet.ibm.com>
  */
 
-#include <linux/spinlock.h>
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -16,8 +15,6 @@
 #include "chsc.h"
 
 static struct device *scm_root;
-static struct eadm_ops *eadm_ops;
-static DEFINE_MUTEX(eadm_ops_mutex);
 
 #define to_scm_dev(n) container_of(n, struct scm_device, dev)
 #define	to_scm_drv(d) container_of(d, struct scm_driver, drv)
@@ -74,49 +71,6 @@ void scm_driver_unregister(struct scm_driver *scmdrv)
 }
 EXPORT_SYMBOL_GPL(scm_driver_unregister);
 
-int scm_get_ref(void)
-{
-	int ret = 0;
-
-	mutex_lock(&eadm_ops_mutex);
-	if (!eadm_ops || !try_module_get(eadm_ops->owner))
-		ret = -ENOENT;
-	mutex_unlock(&eadm_ops_mutex);
-
-	return ret;
-}
-EXPORT_SYMBOL_GPL(scm_get_ref);
-
-void scm_put_ref(void)
-{
-	mutex_lock(&eadm_ops_mutex);
-	module_put(eadm_ops->owner);
-	mutex_unlock(&eadm_ops_mutex);
-}
-EXPORT_SYMBOL_GPL(scm_put_ref);
-
-void register_eadm_ops(struct eadm_ops *ops)
-{
-	mutex_lock(&eadm_ops_mutex);
-	eadm_ops = ops;
-	mutex_unlock(&eadm_ops_mutex);
-}
-EXPORT_SYMBOL_GPL(register_eadm_ops);
-
-void unregister_eadm_ops(struct eadm_ops *ops)
-{
-	mutex_lock(&eadm_ops_mutex);
-	eadm_ops = NULL;
-	mutex_unlock(&eadm_ops_mutex);
-}
-EXPORT_SYMBOL_GPL(unregister_eadm_ops);
-
-int scm_start_aob(struct aob *aob)
-{
-	return eadm_ops->eadm_start(aob);
-}
-EXPORT_SYMBOL_GPL(scm_start_aob);
-
 void scm_irq_handler(struct aob *aob, int error)
 {
 	struct aob_rq_header *aobrq = (void *) aob->request.data;
@@ -134,9 +88,9 @@ static ssize_t show_##name(struct device *dev,				\
 	struct scm_device *scmdev = to_scm_dev(dev);			\
 	int ret;							\
 									\
-	spin_lock(&scmdev->lock);					\
+	device_lock(dev);						\
 	ret = sprintf(buf, "%u\n", scmdev->attrs.name);			\
-	spin_unlock(&scmdev->lock);					\
+	device_unlock(dev);						\
 									\
 	return ret;							\
 }									\
@@ -193,7 +147,6 @@ static void scmdev_setup(struct scm_device *scmdev, struct sale *sale,
 	scmdev->dev.bus = &scm_bus_type;
 	scmdev->dev.release = scmdev_release;
 	scmdev->dev.groups = scmdev_attr_groups;
-	spin_lock_init(&scmdev->lock);
 }
 
 /*
@@ -204,6 +157,7 @@ static void scmdev_update(struct scm_device *scmdev, struct sale *sale)
 	struct scm_driver *scmdrv;
 	bool changed;
 
+	device_lock(&scmdev->dev);
 	changed = scmdev->attrs.rank != sale->rank ||
 		  scmdev->attrs.oper_state != sale->op_state;
 	scmdev->attrs.rank = sale->rank;
@@ -214,6 +168,7 @@ static void scmdev_update(struct scm_device *scmdev, struct sale *sale)
 	if (changed && scmdrv->notify)
 		scmdrv->notify(scmdev, SCM_CHANGE);
 out:
+	device_unlock(&scmdev->dev);
 	if (changed)
 		kobject_uevent(&scmdev->dev.kobj, KOBJ_CHANGE);
 }

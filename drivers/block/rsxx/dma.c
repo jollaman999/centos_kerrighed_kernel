@@ -23,7 +23,6 @@
 */
 
 #include <linux/slab.h>
-#include <linux/nospec.h>
 #include "rsxx_priv.h"
 
 struct rsxx_dma {
@@ -705,12 +704,11 @@ int rsxx_dma_queue_bio(struct rsxx_cardinfo *card,
 		dma_cnt[i] = 0;
 	}
 
-	if (bio_rw_flagged(bio, BIO_RW_DISCARD)) {
+	if (bio->bi_rw & REQ_DISCARD) {
 		bv_len = bio->bi_size;
 
 		while (bv_len > 0) {
 			tgt   = rsxx_get_dma_tgt(card, addr8);
-			tgt   = array_index_nospec(tgt, RSXX_MAX_TARGETS);
 			laddr = rsxx_addr8_to_laddr(addr8, card);
 
 			st = rsxx_queue_discard(card, &dma_list[tgt], laddr,
@@ -730,7 +728,6 @@ int rsxx_dma_queue_bio(struct rsxx_cardinfo *card,
 
 			while (bv_len > 0) {
 				tgt   = rsxx_get_dma_tgt(card, addr8);
-				tgt   = array_index_nospec(tgt, RSXX_MAX_TARGETS);
 				laddr = rsxx_addr8_to_laddr(addr8, card);
 				dma_off = addr8 & RSXX_HW_BLK_MASK;
 				dma_len = min(bv_len,

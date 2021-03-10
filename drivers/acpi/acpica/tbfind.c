@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -52,7 +52,7 @@ ACPI_MODULE_NAME("tbfind")
  *
  * FUNCTION:    acpi_tb_find_table
  *
- * PARAMETERS:  Signature           - String with ACPI table signature
+ * PARAMETERS:  signature           - String with ACPI table signature
  *              oem_id              - String with the table OEM ID
  *              oem_table_id        - String with the OEM Table ID
  *              table_index         - Where the table index is returned
@@ -76,16 +76,16 @@ acpi_tb_find_table(char *signature,
 
 	/* Normalize the input strings */
 
-	ACPI_MEMSET(&header, 0, sizeof(struct acpi_table_header));
-	ACPI_STRNCPY(header.signature, signature, ACPI_NAME_SIZE);
-	ACPI_STRNCPY(header.oem_id, oem_id, ACPI_OEM_ID_SIZE);
-	ACPI_STRNCPY(header.oem_table_id, oem_table_id, ACPI_OEM_TABLE_ID_SIZE);
+	memset(&header, 0, sizeof(struct acpi_table_header));
+	ACPI_MOVE_NAME(header.signature, signature);
+	strncpy(header.oem_id, oem_id, ACPI_OEM_ID_SIZE);
+	strncpy(header.oem_table_id, oem_table_id, ACPI_OEM_TABLE_ID_SIZE);
 
 	/* Search for the table */
 
-	for (i = 0; i < acpi_gbl_root_table_list.count; ++i) {
-		if (ACPI_MEMCMP(&(acpi_gbl_root_table_list.tables[i].signature),
-				header.signature, ACPI_NAME_SIZE)) {
+	for (i = 0; i < acpi_gbl_root_table_list.current_table_count; ++i) {
+		if (memcmp(&(acpi_gbl_root_table_list.tables[i].signature),
+			   header.signature, ACPI_NAME_SIZE)) {
 
 			/* Not the requested table */
 
@@ -99,8 +99,8 @@ acpi_tb_find_table(char *signature,
 			/* Table is not currently mapped, map it */
 
 			status =
-			    acpi_tb_verify_table(&acpi_gbl_root_table_list.
-						 tables[i]);
+			    acpi_tb_validate_table(&acpi_gbl_root_table_list.
+						   tables[i]);
 			if (ACPI_FAILURE(status)) {
 				return_ACPI_STATUS(status);
 			}
@@ -112,21 +112,20 @@ acpi_tb_find_table(char *signature,
 
 		/* Check for table match on all IDs */
 
-		if (!ACPI_MEMCMP
+		if (!memcmp
 		    (acpi_gbl_root_table_list.tables[i].pointer->signature,
 		     header.signature, ACPI_NAME_SIZE) && (!oem_id[0]
 							   ||
-							   !ACPI_MEMCMP
+							   !memcmp
 							   (acpi_gbl_root_table_list.
 							    tables[i].pointer->
 							    oem_id,
 							    header.oem_id,
 							    ACPI_OEM_ID_SIZE))
 		    && (!oem_table_id[0]
-			|| !ACPI_MEMCMP(acpi_gbl_root_table_list.tables[i].
-					pointer->oem_table_id,
-					header.oem_table_id,
-					ACPI_OEM_TABLE_ID_SIZE))) {
+			|| !memcmp(acpi_gbl_root_table_list.tables[i].pointer->
+				   oem_table_id, header.oem_table_id,
+				   ACPI_OEM_TABLE_ID_SIZE))) {
 			*table_index = i;
 
 			ACPI_DEBUG_PRINT((ACPI_DB_TABLES,

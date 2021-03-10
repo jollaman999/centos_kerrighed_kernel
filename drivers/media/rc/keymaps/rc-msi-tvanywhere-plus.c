@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /*
   Keycodes for remote on the MSI TV@nywhere Plus. The controller IC on the card
@@ -62,7 +63,7 @@ static struct rc_map_table msi_tvanywhere_plus[] = {
 	{ 0x13, KEY_AGAIN },		/* Recall */
 
 	{ 0x1e, KEY_POWER },		/* Power */
-	{ 0x07, KEY_TUNER },		/* Source */
+	{ 0x07, KEY_VIDEO },		/* Source */
 	{ 0x1c, KEY_SEARCH },		/* Scan */
 	{ 0x18, KEY_MUTE },		/* Mute */
 

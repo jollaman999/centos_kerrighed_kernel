@@ -9,13 +9,16 @@
  */
 
 #include <linux/netdevice.h>
+#include <linux/slab.h>
 #include <linux/ethtool.h>
 #include <linux/etherdevice.h>
 #include <linux/u64_stats_sync.h>
 
+#include <net/rtnetlink.h>
 #include <net/dst.h>
 #include <net/xfrm.h>
 #include <linux/veth.h>
+#include <linux/module.h>
 
 #define DRV_NAME	"veth"
 #define DRV_VERSION	"1.0"
@@ -32,6 +35,7 @@ struct pcpu_vstats {
 struct veth_priv {
 	struct net_device __rcu	*peer;
 	atomic64_t		dropped;
+	unsigned		requested_headroom;
 };
 
 /*
@@ -48,7 +52,7 @@ static int veth_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 {
 	cmd->supported		= 0;
 	cmd->advertising	= 0;
-	cmd->speed		= SPEED_10000;
+	ethtool_cmd_speed_set(cmd, SPEED_10000);
 	cmd->duplex		= DUPLEX_FULL;
 	cmd->port		= PORT_TP;
 	cmd->phy_address	= 0;
@@ -61,9 +65,8 @@ static int veth_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
 
 static void veth_get_drvinfo(struct net_device *dev, struct ethtool_drvinfo *info)
 {
-	strcpy(info->driver, DRV_NAME);
-	strcpy(info->version, DRV_VERSION);
-	strcpy(info->fw_version, "N/A");
+	strlcpy(info->driver, DRV_NAME, sizeof(info->driver));
+	strlcpy(info->version, DRV_VERSION, sizeof(info->version));
 }
 
 static void veth_get_strings(struct net_device *dev, u32 stringset, u8 *buf)
@@ -117,8 +120,7 @@ static netdev_tx_t veth_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	if (likely(dev_forward_skb(rcv, skb) == NET_RX_SUCCESS)) {
-		struct pcpu_vstats *stats =
-			this_cpu_ptr((void __percpu __force *)dev->ml_priv);
+		struct pcpu_vstats *stats = this_cpu_ptr(dev->vstats);
 
 		u64_stats_update_begin(&stats->syncp);
 		stats->bytes += length;
@@ -144,8 +146,7 @@ static u64 veth_stats_one(struct pcpu_vstats *result, struct net_device *dev)
 	result->packets = 0;
 	result->bytes = 0;
 	for_each_possible_cpu(cpu) {
-		struct pcpu_vstats *stats =
-			per_cpu_ptr((void __percpu __force *)dev->ml_priv, cpu);
+		struct pcpu_vstats *stats = per_cpu_ptr(dev->vstats, cpu);
 		u64 packets, bytes;
 		unsigned int start;
 
@@ -160,8 +161,8 @@ static u64 veth_stats_one(struct pcpu_vstats *result, struct net_device *dev)
 	return atomic64_read(&priv->dropped);
 }
 
-static struct rtnl_link_stats64 *veth_get_stats64(struct net_device *dev,
-						  struct rtnl_link_stats64 *tot)
+static void veth_get_stats64(struct net_device *dev,
+			     struct rtnl_link_stats64 *tot)
 {
 	struct veth_priv *priv = netdev_priv(dev);
 	struct net_device *peer;
@@ -179,8 +180,11 @@ static struct rtnl_link_stats64 *veth_get_stats64(struct net_device *dev,
 		tot->rx_packets = one.packets;
 	}
 	rcu_read_unlock();
+}
 
-	return tot;
+/* fake multicast ability */
+static void veth_set_multicast_list(struct net_device *dev)
+{
 }
 
 static int veth_open(struct net_device *dev)
@@ -212,7 +216,7 @@ static int veth_close(struct net_device *dev)
 
 static int is_valid_veth_mtu(int new_mtu)
 {
-	return (new_mtu >= MIN_MTU && new_mtu <= MAX_MTU);
+	return new_mtu >= MIN_MTU && new_mtu <= MAX_MTU;
 }
 
 static int veth_change_mtu(struct net_device *dev, int new_mtu)
@@ -225,8 +229,8 @@ static int veth_change_mtu(struct net_device *dev, int new_mtu)
 
 static int veth_dev_init(struct net_device *dev)
 {
-	dev->ml_priv = (void __force *)alloc_percpu(struct pcpu_vstats);
-	if (!dev->ml_priv)
+	dev->vstats = alloc_percpu(struct pcpu_vstats);
+	if (!dev->vstats)
 		return -ENOMEM;
 
 	return 0;
@@ -234,8 +238,44 @@ static int veth_dev_init(struct net_device *dev)
 
 static void veth_dev_free(struct net_device *dev)
 {
-	free_percpu((void __percpu __force *)dev->ml_priv);
-	free_netdev(dev);
+	free_percpu(dev->vstats);
+}
+
+static int veth_get_iflink(const struct net_device *dev)
+{
+	struct veth_priv *priv = netdev_priv(dev);
+	struct net_device *peer;
+	int iflink;
+
+	rcu_read_lock();
+	peer = rcu_dereference(priv->peer);
+	iflink = peer ? peer->ifindex : 0;
+	rcu_read_unlock();
+
+	return iflink;
+}
+
+static void veth_set_rx_headroom(struct net_device *dev, int new_hr)
+{
+	struct veth_priv *peer_priv, *priv = netdev_priv(dev);
+	struct net_device *peer;
+
+	if (new_hr < 0)
+		new_hr = 0;
+
+	rcu_read_lock();
+	peer = rcu_dereference(priv->peer);
+	if (unlikely(!peer))
+		goto out;
+
+	peer_priv = netdev_priv(peer);
+	priv->requested_headroom = new_hr;
+	new_hr = max(priv->requested_headroom, peer_priv->requested_headroom);
+	dev->needed_headroom = new_hr;
+	peer->needed_headroom = new_hr;
+
+out:
+	rcu_read_unlock();
 }
 
 static const struct net_device_ops veth_netdev_ops = {
@@ -243,35 +283,42 @@ static const struct net_device_ops veth_netdev_ops = {
 	.ndo_open            = veth_open,
 	.ndo_stop            = veth_close,
 	.ndo_start_xmit      = veth_xmit,
-	.ndo_change_mtu      = veth_change_mtu,
+	.ndo_change_mtu_rh74 = veth_change_mtu,
+	.ndo_get_stats64     = veth_get_stats64,
+	.ndo_set_rx_mode     = veth_set_multicast_list,
 	.ndo_set_mac_address = eth_mac_addr,
+	.ndo_get_iflink		= veth_get_iflink,
+	.ndo_size		= sizeof(struct net_device_ops),
+	.extended.ndo_set_rx_headroom	= veth_set_rx_headroom,
 };
 
-static const struct net_device_ops_ext veth_netdev_ops_ext = {
-	.size			= sizeof(struct net_device_ops_ext),
-	.ndo_get_stats64	= veth_get_stats64,
-};
-
-#define VETH_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_ALL_TSO |    \
-		       NETIF_F_HW_CSUM | NETIF_F_RXCSUM | NETIF_F_HIGHDMA | \
-		       NETIF_F_HW_VLAN_TX)
+#define VETH_FEATURES (NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_HW_CSUM | \
+		       NETIF_F_RXCSUM | NETIF_F_SCTP_CRC | NETIF_F_HIGHDMA | \
+		       NETIF_F_GSO_SOFTWARE | NETIF_F_GSO_ENCAP_ALL | \
+		       NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_CTAG_RX | \
+		       NETIF_F_HW_VLAN_STAG_TX | NETIF_F_HW_VLAN_STAG_RX )
 
 static void veth_setup(struct net_device *dev)
 {
 	ether_setup(dev);
 
-	netdev_extended(dev)->ext_priv_flags &= ~IFF_TX_SKB_SHARING;
-	netdev_extended(dev)->ext_priv_flags |= IFF_LIVE_ADDR_CHANGE;
+	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
+	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
+	dev->priv_flags |= IFF_NO_QUEUE;
+	dev->priv_flags |= IFF_PHONY_HEADROOM;
 
 	dev->netdev_ops = &veth_netdev_ops;
-	set_netdev_ops_ext(dev, &veth_netdev_ops_ext);
 	dev->ethtool_ops = &veth_ethtool_ops;
 	dev->features |= NETIF_F_LLTX;
 	dev->features |= VETH_FEATURES;
-	dev->vlan_features = dev->features;
-	dev->destructor = veth_dev_free;
+	dev->vlan_features = dev->features &
+			     ~(NETIF_F_HW_VLAN_CTAG_TX | NETIF_F_HW_VLAN_STAG_TX);
+	dev->extended->needs_free_netdev = true;
+	dev->extended->priv_destructor = veth_dev_free;
 
-	set_netdev_hw_features(dev, VETH_FEATURES);
+	dev->hw_features = VETH_FEATURES;
+	dev->hw_enc_features = VETH_FEATURES;
+	dev->mpls_features = NETIF_F_HW_CSUM | NETIF_F_GSO_SOFTWARE;
 }
 
 /*
@@ -295,31 +342,28 @@ static int veth_validate(struct nlattr *tb[], struct nlattr *data[])
 
 static struct rtnl_link_ops veth_link_ops;
 
-static int veth_newlink(struct net_device *dev,
+static int veth_newlink(struct net *src_net, struct net_device *dev,
 			 struct nlattr *tb[], struct nlattr *data[])
 {
-	struct net *net, *src_net = netdev_extended(dev)->src_net;
 	int err;
 	struct net_device *peer;
 	struct veth_priv *priv;
 	char ifname[IFNAMSIZ];
 	struct nlattr *peer_tb[IFLA_MAX + 1], **tbp;
+	struct ifinfomsg *ifmp;
+	struct net *net;
 
 	/*
 	 * create and register peer first
-	 *
-	 * struct ifinfomsg is at the head of VETH_INFO_PEER, but we
-	 * skip it since no info from it is useful yet
 	 */
-
 	if (data != NULL && data[VETH_INFO_PEER] != NULL) {
 		struct nlattr *nla_peer;
 
 		nla_peer = data[VETH_INFO_PEER];
-		err = nla_parse(peer_tb, IFLA_MAX,
-				nla_data(nla_peer) + sizeof(struct ifinfomsg),
-				nla_len(nla_peer) - sizeof(struct ifinfomsg),
-				ifla_policy);
+		ifmp = nla_data(nla_peer);
+		err = rtnl_nla_parse_ifla(peer_tb,
+					  nla_data(nla_peer) + sizeof(struct ifinfomsg),
+					  nla_len(nla_peer) - sizeof(struct ifinfomsg));
 		if (err < 0)
 			return err;
 
@@ -328,10 +372,12 @@ static int veth_newlink(struct net_device *dev,
 			return err;
 
 		tbp = peer_tb;
-	} else
+	} else {
+		ifmp = NULL;
 		tbp = tb;
+	}
 
-	if (tbp[IFLA_IFNAME])
+	if (ifmp && tbp[IFLA_IFNAME])
 		nla_strlcpy(ifname, tbp[IFLA_IFNAME], IFNAMSIZ);
 	else
 		snprintf(ifname, IFNAMSIZ, DRV_NAME "%%d");
@@ -340,14 +386,17 @@ static int veth_newlink(struct net_device *dev,
 	if (IS_ERR(net))
 		return PTR_ERR(net);
 
-	peer = rtnl_create_link(src_net, net, ifname, &veth_link_ops, tbp);
+	peer = rtnl_create_link(net, ifname, &veth_link_ops, tbp);
 	if (IS_ERR(peer)) {
 		put_net(net);
 		return PTR_ERR(peer);
 	}
 
-	if (tbp[IFLA_ADDRESS] == NULL)
+	if (!ifmp || !tbp[IFLA_ADDRESS])
 		eth_hw_addr_random(peer);
+
+	if (ifmp && (dev->ifindex != 0))
+		peer->ifindex = ifmp->ifi_index;
 
 	err = register_netdevice(peer);
 	put_net(net);
@@ -356,6 +405,10 @@ static int veth_newlink(struct net_device *dev,
 		goto err_register_peer;
 
 	netif_carrier_off(peer);
+
+	err = rtnl_configure_link(peer, ifmp);
+	if (err < 0)
+		goto err_configure_peer;
 
 	/*
 	 * register dev last
@@ -398,6 +451,7 @@ static int veth_newlink(struct net_device *dev,
 err_register_dev:
 	/* nothing to do */
 err_alloc_name:
+err_configure_peer:
 	unregister_netdevice(peer);
 	return err;
 
@@ -406,7 +460,7 @@ err_register_peer:
 	return err;
 }
 
-static void veth_dellink(struct net_device *dev)
+static void veth_dellink(struct net_device *dev, struct list_head *head)
 {
 	struct veth_priv *priv;
 	struct net_device *peer;
@@ -419,18 +473,26 @@ static void veth_dellink(struct net_device *dev)
 	 * not being freed before one RCU grace period.
 	 */
 	RCU_INIT_POINTER(priv->peer, NULL);
-	unregister_netdevice(dev);
+	unregister_netdevice_queue(dev, head);
 
 	if (peer) {
 		priv = netdev_priv(peer);
 		RCU_INIT_POINTER(priv->peer, NULL);
-		unregister_netdevice(peer);
+		unregister_netdevice_queue(peer, head);
 	}
 }
 
 static const struct nla_policy veth_policy[VETH_INFO_MAX + 1] = {
 	[VETH_INFO_PEER]	= { .len = sizeof(struct ifinfomsg) },
 };
+
+static struct net *veth_get_link_net(const struct net_device *dev)
+{
+	struct veth_priv *priv = netdev_priv(dev);
+	struct net_device *peer = rtnl_dereference(priv->peer);
+
+	return peer ? dev_net(peer) : dev_net(dev);
+}
 
 static struct rtnl_link_ops veth_link_ops = {
 	.kind		= DRV_NAME,
@@ -441,6 +503,7 @@ static struct rtnl_link_ops veth_link_ops = {
 	.dellink	= veth_dellink,
 	.policy		= veth_policy,
 	.maxtype	= VETH_INFO_MAX,
+	.get_link_net	= veth_get_link_net,
 };
 
 /*

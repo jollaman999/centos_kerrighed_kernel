@@ -32,6 +32,7 @@ probe_likely_condition(struct ftrace_branch_data *f, int val, int expect)
 {
 	struct ftrace_event_call *call = &event_branch;
 	struct trace_array *tr = branch_tracer;
+	struct trace_array_cpu *data;
 	struct ring_buffer_event *event;
 	struct trace_branch *entry;
 	struct ring_buffer *buffer;
@@ -51,11 +52,12 @@ probe_likely_condition(struct ftrace_branch_data *f, int val, int expect)
 
 	local_irq_save(flags);
 	cpu = raw_smp_processor_id();
-	if (atomic_inc_return(&tr->data[cpu]->disabled) != 1)
+	data = per_cpu_ptr(tr->trace_buffer.data, cpu);
+	if (atomic_inc_return(&data->disabled) != 1)
 		goto out;
 
 	pc = preempt_count();
-	buffer = tr->buffer;
+	buffer = tr->trace_buffer.buffer;
 	event = trace_buffer_lock_reserve(buffer, TRACE_BRANCH,
 					  sizeof(*entry), flags, pc);
 	if (!event)
@@ -77,10 +79,10 @@ probe_likely_condition(struct ftrace_branch_data *f, int val, int expect)
 	entry->correct = val == expect;
 
 	if (!filter_check_discard(call, entry, buffer, event))
-		ring_buffer_unlock_commit(buffer, event);
+		__buffer_unlock_commit(buffer, event);
 
  out:
-	atomic_dec(&tr->data[cpu]->disabled);
+	atomic_dec(&data->disabled);
 	local_irq_restore(flags);
 }
 
@@ -143,7 +145,7 @@ static void branch_trace_reset(struct trace_array *tr)
 }
 
 static enum print_line_t trace_branch_print(struct trace_iterator *iter,
-					    int flags)
+					    int flags, struct trace_event *event)
 {
 	struct trace_branch *field;
 
@@ -167,9 +169,13 @@ static void branch_print_header(struct seq_file *s)
 		"    |\n");
 }
 
+static struct trace_event_functions trace_branch_funcs = {
+	.trace		= trace_branch_print,
+};
+
 static struct trace_event trace_branch_event = {
 	.type		= TRACE_BRANCH,
-	.trace		= trace_branch_print,
+	.funcs		= &trace_branch_funcs,
 };
 
 static struct tracer branch_trace __read_mostly =
@@ -195,7 +201,7 @@ __init static int init_branch_tracer(void)
 	}
 	return register_tracer(&branch_trace);
 }
-device_initcall(init_branch_tracer);
+core_initcall(init_branch_tracer);
 
 #else
 static inline
@@ -307,8 +313,23 @@ static int annotated_branch_stat_cmp(void *p1, void *p2)
 		return -1;
 	if (percent_a > percent_b)
 		return 1;
-	else
-		return 0;
+
+	if (a->incorrect < b->incorrect)
+		return -1;
+	if (a->incorrect > b->incorrect)
+		return 1;
+
+	/*
+	 * Since the above shows worse (incorrect) cases
+	 * first, we continue that by showing best (correct)
+	 * cases last.
+	 */
+	if (a->correct > b->correct)
+		return -1;
+	if (a->correct < b->correct)
+		return 1;
+
+	return 0;
 }
 
 static struct tracer_stat annotated_branch_stats = {

@@ -12,18 +12,44 @@
 #include <linux/kexec.h>
 #include <linux/reboot.h>
 #include <linux/threads.h>
-#include <linux/lmb.h>
+#include <linux/memblock.h>
 #include <linux/of.h>
+#include <linux/irq.h>
+#include <linux/ftrace.h>
+
 #include <asm/machdep.h>
+#include <asm/pgalloc.h>
 #include <asm/prom.h>
 #include <asm/sections.h>
+#ifdef CONFIG_KEXEC_AUTO_RESERVE
+#include <asm/fadump.h>
+#endif
+
+void machine_kexec_mask_interrupts(void) {
+	unsigned int i;
+	struct irq_desc *desc;
+
+	for_each_irq_desc(i, desc) {
+		struct irq_chip *chip;
+
+		chip = irq_desc_get_chip(desc);
+		if (!chip)
+			continue;
+
+		if (chip->irq_eoi && irqd_irq_inprogress(&desc->irq_data))
+			chip->irq_eoi(&desc->irq_data);
+
+		if (chip->irq_mask)
+			chip->irq_mask(&desc->irq_data);
+
+		if (chip->irq_disable && !irqd_irq_disabled(&desc->irq_data))
+			chip->irq_disable(&desc->irq_data);
+	}
+}
 
 void machine_crash_shutdown(struct pt_regs *regs)
 {
-	if (ppc_md.machine_crash_shutdown)
-		ppc_md.machine_crash_shutdown(regs);
-	else
-		default_machine_crash_shutdown(regs);
+	default_machine_crash_shutdown(regs);
 }
 
 /*
@@ -41,8 +67,6 @@ int machine_kexec_prepare(struct kimage *image)
 
 void machine_kexec_cleanup(struct kimage *image)
 {
-	if (ppc_md.machine_kexec_cleanup)
-		ppc_md.machine_kexec_cleanup(image);
 }
 
 void arch_crash_save_vmcoreinfo(void)
@@ -55,6 +79,17 @@ void arch_crash_save_vmcoreinfo(void)
 #ifndef CONFIG_NEED_MULTIPLE_NODES
 	VMCOREINFO_SYMBOL(contig_page_data);
 #endif
+#if defined(CONFIG_PPC64) && defined(CONFIG_SPARSEMEM_VMEMMAP)
+	VMCOREINFO_SYMBOL(vmemmap_list);
+	VMCOREINFO_SYMBOL(mmu_vmemmap_psize);
+	VMCOREINFO_SYMBOL(mmu_psize_defs);
+	VMCOREINFO_STRUCT_SIZE(vmemmap_backing);
+	VMCOREINFO_OFFSET(vmemmap_backing, list);
+	VMCOREINFO_OFFSET(vmemmap_backing, phys);
+	VMCOREINFO_OFFSET(vmemmap_backing, virt_addr);
+	VMCOREINFO_STRUCT_SIZE(mmu_psize_def);
+	VMCOREINFO_OFFSET(mmu_psize_def, shift);
+#endif
 }
 
 /*
@@ -63,10 +98,18 @@ void arch_crash_save_vmcoreinfo(void)
  */
 void machine_kexec(struct kimage *image)
 {
+	int save_ftrace_enabled;
+
+	save_ftrace_enabled = __ftrace_enabled_save();
+	this_cpu_disable_ftrace();
+
 	if (ppc_md.machine_kexec)
 		ppc_md.machine_kexec(image);
 	else
 		default_machine_kexec(image);
+
+	this_cpu_enable_ftrace();
+	__ftrace_enabled_restore(save_ftrace_enabled);
 
 	/* Fall back to normal restart if we're still alive. */
 	machine_restart(NULL);
@@ -83,35 +126,50 @@ unsigned long long __init arch_default_crash_base(void)
 #endif
 }
 
-unsigned long long __init
-arch_crash_auto_scale(unsigned long long total_size, unsigned long long size)
+unsigned long long __init arch_default_crash_size(unsigned long long total_size)
 {
+	/*
+	 * 'crashkernel=' can be used for fadump memory reservation as well.
+	 * So, if fadump is enabled, calculate auto value for it accordingly.
+	 */
+	if (is_fadump_enabled())
+		return fadump_default_reserve_size();
+
 	if (total_size < KEXEC_AUTO_THRESHOLD)
 		return 0;
+
+#ifdef CONFIG_64BIT
+	/*
+	 * crashkernel 'auto' reservation scheme
+	 * 2G-4G:384M,4G-16G:512M,16G-64G:1G,64G-128G:2G,128G-:4G
+	 */
+	if (total_size < (1ULL<<32)) /* 4G */
+		return ((1ULL<<28) + (1ULL<<27)); /* 384M */
+	if (total_size < (1ULL<<34)) /* 16G */
+		return 1ULL<<29; /* 512M */
+	if (total_size < (1ULL<<36)) /* 64G */
+		return 1ULL<<30; /* 1G */
+	if (total_size < (1ULL<<37)) /* 128G */
+		return 1ULL<<31; /* 2G */
+
+	return 1ULL<<32; /* 4G */
+#else
 	if (total_size < (1ULL<<32))
 		return 1ULL<<27;
-	else {
-#ifdef CONFIG_64BIT
-		if (total_size > (1ULL<<37)) /* 128G */
-			return 1ULL<<32; /* 4G */
-		return 1ULL<<ilog2(roundup(total_size/32, 1ULL<<21));
-#else
+	else
 		return 1ULL<<28;
 #endif
-	}
 }
 #endif
 
 void __init reserve_crashkernel(void)
 {
-	unsigned long long crash_size, crash_base;
+	unsigned long long crash_size, crash_base, total_mem_sz;
 	int ret;
 
-	/* this is necessary because of lmb_phys_mem_size() */
-	lmb_analyze();
-
+	total_mem_sz = memory_limit ? memory_limit : memblock_phys_mem_size();
 	/* use common parsing */
-	ret = parse_crashkernel(boot_command_line, lmb_phys_mem_size(),
+	ret = parse_crashkernel(boot_command_line, total_mem_sz,
 			&crash_size, &crash_base);
 	if (ret == 0 && crash_size > 0) {
 		crashk_res.start = crash_base;
@@ -126,9 +184,9 @@ void __init reserve_crashkernel(void)
 	/* We might have got these values via the command line or the
 	 * device tree, either way sanitise them now. */
 
-	crash_size = crashk_res.end - crashk_res.start + 1;
+	crash_size = resource_size(&crashk_res);
 
-#ifndef CONFIG_RELOCATABLE
+#ifndef CONFIG_NONSTATIC_KERNEL
 	if (crashk_res.start != KDUMP_KERNELBASE)
 		printk("Crash kernel location must be 0x%x\n",
 				KDUMP_KERNELBASE);
@@ -136,12 +194,16 @@ void __init reserve_crashkernel(void)
 	crashk_res.start = KDUMP_KERNELBASE;
 #else
 	if (!crashk_res.start) {
+#ifdef CONFIG_PPC64
 		/*
-		 * unspecified address, choose a region of specified size
-		 * can overlap with initrd (ignoring corruption when retained)
-		 * ppc64 requires kernel and some stacks to be in first segment
+		 * On 64bit we split the RMO in half but cap it at half of
+		 * a small SLB (128MB) since the crash kernel needs to place
+		 * itself and some stacks to be in the first segment.
 		 */
+		crashk_res.start = min(0x8000000ULL, (ppc64_rma_size / 2));
+#else
 		crashk_res.start = KDUMP_KERNELBASE;
+#endif
 	}
 
 	crash_base = PAGE_ALIGN(crashk_res.start);
@@ -150,40 +212,23 @@ void __init reserve_crashkernel(void)
 				PAGE_SIZE);
 		crashk_res.start = crash_base;
 	}
+
 #endif
 	crash_size = PAGE_ALIGN(crash_size);
 	crashk_res.end = crashk_res.start + crash_size - 1;
 
 	/* The crash region must not overlap the current kernel */
 	if (overlaps_crashkernel(__pa(_stext), _end - _stext)) {
-#ifdef CONFIG_RELOCATABLE
-		do {
-			/* Align kdump kernel to 16MB (size of large page) */
-			crashk_res.start = ALIGN(crashk_res.start +
-						(16 * 1024 * 1024), 0x1000000);
-			if (crashk_res.start + (_end - _stext) > lmb.rmo_size) {
-				printk(KERN_WARNING
-					"Not enough memory for crash kernel\n");
-				crashk_res.start = crashk_res.end = 0;
-				return;
-			}
-		} while (overlaps_crashkernel(__pa(_stext), _end - _stext));
-
-		crashk_res.end = crashk_res.start + crash_size - 1;
-		printk(KERN_INFO
-			"crash kernel memory overlaps with kernel memory\n"
-			"Moving it to %ldMB\n", (unsigned long)(crashk_res.start >> 20));
-#else
 		printk(KERN_WARNING
 			"Crash kernel can not overlap current kernel\n");
 		crashk_res.start = crashk_res.end = 0;
 		return;
-#endif
 	}
 
 	/* Crash kernel trumps memory limit */
 	if (memory_limit && memory_limit <= crashk_res.end) {
 		memory_limit = crashk_res.end + 1;
+		total_mem_sz = memory_limit;
 		printk("Adjusted memory limit for crashkernel, now 0x%llx\n",
 		       memory_limit);
 	}
@@ -192,9 +237,14 @@ void __init reserve_crashkernel(void)
 			"for crashkernel (System RAM: %ldMB)\n",
 			(unsigned long)(crash_size >> 20),
 			(unsigned long)(crashk_res.start >> 20),
-			(unsigned long)(lmb_phys_mem_size() >> 20));
+			(unsigned long)(total_mem_sz >> 20));
 
-	lmb_reserve(crashk_res.start, crash_size);
+	if (!memblock_is_region_memory(crashk_res.start, crash_size) ||
+	    memblock_reserve(crashk_res.start, crash_size)) {
+		pr_err("Failed to reserve memory for crashkernel!\n");
+		crashk_res.start = crashk_res.end = 0;
+		return;
+	}
 }
 
 int overlaps_crashkernel(unsigned long start, unsigned long size)
@@ -203,32 +253,36 @@ int overlaps_crashkernel(unsigned long start, unsigned long size)
 }
 
 /* Values we need to export to the second kernel via the device tree. */
-static unsigned long kernel_end;
-static unsigned long crashk_size;
+static phys_addr_t kernel_end;
+static phys_addr_t crashk_base;
+static phys_addr_t crashk_size;
+static unsigned long long mem_limit;
 
 static struct property kernel_end_prop = {
 	.name = "linux,kernel-end",
-	.length = sizeof(unsigned long),
+	.length = sizeof(phys_addr_t),
 	.value = &kernel_end,
 };
 
 static struct property crashk_base_prop = {
 	.name = "linux,crashkernel-base",
-	.length = sizeof(unsigned long),
-	.value = &crashk_res.start,
+	.length = sizeof(phys_addr_t),
+	.value = &crashk_base
 };
 
 static struct property crashk_size_prop = {
 	.name = "linux,crashkernel-size",
-	.length = sizeof(unsigned long),
+	.length = sizeof(phys_addr_t),
 	.value = &crashk_size,
 };
 
 static struct property memory_limit_prop = {
 	.name = "linux,memory-limit",
 	.length = sizeof(unsigned long long),
-	.value = &memory_limit,
+	.value = &mem_limit,
 };
+
+#define cpu_to_be_ulong	__PASTE(cpu_to_be, BITS_PER_LONG)
 
 static void __init export_crashk_values(struct device_node *node)
 {
@@ -238,27 +292,25 @@ static void __init export_crashk_values(struct device_node *node)
 	 * be sure what's in them, so remove them. */
 	prop = of_find_property(node, "linux,crashkernel-base", NULL);
 	if (prop)
-		prom_remove_property(node, prop);
+		of_remove_property(node, prop);
 
 	prop = of_find_property(node, "linux,crashkernel-size", NULL);
 	if (prop)
-		prom_remove_property(node, prop);
+		of_remove_property(node, prop);
 
 	if (crashk_res.start != 0) {
-		prom_add_property(node, &crashk_base_prop);
-		crashk_size = crashk_res.end - crashk_res.start + 1;
-		prom_add_property(node, &crashk_size_prop);
+		crashk_base = cpu_to_be_ulong(crashk_res.start),
+		of_add_property(node, &crashk_base_prop);
+		crashk_size = cpu_to_be_ulong(resource_size(&crashk_res));
+		of_add_property(node, &crashk_size_prop);
 	}
 
 	/*
 	 * memory_limit is required by the kexec-tools to limit the
 	 * crash regions to the actual memory used.
 	 */
-	prop = of_find_property(node, memory_limit_prop.name, NULL);
- 	if (!prop)
-		prom_add_property(node, &memory_limit_prop);
-	else
-		prom_update_property(node, &memory_limit_prop, prop);
+	mem_limit = cpu_to_be_ulong(memory_limit);
+	of_update_property(node, &memory_limit_prop);
 }
 
 static int __init kexec_setup(void)
@@ -273,11 +325,11 @@ static int __init kexec_setup(void)
 	/* remove any stale properties so ours can be found */
 	prop = of_find_property(node, kernel_end_prop.name, NULL);
 	if (prop)
-		prom_remove_property(node, prop);
+		of_remove_property(node, prop);
 
 	/* information needed by userspace when using default_machine_kexec */
-	kernel_end = __pa(_end);
-	prom_add_property(node, &kernel_end_prop);
+	kernel_end = cpu_to_be_ulong(__pa(_end));
+	of_add_property(node, &kernel_end_prop);
 
 	export_crashk_values(node);
 

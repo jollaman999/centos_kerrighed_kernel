@@ -79,7 +79,7 @@ void radeon_pm_acpi_event_handler(struct radeon_device *rdev)
 				radeon_dpm_enable_bapm(rdev, rdev->pm.dpm.ac_power);
 		}
 		mutex_unlock(&rdev->pm.mutex);
-        } else if (rdev->pm.pm_method == PM_METHOD_PROFILE) {
+	} else if (rdev->pm.pm_method == PM_METHOD_PROFILE) {
 		if (rdev->pm.profile == PM_PROFILE_AUTO) {
 			mutex_lock(&rdev->pm.mutex);
 			radeon_pm_update_profile(rdev);
@@ -246,6 +246,7 @@ static void radeon_set_power_state(struct radeon_device *rdev)
 
 static void radeon_pm_set_clocks(struct radeon_device *rdev)
 {
+	struct drm_crtc *crtc;
 	int i, r;
 
 	/* no need to take locks, etc. if nothing's going to change */
@@ -274,22 +275,30 @@ static void radeon_pm_set_clocks(struct radeon_device *rdev)
 	radeon_unmap_vram_bos(rdev);
 
 	if (rdev->irq.installed) {
-		for (i = 0; i < rdev->num_crtc; i++) {
+		i = 0;
+		drm_for_each_crtc(crtc, rdev->ddev) {
 			if (rdev->pm.active_crtcs & (1 << i)) {
-				rdev->pm.req_vblank |= (1 << i);
-				drm_vblank_get(rdev->ddev, i);
+				/* This can fail if a modeset is in progress */
+				if (drm_crtc_vblank_get(crtc) == 0)
+					rdev->pm.req_vblank |= (1 << i);
+				else
+					DRM_DEBUG_DRIVER("crtc %d no vblank, can glitch\n",
+							 i);
 			}
+			i++;
 		}
 	}
 
 	radeon_set_power_state(rdev);
 
 	if (rdev->irq.installed) {
-		for (i = 0; i < rdev->num_crtc; i++) {
+		i = 0;
+		drm_for_each_crtc(crtc, rdev->ddev) {
 			if (rdev->pm.req_vblank & (1 << i)) {
 				rdev->pm.req_vblank &= ~(1 << i);
-				drm_vblank_put(rdev->ddev, i);
+				drm_crtc_vblank_put(crtc);
 			}
+			i++;
 		}
 	}
 
@@ -710,10 +719,10 @@ static struct attribute *hwmon_attributes[] = {
 	NULL
 };
 
-static mode_t hwmon_attributes_visible(struct kobject *kobj,
+static umode_t hwmon_attributes_visible(struct kobject *kobj,
 					struct attribute *attr, int index)
 {
-	struct device *dev = container_of(kobj, struct device, kobj);
+	struct device *dev = kobj_to_dev(kobj);
 	struct radeon_device *rdev = dev_get_drvdata(dev);
 	umode_t effective_mode = attr->mode;
 
@@ -763,11 +772,14 @@ static const struct attribute_group hwmon_attrgroup = {
 	.is_visible = hwmon_attributes_visible,
 };
 
+static const struct attribute_group *hwmon_groups[] = {
+	&hwmon_attrgroup,
+	NULL
+};
+
 static int radeon_hwmon_init(struct radeon_device *rdev)
 {
 	int err = 0;
-
-	rdev->pm.int_hwmon_dev = NULL;
 
 	switch (rdev->pm.int_thermal_type) {
 	case THERMAL_TYPE_RV6XX:
@@ -780,20 +792,13 @@ static int radeon_hwmon_init(struct radeon_device *rdev)
 	case THERMAL_TYPE_KV:
 		if (rdev->asic->pm.get_temperature == NULL)
 			return err;
-		rdev->pm.int_hwmon_dev = hwmon_device_register(rdev->dev);
+		rdev->pm.int_hwmon_dev = hwmon_device_register_with_groups(rdev->dev,
+									   "radeon", rdev,
+									   hwmon_groups);
 		if (IS_ERR(rdev->pm.int_hwmon_dev)) {
 			err = PTR_ERR(rdev->pm.int_hwmon_dev);
 			dev_err(rdev->dev,
 				"Unable to register hwmon device: %d\n", err);
-			break;
-		}
-		dev_set_drvdata(rdev->pm.int_hwmon_dev, rdev);
-		err = sysfs_create_group(&rdev->pm.int_hwmon_dev->kobj,
-					 &hwmon_attrgroup);
-		if (err) {
-			dev_err(rdev->dev,
-				"Unable to create hwmon sysfs file: %d\n", err);
-			hwmon_device_unregister(rdev->dev);
 		}
 		break;
 	default:
@@ -805,10 +810,8 @@ static int radeon_hwmon_init(struct radeon_device *rdev)
 
 static void radeon_hwmon_fini(struct radeon_device *rdev)
 {
-	if (rdev->pm.int_hwmon_dev) {
-		sysfs_remove_group(&rdev->pm.int_hwmon_dev->kobj, &hwmon_attrgroup);
+	if (rdev->pm.int_hwmon_dev)
 		hwmon_device_unregister(rdev->pm.int_hwmon_dev);
-	}
 }
 
 static void radeon_dpm_thermal_work_handler(struct work_struct *work)
@@ -1084,10 +1087,6 @@ force:
 	/* update displays */
 	radeon_dpm_display_configuration_changed(rdev);
 
-	rdev->pm.dpm.current_active_crtcs = rdev->pm.dpm.new_active_crtcs;
-	rdev->pm.dpm.current_active_crtc_count = rdev->pm.dpm.new_active_crtc_count;
-	rdev->pm.dpm.single_display = single_display;
-
 	/* wait for the rings to drain */
 	for (i = 0; i < RADEON_NUM_RINGS; i++) {
 		struct radeon_ring *ring = &rdev->ring[i];
@@ -1102,6 +1101,10 @@ force:
 	rdev->pm.dpm.current_ps = rdev->pm.dpm.requested_ps;
 
 	radeon_dpm_post_set_power_state(rdev);
+
+	rdev->pm.dpm.current_active_crtcs = rdev->pm.dpm.new_active_crtcs;
+	rdev->pm.dpm.current_active_crtc_count = rdev->pm.dpm.new_active_crtc_count;
+	rdev->pm.dpm.single_display = single_display;
 
 	if (rdev->asic->dpm.force_performance_level) {
 		if (rdev->pm.dpm.thermal_active) {

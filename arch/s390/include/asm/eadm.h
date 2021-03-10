@@ -3,7 +3,6 @@
 
 #include <linux/types.h>
 #include <linux/device.h>
-#include <linux/spinlock.h>
 
 struct arqb {
 	u64 data;
@@ -85,7 +84,6 @@ struct scm_device {
 	u64 size;
 	unsigned int nr_max_block;
 	struct device dev;
-	spinlock_t lock;
 	struct {
 		unsigned int persistence:4;
 		unsigned int oper_state:4;
@@ -113,18 +111,7 @@ struct scm_driver {
 int scm_driver_register(struct scm_driver *scmdrv);
 void scm_driver_unregister(struct scm_driver *scmdrv);
 
-int scm_start_aob(struct aob *aob);
+int eadm_start_aob(struct aob *aob);
 void scm_irq_handler(struct aob *aob, int error);
-
-struct eadm_ops {
-	int (*eadm_start) (struct aob *aob);
-	struct module *owner;
-};
-
-int scm_get_ref(void);
-void scm_put_ref(void);
-
-void register_eadm_ops(struct eadm_ops *ops);
-void unregister_eadm_ops(struct eadm_ops *ops);
 
 #endif /* _ASM_S390_EADM_H */

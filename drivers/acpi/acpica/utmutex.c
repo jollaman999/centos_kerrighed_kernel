@@ -5,7 +5,7 @@
  ******************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -50,7 +50,7 @@ ACPI_MODULE_NAME("utmutex")
 /* Local prototypes */
 static acpi_status acpi_ut_create_mutex(acpi_mutex_handle mutex_id);
 
-static acpi_status acpi_ut_delete_mutex(acpi_mutex_handle mutex_id);
+static void acpi_ut_delete_mutex(acpi_mutex_handle mutex_id);
 
 /*******************************************************************************
  *
@@ -93,12 +93,14 @@ acpi_status acpi_ut_mutex_initialize(void)
 		return_ACPI_STATUS (status);
 	}
 
-	status = acpi_os_create_lock (&acpi_ev_global_lock_pending_lock);
-	if (ACPI_FAILURE (status)) {
-		return_ACPI_STATUS (status);
+	status = acpi_os_create_lock(&acpi_gbl_reference_count_lock);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
 	}
 
-	status = acpi_os_create_lock(&acpi_gbl_reference_count_lock);
+	/* Mutex for _OSI support */
+
+	status = acpi_os_create_mutex(&acpi_gbl_osi_mutex);
 	if (ACPI_FAILURE(status)) {
 		return_ACPI_STATUS(status);
 	}
@@ -131,8 +133,10 @@ void acpi_ut_mutex_terminate(void)
 	/* Delete each predefined mutex object */
 
 	for (i = 0; i < ACPI_NUM_MUTEX; i++) {
-		(void)acpi_ut_delete_mutex(i);
+		acpi_ut_delete_mutex(i);
 	}
+
+	acpi_os_delete_mutex(acpi_gbl_osi_mutex);
 
 	/* Delete the spinlocks */
 
@@ -150,7 +154,7 @@ void acpi_ut_mutex_terminate(void)
  *
  * FUNCTION:    acpi_ut_create_mutex
  *
- * PARAMETERS:  mutex_iD        - ID of the mutex to be created
+ * PARAMETERS:  mutex_ID        - ID of the mutex to be created
  *
  * RETURN:      Status
  *
@@ -163,10 +167,6 @@ static acpi_status acpi_ut_create_mutex(acpi_mutex_handle mutex_id)
 	acpi_status status = AE_OK;
 
 	ACPI_FUNCTION_TRACE_U32(ut_create_mutex, mutex_id);
-
-	if (mutex_id > ACPI_MAX_MUTEX) {
-		return_ACPI_STATUS(AE_BAD_PARAMETER);
-	}
 
 	if (!acpi_gbl_mutex_info[mutex_id].mutex) {
 		status =
@@ -183,7 +183,7 @@ static acpi_status acpi_ut_create_mutex(acpi_mutex_handle mutex_id)
  *
  * FUNCTION:    acpi_ut_delete_mutex
  *
- * PARAMETERS:  mutex_iD        - ID of the mutex to be deleted
+ * PARAMETERS:  mutex_ID        - ID of the mutex to be deleted
  *
  * RETURN:      Status
  *
@@ -191,28 +191,24 @@ static acpi_status acpi_ut_create_mutex(acpi_mutex_handle mutex_id)
  *
  ******************************************************************************/
 
-static acpi_status acpi_ut_delete_mutex(acpi_mutex_handle mutex_id)
+static void acpi_ut_delete_mutex(acpi_mutex_handle mutex_id)
 {
 
 	ACPI_FUNCTION_TRACE_U32(ut_delete_mutex, mutex_id);
-
-	if (mutex_id > ACPI_MAX_MUTEX) {
-		return_ACPI_STATUS(AE_BAD_PARAMETER);
-	}
 
 	acpi_os_delete_mutex(acpi_gbl_mutex_info[mutex_id].mutex);
 
 	acpi_gbl_mutex_info[mutex_id].mutex = NULL;
 	acpi_gbl_mutex_info[mutex_id].thread_id = ACPI_MUTEX_NOT_ACQUIRED;
 
-	return_ACPI_STATUS(AE_OK);
+	return_VOID;
 }
 
 /*******************************************************************************
  *
  * FUNCTION:    acpi_ut_acquire_mutex
  *
- * PARAMETERS:  mutex_iD        - ID of the mutex to be acquired
+ * PARAMETERS:  mutex_ID        - ID of the mutex to be acquired
  *
  * RETURN:      Status
  *
@@ -239,27 +235,26 @@ acpi_status acpi_ut_acquire_mutex(acpi_mutex_handle mutex_id)
 		/*
 		 * Mutex debug code, for internal debugging only.
 		 *
-		 * Deadlock prevention.  Check if this thread owns any mutexes of value
-		 * greater than or equal to this one.  If so, the thread has violated
-		 * the mutex ordering rule.  This indicates a coding error somewhere in
+		 * Deadlock prevention. Check if this thread owns any mutexes of value
+		 * greater than or equal to this one. If so, the thread has violated
+		 * the mutex ordering rule. This indicates a coding error somewhere in
 		 * the ACPI subsystem code.
 		 */
 		for (i = mutex_id; i < ACPI_NUM_MUTEX; i++) {
 			if (acpi_gbl_mutex_info[i].thread_id == this_thread_id) {
 				if (i == mutex_id) {
 					ACPI_ERROR((AE_INFO,
-						    "Mutex [%s] already acquired by this thread [%p]",
+						    "Mutex [%s] already acquired by this thread [%u]",
 						    acpi_ut_get_mutex_name
 						    (mutex_id),
-						    ACPI_CAST_PTR(void,
-								  this_thread_id)));
+						    (u32)this_thread_id));
 
 					return (AE_ALREADY_ACQUIRED);
 				}
 
 				ACPI_ERROR((AE_INFO,
-					    "Invalid acquire order: Thread %p owns [%s], wants [%s]",
-					    ACPI_CAST_PTR(void, this_thread_id),
+					    "Invalid acquire order: Thread %u owns [%s], wants [%s]",
+					    (u32)this_thread_id,
 					    acpi_ut_get_mutex_name(i),
 					    acpi_ut_get_mutex_name(mutex_id)));
 
@@ -270,24 +265,24 @@ acpi_status acpi_ut_acquire_mutex(acpi_mutex_handle mutex_id)
 #endif
 
 	ACPI_DEBUG_PRINT((ACPI_DB_MUTEX,
-			  "Thread %p attempting to acquire Mutex [%s]\n",
-			  ACPI_CAST_PTR(void, this_thread_id),
+			  "Thread %u attempting to acquire Mutex [%s]\n",
+			  (u32)this_thread_id,
 			  acpi_ut_get_mutex_name(mutex_id)));
 
 	status = acpi_os_acquire_mutex(acpi_gbl_mutex_info[mutex_id].mutex,
 				       ACPI_WAIT_FOREVER);
 	if (ACPI_SUCCESS(status)) {
 		ACPI_DEBUG_PRINT((ACPI_DB_MUTEX,
-				  "Thread %p acquired Mutex [%s]\n",
-				  ACPI_CAST_PTR(void, this_thread_id),
+				  "Thread %u acquired Mutex [%s]\n",
+				  (u32)this_thread_id,
 				  acpi_ut_get_mutex_name(mutex_id)));
 
 		acpi_gbl_mutex_info[mutex_id].use_count++;
 		acpi_gbl_mutex_info[mutex_id].thread_id = this_thread_id;
 	} else {
 		ACPI_EXCEPTION((AE_INFO, status,
-				"Thread %p could not acquire Mutex [0x%X]",
-				ACPI_CAST_PTR(void, this_thread_id), mutex_id));
+				"Thread %u could not acquire Mutex [0x%X]",
+				(u32)this_thread_id, mutex_id));
 	}
 
 	return (status);
@@ -297,7 +292,7 @@ acpi_status acpi_ut_acquire_mutex(acpi_mutex_handle mutex_id)
  *
  * FUNCTION:    acpi_ut_release_mutex
  *
- * PARAMETERS:  mutex_iD        - ID of the mutex to be released
+ * PARAMETERS:  mutex_ID        - ID of the mutex to be released
  *
  * RETURN:      Status
  *
@@ -307,13 +302,10 @@ acpi_status acpi_ut_acquire_mutex(acpi_mutex_handle mutex_id)
 
 acpi_status acpi_ut_release_mutex(acpi_mutex_handle mutex_id)
 {
-	acpi_thread_id this_thread_id;
-
 	ACPI_FUNCTION_NAME(ut_release_mutex);
 
-	this_thread_id = acpi_os_get_thread_id();
-	ACPI_DEBUG_PRINT((ACPI_DB_MUTEX, "Thread %p releasing Mutex [%s]\n",
-			  ACPI_CAST_PTR(void, this_thread_id),
+	ACPI_DEBUG_PRINT((ACPI_DB_MUTEX, "Thread %u releasing Mutex [%s]\n",
+			  (u32)acpi_os_get_thread_id(),
 			  acpi_ut_get_mutex_name(mutex_id)));
 
 	if (mutex_id > ACPI_MAX_MUTEX) {
@@ -336,13 +328,14 @@ acpi_status acpi_ut_release_mutex(acpi_mutex_handle mutex_id)
 		/*
 		 * Mutex debug code, for internal debugging only.
 		 *
-		 * Deadlock prevention.  Check if this thread owns any mutexes of value
-		 * greater than this one.  If so, the thread has violated the mutex
-		 * ordering rule.  This indicates a coding error somewhere in
+		 * Deadlock prevention. Check if this thread owns any mutexes of value
+		 * greater than this one. If so, the thread has violated the mutex
+		 * ordering rule. This indicates a coding error somewhere in
 		 * the ACPI subsystem code.
 		 */
 		for (i = mutex_id; i < ACPI_NUM_MUTEX; i++) {
-			if (acpi_gbl_mutex_info[i].thread_id == this_thread_id) {
+			if (acpi_gbl_mutex_info[i].thread_id ==
+			    acpi_os_get_thread_id()) {
 				if (i == mutex_id) {
 					continue;
 				}
@@ -364,41 +357,4 @@ acpi_status acpi_ut_release_mutex(acpi_mutex_handle mutex_id)
 
 	acpi_os_release_mutex(acpi_gbl_mutex_info[mutex_id].mutex);
 	return (AE_OK);
-}
-
-/*******************************************************************************
- *
- * FUNCTION:    acpi_ut_is_mutex_ours
- *
- * PARAMETERS:  mutex_id        - ID of the mutex to be tested
- *
- * RETURN:      TRUE if mutex object is owned by this thread; FALSE otherwise
- *
- * DESCRIPTION: Test whether a mutex object is currently owned by this thread.
- *              RHEL6-ONLY
- *
- ******************************************************************************/
-
-bool acpi_ut_is_mutex_ours(acpi_mutex_handle mutex_id)
-{
-	acpi_thread_id mutex_owner_id;
-
-	ACPI_FUNCTION_NAME(ut_is_mutex_ours);
-
-	if (mutex_id > ACPI_MAX_MUTEX) {
-		ACPI_ERROR((AE_INFO,
-			    "Mutex id [0x%X] is not valid",
-			    mutex_id));
-		return FALSE;
-	}
-
-	mutex_owner_id = acpi_gbl_mutex_info[mutex_id].thread_id;
-
-	if (mutex_owner_id == ACPI_MUTEX_NOT_ACQUIRED) {
-		return FALSE;
-	}
-	if (mutex_owner_id == acpi_os_get_thread_id()) {
-		return TRUE;
-	}
-	return FALSE;
 }

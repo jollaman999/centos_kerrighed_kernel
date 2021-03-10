@@ -28,11 +28,9 @@
 #include <linux/spinlock.h>
 #include <net/protocol.h>
 
-const struct net_protocol *inet_protos[MAX_INET_PROTOS] ____cacheline_aligned_in_smp;
-static DEFINE_SPINLOCK(inet_proto_lock);
-
-const struct net_offload *inet_offloads[MAX_INET_PROTOS] ____cacheline_aligned_in_smp;
-static DEFINE_SPINLOCK(inet_offload_lock);
+const struct net_protocol __rcu *inet_protos[MAX_INET_PROTOS] __read_mostly;
+const struct net_offload __rcu *inet_offloads[MAX_INET_PROTOS] __read_mostly;
+EXPORT_SYMBOL(inet_offloads);
 
 /*
  *	Add a protocol handler to the hash tables
@@ -40,21 +38,23 @@ static DEFINE_SPINLOCK(inet_offload_lock);
 
 int inet_add_protocol(const struct net_protocol *prot, unsigned char protocol)
 {
-	int hash, ret;
-
-	hash = protocol & (MAX_INET_PROTOS - 1);
-
-	spin_lock_bh(&inet_proto_lock);
-	if (inet_protos[hash]) {
-		ret = -1;
-	} else {
-		inet_protos[hash] = prot;
-		ret = 0;
+	if (!prot->netns_ok) {
+		pr_err("Protocol %u is not namespace aware, cannot register.\n",
+			protocol);
+		return -EINVAL;
 	}
-	spin_unlock_bh(&inet_proto_lock);
 
-	return ret;
+	return !cmpxchg((const struct net_protocol **)&inet_protos[protocol],
+			NULL, prot) ? 0 : -1;
 }
+EXPORT_SYMBOL(inet_add_protocol);
+
+int inet_add_offload(const struct net_offload *prot, unsigned char protocol)
+{
+	return !cmpxchg((const struct net_offload **)&inet_offloads[protocol],
+			NULL, prot) ? 0 : -1;
+}
+EXPORT_SYMBOL(inet_add_offload);
 
 /*
  *	Remove a protocol from the hash tables.
@@ -62,63 +62,26 @@ int inet_add_protocol(const struct net_protocol *prot, unsigned char protocol)
 
 int inet_del_protocol(const struct net_protocol *prot, unsigned char protocol)
 {
-	int hash, ret;
+	int ret;
 
-	hash = protocol & (MAX_INET_PROTOS - 1);
-
-	spin_lock_bh(&inet_proto_lock);
-	if (inet_protos[hash] == prot) {
-		inet_protos[hash] = NULL;
-		ret = 0;
-	} else {
-		ret = -1;
-	}
-	spin_unlock_bh(&inet_proto_lock);
+	ret = (cmpxchg((const struct net_protocol **)&inet_protos[protocol],
+		       prot, NULL) == prot) ? 0 : -1;
 
 	synchronize_net();
 
 	return ret;
 }
-
-EXPORT_SYMBOL(inet_add_protocol);
 EXPORT_SYMBOL(inet_del_protocol);
-
-int inet_add_offload(const struct net_offload *prot, unsigned char protocol)
-{
-	int hash, ret;
-
-	hash = protocol & (MAX_INET_PROTOS - 1);
-
-	spin_lock_bh(&inet_offload_lock);
-	if (inet_offloads[hash]) {
-		ret = -1;
-	} else {
-		inet_offloads[hash] = prot;
-		ret = 0;
-	}
-	spin_unlock_bh(&inet_offload_lock);
-
-	return ret;
-}
 
 int inet_del_offload(const struct net_offload *prot, unsigned char protocol)
 {
-	int hash, ret;
+	int ret;
 
-	hash = protocol & (MAX_INET_PROTOS - 1);
-
-	spin_lock_bh(&inet_offload_lock);
-	if (inet_offloads[hash] == prot) {
-		inet_offloads[hash] = NULL;
-		ret = 0;
-	} else {
-		ret = -1;
-	}
-	spin_unlock_bh(&inet_offload_lock);
+	ret = (cmpxchg((const struct net_offload **)&inet_offloads[protocol],
+		       prot, NULL) == prot) ? 0 : -1;
 
 	synchronize_net();
 
 	return ret;
 }
-EXPORT_SYMBOL(inet_add_offload);
 EXPORT_SYMBOL(inet_del_offload);

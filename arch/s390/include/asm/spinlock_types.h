@@ -5,24 +5,18 @@
 # error "please don't include this file directly"
 #endif
 
-typedef struct {
-#ifndef __GENKSYMS__
-	unsigned int lock;
-#else
-	volatile unsigned int owner_cpu;
-#endif
-} __attribute__ ((aligned (4))) raw_spinlock_t;
-
-#define __RAW_SPIN_LOCK_UNLOCKED { .lock = 0, }
+#include <linux/rh_kabi.h>
 
 typedef struct {
-#ifndef __GENKSYMS__
-	unsigned int lock;
-#else
-	volatile unsigned int lock;
-#endif
-} raw_rwlock_t;
+	RH_KABI_REPLACE(volatile unsigned int owner_cpu, unsigned int lock)
+} __attribute__ ((aligned (4))) arch_spinlock_t;
 
-#define __RAW_RW_LOCK_UNLOCKED		{ 0 }
+#define __ARCH_SPIN_LOCK_UNLOCKED { .lock = 0, }
+
+typedef struct {
+	RH_KABI_REPLACE(volatile unsigned int lock, unsigned int lock)
+} arch_rwlock_t;
+
+#define __ARCH_RW_LOCK_UNLOCKED		{ .lock = 0 }
 
 #endif

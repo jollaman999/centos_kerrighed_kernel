@@ -74,15 +74,32 @@
 	.endm
 
 #ifndef CONFIG_THUMB2_KERNEL
-	.macro	svc_exit, rpsr
+	.macro	svc_exit, rpsr, irq = 0
+	.if	\irq != 0
+	@ IRQs already off
+#ifdef CONFIG_TRACE_IRQFLAGS
+	@ The parent context IRQs must have been enabled to get here in
+	@ the first place, so there's no point checking the PSR I bit.
+	bl	trace_hardirqs_on
+#endif
+	.else
+	@ IRQs off again before pulling preserved data off the stack
+	disable_irq_notrace
+#ifdef CONFIG_TRACE_IRQFLAGS
+	tst	\rpsr, #PSR_I_BIT
+	bleq	trace_hardirqs_on
+	tst	\rpsr, #PSR_I_BIT
+	blne	trace_hardirqs_off
+#endif
+	.endif
 	msr	spsr_cxsf, \rpsr
-#if defined(CONFIG_CPU_32v6K)
-	clrex					@ clear the exclusive monitor
-	ldmia	sp, {r0 - pc}^			@ load r0 - pc, cpsr
-#elif defined (CONFIG_CPU_V6)
+#if defined(CONFIG_CPU_V6)
 	ldr	r0, [sp]
 	strex	r1, r2, [sp]			@ clear the exclusive monitor
 	ldmib	sp, {r1 - pc}^			@ load r1 - pc, cpsr
+#elif defined(CONFIG_CPU_32v6K)
+	clrex					@ clear the exclusive monitor
+	ldmia	sp, {r0 - pc}^			@ load r0 - pc, cpsr
 #else
 	ldmia	sp, {r0 - pc}^			@ load r0 - pc, cpsr
 #endif
@@ -92,16 +109,18 @@
 	ldr	r1, [sp, #\offset + S_PSR]	@ get calling cpsr
 	ldr	lr, [sp, #\offset + S_PC]!	@ get pc
 	msr	spsr_cxsf, r1			@ save in spsr_svc
-#if defined(CONFIG_CPU_32v6K)
-	clrex					@ clear the exclusive monitor
-#elif defined (CONFIG_CPU_V6)
+#if defined(CONFIG_CPU_V6)
 	strex	r1, r2, [sp]			@ clear the exclusive monitor
+#elif defined(CONFIG_CPU_32v6K)
+	clrex					@ clear the exclusive monitor
 #endif
 	.if	\fast
 	ldmdb	sp, {r1 - lr}^			@ get calling r1 - lr
 	.else
 	ldmdb	sp, {r0 - lr}^			@ get calling r0 - lr
 	.endif
+	mov	r0, r0				@ ARMv5T and earlier require a nop
+						@ after ldm {}^
 	add	sp, sp, #S_FRAME_SIZE - S_PC
 	movs	pc, lr				@ return & move spsr_svc into cpsr
 	.endm
@@ -118,16 +137,31 @@
 	mov	pc, \reg
 	.endm
 #else	/* CONFIG_THUMB2_KERNEL */
-	.macro	svc_exit, rpsr
+	.macro	svc_exit, rpsr, irq = 0
+	.if	\irq != 0
+	@ IRQs already off
+#ifdef CONFIG_TRACE_IRQFLAGS
+	@ The parent context IRQs must have been enabled to get here in
+	@ the first place, so there's no point checking the PSR I bit.
+	bl	trace_hardirqs_on
+#endif
+	.else
+	@ IRQs off again before pulling preserved data off the stack
+	disable_irq_notrace
+#ifdef CONFIG_TRACE_IRQFLAGS
+	tst	\rpsr, #PSR_I_BIT
+	bleq	trace_hardirqs_on
+	tst	\rpsr, #PSR_I_BIT
+	blne	trace_hardirqs_off
+#endif
+	.endif
+	ldr	lr, [sp, #S_SP]			@ top of the stack
+	ldrd	r0, r1, [sp, #S_LR]		@ calling lr and pc
 	clrex					@ clear the exclusive monitor
-	ldr	r0, [sp, #S_SP]			@ top of the stack
-	ldr	r1, [sp, #S_PC]			@ return address
-	tst	r0, #4				@ orig stack 8-byte aligned?
-	stmdb	r0, {r1, \rpsr}			@ rfe context
+	stmdb	lr!, {r0, r1, \rpsr}		@ calling lr and rfe context
 	ldmia	sp, {r0 - r12}
-	ldr	lr, [sp, #S_LR]
-	addeq	sp, sp, #S_FRAME_SIZE - 8	@ aligned
-	addne	sp, sp, #S_FRAME_SIZE - 4	@ not aligned
+	mov	sp, lr
+	ldr	lr, [sp], #4
 	rfeia	sp!
 	.endm
 
@@ -162,6 +196,34 @@
 	nop
 	.endm
 #endif	/* !CONFIG_THUMB2_KERNEL */
+
+/*
+ * Context tracking subsystem.  Used to instrument transitions
+ * between user and kernel mode.
+ */
+	.macro ct_user_exit, save = 1
+#ifdef CONFIG_CONTEXT_TRACKING
+	.if	\save
+	stmdb   sp!, {r0-r3, ip, lr}
+	bl	user_exit
+	ldmia	sp!, {r0-r3, ip, lr}
+	.else
+	bl	user_exit
+	.endif
+#endif
+	.endm
+
+	.macro ct_user_enter, save = 1
+#ifdef CONFIG_CONTEXT_TRACKING
+	.if	\save
+	stmdb   sp!, {r0-r3, ip, lr}
+	bl	user_enter
+	ldmia	sp!, {r0-r3, ip, lr}
+	.else
+	bl	user_enter
+	.endif
+#endif
+	.endm
 
 /*
  * These are the registers used in the syscall handler, and allow us to

@@ -5,6 +5,7 @@
  * Copyright (c) 2004-2006 Herbert Xu <herbert@gondor.apana.org.au>
  */
 
+#include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -13,16 +14,16 @@
 #include <net/dsfield.h>
 #include <net/dst.h>
 #include <net/inet_ecn.h>
+#include <net/ip6_route.h>
 #include <net/ipv6.h>
 #include <net/xfrm.h>
 
 static inline void ipip6_ecn_decapsulate(struct sk_buff *skb)
 {
-	struct ipv6hdr *outer_iph = ipv6_hdr(skb);
 	struct ipv6hdr *inner_iph = ipipv6_hdr(skb);
 
-	if (INET_ECN_is_ce(ipv6_get_dsfield(outer_iph)))
-		IP6_ECN_set_ce(inner_iph);
+	if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
+		IP6_ECN_set_ce(skb, inner_iph);
 }
 
 /* Add encapsulation header.
@@ -47,21 +48,29 @@ static int xfrm6_mode_tunnel_output(struct xfrm_state *x, struct sk_buff *skb)
 	       sizeof(top_iph->flow_lbl));
 	top_iph->nexthdr = xfrm_af2proto(skb_dst(skb)->ops->family);
 
-	dsfield = XFRM_MODE_SKB_CB(skb)->tos;
-	dsfield = INET_ECN_encapsulate(dsfield, dsfield);
+	if (x->props.extra_flags & XFRM_SA_XFLAG_DONT_ENCAP_DSCP)
+		dsfield = 0;
+	else
+		dsfield = XFRM_MODE_SKB_CB(skb)->tos;
+	dsfield = INET_ECN_encapsulate(dsfield, XFRM_MODE_SKB_CB(skb)->tos);
 	if (x->props.flags & XFRM_STATE_NOECN)
 		dsfield &= ~INET_ECN_MASK;
 	ipv6_change_dsfield(top_iph, 0, dsfield);
-	top_iph->hop_limit = dst_metric(dst->child, RTAX_HOPLIMIT);
-	ipv6_addr_copy(&top_iph->saddr, (struct in6_addr *)&x->props.saddr);
-	ipv6_addr_copy(&top_iph->daddr, (struct in6_addr *)&x->id.daddr);
+	top_iph->hop_limit = ip6_dst_hoplimit(dst->child);
+	top_iph->saddr = *(struct in6_addr *)&x->props.saddr;
+	top_iph->daddr = *(struct in6_addr *)&x->id.daddr;
 	return 0;
 }
+
+#define for_each_input_rcu(head, handler)	\
+	for (handler = rcu_dereference(head);	\
+	     handler != NULL;			\
+	     handler = rcu_dereference(handler->next))
+
 
 static int xfrm6_mode_tunnel_input(struct xfrm_state *x, struct sk_buff *skb)
 {
 	int err = -EINVAL;
-	const unsigned char *old_mac;
 
 	if (XFRM_MODE_SKB_CB(skb)->protocol != IPPROTO_IPV6)
 		goto out;
@@ -78,10 +87,9 @@ static int xfrm6_mode_tunnel_input(struct xfrm_state *x, struct sk_buff *skb)
 	if (!(x->props.flags & XFRM_STATE_NOECN))
 		ipip6_ecn_decapsulate(skb);
 
-	old_mac = skb_mac_header(skb);
-	skb_set_mac_header(skb, -skb->mac_len);
-	memmove(skb_mac_header(skb), old_mac, skb->mac_len);
 	skb_reset_network_header(skb);
+	skb_mac_header_rebuild(skb);
+
 	err = 0;
 
 out:

@@ -2,6 +2,7 @@
 #define _FLEX_ARRAY_H
 
 #include <linux/types.h>
+#include <linux/reciprocal_div.h>
 #include <asm/page.h>
 
 #define FLEX_ARRAY_PART_SIZE PAGE_SIZE
@@ -21,6 +22,8 @@ struct flex_array {
 		struct {
 			int element_size;
 			int total_nr_elements;
+			int elems_per_part;
+			struct reciprocal_value reciprocal_elems;
 			struct flex_array_part *parts[];
 		};
 		/*

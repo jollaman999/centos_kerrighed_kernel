@@ -54,7 +54,7 @@ static void v1_mem2disk_dqblk(struct v1_disk_dqblk *d, struct mem_dqblk *m)
 
 static int v1_read_dqblk(struct dquot *dquot)
 {
-	int type = dquot->dq_type;
+	int type = dquot->dq_id.type;
 	struct v1_disk_dqblk dqblk;
 
 	if (!sb_dqopt(dquot->dq_sb)->files[type])
@@ -63,7 +63,8 @@ static int v1_read_dqblk(struct dquot *dquot)
 	/* Set structure to 0s in case read fails/is after end of file */
 	memset(&dqblk, 0, sizeof(struct v1_disk_dqblk));
 	dquot->dq_sb->s_op->quota_read(dquot->dq_sb, type, (char *)&dqblk,
-			sizeof(struct v1_disk_dqblk), v1_dqoff(dquot->dq_id));
+			sizeof(struct v1_disk_dqblk),
+			v1_dqoff(from_kqid(&init_user_ns, dquot->dq_id)));
 
 	v1_disk2mem_dqblk(&dquot->dq_dqb, &dqblk);
 	if (dquot->dq_dqb.dqb_bhardlimit == 0 &&
@@ -71,19 +72,20 @@ static int v1_read_dqblk(struct dquot *dquot)
 	    dquot->dq_dqb.dqb_ihardlimit == 0 &&
 	    dquot->dq_dqb.dqb_isoftlimit == 0)
 		set_bit(DQ_FAKE_B, &dquot->dq_flags);
-	dqstats.reads++;
+	dqstats_inc(DQST_READS);
 
 	return 0;
 }
 
 static int v1_commit_dqblk(struct dquot *dquot)
 {
-	short type = dquot->dq_type;
+	short type = dquot->dq_id.type;
 	ssize_t ret;
 	struct v1_disk_dqblk dqblk;
 
 	v1_mem2disk_dqblk(&dqblk, &dquot->dq_dqb);
-	if (dquot->dq_id == 0) {
+	if (((type == USRQUOTA) && uid_eq(dquot->dq_id.uid, GLOBAL_ROOT_UID)) ||
+	    ((type == GRPQUOTA) && gid_eq(dquot->dq_id.gid, GLOBAL_ROOT_GID))) {
 		dqblk.dqb_btime =
 			sb_dqopt(dquot->dq_sb)->info[type].dqi_bgrace;
 		dqblk.dqb_itime =
@@ -93,10 +95,9 @@ static int v1_commit_dqblk(struct dquot *dquot)
 	if (sb_dqopt(dquot->dq_sb)->files[type])
 		ret = dquot->dq_sb->s_op->quota_write(dquot->dq_sb, type,
 			(char *)&dqblk, sizeof(struct v1_disk_dqblk),
-			v1_dqoff(dquot->dq_id));
+			v1_dqoff(from_kqid(&init_user_ns, dquot->dq_id)));
 	if (ret != sizeof(struct v1_disk_dqblk)) {
-		printk(KERN_WARNING "VFS: dquota write failed on dev %s\n",
-			dquot->dq_sb->s_id);
+		quota_error(dquot->dq_sb, "dquota write failed");
 		if (ret >= 0)
 			ret = -EIO;
 		goto out;
@@ -104,7 +105,7 @@ static int v1_commit_dqblk(struct dquot *dquot)
 	ret = 0;
 
 out:
-	dqstats.writes++;
+	dqstats_inc(DQST_WRITES);
 
 	return ret;
 }
@@ -204,7 +205,7 @@ out:
 	return ret;
 }
 
-static struct quota_format_ops v1_format_ops = {
+static const struct quota_format_ops v1_format_ops = {
 	.check_quota_file	= v1_check_quota_file,
 	.read_file_info		= v1_read_file_info,
 	.write_file_info	= v1_write_file_info,

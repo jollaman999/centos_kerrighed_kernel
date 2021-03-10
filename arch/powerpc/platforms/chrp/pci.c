@@ -142,7 +142,7 @@ hydra_init(void)
 		return 0;
 	}
 	of_node_put(np);
-	Hydra = ioremap(r.start, r.end-r.start);
+	Hydra = ioremap(r.start, resource_size(&r));
 	printk("Hydra Mac I/O at %llx\n", (unsigned long long)r.start);
 	printk("Hydra Feature_Control was %x",
 	       in_le32(&Hydra->Feature_Control));
@@ -323,7 +323,7 @@ chrp_find_bridges(void)
  * ATA controller to be set to fully native mode or bad things
  * will happen.
  */
-static void __devinit chrp_pci_fixup_winbond_ata(struct pci_dev *sl82c105)
+static void chrp_pci_fixup_winbond_ata(struct pci_dev *sl82c105)
 {
 	u8 progif;
 

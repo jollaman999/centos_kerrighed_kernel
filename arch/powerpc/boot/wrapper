@@ -39,9 +39,14 @@ dts=
 cacheit=
 binary=
 gzip=.gz
+pie=
+format=
 
 # cross-compilation prefix
 CROSS=
+
+# mkimage wrapper script
+MKIMAGE=$srctree/scripts/mkuboot.sh
 
 # directory for object and other files used by this script
 object=arch/powerpc/boot
@@ -132,6 +137,36 @@ if [ -z "$kernel" ]; then
     kernel=vmlinux
 fi
 
+elfformat="`${CROSS}objdump -p "$kernel" | grep 'file format' | awk '{print $4}'`"
+case "$elfformat" in
+    elf64-powerpcle)	format=elf64lppc	;;
+    elf64-powerpc)	format=elf32ppc	;;
+    elf32-powerpc)	format=elf32ppc	;;
+esac
+
+ld_version()
+{
+    # Poached from scripts/ld-version.sh, but we don't want to call that because
+    # this script (wrapper) is distributed separately from the kernel source.
+    # Extract linker version number from stdin and turn into single number.
+    awk '{
+	gsub(".*\\)", "");
+	gsub(".*version ", "");
+	gsub("-.*", "");
+	split($1,a, ".");
+	print a[1]*100000000 + a[2]*1000000 + a[3]*10000;
+	exit
+    }'
+}
+
+# Do not include PT_INTERP segment when linking pie. Non-pie linking
+# just ignores this option.
+LD_VERSION=$(${CROSS}ld --version | ld_version)
+LD_NO_DL_MIN_VERSION=$(echo 2.26 | ld_version)
+if [ "$LD_VERSION" -ge "$LD_NO_DL_MIN_VERSION" ] ; then
+	nodl="--no-dynamic-linker"
+fi
+
 platformo=$object/"$platform".o
 lds=$object/zImage.lds
 ext=strip
@@ -140,21 +175,39 @@ tmp=$tmpdir/zImage.$$.o
 ksection=.kernel:vmlinux.strip
 isection=.kernel:initrd
 link_address='0x400000'
+make_space=y
 
 case "$platform" in
+of)
+    platformo="$object/of.o $object/epapr.o"
+    make_space=n
+    ;;
 pseries)
-    platformo=$object/of.o
+    platformo="$object/pseries-head.o $object/of.o $object/epapr.o"
     link_address='0x4000000'
+    if [ "$format" != "elf32ppc" ]; then
+	link_address=
+	pie=-pie
+    fi
+    make_space=n
+    ;;
+maple)
+    platformo="$object/of.o $object/epapr.o"
+    link_address='0x400000'
+    make_space=n
     ;;
 pmac|chrp)
-    platformo=$object/of.o
+    platformo="$object/of.o $object/epapr.o"
+    make_space=n
     ;;
 coff)
-    platformo=$object/of.o
+    platformo="$object/crt0.o $object/of.o $object/epapr.o"
     lds=$object/zImage.coff.lds
     link_address='0x500000'
+    make_space=n
+    pie=
     ;;
-miboot|uboot)
+miboot|uboot*)
     # miboot and U-boot want just the bare bits, not an ELF binary
     ext=bin
     objflags="-O binary"
@@ -201,6 +254,8 @@ ps3)
     ksection=.kernel:vmlinux.bin
     isection=.kernel:initrd
     link_address=''
+    make_space=n
+    pie=
     ;;
 ep88xc|ep405|ep8248e)
     platformo="$object/fixed-head.o $object/$platform.o"
@@ -230,14 +285,31 @@ xpedite52*)
     link_address='0x1400000'
     platformo=$object/cuboot-85xx.o
     ;;
+gamecube|wii)
+    link_address='0x600000'
+    platformo="$object/$platform-head.o $object/$platform.o"
+    ;;
+treeboot-currituck)
+    link_address='0x1000000'
+    ;;
+treeboot-iss4xx-mpic)
+    platformo="$object/treeboot-iss4xx.o"
+    ;;
+epapr)
+    platformo="$object/epapr.o $object/epapr-wrapper.o"
+    link_address='0x20000000'
+    pie=-pie
+    ;;
 esac
 
 vmz="$tmpdir/`basename \"$kernel\"`.$ext"
 if [ -z "$cacheit" -o ! -f "$vmz$gzip" -o "$vmz$gzip" -ot "$kernel" ]; then
     ${CROSS}objcopy $objflags "$kernel" "$vmz.$$"
 
+    strip_size=$(stat -c %s $vmz.$$)
+
     if [ -n "$gzip" ]; then
-        gzip -f -9 "$vmz.$$"
+        gzip -n -f -9 "$vmz.$$"
     fi
 
     if [ -n "$cacheit" ]; then
@@ -245,6 +317,26 @@ if [ -z "$cacheit" -o ! -f "$vmz$gzip" -o "$vmz$gzip" -ot "$kernel" ]; then
     else
 	vmz="$vmz.$$"
     fi
+else
+    # Calculate the vmlinux.strip size
+    ${CROSS}objcopy $objflags "$kernel" "$vmz.$$"
+    strip_size=$(stat -c %s $vmz.$$)
+    rm -f $vmz.$$
+fi
+
+if [ "$make_space" = "y" ]; then
+	# Round the size to next higher MB limit
+	round_size=$(((strip_size + 0xfffff) & 0xfff00000))
+
+	round_size=0x$(printf "%x" $round_size)
+	link_addr=$(printf "%d" $link_address)
+
+	if [ $link_addr -lt $strip_size ]; then
+	    echo "INFO: Uncompressed kernel (size 0x$(printf "%x\n" $strip_size))" \
+			"overlaps the address of the wrapper($link_address)"
+	    echo "INFO: Fixing the link_address of wrapper to ($round_size)"
+	    link_address=$round_size
+	fi
 fi
 
 vmz="$vmz$gzip"
@@ -263,8 +355,28 @@ membase=`${CROSS}objdump -p "$kernel" | grep -m 1 LOAD | awk '{print $7}'`
 case "$platform" in
 uboot)
     rm -f "$ofile"
-    mkimage -A ppc -O linux -T kernel -C gzip -a $membase -e $membase \
+    ${MKIMAGE} -A ppc -O linux -T kernel -C gzip -a $membase -e $membase \
 	$uboot_version -d "$vmz" "$ofile"
+    if [ -z "$cacheit" ]; then
+	rm -f "$vmz"
+    fi
+    exit 0
+    ;;
+uboot-obs600)
+    rm -f "$ofile"
+    # obs600 wants a multi image with an initrd, so we need to put a fake
+    # one in even when building a "normal" image.
+    if [ -n "$initrd" ]; then
+	real_rd="$initrd"
+    else
+	real_rd=`mktemp`
+	echo "\0" >>"$real_rd"
+    fi
+    ${MKIMAGE} -A ppc -O linux -T multi -C gzip -a $membase -e $membase \
+	$uboot_version -d "$vmz":"$real_rd":"$dtb" "$ofile"
+    if [ -z "$initrd" ]; then
+	rm -f "$real_rd"
+    fi
     if [ -z "$cacheit" ]; then
 	rm -f "$vmz"
     fi
@@ -296,9 +408,10 @@ fi
 
 if [ "$platform" != "miboot" ]; then
     if [ -n "$link_address" ] ; then
-        text_start="-Ttext $link_address --defsym _start=$link_address"
+        text_start="-Ttext $link_address"
     fi
-    ${CROSS}ld -m elf32ppc -T $lds $text_start -o "$ofile" \
+#link everything
+    ${CROSS}ld -m $format -T $lds $text_start $pie $nodl -o "$ofile" \
 	$platformo $tmp $object/wrapper.a
     rm $tmp
 fi
@@ -314,7 +427,7 @@ fi
 
 # post-processing needed for some platforms
 case "$platform" in
-pseries|chrp)
+pseries|chrp|maple)
     $objbin/addnote "$ofile"
     ;;
 coff)
@@ -322,8 +435,8 @@ coff)
     $objbin/hack-coff "$ofile"
     ;;
 cuboot*)
-    gzip -f -9 "$ofile"
-    mkimage -A ppc -O linux -T kernel -C gzip -a "$base" -e "$entry" \
+    gzip -n -f -9 "$ofile"
+    ${MKIMAGE} -A ppc -O linux -T kernel -C gzip -a "$base" -e "$entry" \
             $uboot_version -d "$ofile".gz "$ofile"
     ;;
 treeboot*)
@@ -369,6 +482,6 @@ ps3)
 
     odir="$(dirname "$ofile.bin")"
     rm -f "$odir/otheros.bld"
-    gzip --force -9 --stdout "$ofile.bin" > "$odir/otheros.bld"
+    gzip -n --force -9 --stdout "$ofile.bin" > "$odir/otheros.bld"
     ;;
 esac

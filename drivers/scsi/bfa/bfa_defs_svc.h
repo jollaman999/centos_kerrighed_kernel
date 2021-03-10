@@ -152,7 +152,7 @@ struct bfa_fw_ioim_stats_s {
 	u32	ioh_data_oor_event;	/*  Data out of range */
 	u32	ioh_ro_ooo_event;	/*  Relative offset out of range */
 	u32	ioh_cpu_owned_event;	/*  IOH hit -iost owned by f/w */
-	u32	ioh_unexp_frame_event;	/*  unexpected frame recieved
+	u32	ioh_unexp_frame_event;	/*  unexpected frame received
 					 *  count */
 	u32	ioh_err_int;		/*  IOH error int during data-phase
 					 *  for scsi write */
@@ -701,8 +701,8 @@ struct bfa_itnim_iostats_s {
 	u32	input_reqs;		/*  Data in-bound requests	*/
 	u32	output_reqs;		/*  Data out-bound requests	*/
 	u32	io_comps;		/*  Total IO Completions	*/
-	u32	wr_throughput;		/*  Write data transfered in bytes */
-	u32	rd_throughput;		/*  Read data transfered in bytes  */
+	u32	wr_throughput;		/*  Write data transferred in bytes */
+	u32	rd_throughput;		/*  Read data transferred in bytes  */
 
 	u32	iocomp_ok;		/*  Slowpath IO completions	*/
 	u32	iocomp_underrun;	/*  IO underrun		*/
@@ -753,6 +753,7 @@ struct bfa_itnim_iostats_s {
 	u32	tm_iocdowns;		/*  TM cleaned-up due to IOC down   */
 	u32	tm_cleanups;		/*  TM cleanup requests	*/
 	u32	tm_cleanup_comps;	/*  TM cleanup completions	*/
+	u32	rsvd[6];
 };
 
 /* Modify char* port_stt[] in bfal_port.c if a new state was added */
@@ -874,6 +875,27 @@ enum bfa_port_linkstate_rsn {
 	CEE_ISCSI_PRI_OVERLAP_FCOE_PRI		= 43
 };
 
+#define MAX_LUN_MASK_CFG 16
+
+/*
+ * Initially flash content may be fff. On making LUN mask enable and disable
+ * state chnage.  when report lun command is being processed it goes from
+ * BFA_LUN_MASK_ACTIVE to BFA_LUN_MASK_FETCH and comes back to
+ * BFA_LUN_MASK_ACTIVE.
+ */
+enum bfa_ioim_lun_mask_state_s {
+	BFA_IOIM_LUN_MASK_INACTIVE = 0,
+	BFA_IOIM_LUN_MASK_ACTIVE = 1,
+	BFA_IOIM_LUN_MASK_FETCHED = 2,
+};
+
+enum bfa_lunmask_state_s {
+	BFA_LUNMASK_DISABLED = 0x00,
+	BFA_LUNMASK_ENABLED = 0x01,
+	BFA_LUNMASK_MINCFG = 0x02,
+	BFA_LUNMASK_UNINITIALIZED = 0xff,
+};
+
 /**
  * FEC states
  */
@@ -890,7 +912,7 @@ enum bfa_fec_state_s {
 struct bfa_lun_mask_s {
 	wwn_t		lp_wwn;
 	wwn_t		rp_wwn;
-	lun_t		lun;
+	struct scsi_lun	lun;
 	u8		ua;
 	u8		rsvd[3];
 	u16		rp_tag;

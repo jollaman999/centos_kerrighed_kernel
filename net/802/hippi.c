@@ -35,7 +35,6 @@
 #include <net/arp.h>
 #include <net/sock.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 
 /*
  * Create the HIPPI MAC header for an arbitrary protocol layer
@@ -46,9 +45,9 @@
 
 static int hippi_header(struct sk_buff *skb, struct net_device *dev,
 			unsigned short type,
-			const void *daddr, const void *saddr, unsigned len)
+			const void *daddr, const void *saddr, unsigned int len)
 {
-	struct hippi_hdr *hip = (struct hippi_hdr *)skb_push(skb, HIPPI_HLEN);
+	struct hippi_hdr *hip = skb_push(skb, HIPPI_HLEN);
 	struct hippi_cb *hcb = (struct hippi_cb *) skb->cb;
 
 	if (!len){
@@ -152,7 +151,7 @@ int hippi_change_mtu(struct net_device *dev, int new_mtu)
 	if ((new_mtu < 68) || (new_mtu > 65280))
 		return -EINVAL;
 	dev->mtu = new_mtu;
-	return(0);
+	return 0;
 }
 EXPORT_SYMBOL(hippi_change_mtu);
 
@@ -173,14 +172,14 @@ EXPORT_SYMBOL(hippi_mac_addr);
 int hippi_neigh_setup_dev(struct net_device *dev, struct neigh_parms *p)
 {
 	/* Never send broadcast/multicast ARP messages */
-	p->mcast_probes = 0;
+	NEIGH_VAR_SET(p, MCAST_PROBES, 0);
 
 	/* In IPv6 unicast probes are valid even on NBMA,
 	* because they are encapsulated in normal IPv6 protocol.
 	* Should be a generic flag.
 	*/
 	if (p->tbl->family != AF_INET6)
-		p->ucast_probes = 0;
+		NEIGH_VAR_SET(p, UCAST_PROBES, 0);
 	return 0;
 }
 EXPORT_SYMBOL(hippi_neigh_setup_dev);

@@ -19,7 +19,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <scsi/scsi_host.h>
@@ -33,9 +32,9 @@
  */
 
 enum {
-	ATA_GEN_CLASS_MATCH             = (1 << 0),
-	ATA_GEN_FORCE_DMA               = (1 << 1),
-	ATA_GEN_INTEL_IDER              = (1 << 2),
+	ATA_GEN_CLASS_MATCH		= (1 << 0),
+	ATA_GEN_FORCE_DMA		= (1 << 1),
+	ATA_GEN_INTEL_IDER		= (1 << 2),
 };
 
 /**
@@ -52,16 +51,16 @@ enum {
 static int generic_set_mode(struct ata_link *link, struct ata_device **unused)
 {
 	struct ata_port *ap = link->ap;
+	const struct pci_device_id *id = ap->host->private_data;
 	int dma_enabled = 0;
 	struct ata_device *dev;
-	struct pci_dev *pdev = to_pci_dev(ap->host->dev);
 
-	/* Bits 5 and 6 indicate if DMA is active on master/slave */
-	if (ap->ioaddr.bmdma_addr)
+	if (id->driver_data & ATA_GEN_FORCE_DMA) {
+		dma_enabled = 0xff;
+	} else if (ap->ioaddr.bmdma_addr) {
+		/* Bits 5 and 6 indicate if DMA is active on master/slave */
 		dma_enabled = ioread8(ap->ioaddr.bmdma_addr + ATA_DMA_STATUS);
-
-	if (pdev->vendor == PCI_VENDOR_ID_CENATEK)
-		dma_enabled = 0xFF;
+	}
 
 	ata_for_each_dev(dev, link, ENABLED) {
 		/* We don't really care */
@@ -81,14 +80,13 @@ static int generic_set_mode(struct ata_link *link, struct ata_device **unused)
 				xfer_mask |= ata_xfer_mode2mask(XFER_MW_DMA_0);
 			}
 
-			ata_dev_printk(dev, KERN_INFO, "configured for %s\n",
-				       name);
+			ata_dev_info(dev, "configured for %s\n", name);
 
 			dev->xfer_mode = ata_xfer_mask2mode(xfer_mask);
 			dev->xfer_shift = ata_xfer_mode2shift(dev->xfer_mode);
 			dev->flags &= ~ATA_DFLAG_PIO;
 		} else {
-			ata_dev_printk(dev, KERN_INFO, "configured for PIO\n");
+			ata_dev_info(dev, "configured for PIO\n");
 			dev->xfer_mode = XFER_PIO_0;
 			dev->xfer_shift = ATA_SHIFT_PIO;
 			dev->flags |= ATA_DFLAG_PIO;
@@ -110,17 +108,17 @@ static struct ata_port_operations generic_port_ops = {
 static int all_generic_ide;		/* Set to claim all devices */
 
 /**
- *     is_intel_ider           -       identify intel IDE-R devices
- *     @dev: PCI device
+ *	is_intel_ider		-	identify intel IDE-R devices
+ *	@dev: PCI device
  *
- *     Distinguish Intel IDE-R controller devices from other Intel IDE
- *     devices. IDE-R devices have no timing registers and are in
- *     most respects virtual. They should be driven by the ata_generic
- *     driver.
+ *	Distinguish Intel IDE-R controller devices from other Intel IDE
+ *	devices. IDE-R devices have no timing registers and are in
+ *	most respects virtual. They should be driven by the ata_generic
+ *	driver.
  *
- *     IDE-R devices have PCI offset 0xF8.L as zero, later Intel ATA has
- *     it non zero. All Intel ATA has 0x40 writable (timing), but it is
- *     not writable on IDE-R devices (this is guaranteed).
+ *	IDE-R devices have PCI offset 0xF8.L as zero, later Intel ATA has
+ *	it non zero. All Intel ATA has 0x40 writable (timing), but it is
+ *	not writable on IDE-R devices (this is guaranteed).
  */
 
 static int is_intel_ider(struct pci_dev *dev)
@@ -153,7 +151,6 @@ static int is_intel_ider(struct pci_dev *dev)
 }
 
 /**
- * 
  *	ata_generic_init		-	attach generic IDE
  *	@dev: PCI device found
  *	@id: match entry
@@ -176,10 +173,10 @@ static int ata_generic_init_one(struct pci_dev *dev, const struct pci_device_id 
 	const struct ata_port_info *ppi[] = { &info, NULL };
 
 	/* Don't use the generic entry unless instructed to do so */
-	if (id->driver_data == 1 && all_generic_ide == 0)
+	if ((id->driver_data & ATA_GEN_CLASS_MATCH) && all_generic_ide == 0)
 		return -ENODEV;
 
-	if (id->driver_data & ATA_GEN_INTEL_IDER)
+	if ((id->driver_data & ATA_GEN_INTEL_IDER) && !all_generic_ide)
 		if (!is_intel_ider(dev))
 			return -ENODEV;
 
@@ -209,7 +206,7 @@ static int ata_generic_init_one(struct pci_dev *dev, const struct pci_device_id 
 			return rc;
 		pcim_pin_device(dev);
 	}
-	return ata_pci_sff_init_one(dev, ppi, &generic_sht, NULL);
+	return ata_pci_bmdma_init_one(dev, ppi, &generic_sht, (void *)id, 0);
 }
 
 static struct pci_device_id ata_generic[] = {
@@ -221,16 +218,28 @@ static struct pci_device_id ata_generic[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_HINT,   PCI_DEVICE_ID_HINT_VXPROII_IDE), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_VIA,    PCI_DEVICE_ID_VIA_82C561), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_OPTI,   PCI_DEVICE_ID_OPTI_82C558), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_CENATEK,PCI_DEVICE_ID_CENATEK_IDE), },
-	{ PCI_DEVICE(PCI_VENDOR_ID_TOSHIBA,PCI_DEVICE_ID_TOSHIBA_PICCOLO), },
+	{ PCI_DEVICE(PCI_VENDOR_ID_CENATEK,PCI_DEVICE_ID_CENATEK_IDE),
+	  .driver_data = ATA_GEN_FORCE_DMA },
+	/*
+	 * For some reason, MCP89 on MacBook 7,1 doesn't work with
+	 * ahci, use ata_generic instead.
+	 */
+	{ PCI_VENDOR_ID_NVIDIA, PCI_DEVICE_ID_NVIDIA_NFORCE_MCP89_SATA,
+	  PCI_VENDOR_ID_APPLE, 0xcb89,
+	  .driver_data = ATA_GEN_FORCE_DMA },
+#if !defined(CONFIG_PATA_TOSHIBA) && !defined(CONFIG_PATA_TOSHIBA_MODULE)
 	{ PCI_DEVICE(PCI_VENDOR_ID_TOSHIBA,PCI_DEVICE_ID_TOSHIBA_PICCOLO_1), },
 	{ PCI_DEVICE(PCI_VENDOR_ID_TOSHIBA,PCI_DEVICE_ID_TOSHIBA_PICCOLO_2),  },
+	{ PCI_DEVICE(PCI_VENDOR_ID_TOSHIBA,PCI_DEVICE_ID_TOSHIBA_PICCOLO_3),  },
+	{ PCI_DEVICE(PCI_VENDOR_ID_TOSHIBA,PCI_DEVICE_ID_TOSHIBA_PICCOLO_5),  },
+#endif
 	/* Intel, IDE class device */
 	{ PCI_VENDOR_ID_INTEL, PCI_ANY_ID, PCI_ANY_ID, PCI_ANY_ID,
-	  PCI_CLASS_STORAGE_IDE << 8, 0xFFFFFF00UL, 
+	  PCI_CLASS_STORAGE_IDE << 8, 0xFFFFFF00UL,
 	  .driver_data = ATA_GEN_INTEL_IDER },
 	/* Must come last. If you add entries adjust this table appropriately */
-	{ PCI_ANY_ID,		PCI_ANY_ID,			   PCI_ANY_ID, PCI_ANY_ID, PCI_CLASS_STORAGE_IDE << 8, 0xFFFFFF00UL, 1},
+	{ PCI_DEVICE_CLASS(PCI_CLASS_STORAGE_IDE << 8, 0xFFFFFF00UL),
+	  .driver_data = ATA_GEN_CLASS_MATCH },
 	{ 0, },
 };
 
@@ -245,25 +254,12 @@ static struct pci_driver ata_generic_pci_driver = {
 #endif
 };
 
-static int __init ata_generic_init(void)
-{
-	return pci_register_driver(&ata_generic_pci_driver);
-}
-
-
-static void __exit ata_generic_exit(void)
-{
-	pci_unregister_driver(&ata_generic_pci_driver);
-}
-
+module_pci_driver(ata_generic_pci_driver);
 
 MODULE_AUTHOR("Alan Cox");
 MODULE_DESCRIPTION("low-level driver for generic ATA");
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, ata_generic);
 MODULE_VERSION(DRV_VERSION);
-
-module_init(ata_generic_init);
-module_exit(ata_generic_exit);
 
 module_param(all_generic_ide, int, 0);

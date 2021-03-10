@@ -5,7 +5,8 @@
 #include <linux/sched.h>
 
 #include <asm/processor.h>
-#include <asm/system.h>
+#include <asm/cpufeature.h>
+#include <asm/special_insns.h>
 
 #ifdef CONFIG_PARAVIRT
 #include <asm/paravirt.h>
@@ -63,10 +64,28 @@ static inline void invpcid_flush_all_nonglobals(void)
 	__invpcid(0, 0, INVPCID_TYPE_ALL_NON_GLOBAL);
 }
 
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+
 /*
- * PCID isn't supported in the x86-32.
+ * RHEL7 Only
  */
-#if defined(CONFIG_PAGE_TABLE_ISOLATION) && defined(CONFIG_X86_64)
+#ifdef CONFIG_EFI
+/*
+ * Test whether this is the EFI pgd_t CR3 value used for EFI runtime services
+ */
+static inline bool is_efi_pgd_cr3(unsigned long cr3)
+{
+	extern unsigned long efi_pgd_cr3;
+	return cr3 == efi_pgd_cr3;
+}
+#else
+
+static inline bool is_efi_pgd_cr3(unsigned long cr3)
+{
+	return false;
+}
+#endif
+
 static __always_inline void __load_cr3(unsigned long cr3)
 {
 	if (static_cpu_has(X86_FEATURE_PCID) && kaiser_active()) {
@@ -77,6 +96,19 @@ static __always_inline void __load_cr3(unsigned long cr3)
 
 		if (this_cpu_has(X86_FEATURE_INVPCID_SINGLE)) {
 			invpcid_flush_single_context(KAISER_SHADOW_PCID_ASID);
+			write_cr3(cr3);
+			return;
+		}
+
+		/*
+		 * RHEL7 Only
+		 * The EFI pgd, which maps UEFI runtime services code and data
+		 * in addition to kernel space but no userspace, does not have
+		 * a shadow pgd. This exclusion is "RHEL7 Only" because the
+		 * subsequent performance optimization for processors with the
+		 * PCID feature but without INVPCID_SINGLE is also RHEL7 only.
+		 */
+		if (is_efi_pgd_cr3(cr3)) {
 			write_cr3(cr3);
 			return;
 		}
@@ -99,16 +131,16 @@ static __always_inline void __load_cr3(unsigned long cr3)
 	} else
 		write_cr3(cr3);
 }
-#else /* CONFIG_PAGE_TABLE_ISOLATION && CONFIG_X86_64 */
+#else /* CONFIG_PAGE_TABLE_ISOLATION */
 static __always_inline void __load_cr3(unsigned long cr3)
 {
 	write_cr3(cr3);
 }
-#endif /* CONFIG_PAGE_TABLE_ISOLATION && CONFIG_X86_64 */
+#endif /* CONFIG_PAGE_TABLE_ISOLATION */
 
 static inline void __native_flush_tlb(void)
 {
-	if (IS_ENABLED(CONFIG_X86_32) || !static_cpu_has(X86_FEATURE_INVPCID)) {
+	if (!static_cpu_has(X86_FEATURE_INVPCID)) {
 		__load_cr3(native_read_cr3());
 		return;
 	}
@@ -118,28 +150,9 @@ static inline void __native_flush_tlb(void)
 	invpcid_flush_all_nonglobals();
 }
 
-static inline void __native_flush_tlb_global(void)
+static inline void __native_flush_tlb_global_irq_disabled(void)
 {
-	unsigned long flags;
 	unsigned long cr4;
-
-	if (IS_ENABLED(CONFIG_X86_64) && static_cpu_has(X86_FEATURE_INVPCID)) {
-		/*
-		 * Using INVPCID is considerably faster than a pair of writes
-		 * to CR4 sandwiched inside an IRQ flag save/restore.
-		 *
-		 * Note, this works with CR4.PCIDE=0 or 1.
-		 */
-		invpcid_flush_all();
-		return;
-	}
-
-	/*
-	 * Read-modify-write to CR4 - protect it from preemption and
-	 * from interrupts. (Use the raw variant because this code can
-	 * be called from deep inside debugging code.)
-	 */
-	raw_local_irq_save(flags);
 
 	cr4 = native_read_cr4();
 	/*
@@ -161,13 +174,38 @@ static inline void __native_flush_tlb_global(void)
 
 	/* Put original CR4 value back: */
 	native_write_cr4(cr4);
+}
+
+static inline void __native_flush_tlb_global(void)
+{
+	unsigned long flags;
+
+	if (static_cpu_has(X86_FEATURE_INVPCID)) {
+		/*
+		 * Using INVPCID is considerably faster than a pair of writes
+		 * to CR4 sandwiched inside an IRQ flag save/restore.
+		 *
+		 * Note, this works with CR4.PCIDE=0 or 1.
+		 */
+		invpcid_flush_all();
+		return;
+	}
+
+	/*
+	 * Read-modify-write to CR4 - protect it from preemption and
+	 * from interrupts. (Use the raw variant because this code can
+	 * be called from deep inside debugging code.)
+	 */
+	raw_local_irq_save(flags);
+
+	__native_flush_tlb_global_irq_disabled();
 
 	raw_local_irq_restore(flags);
 }
 
 static inline void __native_flush_tlb_single(unsigned long addr)
 {
-#if defined(CONFIG_PAGE_TABLE_ISOLATION) && defined(CONFIG_X86_64)
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
 	unsigned long cr3, shadow_cr3;
 
 	/* Flush the address out of both PCIDs. */
@@ -229,35 +267,23 @@ static inline void __flush_tlb_all(void)
 
 static inline void __flush_tlb_one(unsigned long addr)
 {
-	if (cpu_has_invlpg)
 		__flush_tlb_single(addr);
-	else
-		__flush_tlb();
 }
 
-#ifdef CONFIG_X86_32
-# define TLB_FLUSH_ALL	0xffffffff
-#else
-# define TLB_FLUSH_ALL	-1ULL
-#endif
+#define TLB_FLUSH_ALL	-1UL
 
 /*
  * TLB flushing:
  *
- *  - flush_tlb() flushes the current mm struct TLBs
  *  - flush_tlb_all() flushes all processes TLBs
  *  - flush_tlb_mm(mm) flushes the specified mm context TLB's
  *  - flush_tlb_page(vma, vmaddr) flushes one page
  *  - flush_tlb_range(vma, start, end) flushes a range of pages
  *  - flush_tlb_kernel_range(start, end) flushes a range of kernel pages
- *  - flush_tlb_others(cpumask, mm, va) flushes TLBs on other cpus
+ *  - flush_tlb_others(cpumask, mm, start, end) flushes TLBs on other cpus
  *
  * ..but the i386 has somewhat limited tlb flushing capabilities,
  * and page-granular flushes are available only on i486 and up.
- *
- * x86-64 can only flush individual pages or full VMs. For a range flush
- * we always do the full VM. Might be worth trying if for a small
- * range a few INVLPGs in a row are a win.
  */
 
 #ifndef CONFIG_SMP
@@ -286,14 +312,28 @@ static inline void flush_tlb_range(struct vm_area_struct *vma,
 		__flush_tlb();
 }
 
+static inline void flush_tlb_mm_range(struct mm_struct *mm,
+	   unsigned long start, unsigned long end, unsigned long vmflag)
+{
+	if (mm == current->active_mm)
+		__flush_tlb();
+}
+
 static inline void native_flush_tlb_others(const struct cpumask *cpumask,
 					   struct mm_struct *mm,
-					   unsigned long va)
+					   unsigned long start,
+					   unsigned long end)
 {
 }
 
 static inline void reset_lazy_tlbstate(void)
 {
+}
+
+static inline void flush_tlb_kernel_range(unsigned long start,
+					  unsigned long end)
+{
+	flush_tlb_all();
 }
 
 #else  /* SMP */
@@ -302,21 +342,20 @@ static inline void reset_lazy_tlbstate(void)
 
 #define local_flush_tlb() __flush_tlb()
 
+#define flush_tlb_mm(mm)	flush_tlb_mm_range(mm, 0UL, TLB_FLUSH_ALL, 0UL)
+
+#define flush_tlb_range(vma, start, end)	\
+		flush_tlb_mm_range(vma->vm_mm, start, end, vma->vm_flags)
+
 extern void flush_tlb_all(void);
-extern void flush_tlb_current_task(void);
-extern void flush_tlb_mm(struct mm_struct *);
 extern void flush_tlb_page(struct vm_area_struct *, unsigned long);
-
-#define flush_tlb()	flush_tlb_current_task()
-
-static inline void flush_tlb_range(struct vm_area_struct *vma,
-				   unsigned long start, unsigned long end)
-{
-	flush_tlb_mm(vma->vm_mm);
-}
+extern void flush_tlb_mm_range(struct mm_struct *mm, unsigned long start,
+				unsigned long end, unsigned long vmflag);
+extern void flush_tlb_kernel_range(unsigned long start, unsigned long end);
 
 void native_flush_tlb_others(const struct cpumask *cpumask,
-			     struct mm_struct *mm, unsigned long va);
+				struct mm_struct *mm,
+				unsigned long start, unsigned long end);
 
 #define TLBSTATE_OK	1
 #define TLBSTATE_LAZY	2
@@ -329,22 +368,21 @@ DECLARE_PER_CPU_SHARED_ALIGNED(struct tlb_state, cpu_tlbstate);
 
 static inline void reset_lazy_tlbstate(void)
 {
-	percpu_write(cpu_tlbstate.state, 0);
-	percpu_write(cpu_tlbstate.active_mm, &init_mm);
+	this_cpu_write(cpu_tlbstate.state, 0);
+	this_cpu_write(cpu_tlbstate.active_mm, &init_mm);
 }
 
 #endif	/* SMP */
 
-#ifndef CONFIG_PARAVIRT
-#define flush_tlb_others(mask, mm, va)	native_flush_tlb_others(mask, mm, va)
-#endif
-
-static inline void flush_tlb_kernel_range(unsigned long start,
-					  unsigned long end)
-{
-	flush_tlb_all();
+/* Not inlined due to inc_irq_stat not being defined yet */
+#define flush_tlb_local() {		\
+	inc_irq_stat(irq_tlb_count);	\
+	local_flush_tlb();		\
 }
 
-extern void zap_low_mappings(bool early);
+#ifndef CONFIG_PARAVIRT
+#define flush_tlb_others(mask, mm, start, end)	\
+	native_flush_tlb_others(mask, mm, start, end)
+#endif
 
 #endif /* _ASM_X86_TLBFLUSH_H */

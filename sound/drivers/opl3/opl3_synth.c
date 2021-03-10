@@ -19,11 +19,14 @@
  *
  */
 
+#include <linux/slab.h>
+#include <linux/export.h>
+#include <linux/nospec.h>
 #include <sound/opl3.h>
 #include <sound/asound_fm.h>
-#include <linux/nospec.h>
+#include "opl3_voice.h"
 
-#if defined(CONFIG_SND_SEQUENCER) || defined(CONFIG_SND_SEQUENCER_MODULE)
+#if IS_ENABLED(CONFIG_SND_SEQUENCER)
 #define OPL3_SUPPORT_SYNTH
 #endif
 

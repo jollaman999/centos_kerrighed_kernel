@@ -23,8 +23,7 @@ static struct ebt_entries initial_chain = {
 	.policy		= EBT_ACCEPT,
 };
 
-static struct ebt_replace_kernel initial_table =
-{
+static struct ebt_replace_kernel initial_table = {
 	.name		= "broute",
 	.valid_hooks	= 1 << NF_BR_BROUTING,
 	.entries_size	= sizeof(struct ebt_entries),
@@ -41,8 +40,7 @@ static int check(const struct ebt_table_info *info, unsigned int valid_hooks)
 	return 0;
 }
 
-static const struct ebt_table broute_table =
-{
+static const struct ebt_table broute_table = {
 	.name		= "broute",
 	.table		= &initial_table,
 	.valid_hooks	= 1 << NF_BR_BROUTING,
@@ -52,10 +50,14 @@ static const struct ebt_table broute_table =
 
 static int ebt_broute(struct sk_buff *skb)
 {
+	struct nf_hook_state state;
 	int ret;
 
-	ret = ebt_do_table(NF_BR_BROUTING, skb, skb->dev, NULL,
-			   dev_net(skb->dev)->xt.broute_table);
+	nf_hook_state_init(&state, NF_BR_BROUTING, INT_MIN,
+			   NFPROTO_BRIDGE, skb->dev, NULL, NULL,
+			   dev_net(skb->dev), NULL);
+
+	ret = ebt_do_table(skb, &state, state.net->xt.broute_table);
 	if (ret == NF_DROP)
 		return 1; /* route it */
 	return 0; /* bridge it */
@@ -64,14 +66,12 @@ static int ebt_broute(struct sk_buff *skb)
 static int __net_init broute_net_init(struct net *net)
 {
 	net->xt.broute_table = ebt_register_table(net, &broute_table);
-	if (IS_ERR(net->xt.broute_table))
-		return PTR_ERR(net->xt.broute_table);
-	return 0;
+	return PTR_RET(net->xt.broute_table);
 }
 
 static void __net_exit broute_net_exit(struct net *net)
 {
-	ebt_unregister_table(net->xt.broute_table);
+	ebt_unregister_table(net, net->xt.broute_table);
 }
 
 static struct pernet_operations broute_net_ops = {
@@ -87,13 +87,14 @@ static int __init ebtable_broute_init(void)
 	if (ret < 0)
 		return ret;
 	/* see br_input.c */
-	rcu_assign_pointer(br_should_route_hook, ebt_broute);
+	RCU_INIT_POINTER(br_should_route_hook,
+			   (br_should_route_hook_t *)ebt_broute);
 	return 0;
 }
 
 static void __exit ebtable_broute_fini(void)
 {
-	rcu_assign_pointer(br_should_route_hook, NULL);
+	RCU_INIT_POINTER(br_should_route_hook, NULL);
 	synchronize_net();
 	unregister_pernet_subsys(&broute_net_ops);
 }

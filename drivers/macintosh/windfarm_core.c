@@ -25,6 +25,7 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/spinlock.h>
 #include <linux/kthread.h>
@@ -163,13 +164,27 @@ static ssize_t wf_show_control(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
 	struct wf_control *ctrl = container_of(attr, struct wf_control, attr);
+	const char *typestr;
 	s32 val = 0;
 	int err;
 
 	err = ctrl->ops->get_value(ctrl, &val);
-	if (err < 0)
+	if (err < 0) {
+		if (err == -EFAULT)
+			return sprintf(buf, "<HW FAULT>\n");
 		return err;
-	return sprintf(buf, "%d\n", val);
+	}
+	switch(ctrl->type) {
+	case WF_CONTROL_RPM_FAN:
+		typestr = " RPM";
+		break;
+	case WF_CONTROL_PWM_FAN:
+		typestr = " %";
+		break;
+	default:
+		typestr = "";
+	}
+	return sprintf(buf, "%d%s\n", val, typestr);
 }
 
 /* This is really only for debugging... */
@@ -209,6 +224,7 @@ int wf_register_control(struct wf_control *new_ct)
 	kref_init(&new_ct->ref);
 	list_add(&new_ct->link, &wf_controls);
 
+	sysfs_attr_init(&new_ct->attr.attr);
 	new_ct->attr.attr.name = new_ct->name;
 	new_ct->attr.attr.mode = 0644;
 	new_ct->attr.show = wf_show_control;
@@ -321,6 +337,7 @@ int wf_register_sensor(struct wf_sensor *new_sr)
 	kref_init(&new_sr->ref);
 	list_add(&new_sr->link, &wf_sensors);
 
+	sysfs_attr_init(&new_sr->attr.attr);
 	new_sr->attr.attr.name = new_sr->name;
 	new_sr->attr.attr.mode = 0444;
 	new_sr->attr.show = wf_show_sensor;
@@ -467,11 +484,6 @@ static int __init windfarm_core_init(void)
 {
 	DBG("wf: core loaded\n");
 
-	/* Don't register on old machines that use therm_pm72 for now */
-	if (machine_is_compatible("PowerMac7,2") ||
-	    machine_is_compatible("PowerMac7,3") ||
-	    machine_is_compatible("RackMac3,1"))
-		return -ENODEV;
 	platform_device_register(&wf_platform_device);
 	return 0;
 }

@@ -8,6 +8,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/errno.h>
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
@@ -210,6 +211,8 @@ int pnp_check_port(struct pnp_dev *dev, struct resource *res)
 			if (tres->flags & IORESOURCE_IO) {
 				if (cannot_compare(tres->flags))
 					continue;
+				if (tres->flags & IORESOURCE_WINDOW)
+					continue;
 				tport = &tres->start;
 				tend = &tres->end;
 				if (ranged_conflict(port, end, tport, tend))
@@ -269,6 +272,8 @@ int pnp_check_mem(struct pnp_dev *dev, struct resource *res)
 		     i++) {
 			if (tres->flags & IORESOURCE_MEM) {
 				if (cannot_compare(tres->flags))
+					continue;
+				if (tres->flags & IORESOURCE_WINDOW)
 					continue;
 				taddr = &tres->start;
 				tend = &tres->end;
@@ -404,9 +409,9 @@ int pnp_check_irq(struct pnp_dev *dev, struct resource *res)
 	return 1;
 }
 
+#ifdef CONFIG_ISA_DMA_API
 int pnp_check_dma(struct pnp_dev *dev, struct resource *res)
 {
-#ifndef CONFIG_IA64
 	int i;
 	struct pnp_dev *tdev;
 	struct resource *tres;
@@ -461,16 +466,14 @@ int pnp_check_dma(struct pnp_dev *dev, struct resource *res)
 	}
 
 	return 1;
-#else
-	/* IA64 does not have legacy DMA */
-	return 0;
-#endif
 }
+#endif /* CONFIG_ISA_DMA_API */
 
 unsigned long pnp_resource_type(struct resource *res)
 {
 	return res->flags & (IORESOURCE_IO  | IORESOURCE_MEM |
-			     IORESOURCE_IRQ | IORESOURCE_DMA);
+			     IORESOURCE_IRQ | IORESOURCE_DMA |
+			     IORESOURCE_BUS);
 }
 
 struct resource *pnp_get_resource(struct pnp_dev *dev,
@@ -497,6 +500,23 @@ static struct pnp_resource *pnp_new_resource(struct pnp_dev *dev)
 		return NULL;
 
 	list_add_tail(&pnp_res->list, &dev->resources);
+	return pnp_res;
+}
+
+struct pnp_resource *pnp_add_resource(struct pnp_dev *dev,
+				      struct resource *res)
+{
+	struct pnp_resource *pnp_res;
+
+	pnp_res = pnp_new_resource(dev);
+	if (!pnp_res) {
+		dev_err(&dev->dev, "can't add resource %pR\n", res);
+		return NULL;
+	}
+
+	pnp_res->res = *res;
+	pnp_res->res.name = dev->name;
+	dev_dbg(&dev->dev, "%pR\n", res);
 	return pnp_res;
 }
 
@@ -583,6 +603,30 @@ struct pnp_resource *pnp_add_mem_resource(struct pnp_dev *dev,
 
 	res = &pnp_res->res;
 	res->flags = IORESOURCE_MEM | flags;
+	res->start = start;
+	res->end = end;
+
+	dev_printk(KERN_DEBUG, &dev->dev, "%pR\n", res);
+	return pnp_res;
+}
+
+struct pnp_resource *pnp_add_bus_resource(struct pnp_dev *dev,
+					  resource_size_t start,
+					  resource_size_t end)
+{
+	struct pnp_resource *pnp_res;
+	struct resource *res;
+
+	pnp_res = pnp_new_resource(dev);
+	if (!pnp_res) {
+		dev_err(&dev->dev, "can't add resource for BUS %#llx-%#llx\n",
+			(unsigned long long) start,
+			(unsigned long long) end);
+		return NULL;
+	}
+
+	res = &pnp_res->res;
+	res->flags = IORESOURCE_BUS;
 	res->start = start;
 	res->end = end;
 

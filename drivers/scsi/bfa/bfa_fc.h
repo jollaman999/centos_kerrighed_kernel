@@ -22,7 +22,6 @@
 #include "bfad_drv.h"
 
 typedef u64 wwn_t;
-typedef u64 lun_t;
 
 #define WWN_NULL	(0)
 #define FC_SYMNAME_MAX	256	/*  max name server symbolic name size */
@@ -278,7 +277,7 @@ enum {
  * FC-PH-x. Figure-76. pg. 308.
  */
 struct fc_plogi_csp_s {
-	u8         	verhi;		/* FC-PH high version */
+	u8		verhi;		/* FC-PH high version */
 	u8		verlo;		/* FC-PH low version */
 	__be16		bbcred;		/* BB_Credit */
 
@@ -318,7 +317,7 @@ struct fc_plogi_csp_s {
 			query_dbc:1,
 			hg_supp:1;
 #endif
-	__be16		rxsz;		/* recieve data_field size */
+	__be16		rxsz;		/* receive data_field size */
 	__be16		conseq;
 	__be16		ro_bitmap;
 	__be32		e_d_tov;
@@ -1065,11 +1064,11 @@ struct fcp_cmnd_s {
 	struct scsi_lun	lun;		/* 64-bit LU number */
 	u8		crn;		/* command reference number */
 #ifdef __BIG_ENDIAN
-	u8         	resvd:1,
+	u8		resvd:1,
 			priority:4,	/* FCP-3: SAM-3 priority */
 			taskattr:3;	/* scsi task attribute */
 #else
-	u8         	taskattr:3,	/* scsi task attribute */
+	u8		taskattr:3,	/* scsi task attribute */
 			priority:4,	/* FCP-3: SAM-3 priority */
 			resvd:1;
 #endif
@@ -1328,11 +1327,11 @@ struct fcgs_rftid_req_s {
 #define FC_GS_FCP_FC4_FEATURE_TARGET	 0x01
 
 struct fcgs_rffid_req_s {
-    u32    rsvd:8;
-    u32    dap:24;		/* port identifier */
-    u32    rsvd1:16;
-    u32    fc4ftr_bits:8;	/* fc4 feature bits */
-    u32    fc4_type:8;		/* corresponding FC4 Type */
+	u32	rsvd:8;
+	u32	dap:24;		/* port identifier */
+	u32	rsvd1:16;
+	u32	fc4ftr_bits:8;	/* fc4 feature bits */
+	u32	fc4_type:8;		/* corresponding FC4 Type */
 };
 
 /*

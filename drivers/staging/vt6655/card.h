@@ -30,6 +30,7 @@
 #define __CARD_H__
 
 #include "ttype.h"
+#include <linux/types.h>
 
 /*---------------------  Export Definitions -------------------------*/
 //
@@ -39,7 +40,6 @@
 #define CARD_LB_NONE            MAKEWORD(MAC_LB_NONE, 0)
 #define CARD_LB_MAC             MAKEWORD(MAC_LB_INTERNAL, 0)   // PHY must ISO, avoid MAC loopback packet go out
 #define CARD_LB_PHY             MAKEWORD(MAC_LB_EXT, 0)
-
 
 #define DEFAULT_MSDU_LIFETIME           512  // ms
 #define DEFAULT_MSDU_LIFETIME_RES_64us  8000 // 64us
@@ -52,33 +52,31 @@
 #define CB_MAX_CHANNEL          (CB_MAX_CHANNEL_24G+CB_MAX_CHANNEL_5G)
 
 typedef enum _CARD_PHY_TYPE {
-    PHY_TYPE_AUTO,
-    PHY_TYPE_11B,
-    PHY_TYPE_11G,
-    PHY_TYPE_11A
+	PHY_TYPE_AUTO,
+	PHY_TYPE_11B,
+	PHY_TYPE_11G,
+	PHY_TYPE_11A
 } CARD_PHY_TYPE, *PCARD_PHY_TYPE;
 
 typedef enum _CARD_PKT_TYPE {
-    PKT_TYPE_802_11_BCN,
-    PKT_TYPE_802_11_MNG,
-    PKT_TYPE_802_11_DATA,
-    PKT_TYPE_802_11_ALL
+	PKT_TYPE_802_11_BCN,
+	PKT_TYPE_802_11_MNG,
+	PKT_TYPE_802_11_DATA,
+	PKT_TYPE_802_11_ALL
 } CARD_PKT_TYPE, *PCARD_PKT_TYPE;
 
 typedef enum _CARD_STATUS_TYPE {
-    CARD_STATUS_MEDIA_CONNECT,
-    CARD_STATUS_MEDIA_DISCONNECT,
-    CARD_STATUS_PMKID
+	CARD_STATUS_MEDIA_CONNECT,
+	CARD_STATUS_MEDIA_DISCONNECT,
+	CARD_STATUS_PMKID
 } CARD_STATUS_TYPE, *PCARD_STATUS_TYPE;
 
 typedef enum _CARD_OP_MODE {
-    OP_MODE_INFRASTRUCTURE,
-    OP_MODE_ADHOC,
-    OP_MODE_AP,
-    OP_MODE_UNKNOWN
+	OP_MODE_INFRASTRUCTURE,
+	OP_MODE_ADHOC,
+	OP_MODE_AP,
+	OP_MODE_UNKNOWN
 } CARD_OP_MODE, *PCARD_OP_MODE;
-
-
 
 /*---------------------  Export Classes  ----------------------------*/
 
@@ -86,171 +84,108 @@ typedef enum _CARD_OP_MODE {
 
 /*---------------------  Export Functions  --------------------------*/
 
-BOOL ChannelValid(UINT CountryCode, UINT ChannelIndex);
-void CARDvSetRSPINF(PVOID pDeviceHandler, CARD_PHY_TYPE ePHYType);
-void vUpdateIFS(PVOID pDeviceHandler);
-void CARDvUpdateBasicTopRate(PVOID pDeviceHandler);
-BOOL CARDbAddBasicRate(PVOID pDeviceHandler, WORD wRateIdx);
-BOOL CARDbIsOFDMinBasicRate(PVOID pDeviceHandler);
-void CARDvSetLoopbackMode(DWORD_PTR dwIoBase, WORD wLoopbackMode);
-BOOL CARDbSoftwareReset(PVOID pDeviceHandler);
-void CARDvSetFirstNextTBTT(DWORD_PTR dwIoBase, WORD wBeaconInterval);
-void CARDvUpdateNextTBTT(DWORD_PTR dwIoBase, QWORD qwTSF, WORD wBeaconInterval);
-BOOL CARDbGetCurrentTSF(DWORD_PTR dwIoBase, PQWORD pqwCurrTSF);
-QWORD CARDqGetNextTBTT(QWORD qwTSF, WORD wBeaconInterval);
-QWORD CARDqGetTSFOffset(BYTE byRxRate, QWORD qwTSF1, QWORD qwTSF2);
-BOOL CARDbSetTxPower(PVOID pDeviceHandler, ULONG ulTxPower);
-BYTE CARDbyGetPktType(PVOID pDeviceHandler);
-VOID CARDvSafeResetTx(PVOID pDeviceHandler);
-VOID CARDvSafeResetRx(PVOID pDeviceHandler);
+void CARDvSetRSPINF(void *pDeviceHandler, CARD_PHY_TYPE ePHYType);
+void vUpdateIFS(void *pDeviceHandler);
+void CARDvUpdateBasicTopRate(void *pDeviceHandler);
+bool CARDbAddBasicRate(void *pDeviceHandler, unsigned short wRateIdx);
+bool CARDbIsOFDMinBasicRate(void *pDeviceHandler);
+void CARDvSetLoopbackMode(unsigned long dwIoBase, unsigned short wLoopbackMode);
+bool CARDbSoftwareReset(void *pDeviceHandler);
+void CARDvSetFirstNextTBTT(unsigned long dwIoBase, unsigned short wBeaconInterval);
+void CARDvUpdateNextTBTT(unsigned long dwIoBase, QWORD qwTSF, unsigned short wBeaconInterval);
+bool CARDbGetCurrentTSF(unsigned long dwIoBase, PQWORD pqwCurrTSF);
+QWORD CARDqGetNextTBTT(QWORD qwTSF, unsigned short wBeaconInterval);
+QWORD CARDqGetTSFOffset(unsigned char byRxRate, QWORD qwTSF1, QWORD qwTSF2);
+bool CARDbSetTxPower(void *pDeviceHandler, unsigned long ulTxPower);
+unsigned char CARDbyGetPktType(void *pDeviceHandler);
+void CARDvSafeResetTx(void *pDeviceHandler);
+void CARDvSafeResetRx(void *pDeviceHandler);
 
 //xxx
-BOOL CARDbRadioPowerOff(PVOID pDeviceHandler);
-BOOL CARDbRadioPowerOn(PVOID pDeviceHandler);
-BOOL CARDbSetChannel(PVOID pDeviceHandler, UINT uConnectionChannel);
-//BOOL CARDbSendPacket(PVOID pDeviceHandler, PVOID pPacket, CARD_PKT_TYPE ePktType, UINT uLength);
-BOOL CARDbIsShortPreamble(PVOID pDeviceHandler);
-BOOL CARDbIsShorSlotTime(PVOID pDeviceHandler);
-BOOL CARDbSetPhyParameter(PVOID pDeviceHandler, CARD_PHY_TYPE ePHYType, WORD wCapInfo, BYTE byERPField, PVOID pvSupportRateIEs, PVOID pvExtSupportRateIEs);
-BOOL CARDbUpdateTSF(PVOID pDeviceHandler, BYTE byRxRate, QWORD qwBSSTimestamp, QWORD qwLocalTSF);
-BOOL CARDbStopTxPacket(PVOID pDeviceHandler, CARD_PKT_TYPE ePktType);
-BOOL CARDbStartTxPacket(PVOID pDeviceHandler, CARD_PKT_TYPE ePktType);
-BOOL CARDbSetBeaconPeriod(PVOID pDeviceHandler, WORD wBeaconInterval);
-BOOL CARDbSetBSSID(PVOID pDeviceHandler, PBYTE pbyBSSID, CARD_OP_MODE eOPMode);
+bool CARDbRadioPowerOff(void *pDeviceHandler);
+bool CARDbRadioPowerOn(void *pDeviceHandler);
+//bool CARDbSendPacket(void *pDeviceHandler, void *pPacket, CARD_PKT_TYPE ePktType, unsigned int uLength);
+bool CARDbIsShortPreamble(void *pDeviceHandler);
+bool CARDbIsShorSlotTime(void *pDeviceHandler);
+bool CARDbSetPhyParameter(void *pDeviceHandler, CARD_PHY_TYPE ePHYType, unsigned short wCapInfo, unsigned char byERPField, void *pvSupportRateIEs, void *pvExtSupportRateIEs);
+bool CARDbUpdateTSF(void *pDeviceHandler, unsigned char byRxRate, QWORD qwBSSTimestamp, QWORD qwLocalTSF);
+bool CARDbStopTxPacket(void *pDeviceHandler, CARD_PKT_TYPE ePktType);
+bool CARDbStartTxPacket(void *pDeviceHandler, CARD_PKT_TYPE ePktType);
+bool CARDbSetBeaconPeriod(void *pDeviceHandler, unsigned short wBeaconInterval);
+bool CARDbSetBSSID(void *pDeviceHandler, unsigned char *pbyBSSID, CARD_OP_MODE eOPMode);
 
-BOOL
+bool
 CARDbPowerDown(
-    PVOID   pDeviceHandler
-    );
+	void *pDeviceHandler
+);
 
-BOOL CARDbSetTxDataRate(
-    PVOID   pDeviceHandler,
-    WORD    wDataRate
-    );
+bool CARDbSetTxDataRate(
+	void *pDeviceHandler,
+	unsigned short wDataRate
+);
 
+bool CARDbRemoveKey(void *pDeviceHandler, unsigned char *pbyBSSID);
 
-BOOL CARDbRemoveKey (PVOID pDeviceHandler, PBYTE pbyBSSID);
+bool
+CARDbAdd_PMKID_Candidate(
+	void *pDeviceHandler,
+	unsigned char *pbyBSSID,
+	bool bRSNCapExist,
+	unsigned short wRSNCap
+);
 
-BOOL
-CARDbAdd_PMKID_Candidate (
-    IN PVOID            pDeviceHandler,
-    IN PBYTE            pbyBSSID,
-    IN BOOL             bRSNCapExist,
-    IN WORD             wRSNCap
-    );
+void *
+CARDpGetCurrentAddress(
+	void *pDeviceHandler
+);
 
-PVOID
-CARDpGetCurrentAddress (
-    IN PVOID            pDeviceHandler
-    );
+bool
+CARDbStartMeasure(
+	void *pDeviceHandler,
+	void *pvMeasureEIDs,
+	unsigned int uNumOfMeasureEIDs
+);
 
+bool
+CARDbChannelSwitch(
+	void *pDeviceHandler,
+	unsigned char byMode,
+	unsigned char byNewChannel,
+	unsigned char byCount
+);
 
-VOID CARDvInitChannelTable(PVOID pDeviceHandler);
-BYTE CARDbyGetChannelMapping(PVOID pDeviceHandler, BYTE byChannelNumber, CARD_PHY_TYPE ePhyType);
+bool
+CARDbSetQuiet(
+	void *pDeviceHandler,
+	bool bResetQuiet,
+	unsigned char byQuietCount,
+	unsigned char byQuietPeriod,
+	unsigned short wQuietDuration,
+	unsigned short wQuietOffset
+);
 
-BOOL
-CARDbStartMeasure (
-    IN PVOID            pDeviceHandler,
-    IN PVOID            pvMeasureEIDs,
-    IN UINT             uNumOfMeasureEIDs
-    );
+bool
+CARDbStartQuiet(
+	void *pDeviceHandler
+);
 
-BOOL
-CARDbChannelSwitch (
-    IN PVOID            pDeviceHandler,
-    IN BYTE             byMode,
-    IN BYTE             byNewChannel,
-    IN BYTE             byCount
-    );
+void
+CARDvSetPowerConstraint(
+	void *pDeviceHandler,
+	unsigned char byChannel,
+	char byPower
+);
 
-BOOL
-CARDbSetQuiet (
-    IN PVOID            pDeviceHandler,
-    IN BOOL             bResetQuiet,
-    IN BYTE             byQuietCount,
-    IN BYTE             byQuietPeriod,
-    IN WORD             wQuietDuration,
-    IN WORD             wQuietOffset
-    );
+void
+CARDvGetPowerCapability(
+	void *pDeviceHandler,
+	unsigned char *pbyMinPower,
+	unsigned char *pbyMaxPower
+);
 
-BOOL
-CARDbStartQuiet (
-    IN PVOID            pDeviceHandler
-    );
-
-VOID
-CARDvSetCountryInfo (
-    IN PVOID            pDeviceHandler,
-    IN CARD_PHY_TYPE    ePHYType,
-    IN PVOID            pIE
-    );
-
-VOID
-CARDvSetPowerConstraint (
-    IN PVOID            pDeviceHandler,
-    IN BYTE             byChannel,
-    IN I8               byPower
-    );
-
-VOID
-CARDvGetPowerCapability (
-    IN PVOID            pDeviceHandler,
-    OUT PBYTE           pbyMinPower,
-    OUT PBYTE           pbyMaxPower
-    );
-
-BYTE
-CARDbySetSupportChannels (
-    IN PVOID            pDeviceHandler,
-    IN OUT PBYTE        pbyIEs
-    );
-
-I8
-CARDbyGetTransmitPower (
-    IN PVOID            pDeviceHandler
-    );
-
-BOOL
-CARDbChannelGetList (
-    IN  UINT       uCountryCodeIdx,
-    OUT PBYTE      pbyChannelTable
-    );
-
-VOID
-CARDvSetCountryIE(
-    IN PVOID        pDeviceHandler,
-    IN PVOID        pIE
-    );
-
-BOOL
-CARDbGetChannelMapInfo(
-    IN PVOID        pDeviceHandler,
-    IN UINT         uChannelIndex,
-    OUT PBYTE       pbyChannelNumber,
-    OUT PBYTE       pbyMap
-    );
-
-VOID
-CARDvSetChannelMapInfo(
-    IN PVOID        pDeviceHandler,
-    IN UINT         uChannelIndex,
-    IN BYTE         byMap
-    );
-
-VOID
-CARDvClearChannelMapInfo(
-    IN PVOID        pDeviceHandler
-    );
-
-BYTE
-CARDbyAutoChannelSelect(
-    IN PVOID        pDeviceHandler,
-    CARD_PHY_TYPE   ePHYType
-    );
-
-BYTE CARDbyGetChannelNumber(PVOID pDeviceHandler, BYTE byChannelIndex);
+char
+CARDbyGetTransmitPower(
+	void *pDeviceHandler
+);
 
 #endif // __CARD_H__
-
-
-

@@ -9,10 +9,11 @@
  * for more details.
  *
  */
+#include <linux/sh_intc.h>
 
-#define HP680_BTN_IRQ		32	/* IRQ0_IRQ */
-#define HP680_TS_IRQ		35	/* IRQ3_IRQ */
-#define HP680_HD64461_IRQ	36	/* IRQ4_IRQ */
+#define HP680_BTN_IRQ		evt2irq(0x600)	/* IRQ0_IRQ */
+#define HP680_TS_IRQ		evt2irq(0x660)	/* IRQ3_IRQ */
+#define HP680_HD64461_IRQ	evt2irq(0x680)	/* IRQ4_IRQ */
 
 #define DAC_LCD_BRIGHTNESS	0
 #define DAC_SPEAKER_VOLUME	1
@@ -29,6 +30,9 @@
 
 #define PKDR_LED_GREEN		0x10
 
+/* HP Palmtop 620lx/660lx speaker on/off */
+#define PKDR_SPEAKER		0x20
+
 #define SCPDR_TS_SCAN_ENABLE	0x20
 #define SCPDR_TS_SCAN_Y		0x02
 #define SCPDR_TS_SCAN_X		0x01
@@ -42,6 +46,7 @@
 #define ADC_CHANNEL_BACKUP	4
 #define ADC_CHANNEL_CHARGE	5
 
+/* HP Jornada 680/690 speaker on/off */
 #define HD64461_GPADR_SPEAKER	0x01
 #define HD64461_GPADR_PCMCIA0	(0x02|0x08)
 

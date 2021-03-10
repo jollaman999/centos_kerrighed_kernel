@@ -25,6 +25,7 @@ BFA_TRC_FILE(HAL, FCPIM);
  *  BFA ITNIM Related definitions
  */
 static void bfa_itnim_update_del_itn_stats(struct bfa_itnim_s *itnim);
+static void bfa_ioim_lm_init(struct bfa_s *bfa);
 
 #define BFA_ITNIM_FROM_TAG(_fcpim, _tag)                                \
 	(((_fcpim)->itnim_arr + ((_tag) & ((_fcpim)->num_itnims - 1))))
@@ -66,6 +67,11 @@ static void bfa_itnim_update_del_itn_stats(struct bfa_itnim_s *itnim);
 		__bfa_cb_itnim_sler, (__itnim));      \
 	}								\
 } while (0)
+
+enum bfa_ioim_lm_ua_status {
+	BFA_IOIM_LM_UA_RESET = 0,
+	BFA_IOIM_LM_UA_SET = 1,
+};
 
 /*
  *  itnim state machine event
@@ -1554,7 +1560,7 @@ bfa_ioim_sm_uninit(struct bfa_ioim_s *ioim, enum bfa_ioim_event event)
 		bfa_sm_set_state(ioim, bfa_ioim_sm_hcb);
 		WARN_ON(!bfa_q_is_on_q(&ioim->itnim->pending_q, ioim));
 		bfa_cb_queue(ioim->bfa, &ioim->hcb_qe,
-				__bfa_cb_ioim_abort, ioim);
+			__bfa_cb_ioim_abort, ioim);
 		break;
 
 	default:
@@ -1977,7 +1983,7 @@ bfa_ioim_sm_cleanup_qfull(struct bfa_ioim_s *ioim, enum bfa_ioim_event event)
 
 	case BFA_IOIM_SM_ABORT:
 		/*
-		 * IO is alraedy being cleaned up implicitly
+		 * IO is already being cleaned up implicitly
 		 */
 		ioim->io_cbfn = __bfa_cb_ioim_abort;
 		break;
@@ -2094,6 +2100,27 @@ bfa_ioim_sm_resfree(struct bfa_ioim_s *ioim, enum bfa_ioim_event event)
 	}
 }
 
+/*
+ * This is called from bfa_fcpim_start after the bfa_init() with flash read
+ * is complete by driver. now invalidate the stale content of lun mask
+ * like unit attention, rp tag and lp tag.
+ */
+static void
+bfa_ioim_lm_init(struct bfa_s *bfa)
+{
+	struct bfa_lun_mask_s *lunm_list;
+	int	i;
+
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_MINCFG)
+		return;
+
+	lunm_list = bfa_get_lun_mask_list(bfa);
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		lunm_list[i].ua = BFA_IOIM_LM_UA_RESET;
+		lunm_list[i].lp_tag = BFA_LP_TAG_INVALID;
+		lunm_list[i].rp_tag = BFA_RPORT_TAG_INVALID;
+	}
+}
 
 static void
 __bfa_cb_ioim_good_comp(void *cbarg, bfa_boolean_t complete)
@@ -2150,6 +2177,224 @@ __bfa_cb_ioim_comp(void *cbarg, bfa_boolean_t complete)
 
 	bfa_cb_ioim_done(ioim->bfa->bfad, ioim->dio, m->io_status,
 			  m->scsi_status, sns_len, snsinfo, residue);
+}
+
+void
+bfa_fcpim_lunmask_rp_update(struct bfa_s *bfa, wwn_t lp_wwn, wwn_t rp_wwn,
+			u16 rp_tag, u8 lp_tag)
+{
+	struct bfa_lun_mask_s *lun_list;
+	u8	i;
+
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_MINCFG)
+		return;
+
+	lun_list = bfa_get_lun_mask_list(bfa);
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if (lun_list[i].state == BFA_IOIM_LUN_MASK_ACTIVE) {
+			if ((lun_list[i].lp_wwn == lp_wwn) &&
+			    (lun_list[i].rp_wwn == rp_wwn)) {
+				lun_list[i].rp_tag = rp_tag;
+				lun_list[i].lp_tag = lp_tag;
+			}
+		}
+	}
+}
+
+/*
+ * set UA for all active luns in LM DB
+ */
+static void
+bfa_ioim_lm_set_ua(struct bfa_s *bfa)
+{
+	struct bfa_lun_mask_s	*lunm_list;
+	int	i;
+
+	lunm_list = bfa_get_lun_mask_list(bfa);
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if (lunm_list[i].state != BFA_IOIM_LUN_MASK_ACTIVE)
+			continue;
+		lunm_list[i].ua = BFA_IOIM_LM_UA_SET;
+	}
+}
+
+bfa_status_t
+bfa_fcpim_lunmask_update(struct bfa_s *bfa, u32 update)
+{
+	struct bfa_lunmask_cfg_s	*lun_mask;
+
+	bfa_trc(bfa, bfa_get_lun_mask_status(bfa));
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_MINCFG)
+		return BFA_STATUS_FAILED;
+
+	if (bfa_get_lun_mask_status(bfa) == update)
+		return BFA_STATUS_NO_CHANGE;
+
+	lun_mask = bfa_get_lun_mask(bfa);
+	lun_mask->status = update;
+
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_ENABLED)
+		bfa_ioim_lm_set_ua(bfa);
+
+	return  bfa_dconf_update(bfa);
+}
+
+bfa_status_t
+bfa_fcpim_lunmask_clear(struct bfa_s *bfa)
+{
+	int i;
+	struct bfa_lun_mask_s	*lunm_list;
+
+	bfa_trc(bfa, bfa_get_lun_mask_status(bfa));
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_MINCFG)
+		return BFA_STATUS_FAILED;
+
+	lunm_list = bfa_get_lun_mask_list(bfa);
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if (lunm_list[i].state == BFA_IOIM_LUN_MASK_ACTIVE) {
+			if (lunm_list[i].rp_tag != BFA_RPORT_TAG_INVALID)
+				bfa_rport_unset_lunmask(bfa,
+				  BFA_RPORT_FROM_TAG(bfa, lunm_list[i].rp_tag));
+		}
+	}
+
+	memset(lunm_list, 0, sizeof(struct bfa_lun_mask_s) * MAX_LUN_MASK_CFG);
+	return bfa_dconf_update(bfa);
+}
+
+bfa_status_t
+bfa_fcpim_lunmask_query(struct bfa_s *bfa, void *buf)
+{
+	struct bfa_lunmask_cfg_s *lun_mask;
+
+	bfa_trc(bfa, bfa_get_lun_mask_status(bfa));
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_MINCFG)
+		return BFA_STATUS_FAILED;
+
+	lun_mask = bfa_get_lun_mask(bfa);
+	memcpy(buf, lun_mask, sizeof(struct bfa_lunmask_cfg_s));
+	return BFA_STATUS_OK;
+}
+
+bfa_status_t
+bfa_fcpim_lunmask_add(struct bfa_s *bfa, u16 vf_id, wwn_t *pwwn,
+		      wwn_t rpwwn, struct scsi_lun lun)
+{
+	struct bfa_lun_mask_s *lunm_list;
+	struct bfa_rport_s *rp = NULL;
+	int i, free_index = MAX_LUN_MASK_CFG + 1;
+	struct bfa_fcs_lport_s *port = NULL;
+	struct bfa_fcs_rport_s *rp_fcs;
+
+	bfa_trc(bfa, bfa_get_lun_mask_status(bfa));
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_MINCFG)
+		return BFA_STATUS_FAILED;
+
+	port = bfa_fcs_lookup_port(&((struct bfad_s *)bfa->bfad)->bfa_fcs,
+				   vf_id, *pwwn);
+	if (port) {
+		*pwwn = port->port_cfg.pwwn;
+		rp_fcs = bfa_fcs_lport_get_rport_by_pwwn(port, rpwwn);
+		if (rp_fcs)
+			rp = rp_fcs->bfa_rport;
+	}
+
+	lunm_list = bfa_get_lun_mask_list(bfa);
+	/* if entry exists */
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if (lunm_list[i].state != BFA_IOIM_LUN_MASK_ACTIVE)
+			free_index = i;
+		if ((lunm_list[i].lp_wwn == *pwwn) &&
+		    (lunm_list[i].rp_wwn == rpwwn) &&
+		    (scsilun_to_int((struct scsi_lun *)&lunm_list[i].lun) ==
+		     scsilun_to_int((struct scsi_lun *)&lun)))
+			return  BFA_STATUS_ENTRY_EXISTS;
+	}
+
+	if (free_index > MAX_LUN_MASK_CFG)
+		return BFA_STATUS_MAX_ENTRY_REACHED;
+
+	if (rp) {
+		lunm_list[free_index].lp_tag = bfa_lps_get_tag_from_pid(bfa,
+						   rp->rport_info.local_pid);
+		lunm_list[free_index].rp_tag = rp->rport_tag;
+	} else {
+		lunm_list[free_index].lp_tag = BFA_LP_TAG_INVALID;
+		lunm_list[free_index].rp_tag = BFA_RPORT_TAG_INVALID;
+	}
+
+	lunm_list[free_index].lp_wwn = *pwwn;
+	lunm_list[free_index].rp_wwn = rpwwn;
+	lunm_list[free_index].lun = lun;
+	lunm_list[free_index].state = BFA_IOIM_LUN_MASK_ACTIVE;
+
+	/* set for all luns in this rp */
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if ((lunm_list[i].lp_wwn == *pwwn) &&
+		    (lunm_list[i].rp_wwn == rpwwn))
+			lunm_list[i].ua = BFA_IOIM_LM_UA_SET;
+	}
+
+	return bfa_dconf_update(bfa);
+}
+
+bfa_status_t
+bfa_fcpim_lunmask_delete(struct bfa_s *bfa, u16 vf_id, wwn_t *pwwn,
+			 wwn_t rpwwn, struct scsi_lun lun)
+{
+	struct bfa_lun_mask_s	*lunm_list;
+	struct bfa_rport_s	*rp = NULL;
+	struct bfa_fcs_lport_s *port = NULL;
+	struct bfa_fcs_rport_s *rp_fcs;
+	int	i;
+
+	/* in min cfg lunm_list could be NULL but  no commands should run. */
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_MINCFG)
+		return BFA_STATUS_FAILED;
+
+	bfa_trc(bfa, bfa_get_lun_mask_status(bfa));
+	bfa_trc(bfa, *pwwn);
+	bfa_trc(bfa, rpwwn);
+	bfa_trc(bfa, scsilun_to_int((struct scsi_lun *)&lun));
+
+	if (*pwwn == 0) {
+		port = bfa_fcs_lookup_port(
+				&((struct bfad_s *)bfa->bfad)->bfa_fcs,
+				vf_id, *pwwn);
+		if (port) {
+			*pwwn = port->port_cfg.pwwn;
+			rp_fcs = bfa_fcs_lport_get_rport_by_pwwn(port, rpwwn);
+			if (rp_fcs)
+				rp = rp_fcs->bfa_rport;
+		}
+	}
+
+	lunm_list = bfa_get_lun_mask_list(bfa);
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if ((lunm_list[i].lp_wwn == *pwwn) &&
+		    (lunm_list[i].rp_wwn == rpwwn) &&
+		    (scsilun_to_int((struct scsi_lun *)&lunm_list[i].lun) ==
+		     scsilun_to_int((struct scsi_lun *)&lun))) {
+			lunm_list[i].lp_wwn = 0;
+			lunm_list[i].rp_wwn = 0;
+			int_to_scsilun(0, &lunm_list[i].lun);
+			lunm_list[i].state = BFA_IOIM_LUN_MASK_INACTIVE;
+			if (lunm_list[i].rp_tag != BFA_RPORT_TAG_INVALID) {
+				lunm_list[i].rp_tag = BFA_RPORT_TAG_INVALID;
+				lunm_list[i].lp_tag = BFA_LP_TAG_INVALID;
+			}
+			return bfa_dconf_update(bfa);
+		}
+	}
+
+	/* set for all luns in this rp */
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if ((lunm_list[i].lp_wwn == *pwwn) &&
+		    (lunm_list[i].rp_wwn == rpwwn))
+			lunm_list[i].ua = BFA_IOIM_LM_UA_SET;
+	}
+
+	return BFA_STATUS_ENTRY_NOT_EXISTS;
 }
 
 static void
@@ -2641,6 +2886,7 @@ bfa_ioim_good_comp_isr(struct bfa_s *bfa, struct bfi_msg_s *m)
 	WARN_ON(ioim->iotag != iotag);
 
 	bfa_ioim_cb_profile_comp(fcpim, ioim);
+
 	bfa_sm_send_event(ioim, BFA_IOIM_SM_COMP_GOOD);
 }
 
@@ -3501,6 +3747,13 @@ bfa_fcp_detach(struct bfa_s *bfa)
 static void
 bfa_fcp_start(struct bfa_s *bfa)
 {
+	struct bfa_fcp_mod_s *fcp = BFA_FCP_MOD(bfa);
+
+	/*
+	 * bfa_init() with flash read is complete. now invalidate the stale
+	 * content of lun mask like unit attention, rp tag and lp tag.
+	 */
+	bfa_ioim_lm_init(fcp->bfa);
 }
 
 static void

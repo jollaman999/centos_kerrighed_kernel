@@ -9,6 +9,7 @@
 #define _SCSI_SCSI_H
 
 #include <linux/types.h>
+#include <linux/scatterlist.h>
 #include <linux/kernel.h>
 
 struct scsi_cmnd;
@@ -18,23 +19,10 @@ enum scsi_timeouts {
 };
 
 /*
- * The maximum number of SG segments that we will put inside a
- * scatterlist (unless chaining is used). Should ideally fit inside a
- * single page, to avoid a higher order allocation.  We could define this
- * to SG_MAX_SINGLE_ALLOC to pack correctly at the highest order.  The
- * minimum value is 32
+ * DIX-capable adapters effectively support infinite chaining for the
+ * protection information scatterlist
  */
-#define SCSI_MAX_SG_SEGMENTS	128
-
-/*
- * Like SCSI_MAX_SG_SEGMENTS, but for archs that have sg chaining. This limit
- * is totally arbitrary, a setting of 2048 will get you at least 8mb ios.
- */
-#ifdef ARCH_HAS_SG_CHAIN
-#define SCSI_MAX_SG_CHAIN_SEGMENTS	2048
-#else
-#define SCSI_MAX_SG_CHAIN_SEGMENTS	SCSI_MAX_SG_SEGMENTS
-#endif
+#define SCSI_MAX_PROT_SG_SEGMENTS	0xFFFF
 
 /*
  * Special value for scanning to specify scanning or rescanning of all
@@ -72,6 +60,7 @@ enum scsi_timeouts {
 #define SEND_DIAGNOSTIC       0x1d
 #define ALLOW_MEDIUM_REMOVAL  0x1e
 
+#define READ_FORMAT_CAPACITIES 0x23
 #define SET_WINDOW            0x24
 #define READ_CAPACITY         0x25
 #define READ_10               0x28
@@ -101,6 +90,8 @@ enum scsi_timeouts {
 #define WRITE_SAME            0x41
 #define UNMAP		      0x42
 #define READ_TOC              0x43
+#define READ_HEADER           0x44
+#define GET_EVENT_STATUS_NOTIFICATION 0x4a
 #define LOG_SELECT            0x4c
 #define LOG_SENSE             0x4d
 #define XDWRITEREAD_10        0x53
@@ -118,8 +109,10 @@ enum scsi_timeouts {
 #define MOVE_MEDIUM           0xa5
 #define EXCHANGE_MEDIUM       0xa6
 #define READ_12               0xa8
+#define SERVICE_ACTION_OUT_12 0xa9
 #define WRITE_12              0xaa
-#define READ_MEDIA_SERIAL_NUMBER 0xab
+#define READ_MEDIA_SERIAL_NUMBER 0xab /* Obsolete with SPC-2 */
+#define SERVICE_ACTION_IN_12  0xab
 #define WRITE_VERIFY_12       0xae
 #define VERIFY_12	      0xaf
 #define SEARCH_HIGH_12        0xb0
@@ -134,16 +127,21 @@ enum scsi_timeouts {
 #define ACCESS_CONTROL_IN     0x86
 #define ACCESS_CONTROL_OUT    0x87
 #define READ_16               0x88
+#define COMPARE_AND_WRITE     0x89
 #define WRITE_16              0x8a
 #define READ_ATTRIBUTE        0x8c
 #define WRITE_ATTRIBUTE	      0x8d
+#define WRITE_VERIFY_16       0x8e
 #define VERIFY_16	      0x8f
 #define SYNCHRONIZE_CACHE_16  0x91
 #define WRITE_SAME_16	      0x93
-#define SERVICE_ACTION_IN     0x9e
+#define SERVICE_ACTION_BIDIRECTIONAL 0x9d
+#define SERVICE_ACTION_IN_16  0x9e
+#define SERVICE_ACTION_OUT_16 0x9f
 /* values for service action in */
 #define	SAI_READ_CAPACITY_16  0x10
 #define SAI_GET_LBA_STATUS    0x12
+#define SAI_REPORT_REFERRALS  0x13
 /* values for VARIABLE_LENGTH_CMD service action codes
  * see spc4r17 Section D.3.5, table D.7 and D.8 */
 #define VLC_SA_RECEIVE_CREDENTIAL 0x1800
@@ -153,8 +151,8 @@ enum scsi_timeouts {
 #define MI_REPORT_ALIASES     0x0b
 #define MI_REPORT_SUPPORTED_OPERATION_CODES 0x0c
 #define MI_REPORT_SUPPORTED_TASK_MANAGEMENT_FUNCTIONS 0x0d
-#define MI_REPORT_PRIORITY   0x0e
-#define MI_REPORT_TIMESTAMP  0x0f
+#define MI_REPORT_PRIORITY    0x0e
+#define MI_REPORT_TIMESTAMP   0x0f
 #define MI_MANAGEMENT_PROTOCOL_IN 0x10
 /* value for MI_REPORT_TARGET_PGS ext header */
 #define MI_EXT_HDR_PARAM_FMT  0x20
@@ -173,11 +171,15 @@ enum scsi_timeouts {
 #define READ_32		      0x09
 #define VERIFY_32	      0x0a
 #define WRITE_32	      0x0b
+#define WRITE_VERIFY_32	      0x0c
 #define WRITE_SAME_32	      0x0d
 
 /* Values for T10/04-262r7 */
 #define	ATA_16		      0x85	/* 16-byte pass-thru */
 #define	ATA_12		      0xa1	/* 12-byte pass-thru */
+
+/* Vendor specific CDBs start here */
+#define VENDOR_SPECIFIC_CDB 0xc0
 
 /*
  *	SCSI command lengths
@@ -187,10 +189,10 @@ enum scsi_timeouts {
 
 /* defined in T10 SCSI Primary Commands-2 (SPC2) */
 struct scsi_varlen_cdb_hdr {
-	u8 opcode;        /* opcode always == VARIABLE_LENGTH_CMD */
-	u8 control;
-	u8 misc[5];
-	u8 additional_cdb_length;         /* total cdb length - 8 */
+	__u8 opcode;        /* opcode always == VARIABLE_LENGTH_CMD */
+	__u8 control;
+	__u8 misc[5];
+	__u8 additional_cdb_length;         /* total cdb length - 8 */
 	__be16 service_action;
 	/* service specific data follows */
 };
@@ -210,6 +212,16 @@ scsi_command_size(const unsigned char *cmnd)
 	return (cmnd[0] == VARIABLE_LENGTH_CMD) ?
 		scsi_varlen_cdb_length(cmnd) : COMMAND_SIZE(cmnd[0]);
 }
+
+#ifdef CONFIG_ACPI
+struct acpi_bus_type;
+
+extern int
+scsi_register_acpi_bus_type(struct acpi_bus_type *bus);
+
+extern void
+scsi_unregister_acpi_bus_type(struct acpi_bus_type *bus);
+#endif
 
 /*
  *  SCSI Architecture Model (SAM) Status codes. Taken from SAM-3 draft
@@ -244,6 +256,8 @@ static inline int scsi_status_is_good(int status)
 	 */
 	status &= 0xfe;
 	return ((status == SAM_STAT_GOOD) ||
+		(status == SAM_STAT_CONDITION_MET) ||
+		/* Next two "intermediate" statuses are obsolete in SAM-4 */
 		(status == SAM_STAT_INTERMEDIATE) ||
 		(status == SAM_STAT_INTERMEDIATE_CONDITION_MET) ||
 		/* FIXME: this is obsolete in SAM-3 */
@@ -310,7 +324,7 @@ static inline int scsi_status_is_good(int status)
 #define TYPE_ENCLOSURE      0x0d    /* Enclosure Services Device */
 #define TYPE_RBC	    0x0e
 #define TYPE_OSD            0x11
-#define TYPE_MAX            0x1f
+#define TYPE_WLUN           0x1e    /* well-known logical unit */
 #define TYPE_NO_LUN         0x7f
 
 /* SCSI protocols; these are taken from SPC-3 section 7.5 */
@@ -495,7 +509,7 @@ static inline int scsi_is_wlun(unsigned int lun)
 
 #define sense_class(sense)  (((sense) >> 4) & 0x7)
 #define sense_error(sense)  ((sense) & 0xf)
-#define sense_valid(sense)  ((sense) & 0x80);
+#define sense_valid(sense)  ((sense) & 0x80)
 
 /*
  * default timeouts

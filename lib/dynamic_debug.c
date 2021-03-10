@@ -31,6 +31,7 @@
 #include <linux/dynamic_debug.h>
 #include <linux/debugfs.h>
 #include <linux/slab.h>
+#include <linux/jump_label.h>
 #include <linux/hardirq.h>
 #include <linux/sched.h>
 #include <linux/device.h>
@@ -39,20 +40,10 @@
 extern struct _ddebug __start___verbose[];
 extern struct _ddebug __stop___verbose[];
 
-/* dynamic_debug_enabled, and dynamic_debug_enabled2 are bitmasks in which
- * bit n is set to 1 if any modname hashes into the bucket n, 0 otherwise. They
- * use independent hash functions, to reduce the chance of false positives.
- */
-long long dynamic_debug_enabled;
-EXPORT_SYMBOL_GPL(dynamic_debug_enabled);
-long long dynamic_debug_enabled2;
-EXPORT_SYMBOL_GPL(dynamic_debug_enabled2);
-
 struct ddebug_table {
 	struct list_head link;
 	char *mod_name;
 	unsigned int num_ddebugs;
-	unsigned int num_enabled;
 	struct _ddebug *ddebugs;
 };
 
@@ -139,26 +130,6 @@ static void vpr_info_dq(const struct ddebug_query *query, const char *msg)
 }
 
 /*
- * must be called with ddebug_lock held
- */
-
-static int disabled_hash(char hash, bool first_table)
-{
-	struct ddebug_table *dt;
-	char table_hash_value;
-
-	list_for_each_entry(dt, &ddebug_tables, link) {
-		if (first_table)
-			table_hash_value = dt->ddebugs->primary_hash;
-		else
-			table_hash_value = dt->ddebugs->secondary_hash;
-		if (dt->num_enabled && (hash == table_hash_value))
-			return 0;
-	}
-	return 1;
-}
-
-/*
  * Search the tables for _ddebug's which match the given `query' and
  * apply the `flags' and `mask' to them.  Returns number of matching
  * callsites, normally the same as number of changes.  If verbose,
@@ -217,25 +188,7 @@ static int ddebug_change(const struct ddebug_query *query,
 			newflags = (dp->flags & mask) | flags;
 			if (newflags == dp->flags)
 				continue;
-
-			if (!newflags)
-				dt->num_enabled--;
-			else if (!dp->flags)
-				dt->num_enabled++;
 			dp->flags = newflags;
-			if (newflags) {
-				dynamic_debug_enabled |=
-						(1LL << dp->primary_hash);
-				dynamic_debug_enabled2 |=
-						(1LL << dp->secondary_hash);
-			} else {
-				if (disabled_hash(dp->primary_hash, true))
-					dynamic_debug_enabled &=
-						~(1LL << dp->primary_hash);
-				if (disabled_hash(dp->secondary_hash, false))
-					dynamic_debug_enabled2 &=
-						~(1LL << dp->secondary_hash);
-			}
 			vpr_info("changed %s:%d [%s]%s =%s\n",
 				 trim_prefix(dp->filename), dp->lineno,
 				 dt->mod_name, dp->function,
@@ -315,12 +268,14 @@ static int ddebug_tokenize(char *buf, char *words[], int maxwords)
  */
 static inline int parse_lineno(const char *str, unsigned int *val)
 {
+	char *end = NULL;
 	BUG_ON(str == NULL);
 	if (*str == '\0') {
 		*val = 0;
 		return 0;
 	}
-	if (kstrtouint(str, 10, val) < 0) {
+	*val = simple_strtoul(str, &end, 10);
+	if (end == NULL || end == str || *end != '\0') {
 		pr_err("bad line-number: %s\n", str);
 		return -EINVAL;
 	}
@@ -359,7 +314,7 @@ static int ddebug_parse_query(char *words[], int nwords,
 			struct ddebug_query *query, const char *modname)
 {
 	unsigned int i;
-	int rc = 0;
+	int rc;
 
 	/* check we have an even number of words */
 	if (nwords % 2 != 0) {
@@ -393,14 +348,14 @@ static int ddebug_parse_query(char *words[], int nwords,
 			}
 			if (last)
 				*last++ = '\0';
-			if (parse_lineno(first, &query->first_lineno) < 0)
+			if (parse_lineno(first, &query->first_lineno) < 0) {
+				pr_err("line-number is <0\n");
 				return -EINVAL;
+			}
 			if (last) {
 				/* range <first>-<last> */
-				if (parse_lineno(last, &query->last_lineno) < 0)
-					return -EINVAL;
-
-				if (query->last_lineno < query->first_lineno) {
+				if (parse_lineno(last, &query->last_lineno)
+				    < query->first_lineno) {
 					pr_err("last-line:%d < 1st-line:%d\n",
 						query->last_lineno,
 						query->first_lineno);
@@ -557,25 +512,25 @@ static char *dynamic_emit_prefix(const struct _ddebug *desc, char *buf)
 	int pos_after_tid;
 	int pos = 0;
 
-	pos += snprintf(buf + pos, remaining(pos), "%s", KERN_DEBUG);
+	*buf = '\0';
+
 	if (desc->flags & _DPRINTK_FLAGS_INCL_TID) {
 		if (in_interrupt())
-			pos += snprintf(buf + pos, remaining(pos), "%s ",
-						"<intr>");
+			pos += snprintf(buf + pos, remaining(pos), "<intr> ");
 		else
 			pos += snprintf(buf + pos, remaining(pos), "[%d] ",
-						task_pid_vnr(current));
+					task_pid_vnr(current));
 	}
 	pos_after_tid = pos;
 	if (desc->flags & _DPRINTK_FLAGS_INCL_MODNAME)
 		pos += snprintf(buf + pos, remaining(pos), "%s:",
-					desc->modname);
+				desc->modname);
 	if (desc->flags & _DPRINTK_FLAGS_INCL_FUNCNAME)
 		pos += snprintf(buf + pos, remaining(pos), "%s:",
-					desc->function);
+				desc->function);
 	if (desc->flags & _DPRINTK_FLAGS_INCL_LINENO)
 		pos += snprintf(buf + pos, remaining(pos), "%d:",
-					desc->lineno);
+				desc->lineno);
 	if (pos - pos_after_tid)
 		pos += snprintf(buf + pos, remaining(pos), " ");
 	if (pos >= PREFIX_SIZE)
@@ -595,9 +550,13 @@ int __dynamic_pr_debug(struct _ddebug *descriptor, const char *fmt, ...)
 	BUG_ON(!fmt);
 
 	va_start(args, fmt);
+
 	vaf.fmt = fmt;
 	vaf.va = &args;
-	res = printk("%s%pV", dynamic_emit_prefix(descriptor, buf), &vaf);
+
+	res = printk(KERN_DEBUG "%s%pV",
+		     dynamic_emit_prefix(descriptor, buf), &vaf);
+
 	va_end(args);
 
 	return res;
@@ -610,15 +569,26 @@ int __dynamic_dev_dbg(struct _ddebug *descriptor,
 	struct va_format vaf;
 	va_list args;
 	int res;
-	char buf[PREFIX_SIZE];
 
 	BUG_ON(!descriptor);
 	BUG_ON(!fmt);
 
 	va_start(args, fmt);
+
 	vaf.fmt = fmt;
 	vaf.va = &args;
-	res = __dev_printk(dynamic_emit_prefix(descriptor, buf), dev, &vaf);
+
+	if (!dev) {
+		res = printk(KERN_DEBUG "(NULL device *): %pV", &vaf);
+	} else {
+		char buf[PREFIX_SIZE];
+
+		res = dev_printk_emit(LOGLEVEL_DEBUG, dev, "%s%s %s: %pV",
+				      dynamic_emit_prefix(descriptor, buf),
+				      dev_driver_string(dev), dev_name(dev),
+				      &vaf);
+	}
+
 	va_end(args);
 
 	return res;
@@ -628,20 +598,37 @@ EXPORT_SYMBOL(__dynamic_dev_dbg);
 #ifdef CONFIG_NET
 
 int __dynamic_netdev_dbg(struct _ddebug *descriptor,
-		      const struct net_device *dev, const char *fmt, ...)
+			 const struct net_device *dev, const char *fmt, ...)
 {
 	struct va_format vaf;
 	va_list args;
 	int res;
-	char buf[PREFIX_SIZE];
 
 	BUG_ON(!descriptor);
 	BUG_ON(!fmt);
 
 	va_start(args, fmt);
+
 	vaf.fmt = fmt;
 	vaf.va = &args;
-	res = __netdev_printk(dynamic_emit_prefix(descriptor, buf), dev, &vaf);
+
+	if (dev && dev->dev.parent) {
+		char buf[PREFIX_SIZE];
+
+		res = dev_printk_emit(LOGLEVEL_DEBUG, dev->dev.parent,
+				      "%s%s %s %s%s: %pV",
+				      dynamic_emit_prefix(descriptor, buf),
+				      dev_driver_string(dev->dev.parent),
+				      dev_name(dev->dev.parent),
+				      netdev_name(dev), netdev_reg_state(dev),
+				      &vaf);
+	} else if (dev) {
+		res = printk(KERN_DEBUG "%s%s: %pV", netdev_name(dev),
+			     netdev_reg_state(dev), &vaf);
+	} else {
+		res = printk(KERN_DEBUG "(NULL net_device): %pV", &vaf);
+	}
+
 	va_end(args);
 
 	return res;
@@ -666,7 +653,7 @@ static __init int ddebug_setup_query(char *str)
 __setup("ddebug_query=", ddebug_setup_query);
 
 /*
- * File_ops->write method for <debugfs>/dynamic_debug/control.  Gathers the
+ * File_ops->write method for <debugfs>/dynamic_debug/conrol.  Gathers the
  * command text from userspace, parses and executes it.
  */
 #define USER_BUF_PAGE 4096
@@ -844,9 +831,22 @@ static const struct seq_operations ddebug_proc_seqops = {
  */
 static int ddebug_proc_open(struct inode *inode, struct file *file)
 {
+	struct ddebug_iter *iter;
+	int err;
+
 	vpr_info("called\n");
-	return seq_open_private(file, &ddebug_proc_seqops,
-				sizeof(struct ddebug_iter));
+
+	iter = kzalloc(sizeof(*iter), GFP_KERNEL);
+	if (iter == NULL)
+		return -ENOMEM;
+
+	err = seq_open(file, &ddebug_proc_seqops);
+	if (err) {
+		kfree(iter);
+		return err;
+	}
+	((struct seq_file *)file->private_data)->private = iter;
+	return 0;
 }
 
 static const struct file_operations ddebug_proc_fops = {
@@ -878,7 +878,6 @@ int ddebug_add_module(struct _ddebug *tab, unsigned int n,
 	}
 	dt->mod_name = new_name;
 	dt->num_ddebugs = n;
-	dt->num_enabled = 0;
 	dt->ddebugs = tab;
 
 	mutex_lock(&ddebug_lock);
@@ -1054,7 +1053,7 @@ static int __init dynamic_debug_init(void)
 	 */
 	cmdline = kstrdup(saved_command_line, GFP_KERNEL);
 	parse_args("dyndbg params", cmdline, NULL,
-		   0, &ddebug_dyndbg_boot_param_cb);
+		   0, 0, 0, &ddebug_dyndbg_boot_param_cb);
 	kfree(cmdline);
 	return 0;
 

@@ -555,7 +555,7 @@ static snd_pcm_uframes_t usb6fire_pcm_pointer(
 	return ret;
 }
 
-static struct snd_pcm_ops pcm_ops = {
+static const struct snd_pcm_ops pcm_ops = {
 	.open = usb6fire_pcm_open,
 	.close = usb6fire_pcm_close,
 	.ioctl = snd_pcm_lib_ioctl,
@@ -565,7 +565,6 @@ static struct snd_pcm_ops pcm_ops = {
 	.trigger = usb6fire_pcm_trigger,
 	.pointer = usb6fire_pcm_pointer,
 	.page = snd_pcm_lib_get_vmalloc_page,
-	.mmap = snd_pcm_lib_mmap_vmalloc,
 };
 
 static void usb6fire_pcm_init_urb(struct pcm_urb *urb,
@@ -581,7 +580,6 @@ static void usb6fire_pcm_init_urb(struct pcm_urb *urb,
 	urb->instance.pipe = in ? usb_rcvisocpipe(chip->dev, ep)
 			: usb_sndisocpipe(chip->dev, ep);
 	urb->instance.interval = 1;
-	urb->instance.transfer_flags = URB_ISO_ASAP;
 	urb->instance.complete = handler;
 	urb->instance.context = urb;
 	urb->instance.number_of_packets = PCM_N_PACKETS_PER_URB;
@@ -592,12 +590,14 @@ static int usb6fire_pcm_buffers_init(struct pcm_runtime *rt)
 	int i;
 
 	for (i = 0; i < PCM_N_URBS; i++) {
-		rt->out_urbs[i].buffer = kzalloc(PCM_N_PACKETS_PER_URB
-				* PCM_MAX_PACKET_SIZE, GFP_KERNEL);
+		rt->out_urbs[i].buffer = kcalloc(PCM_MAX_PACKET_SIZE,
+						 PCM_N_PACKETS_PER_URB,
+						 GFP_KERNEL);
 		if (!rt->out_urbs[i].buffer)
 			return -ENOMEM;
-		rt->in_urbs[i].buffer = kzalloc(PCM_N_PACKETS_PER_URB
-				* PCM_MAX_PACKET_SIZE, GFP_KERNEL);
+		rt->in_urbs[i].buffer = kcalloc(PCM_MAX_PACKET_SIZE,
+						PCM_N_PACKETS_PER_URB,
+						GFP_KERNEL);
 		if (!rt->in_urbs[i].buffer)
 			return -ENOMEM;
 	}

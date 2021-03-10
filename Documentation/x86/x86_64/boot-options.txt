@@ -31,6 +31,9 @@ Machine check
 		(e.g. BIOS or hardware monitoring applications), conflicting
 		with OS's error handling, and you cannot deactivate the agent,
 		then this option will be a help.
+   mce=no_lmce
+		Do not opt-in to Local MCE delivery. Use legacy method
+		to broadcast MCEs.
    mce=bootlog
 		Enable logging of machine checks left over from booting.
 		Disabled by default on AMD because some BIOS leave bogus ones.
@@ -91,30 +94,12 @@ APICs
 		 apicmaintimer. Useful when your PIT timer is totally
 		 broken.
 
-Early Console
-
-   syntax: earlyprintk=vga
-           earlyprintk=serial[,ttySn[,baudrate]]
-
-   The early console is useful when the kernel crashes before the
-   normal console is initialized. It is not enabled by
-   default because it has some cosmetic problems.
-   Append ,keep to not disable it when the real console takes over.
-   Only vga or serial at a time, not both.
-   Currently only ttyS0 and ttyS1 are supported.
-   Interaction with the standard serial driver is not very good.
-   The VGA output is eventually overwritten by the real console.
-
 Timing
 
   notsc
   Don't use the CPU time stamp counter to read the wall time.
   This can be used to work around timing problems on multiprocessor systems
   with not properly synchronized CPUs.
-
-  report_lost_ticks
-  Report when timer interrupts are lost because some code turned off
-  interrupts for too long.
 
   nohpet
   Don't use the HPET timer.
@@ -173,19 +158,17 @@ NUMA
 
   numa=noacpi   Don't parse the SRAT table for NUMA setup
 
-  numa=fake=CMDLINE
-		If a number, fakes CMDLINE nodes and ignores NUMA setup of the
-		actual machine.  Otherwise, system memory is configured
-		depending on the sizes and coefficients listed.  For example:
-			numa=fake=2*512,1024,4*256,*128
-		gives two 512M nodes, a 1024M node, four 256M nodes, and the
-		rest split into 128M chunks.  If the last character of CMDLINE
-		is a *, the remaining memory is divided up equally among its
-		coefficient:
-			numa=fake=2*512,2*
-		gives two 512M nodes and the rest split into two nodes.
-		Otherwise, the remaining system RAM is allocated to an
-		additional node.
+  numa=fake=<size>[MG]
+		If given as a memory unit, fills all system RAM with nodes of
+		size interleaved over physical nodes.
+
+  numa=fake=<N>
+		If given as an integer, fills all system RAM with N fake nodes
+		interleaved over physical nodes.
+
+  numa=fake=<N>U
+		If given as an integer followed by 'U', it will divide each
+		physical node into N emulated nodes.
 
 ACPI
 
@@ -207,13 +190,13 @@ ACPI
 
 PCI
 
-  pci=off	Don't use PCI
-  pci=conf1	Use conf1 access.
-  pci=conf2	Use conf2 access.
-  pci=rom	Assign ROMs.
-  pci=assign-busses    Assign busses
-  pci=irqmask=MASK	       Set PCI interrupt mask to MASK
-  pci=lastbus=NUMBER	       Scan upto NUMBER busses, no matter what the mptable says.
+  pci=off		Don't use PCI
+  pci=conf1		Use conf1 access.
+  pci=conf2		Use conf2 access.
+  pci=rom		Assign ROMs.
+  pci=assign-busses	Assign busses
+  pci=irqmask=MASK	Set PCI interrupt mask to MASK
+  pci=lastbus=NUMBER	Scan up to NUMBER busses, no matter what the mptable says.
   pci=noacpi		Don't use ACPI to set up PCI interrupt routing.
 
 IOMMU (input/output memory management unit)
@@ -224,7 +207,7 @@ IOMMU (input/output memory management unit)
       (e.g. because you have < 3 GB memory).
       Kernel boot message: "PCI-DMA: Disabling IOMMU"
 
-   2. <arch/x86_64/kernel/pci-gart.c>: AMD GART based hardware IOMMU.
+   2. <arch/x86/kernel/amd_gart_64.c>: AMD GART based hardware IOMMU.
       Kernel boot message: "PCI-DMA: using GART IOMMU"
 
    3. <arch/x86_64/kernel/pci-swiotlb.c> : Software IOMMU implementation. Used
@@ -310,13 +293,6 @@ IOMMU (input/output memory management unit)
     are accessed from userspace directly on some PCI host bridge.
 
 Debugging
-
-  oops=panic	Always panic on oopses. Default is to just kill the process,
-		but there is a small probability of deadlocking the machine.
-		This will also cause panics on machine check exceptions.
-		Useful together with panic=30 to trigger a reboot.
-
-  kstack=N	Print N words from the kernel stack in oops dumps.
 
   pagefaulttrace  Dump all page faults. Only useful for extreme debugging
 		and will create a lot of output.

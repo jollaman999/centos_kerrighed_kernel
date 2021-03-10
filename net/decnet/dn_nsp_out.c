@@ -1,4 +1,3 @@
-
 /*
  * DECnet       An implementation of the DECnet protocol suite for the LINUX
  *              operating system.  DECnet is implemented using the  BSD Socket
@@ -50,8 +49,8 @@
 #include <linux/netdevice.h>
 #include <linux/inet.h>
 #include <linux/route.h>
+#include <linux/slab.h>
 #include <net/sock.h>
-#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/mm.h>
 #include <linux/termios.h>
@@ -77,7 +76,7 @@ static void dn_nsp_send(struct sk_buff *skb)
 	struct sock *sk = skb->sk;
 	struct dn_scp *scp = DN_SK(sk);
 	struct dst_entry *dst;
-	struct flowi fl;
+	struct flowidn fld;
 
 	skb_reset_transport_header(skb);
 	scp->stamp = jiffies;
@@ -90,13 +89,13 @@ try_again:
 		return;
 	}
 
-	memset(&fl, 0, sizeof(fl));
-	fl.oif = sk->sk_bound_dev_if;
-	fl.fld_src = dn_saddr2dn(&scp->addr);
-	fl.fld_dst = dn_saddr2dn(&scp->peer);
-	dn_sk_ports_copy(&fl, scp);
-	fl.proto = DNPROTO_NSP;
-	if (dn_route_output_sock(&sk->sk_dst_cache, &fl, sk, 0) == 0) {
+	memset(&fld, 0, sizeof(fld));
+	fld.flowidn_oif = sk->sk_bound_dev_if;
+	fld.saddr = dn_saddr2dn(&scp->addr);
+	fld.daddr = dn_saddr2dn(&scp->peer);
+	dn_sk_ports_copy(&fld, scp);
+	fld.flowidn_proto = DNPROTO_NSP;
+	if (dn_route_output_sock(&sk->sk_dst_cache, &fld, sk, 0) == 0) {
 		dst = sk_dst_get(sk);
 		sk->sk_route_caps = dst->dev->features;
 		goto try_again;
@@ -209,7 +208,7 @@ static void dn_nsp_rtt(struct sock *sk, long rtt)
  *
  * Returns: The number of times the packet has been sent previously
  */
-static inline unsigned dn_nsp_clone_and_send(struct sk_buff *skb,
+static inline unsigned int dn_nsp_clone_and_send(struct sk_buff *skb,
 					     gfp_t gfp)
 {
 	struct dn_skb_cb *cb = DN_SKB_CB(skb);
@@ -240,7 +239,7 @@ void dn_nsp_output(struct sock *sk)
 {
 	struct dn_scp *scp = DN_SK(sk);
 	struct sk_buff *skb;
-	unsigned reduce_win = 0;
+	unsigned int reduce_win = 0;
 
 	/*
 	 * First we check for otherdata/linkservice messages
@@ -323,7 +322,7 @@ static __le16 *dn_mk_ack_header(struct sock *sk, struct sk_buff *skb, unsigned c
 	/* Set "cross subchannel" bit in ackcrs */
 	ackcrs |= 0x2000;
 
-	ptr = (__le16 *)dn_mk_common_header(scp, skb, msgflag, hlen);
+	ptr = dn_mk_common_header(scp, skb, msgflag, hlen);
 
 	*ptr++ = cpu_to_le16(acknum);
 	*ptr++ = cpu_to_le16(ackcrs);
@@ -554,8 +553,8 @@ static __inline__ void dn_nsp_do_disc(struct sock *sk, unsigned char msgflg,
 	unsigned char *msg;
 
 	if ((dst == NULL) || (rem == 0)) {
-		if (net_ratelimit())
-			printk(KERN_DEBUG "DECnet: dn_nsp_do_disc: BUG! Please report this to SteveW@ACM.org rem=%u dst=%p\n", le16_to_cpu(rem), dst);
+		net_dbg_ratelimited("DECnet: dn_nsp_do_disc: BUG! Please report this to SteveW@ACM.org rem=%u dst=%p\n",
+				    le16_to_cpu(rem), dst);
 		return;
 	}
 
@@ -599,7 +598,7 @@ void dn_nsp_send_disc(struct sock *sk, unsigned char msgflg,
 	if (reason == 0)
 		reason = le16_to_cpu(scp->discdata_out.opt_status);
 
-	dn_nsp_do_disc(sk, msgflg, reason, gfp, sk->sk_dst_cache, ddl,
+	dn_nsp_do_disc(sk, msgflg, reason, gfp, __sk_dst_get(sk), ddl,
 		scp->discdata_out.opt_data, scp->addrrem, scp->addrloc);
 }
 
@@ -692,22 +691,22 @@ void dn_nsp_send_conninit(struct sock *sk, unsigned char msgflg)
 	aux = scp->accessdata.acc_userl;
 	*skb_put(skb, 1) = aux;
 	if (aux > 0)
-	memcpy(skb_put(skb, aux), scp->accessdata.acc_user, aux);
+		memcpy(skb_put(skb, aux), scp->accessdata.acc_user, aux);
 
 	aux = scp->accessdata.acc_passl;
 	*skb_put(skb, 1) = aux;
 	if (aux > 0)
-	memcpy(skb_put(skb, aux), scp->accessdata.acc_pass, aux);
+		memcpy(skb_put(skb, aux), scp->accessdata.acc_pass, aux);
 
 	aux = scp->accessdata.acc_accl;
 	*skb_put(skb, 1) = aux;
 	if (aux > 0)
-	memcpy(skb_put(skb, aux), scp->accessdata.acc_acc, aux);
+		memcpy(skb_put(skb, aux), scp->accessdata.acc_acc, aux);
 
 	aux = (__u8)le16_to_cpu(scp->conndata_out.opt_optl);
 	*skb_put(skb, 1) = aux;
 	if (aux > 0)
-	memcpy(skb_put(skb,aux), scp->conndata_out.opt_data, aux);
+		memcpy(skb_put(skb, aux), scp->conndata_out.opt_data, aux);
 
 	scp->persist = dn_nsp_persist(sk);
 	scp->persist_fxn = dn_nsp_retrans_conninit;

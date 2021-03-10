@@ -15,9 +15,11 @@
 #include <linux/spinlock_types.h>
 #include <linux/linkage.h>
 #include <linux/lockdep.h>
+#include <linux/atomic.h>
+#include <asm/processor.h>
+#include <linux/osq_lock.h>
 
-#include <asm/atomic.h>
-
+#include <linux/rh_kabi.h>
 /*
  * Simple, straightforward mutexes with strict semantics:
  *
@@ -50,15 +52,13 @@ struct mutex {
 	/* 1: unlocked, 0: locked, negative: locked, possible waiters */
 	atomic_t		count;
 	spinlock_t		wait_lock;
-#if defined(CONFIG_SMP) && !defined(CONFIG_DEBUG_MUTEXES) && \
-    !defined(CONFIG_HAVE_DEFAULT_NO_SPIN_MUTEXES) && !defined(__GENKSYMS__)
-	struct list_head	*wait_list;
-	void			*spin_mlock;
-#else
 	struct list_head	wait_list;
-#endif
 #if defined(CONFIG_DEBUG_MUTEXES) || defined(CONFIG_SMP)
-	struct thread_info	*owner;
+	struct task_struct	*owner;
+#endif
+#ifdef CONFIG_MUTEX_SPIN_ON_OWNER
+	RH_KABI_REPLACE(void			*spin_mlock,	/* Spinner MCS lock */
+		          struct optimistic_spin_queue osq)	/* Spinner MCS lock */
 #endif
 #ifdef CONFIG_DEBUG_MUTEXES
 	const char 		*name;
@@ -85,13 +85,21 @@ struct mutex_waiter {
 # include <linux/mutex-debug.h>
 #else
 # define __DEBUG_MUTEX_INITIALIZER(lockname)
+/**
+ * mutex_init - initialize the mutex
+ * @mutex: the mutex to be initialized
+ *
+ * Initialize the mutex to unlocked state.
+ *
+ * It is not allowed to initialize an already locked mutex.
+ */
 # define mutex_init(mutex) \
 do {							\
 	static struct lock_class_key __key;		\
 							\
 	__mutex_init((mutex), #mutex, &__key);		\
 } while (0)
-# define mutex_destroy(mutex)				do { } while (0)
+static inline void mutex_destroy(struct mutex *lock) {}
 #endif
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
@@ -101,27 +109,10 @@ do {							\
 # define __DEP_MAP_MUTEX_INITIALIZER(lockname)
 #endif
 
-#if defined(CONFIG_SMP) && !defined(CONFIG_DEBUG_MUTEXES) && \
-    !defined(CONFIG_HAVE_DEFAULT_NO_SPIN_MUTEXES)
-# define MUTEX_WAIT_LIST_INIT(x)	(struct list_head *)&(x)
-# define MUTEX_INIT_WAIT_LIST(x)	*(x) = (struct list_head *)(x)
-# define MUTEX_LIST_EMPTY(x)		(*(x) == (struct list_head *)(x))
-#define mutex_list_for_each_entry(pos, head, member)				\
-	for (pos = MUTEX_LIST_EMPTY(head) ? NULL : list_entry(*(head), typeof(*pos), member);	\
-	     pos; 	\
-	     pos = (pos->member.next != *(head)) ? list_entry(pos->member.next, typeof(*pos), member) : NULL)
-#else
-# define MUTEX_WAIT_LIST_INIT(x)	LIST_HEAD_INIT(x)
-# define MUTEX_INIT_WAIT_LIST(x)	INIT_LIST_HEAD(x)
-# define MUTEX_LIST_EMPTY(x)		list_empty(x)
-# define mutex_list_for_each_entry(pos, head, member) \
-	list_for_each_entry(pos, head, member)
-#endif
-
 #define __MUTEX_INITIALIZER(lockname) \
 		{ .count = ATOMIC_INIT(1) \
 		, .wait_lock = __SPIN_LOCK_UNLOCKED(lockname.wait_lock) \
-		, .wait_list = MUTEX_WAIT_LIST_INIT(lockname.wait_list) \
+		, .wait_list = LIST_HEAD_INIT(lockname.wait_list) \
 		__DEBUG_MUTEX_INITIALIZER(lockname) \
 		__DEP_MAP_MUTEX_INITIALIZER(lockname) }
 
@@ -187,8 +178,8 @@ extern void mutex_unlock(struct mutex *lock);
 
 extern int atomic_dec_and_mutex_lock(atomic_t *cnt, struct mutex *lock);
 
-#ifndef CONFIG_HAVE_ARCH_MUTEX_CPU_RELAX
-#define arch_mutex_cpu_relax()	cpu_relax()
+#ifndef arch_mutex_cpu_relax
+# define arch_mutex_cpu_relax() cpu_relax()
 #endif
 
-#endif
+#endif /* __LINUX_MUTEX_H */

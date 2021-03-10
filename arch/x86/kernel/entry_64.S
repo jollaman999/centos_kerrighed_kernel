@@ -9,6 +9,8 @@
 /*
  * entry.S contains the system-call and fault low-level handling routines.
  *
+ * Some of this is documented in Documentation/x86/entry_64.txt
+ *
  * NOTE: This code handles signal-recognition, which happens every time
  * after an interrupt and after each system call.
  *
@@ -18,7 +20,7 @@
  * A note on terminology:
  * - top of stack: Architecture defined interrupt frame from SS to RIP
  * at the top of the kernel process stack.
- * - partial stack frame: partially saved registers upto R11.
+ * - partial stack frame: partially saved registers up to R11.
  * - full stack frame: Like partial stack frame, but all register saved.
  *
  * Some macro usage:
@@ -51,11 +53,13 @@
 #include <asm/page_types.h>
 #include <asm/irqflags.h>
 #include <asm/paravirt.h>
-#include <asm/ftrace.h>
 #include <asm/percpu.h>
+#include <asm/asm.h>
+#include <asm/context_tracking.h>
+#include <asm/smap.h>
 #include <asm/spec_ctrl.h>
-#include <linux/err.h>
 #include <asm/nospec-branch.h>
+#include <linux/err.h>
 #include "kaiser.h"
 
 /* Avoid __ASSEMBLER__'ifying <linux/audit.h> just for this.  */
@@ -66,108 +70,6 @@
 
 	.code64
 	.section .entry.text, "ax"
-
-#ifdef CONFIG_FUNCTION_TRACER
-#ifdef CONFIG_DYNAMIC_FTRACE
-ENTRY(mcount)
-	retq
-END(mcount)
-
-ENTRY(ftrace_caller)
-	cmpl $0, function_trace_stop
-	jne  ftrace_stub
-
-	MCOUNT_SAVE_FRAME
-
-	movq 0x38(%rsp), %rdi
-	movq 8(%rbp), %rsi
-	subq $MCOUNT_INSN_SIZE, %rdi
-
-GLOBAL(ftrace_call)
-	call ftrace_stub
-
-	MCOUNT_RESTORE_FRAME
-
-#ifdef CONFIG_FUNCTION_GRAPH_TRACER
-GLOBAL(ftrace_graph_call)
-	jmp ftrace_stub
-#endif
-
-GLOBAL(ftrace_stub)
-	retq
-END(ftrace_caller)
-
-#else /* ! CONFIG_DYNAMIC_FTRACE */
-ENTRY(mcount)
-	cmpl $0, function_trace_stop
-	jne  ftrace_stub
-
-	cmpq $ftrace_stub, ftrace_trace_function
-	jnz trace
-
-#ifdef CONFIG_FUNCTION_GRAPH_TRACER
-	cmpq $ftrace_stub, ftrace_graph_return
-	jnz ftrace_graph_caller
-
-	cmpq $ftrace_graph_entry_stub, ftrace_graph_entry
-	jnz ftrace_graph_caller
-#endif
-
-GLOBAL(ftrace_stub)
-	retq
-
-trace:
-	MCOUNT_SAVE_FRAME
-
-	movq 0x38(%rsp), %rdi
-	movq 8(%rbp), %rsi
-	subq $MCOUNT_INSN_SIZE, %rdi
-
-	movq ftrace_trace_function, %r8
-	CALL_NOSPEC %r8
-
-	MCOUNT_RESTORE_FRAME
-
-	jmp ftrace_stub
-END(mcount)
-#endif /* CONFIG_DYNAMIC_FTRACE */
-#endif /* CONFIG_FUNCTION_TRACER */
-
-#ifdef CONFIG_FUNCTION_GRAPH_TRACER
-ENTRY(ftrace_graph_caller)
-	cmpl $0, function_trace_stop
-	jne ftrace_stub
-
-	MCOUNT_SAVE_FRAME
-
-	leaq 8(%rbp), %rdi
-	movq 0x38(%rsp), %rsi
-	movq (%rbp), %rdx
-	subq $MCOUNT_INSN_SIZE, %rsi
-
-	call	prepare_ftrace_return
-
-	MCOUNT_RESTORE_FRAME
-
-	retq
-END(ftrace_graph_caller)
-
-GLOBAL(return_to_handler)
-	subq  $24, %rsp
-
-	/* Save the return values */
-	movq %rax, (%rsp)
-	movq %rdx, 8(%rsp)
-	movq %rbp, %rdi
-
-	call ftrace_return_to_handler
-
-	movq %rax, 16(%rsp)
-	movq 8(%rsp), %rdx
-	movq (%rsp), %rax
-	addq $16, %rsp
-	retq
-#endif
 
 
 #ifndef CONFIG_PREEMPT
@@ -190,6 +92,44 @@ ENDPROC(native_usergs_sysret64)
 1:
 #endif
 .endm
+
+/*
+ * When dynamic function tracer is enabled it will add a breakpoint
+ * to all locations that it is about to modify, sync CPUs, update
+ * all the code, sync CPUs, then remove the breakpoints. In this time
+ * if lockdep is enabled, it might jump back into the debug handler
+ * outside the updating of the IST protection. (TRACE_IRQS_ON/OFF).
+ *
+ * We need to change the IDT table before calling TRACE_IRQS_ON/OFF to
+ * make sure the stack pointer does not get reset back to the top
+ * of the debug stack, and instead just reuses the current stack.
+ */
+#if defined(CONFIG_DYNAMIC_FTRACE) && defined(CONFIG_TRACE_IRQFLAGS)
+
+.macro TRACE_IRQS_OFF_DEBUG
+	call debug_stack_set_zero
+	TRACE_IRQS_OFF
+	call debug_stack_reset
+.endm
+
+.macro TRACE_IRQS_ON_DEBUG
+	call debug_stack_set_zero
+	TRACE_IRQS_ON
+	call debug_stack_reset
+.endm
+
+.macro TRACE_IRQS_IRETQ_DEBUG offset=ARGOFFSET
+	bt   $9,EFLAGS-\offset(%rsp)	/* interrupts off? */
+	jnc  1f
+	TRACE_IRQS_ON_DEBUG
+1:
+.endm
+
+#else
+# define TRACE_IRQS_OFF_DEBUG		TRACE_IRQS_OFF
+# define TRACE_IRQS_ON_DEBUG		TRACE_IRQS_ON
+# define TRACE_IRQS_IRETQ_DEBUG		TRACE_IRQS_IRETQ
+#endif
 
 /*
  * C code is not supposed to know about undefined top of stack. Every time
@@ -220,23 +160,17 @@ ENDPROC(native_usergs_sysret64)
 	.macro FAKE_STACK_FRAME child_rip
 	/* push in order ss, rsp, eflags, cs, rip */
 	xorl %eax, %eax
-	pushq $__KERNEL_DS /* ss */
-	CFI_ADJUST_CFA_OFFSET	8
+	pushq_cfi $__KERNEL_DS /* ss */
 	/*CFI_REL_OFFSET	ss,0*/
-	pushq %rax /* rsp */
-	CFI_ADJUST_CFA_OFFSET	8
+	pushq_cfi %rax /* rsp */
 	CFI_REL_OFFSET	rsp,0
-	pushq $X86_EFLAGS_IF /* eflags - interrupts on */
-	CFI_ADJUST_CFA_OFFSET	8
+	pushq_cfi $(X86_EFLAGS_IF|X86_EFLAGS_FIXED) /* eflags - interrupts on */
 	/*CFI_REL_OFFSET	rflags,0*/
-	pushq $__KERNEL_CS /* cs */
-	CFI_ADJUST_CFA_OFFSET	8
+	pushq_cfi $__KERNEL_CS /* cs */
 	/*CFI_REL_OFFSET	cs,0*/
-	pushq \child_rip /* rip */
-	CFI_ADJUST_CFA_OFFSET	8
+	pushq_cfi \child_rip /* rip */
 	CFI_REL_OFFSET	rip,0
-	pushq	%rax /* orig rax */
-	CFI_ADJUST_CFA_OFFSET	8
+	pushq_cfi %rax /* orig rax */
 	.endm
 
 	.macro UNFAKE_STACK_FRAME
@@ -308,36 +242,39 @@ ENDPROC(native_usergs_sysret64)
 	.endm
 
 /* save partial stack frame */
-ENTRY(save_args)
-	XCPT_FRAME
+	.macro SAVE_ARGS_IRQ
 	cld
-	movq_cfi rdi, RDI+16-ARGOFFSET
-	movq_cfi rsi, RSI+16-ARGOFFSET
-	movq_cfi rdx, RDX+16-ARGOFFSET
-	movq_cfi rcx, RCX+16-ARGOFFSET
-	movq_cfi rax, RAX+16-ARGOFFSET
-	movq_cfi  r8,  R8+16-ARGOFFSET
-	movq_cfi  r9,  R9+16-ARGOFFSET
-	movq_cfi r10, R10+16-ARGOFFSET
-	movq_cfi r11, R11+16-ARGOFFSET
+	/* start from rbp in pt_regs and jump over */
+	movq_cfi rdi, (RDI-RBP)
+	movq_cfi rsi, (RSI-RBP)
+	movq_cfi rdx, (RDX-RBP)
+	movq_cfi rcx, (RCX-RBP)
+	movq_cfi rax, (RAX-RBP)
+	movq_cfi  r8,  (R8-RBP)
+	movq_cfi  r9,  (R9-RBP)
+	movq_cfi r10, (R10-RBP)
+	movq_cfi r11, (R11-RBP)
 
-	leaq -ARGOFFSET+16(%rsp),%rdi	/* arg1 for handler */
-	movq_cfi rbp, 8		/* push %rbp */
-	leaq 8(%rsp), %rbp		/* mov %rsp, %ebp */
-	testl $3, CS(%rdi)
-	je sa_from_kernel
+	/* Save rbp so that we can unwind from get_irq_regs() */
+	movq_cfi rbp, 0
+
+	/* Save previous stack value */
+	movq %rsp, %rsi
+
+	leaq -RBP(%rsp),%rdi	/* arg1 for handler */
+	testl $3, CS-RBP(%rsi)
+	je 1f
 	SWAPGS
 	FENCE_SWAPGS_USER_ENTRY
 	SWITCH_TO_KERNEL_CR3
 	IBRS_ENTRY_CLOBBER /* no indirect jump allowed before IBRS */
-	movq %rsp, %rsi
 	movq PER_CPU_VAR(kernel_stack), %rsp
 	FILL_RETURN_BUFFER_CLOBBER /* no ret allowed before stuffing the RSB */
 	movq %rsi, %rsp
-	jmp sa_from_kernel2
-sa_from_kernel:
+	jmp 2f
+1:
 	FENCE_SWAPGS_KERNEL_ENTRY
-sa_from_kernel2:
+2:
 	/* Check to see if we're on the trampoline stack. */
 	movq PER_CPU_VAR(init_tss + TSS_sp0), %rcx
 	cmpq %rcx, %rsp
@@ -346,19 +283,20 @@ sa_from_kernel2:
 	cmpq %rsp, %rax
 	ja 1f
 	/*
-	 * We're on the trampoline stack.  Switch to the kernel task stack
-	 * and copy the trampoline stack's contents to it.
+	 * We're on the trampoline stack.  Copy the trampoline stack's
+	 * contents to the kernel task stack and switch to it.
 	 */
 	pushq %rdi
 	subq %rsp, %rcx
 	movq PER_CPU_VAR(kernel_stack), %rdi
 	addq $KERNEL_STACK_OFFSET, %rdi
 	subq %rcx, %rdi
+	movq %rdi, %rax
 	movq %rsp, %rsi
-	movq %rdi, %rsp
 	rep movsb
+	movq %rax, %rsp
 	popq %rdi
-	leaq 8(%rsp), %rbp	/* Update rbp to the new value */
+	movq %rsp, %rsi /* we earlier saved %rsp in %rsi, update it to new one */
 	/*
 	 * irq_count is used to check if a CPU is already on an interrupt stack
 	 * or not. While this is essentially redundant with preempt_count it is
@@ -366,19 +304,34 @@ sa_from_kernel2:
 	 * moving irq_enter into assembly, which would be too much work)
 	 */
 1:	incl PER_CPU_VAR(irq_count)
-	jne 2f
-	popq_cfi %rax			/* move return address... */
-	mov PER_CPU_VAR(irq_stack_ptr),%rsp
-	EMPTY_FRAME 0
-	pushq_cfi %rbp			/* backlink for unwinder */
-	pushq_cfi %rax			/* ... to the new stack */
-	/*
-	 * We entered an interrupt context - irqs are off:
-	 */
-2:	TRACE_IRQS_OFF
+	cmovzq PER_CPU_VAR(irq_stack_ptr),%rsp
+	CFI_DEF_CFA_REGISTER	rsi
+
+	/* Store previous stack value */
+	pushq %rsi
+	CFI_ESCAPE	0x0f /* DW_CFA_def_cfa_expression */, 6, \
+			0x77 /* DW_OP_breg7 */, 0, \
+			0x06 /* DW_OP_deref */, \
+			0x08 /* DW_OP_const1u */, SS+8-RBP, \
+			0x22 /* DW_OP_plus */
+	/* We entered an interrupt context - irqs are off: */
+	TRACE_IRQS_OFF
+	.endm
+
+ENTRY(save_rest)
+	PARTIAL_FRAME 1 (REST_SKIP+8)
+	movq 5*8+16(%rsp), %r11	/* save return address */
+	movq_cfi rbx, RBX+16
+	movq_cfi rbp, RBP+16
+	movq_cfi r12, R12+16
+	movq_cfi r13, R13+16
+	movq_cfi r14, R14+16
+	movq_cfi r15, R15+16
+	movq %r11, 8(%rsp)	/* return address */
+	FIXUP_TOP_OF_STACK %r11, 16
 	ret
 	CFI_ENDPROC
-END(save_args)
+END(save_rest)
 
 /* save complete stack frame */
 	.pushsection .kprobes.text, "ax"
@@ -413,8 +366,7 @@ ENTRY(save_paranoid)
 	FENCE_SWAPGS_KERNEL_ENTRY
 2:
 	SAVE_AND_SWITCH_TO_KERNEL_CR3 scratch_reg=%rax save_reg=%r14
-	/* no indirect jump allowed before IBRS */
-	IBRS_ENTRY_SAVE_AND_CLOBBER save_reg=%r13d
+	IBRS_ENTRY_SAVE_AND_CLOBBER save_reg=%r13d /* no indirect jump allowed before IBRS */
 	FILL_RETURN_BUFFER_CLOBBER /* no ret allowed before stuffing the RSB */
 	ret
 	CFI_ENDPROC
@@ -431,19 +383,18 @@ ENTRY(ret_from_fork)
 
 	LOCK ; btr $TIF_FORK,TI_flags(%r8)
 
-	push kernel_eflags(%rip)
-	CFI_ADJUST_CFA_OFFSET 8
-	popf					# reset kernel eflags
-	CFI_ADJUST_CFA_OFFSET -8
+	pushq_cfi $0x0002
+	popfq_cfi				# reset kernel eflags
 
 	call schedule_tail			# rdi: 'prev' task parameter
+	UNWIND_END_OF_STACK
 
 	GET_THREAD_INFO(%rcx)
 
 	RESTORE_REST
 
 	testl $3, CS-ARGOFFSET(%rsp)		# from kernel_thread?
-	je   int_ret_from_sys_call
+	jz   1f
 
 	/*
 	 * By the time we get here, we have no idea whether our pt_regs,
@@ -454,14 +405,32 @@ ENTRY(ret_from_fork)
 	 */
 	jmp  int_ret_from_sys_call
 
+1:
+	subq $REST_SKIP, %rsp	# leave space for volatiles
+	CFI_ADJUST_CFA_OFFSET	REST_SKIP
+	movq %rbp, %rdi
+
+	/* RHEL-specific hack to make livepatch work with spectre retpolines */
+	.global ret_from_fork_nospec_begin
+	.global ret_from_fork_nospec_end
+
+ret_from_fork_nospec_begin:
+	CALL_NOSPEC %rbx
+	UNWIND_END_OF_STACK
+ret_from_fork_nospec_end:
+
+	movl $0, RAX(%rsp)
+	RESTORE_REST
+	jmp int_ret_from_sys_call
 	CFI_ENDPROC
 END(ret_from_fork)
 
 /*
- * System call entry. Upto 6 arguments in registers are supported.
+ * System call entry. Up to 6 arguments in registers are supported.
  *
  * SYSCALL does not save anything on the stack and does not change the
- * stack pointer.
+ * stack pointer.  However, it does mask the flags register for us, so
+ * CLD and CLAC are not needed.
  */
 
 /*
@@ -500,7 +469,7 @@ ENTRY(system_call)
 	 * after the swapgs, so that it can do the swapgs
 	 * for the guest and jump here on syscall.
 	 */
-ENTRY(system_call_after_swapgs)
+GLOBAL(system_call_after_swapgs)
 
 	SWITCH_TO_KERNEL_CR3
 	movq	%rsp,PER_CPU_VAR(old_rsp)
@@ -512,22 +481,33 @@ ENTRY(system_call_after_swapgs)
 	 * and short:
 	 */
 	ENABLE_INTERRUPTS(CLBR_NONE)
-	SAVE_ARGS 8,1
+	SAVE_ARGS 8,0
 	SAVE_REST
 	CLEAR_EXTRA_REGS
 	movq  %rax,ORIG_RAX(%rsp)
 	movq  %rcx,RIP(%rsp)
 	CFI_REL_OFFSET rip,RIP
-	GET_THREAD_INFO(%rcx)
-	testl $_TIF_WORK_SYSCALL_ENTRY,TI_flags(%rcx)
+	testl $_TIF_WORK_SYSCALL_ENTRY,TI_flags+THREAD_INFO(%rsp,RIP)
 	jnz tracesys
 system_call_fastpath:
+#if __SYSCALL_MASK == ~0
 	cmpq $__NR_syscall_max+1,%rax
+#else
+	andl $__SYSCALL_MASK,%eax
+	cmpl $__NR_syscall_max+1,%eax
+#endif
 	jae badsys
 	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%rcx
 	movq %r10,%rcx
-	movq sys_call_table(,%rax,8), %rax  # XXX:	 rip relative
-	CALL_NOSPEC %rax
+
+#ifdef CONFIG_RETPOLINE
+	movq sys_call_table(, %rax, 8), %rax
+	call __x86_indirect_thunk_rax
+#else
+	call *sys_call_table(, %rax, 8)  # XXX:	 rip relative
+#endif
+
+	UNWIND_END_OF_STACK
 	movq %rax,RAX(%rsp)
 /*
  * Syscall return path ending with SYSRET (fast path)
@@ -538,10 +518,9 @@ ret_from_sys_call:
 	/* edi:	flagmask */
 sysret_check:
 	LOCKDEP_SYS_EXIT
-	GET_THREAD_INFO(%rcx)
 	DISABLE_INTERRUPTS(CLBR_NONE)
 	TRACE_IRQS_OFF
-	movl TI_flags(%rcx),%edx
+	movl TI_flags+THREAD_INFO(%rsp,RIP),%edx
 	andl %edi,%edx
 	jnz  sysret_careful
 	CFI_REMEMBER_STATE
@@ -553,7 +532,7 @@ sysret_check:
 	movq RIP(%rsp),%rcx
 	CFI_REGISTER	rip,rcx
 	RESTORE_REST
-	RESTORE_ARGS 0,-ARG_SKIP,1
+	RESTORE_ARGS 1,-ARG_SKIP,0
 	/*CFI_REGISTER	rflags,r11*/
 	movq	PER_CPU_VAR(old_rsp), %rsp
 	SWITCH_TO_USER_CR3
@@ -568,11 +547,10 @@ sysret_careful:
 	jnc sysret_signal
 	TRACE_IRQS_ON
 	ENABLE_INTERRUPTS(CLBR_NONE)
-	pushq %rdi
-	CFI_ADJUST_CFA_OFFSET 8
-	call schedule
-	popq  %rdi
-	CFI_ADJUST_CFA_OFFSET -8
+	pushq_cfi %rdi
+	SCHEDULE_USER
+	UNWIND_END_OF_STACK
+	popq_cfi %rdi
 	jmp sysret_check
 
 	/* Handle a signal */
@@ -598,17 +576,16 @@ badsys:
 #ifdef CONFIG_AUDITSYSCALL
 	/*
 	 * Fast path for syscall audit without full syscall trace.
-	 * We just call audit_syscall_entry() directly, and then
+	 * We just call __audit_syscall_entry() directly, and then
 	 * jump back to the normal fast path.
 	 */
 auditsys:
-	movq %r10,%r9			/* 6th arg: 4th syscall arg */
-	movq %rdx,%r8			/* 5th arg: 3rd syscall arg */
-	movq %rsi,%rcx			/* 4th arg: 2nd syscall arg */
-	movq %rdi,%rdx			/* 3rd arg: 1st syscall arg */
-	movq %rax,%rsi			/* 2nd arg: syscall number */
-	movl $AUDIT_ARCH_X86_64,%edi	/* 1st arg: audit arch */
-	call audit_syscall_entry
+	movq %r10,%r8			/* 5th arg: 4th syscall arg */
+	movq %rdx,%rcx			/* 4th arg: 3rd syscall arg */
+	movq %rsi,%rdx			/* 3rd arg: 2nd syscall arg */
+	movq %rdi,%rsi			/* 2nd arg: 1st syscall arg */
+	movq %rax,%rdi			/* 1st arg: syscall number */
+	call __audit_syscall_entry
 	LOAD_ARGS ARGOFFSET		/* reload call-clobbered registers */
 	jmp system_call_fastpath
 
@@ -618,7 +595,7 @@ auditsys:
 	 * masked off.
 	 */
 sysret_audit:
-	movq RAX(%rsp), %rsi /* second arg, syscall return value */
+	movq RAX(%rsp),%rsi	/* second arg, syscall return value */
 	cmpq $-MAX_ERRNO,%rsi	/* is it < -MAX_ERRNO? */
 	setbe %al		/* 1 if so, 0 if not */
 	movzbl %al,%edi		/* zero-extend that into %edi */
@@ -630,7 +607,7 @@ sysret_audit:
 	/* Do syscall tracing */
 tracesys:
 #ifdef CONFIG_AUDITSYSCALL
-	testl $(_TIF_WORK_SYSCALL_ENTRY & ~_TIF_SYSCALL_AUDIT),TI_flags(%rcx)
+	testl $(_TIF_WORK_SYSCALL_ENTRY & ~_TIF_SYSCALL_AUDIT),TI_flags+THREAD_INFO(%rsp,RIP)
 	jz auditsys
 #endif
 	movq $-ENOSYS,RAX(%rsp) /* ptrace can change this for a bad syscall */
@@ -643,14 +620,25 @@ tracesys:
 	 * the value it wants us to use in the table lookup.
 	 */
 	LOAD_ARGS ARGOFFSET, 1
+#if __SYSCALL_MASK == ~0
 	cmpq $__NR_syscall_max+1,%rax
+#else
+	andl $__SYSCALL_MASK,%eax
+	cmpl $__NR_syscall_max+1,%eax
+#endif
 	jae   1f	/* RAX(%rsp) set to -ENOSYS above */
 	ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg=%rcx
 	movq %r10,%rcx	/* fixup for C */
-	movq sys_call_table(,%rax,8), %rax
-	CALL_NOSPEC %rax
+
+#ifdef CONFIG_RETPOLINE
+	movq sys_call_table(, %rax, 8), %rax
+	call __x86_indirect_thunk_rax
+#else
+	call *sys_call_table(, %rax, 8)  # XXX:	 rip relative
+#endif
+
+	UNWIND_END_OF_STACK
 	movq %rax,RAX(%rsp)
-	/* Use IRET because user could have changed frame */
 1:	RESTORE_REST
 /* Use IRET because user could have changed frame */
 
@@ -661,8 +649,6 @@ tracesys:
 GLOBAL(int_ret_from_sys_call)
 	DISABLE_INTERRUPTS(CLBR_NONE)
 	TRACE_IRQS_OFF
-	testl $3,CS-ARGOFFSET(%rsp)
-	je retint_restore_args
 	movl $_TIF_ALLWORK_MASK,%edi
 	/* edi:	mask to check */
 GLOBAL(int_with_check)
@@ -682,11 +668,10 @@ int_careful:
 	jnc  int_very_careful
 	TRACE_IRQS_ON
 	ENABLE_INTERRUPTS(CLBR_NONE)
-	pushq %rdi
-	CFI_ADJUST_CFA_OFFSET 8
-	call schedule
-	popq %rdi
-	CFI_ADJUST_CFA_OFFSET -8
+	pushq_cfi %rdi
+	SCHEDULE_USER
+	UNWIND_END_OF_STACK
+	popq_cfi %rdi
 	DISABLE_INTERRUPTS(CLBR_NONE)
 	TRACE_IRQS_OFF
 	jmp int_with_check
@@ -700,12 +685,10 @@ int_check_syscall_exit_work:
 	/* Check for syscall exit trace */
 	testl $_TIF_WORK_SYSCALL_EXIT,%edx
 	jz int_signal
-	pushq %rdi
-	CFI_ADJUST_CFA_OFFSET 8
+	pushq_cfi %rdi
 	leaq 8(%rsp),%rdi	# &ptregs -> arg1
 	call syscall_trace_leave
-	popq %rdi
-	CFI_ADJUST_CFA_OFFSET -8
+	popq_cfi %rdi
 	andl $~(_TIF_WORK_SYSCALL_EXIT|_TIF_SYSCALL_EMU),%edi
 	jmp int_restore_rest
 
@@ -724,37 +707,44 @@ int_restore_rest:
 	CFI_ENDPROC
 END(system_call)
 
-/*
- * Certain special system calls that need to save a complete full stack frame.
- */
-	.macro PTREGSCALL label,func,arg
+	.macro FORK_LIKE func
+ENTRY(stub_\func)
+	CFI_STARTPROC
+	DEFAULT_FRAME 0 8		/* offset 8: return address */
+	FIXUP_TOP_OF_STACK %r11, 8
+	call sys_\func
+	UNWIND_END_OF_STACK
+	RESTORE_TOP_OF_STACK %r11, 8
+	ret
+	CFI_ENDPROC
+END(stub_\func)
+	.endm
+
+	.macro FIXED_FRAME label,func
 ENTRY(\label)
 	CFI_STARTPROC
 	DEFAULT_FRAME 0 8		/* offset 8: return address */
 	FIXUP_TOP_OF_STACK %r11, 8
-	leaq 8(%rsp), \arg	/* pt_regs pointer */
 	call \func
+	UNWIND_END_OF_STACK
 	RESTORE_TOP_OF_STACK %r11, 8
 	ret
 	CFI_ENDPROC
 END(\label)
 	.endm
 
-	PTREGSCALL stub_clone, sys_clone, %r8
-	PTREGSCALL stub_fork, sys_fork, %rdi
-	PTREGSCALL stub_vfork, sys_vfork, %rdi
-	PTREGSCALL stub_sigaltstack, sys_sigaltstack, %rdx
-	PTREGSCALL stub_iopl, sys_iopl, %rsi
+	FORK_LIKE  clone
+	FORK_LIKE  fork
+	FORK_LIKE  vfork
+	FIXED_FRAME stub_iopl, sys_iopl
 
 ENTRY(stub_execve)
 	CFI_STARTPROC
-	popq %r11
-	CFI_ADJUST_CFA_OFFSET -8
-	CFI_REGISTER rip, r11
+	addq $8, %rsp
+	DEFAULT_FRAME 0
 	FIXUP_TOP_OF_STACK %r11
-	movq %rsp, %rcx
 	call sys_execve
-	RESTORE_TOP_OF_STACK %r11
+	UNWIND_END_OF_STACK
 	movq %rax,RAX(%rsp)
 	RESTORE_REST
 	jmp int_ret_from_sys_call
@@ -768,15 +758,45 @@ END(stub_execve)
 ENTRY(stub_rt_sigreturn)
 	CFI_STARTPROC
 	addq $8, %rsp
-	CFI_ADJUST_CFA_OFFSET	-8
-	movq %rsp,%rdi
+	DEFAULT_FRAME 0
 	FIXUP_TOP_OF_STACK %r11
 	call sys_rt_sigreturn
+	UNWIND_END_OF_STACK
 	movq %rax,RAX(%rsp) # fixme, this could be done at the higher layer
 	RESTORE_REST
 	jmp int_ret_from_sys_call
 	CFI_ENDPROC
 END(stub_rt_sigreturn)
+
+#ifdef CONFIG_X86_X32_ABI
+ENTRY(stub_x32_rt_sigreturn)
+	CFI_STARTPROC
+	addq $8, %rsp
+	DEFAULT_FRAME 0
+	FIXUP_TOP_OF_STACK %r11
+	call sys32_x32_rt_sigreturn
+	UNWIND_END_OF_STACK
+	movq %rax,RAX(%rsp) # fixme, this could be done at the higher layer
+	RESTORE_REST
+	jmp int_ret_from_sys_call
+	CFI_ENDPROC
+END(stub_x32_rt_sigreturn)
+
+ENTRY(stub_x32_execve)
+	CFI_STARTPROC
+	addq $8, %rsp
+	DEFAULT_FRAME 0
+	FIXUP_TOP_OF_STACK %r11
+	call compat_sys_execve
+	UNWIND_END_OF_STACK
+	RESTORE_TOP_OF_STACK %r11
+	movq %rax,RAX(%rsp)
+	RESTORE_REST
+	jmp int_ret_from_sys_call
+	CFI_ENDPROC
+END(stub_x32_execve)
+
+#endif
 
 /*
  * Build the entry stubs and pointer table with some assembler magic.
@@ -798,8 +818,7 @@ vector=FIRST_EXTERNAL_VECTOR
       .if vector <> FIRST_EXTERNAL_VECTOR
 	CFI_ADJUST_CFA_OFFSET -8
       .endif
-1:	pushq $(~vector+0x80)	/* Note: always in signed byte range */
-	CFI_ADJUST_CFA_OFFSET 8
+1:	pushq_cfi $(~vector+0x80)	/* Note: always in signed byte range */
       .if ((vector-FIRST_EXTERNAL_VECTOR)%7) <> 6
 	jmp 2f
       .endif
@@ -828,13 +847,18 @@ END(interrupt)
 
 /* 0(%rsp): ~(interrupt number) */
 	.macro interrupt func
-	subq $10*8, %rsp
-	CFI_ADJUST_CFA_OFFSET 10*8
-	call save_args
-	PARTIAL_FRAME 0
+	/* reserve pt_regs for scratch regs and rbp */
+	subq $ORIG_RAX-RBP, %rsp
+	CFI_ADJUST_CFA_OFFSET ORIG_RAX-RBP
+	SAVE_ARGS_IRQ
 	call \func
+	UNWIND_UNSAFE_STACK
 	.endm
 
+/*
+ * Interrupt entry/exit should be protected against kprobes
+ */
+	.pushsection .kprobes.text, "ax"
 	/*
 	 * The interrupt stubs push (~vector+0x80) onto the stack and
 	 * then jump to common_interrupt.
@@ -842,6 +866,7 @@ END(interrupt)
 	.p2align CONFIG_X86_L1_CACHE_SHIFT
 common_interrupt:
 	XCPT_FRAME
+	ASM_CLAC
 	addq $-0x80,(%rsp)		/* Adjust vector to [-256,-1] range */
 	interrupt do_IRQ
 	/* 0(%rsp): old_rsp-ARGOFFSET */
@@ -849,9 +874,14 @@ ret_from_intr:
 	DISABLE_INTERRUPTS(CLBR_NONE)
 	TRACE_IRQS_OFF
 	decl PER_CPU_VAR(irq_count)
-	leaveq
+
+	/* Restore saved previous stack */
+	popq %rsi
+	CFI_DEF_CFA rsi,SS+8-RBP	/* reg/off reset after def_cfa_expr */
+	leaq ARGOFFSET-RBP(%rsi), %rsp
 	CFI_DEF_CFA_REGISTER	rsp
-	CFI_ADJUST_CFA_OFFSET	-8
+	CFI_ADJUST_CFA_OFFSET	RBP-ARGOFFSET
+
 exit_intr:
 	GET_THREAD_INFO(%rcx)
 	testl $3,CS-ARGOFFSET(%rsp)
@@ -884,31 +914,24 @@ retint_userspace_restore_args:
 	 * Returning from an interrupt/NMI/exception to user space, currently
 	 * on the kernel task stack, which is not user-mapped.  Copy the iret
 	 * frame to the trampoline stack and switch to it before returning.
-	 *
-	 * %rsp is made to point to kernel_stack for as long as possible and
-	 * is switched to the trampoline stack only after all the register
-	 * contents are transferred to it. %rax will point to the trampoline
-	 * stack during the switching.
 	 */
-	RESTORE_ARGS 0,8,0
+	RESTORE_ARGS 1,8,1
 	pushq %rax
-	movq PER_CPU_VAR(init_tss + TSS_sp0), %rax
-	leaq -6*8(%rax), %rax
-	popq ORIG_RAX-ORIG_RAX(%rax)
-	popq RIP-ORIG_RAX(%rax)
-	popq CS-ORIG_RAX(%rax)
-	popq EFLAGS-ORIG_RAX(%rax)
-	popq RSP-ORIG_RAX(%rax)
-	popq SS-ORIG_RAX(%rax)
-	movq %rax, %rsp
-	popq %rax
+	movq %rsp, %rax
+	movq PER_CPU_VAR(init_tss + TSS_sp0), %rsp
+	pushq SS-ORIG_RAX(%rax)
+	pushq RSP-ORIG_RAX(%rax)
+	pushq EFLAGS-ORIG_RAX(%rax)
+	pushq CS-ORIG_RAX(%rax)
+	pushq RIP-ORIG_RAX(%rax)
+	movq (%rax), %rax
 	SWITCH_TO_USER_CR3
 	SWAPGS
 	MDS_USER_CLEAR_CPU_BUFFERS
 	jmp irq_return
 
 paranoid_userspace_restore_all:
-	TRACE_IRQS_IRETQ 0
+	TRACE_IRQS_IRETQ
 	RESTORE_REST
 	jmp retint_userspace_restore_args
 
@@ -918,22 +941,20 @@ retint_restore_args:	/* return to kernel space */
 	 * The iretq could re-enable interrupts:
 	 */
 	TRACE_IRQS_IRETQ
-	RESTORE_ARGS 0,8,0
+	RESTORE_ARGS 1,8,1
 
 irq_return:
+	/*
+	 * ARCH_HAS_MEMBARRIER_SYNC_CORE rely on IRET core serialization
+	 * when returning from IPI handler.
+	 */
 	INTERRUPT_RETURN
-
-	.section __ex_table, "a"
-	.quad irq_return, bad_iret
-	.previous
+	_ASM_EXTABLE(irq_return, bad_iret)
 
 #ifdef CONFIG_PARAVIRT
 ENTRY(native_iret)
 	iretq
-
-	.section __ex_table,"a"
-	.quad native_iret, bad_iret
-	.previous
+	_ASM_EXTABLE(native_iret, bad_iret)
 #endif
 
 	.section .fixup,"ax"
@@ -971,11 +992,9 @@ retint_careful:
 	jnc   retint_signal
 	TRACE_IRQS_ON
 	ENABLE_INTERRUPTS(CLBR_NONE)
-	pushq %rdi
-	CFI_ADJUST_CFA_OFFSET	8
-	call  schedule
-	popq %rdi
-	CFI_ADJUST_CFA_OFFSET	-8
+	pushq_cfi %rdi
+	SCHEDULE_USER
+	popq_cfi %rdi
 	GET_THREAD_INFO(%rcx)
 	DISABLE_INTERRUPTS(CLBR_NONE)
 	TRACE_IRQS_OFF
@@ -1013,6 +1032,10 @@ ENTRY(retint_kernel)
 
 	CFI_ENDPROC
 END(common_interrupt)
+/*
+ * End of kprobes section
+ */
+       .popsection
 
 /*
  * APIC interrupts.
@@ -1020,8 +1043,9 @@ END(common_interrupt)
 .macro apicinterrupt3 num sym do_sym
 ENTRY(\sym)
 	INTR_FRAME
-	pushq $~(\num)
-	CFI_ADJUST_CFA_OFFSET 8
+	ASM_CLAC
+	pushq_cfi $~(\num)
+.Lcommon_\sym:
 	interrupt \do_sym
 	jmp ret_from_intr
 	CFI_ENDPROC
@@ -1061,23 +1085,13 @@ apicinterrupt LOCAL_TIMER_VECTOR \
 apicinterrupt X86_PLATFORM_IPI_VECTOR \
 	x86_platform_ipi smp_x86_platform_ipi
 
-#ifdef CONFIG_SMP
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+0 \
-	invalidate_interrupt0 smp_invalidate_interrupt
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+1 \
-	invalidate_interrupt1 smp_invalidate_interrupt
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+2 \
-	invalidate_interrupt2 smp_invalidate_interrupt
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+3 \
-	invalidate_interrupt3 smp_invalidate_interrupt
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+4 \
-	invalidate_interrupt4 smp_invalidate_interrupt
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+5 \
-	invalidate_interrupt5 smp_invalidate_interrupt
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+6 \
-	invalidate_interrupt6 smp_invalidate_interrupt
-apicinterrupt3 INVALIDATE_TLB_VECTOR_START+7 \
-	invalidate_interrupt7 smp_invalidate_interrupt
+#ifdef CONFIG_HAVE_KVM
+apicinterrupt3 POSTED_INTR_VECTOR \
+	kvm_posted_intr_ipi smp_kvm_posted_intr_ipi
+apicinterrupt3 POSTED_INTR_WAKEUP_VECTOR \
+	kvm_posted_intr_wakeup_ipi smp_kvm_posted_intr_wakeup_ipi
+apicinterrupt3 POSTED_INTR_WAKEUP_VECTOR \
+	kvm_posted_intr_nested_ipi smp_kvm_posted_intr_nested_ipi
 #endif
 
 #ifdef CONFIG_X86_MCE_THRESHOLD
@@ -1085,14 +1099,14 @@ apicinterrupt THRESHOLD_APIC_VECTOR \
 	threshold_interrupt smp_threshold_interrupt
 #endif
 
+#ifdef CONFIG_X86_MCE_AMD
+apicinterrupt DEFERRED_ERROR_VECTOR \
+	deferred_error_interrupt smp_deferred_error_interrupt
+#endif
+
 #ifdef CONFIG_X86_THERMAL_VECTOR
 apicinterrupt THERMAL_APIC_VECTOR \
 	thermal_interrupt smp_thermal_interrupt
-#endif
-
-#ifdef CONFIG_X86_MCE
-apicinterrupt3 MCE_SELF_VECTOR \
-	mce_self_interrupt smp_mce_self_interrupt
 #endif
 
 #ifdef CONFIG_SMP
@@ -1120,15 +1134,17 @@ apicinterrupt IRQ_WORK_VECTOR \
 .macro zeroentry sym do_sym
 ENTRY(\sym)
 	INTR_FRAME
+	ASM_CLAC
 	PARAVIRT_ADJUST_EXCEPTION_FRAME
 	pushq_cfi $-1		/* ORIG_RAX: no syscall to restart */
-	subq $15*8,%rsp
-	CFI_ADJUST_CFA_OFFSET 15*8
+	subq $ORIG_RAX-R15, %rsp
+	CFI_ADJUST_CFA_OFFSET ORIG_RAX-R15
 	call error_entry
 	DEFAULT_FRAME 0
 	movq %rsp,%rdi		/* pt_regs pointer */
 	xorl %esi,%esi		/* no error code */
 	call \do_sym
+	UNWIND_UNSAFE_STACK
 	jmp error_exit		/* %ebx: no swapgs flag */
 	CFI_ENDPROC
 END(\sym)
@@ -1137,35 +1153,39 @@ END(\sym)
 .macro paranoidzeroentry sym do_sym
 ENTRY(\sym)
 	INTR_FRAME
+	ASM_CLAC
 	PARAVIRT_ADJUST_EXCEPTION_FRAME
-	pushq $-1		/* ORIG_RAX: no syscall to restart */
-	CFI_ADJUST_CFA_OFFSET 8
-	subq $15*8, %rsp
+	pushq_cfi $-1		/* ORIG_RAX: no syscall to restart */
+	subq $ORIG_RAX-R15, %rsp
+	CFI_ADJUST_CFA_OFFSET ORIG_RAX-R15
 	call save_paranoid
 	TRACE_IRQS_OFF
 	movq %rsp,%rdi		/* pt_regs pointer */
 	xorl %esi,%esi		/* no error code */
 	call \do_sym
+	UNWIND_UNSAFE_STACK
 	jmp paranoid_exit	/* %ebx: no swapgs flag */
 	CFI_ENDPROC
 END(\sym)
 .endm
 
+#define INIT_TSS_IST(x) PER_CPU_VAR(init_tss) + (TSS_ist + ((x) - 1) * 8)
 .macro paranoidzeroentry_ist sym do_sym ist
 ENTRY(\sym)
 	INTR_FRAME
+	ASM_CLAC
 	PARAVIRT_ADJUST_EXCEPTION_FRAME
-	pushq $-1		/* ORIG_RAX: no syscall to restart */
-	CFI_ADJUST_CFA_OFFSET 8
-	subq $15*8, %rsp
+	pushq_cfi $-1		/* ORIG_RAX: no syscall to restart */
+	subq $ORIG_RAX-R15, %rsp
+	CFI_ADJUST_CFA_OFFSET ORIG_RAX-R15
 	call save_paranoid
-	TRACE_IRQS_OFF
+	TRACE_IRQS_OFF_DEBUG
 	movq %rsp,%rdi		/* pt_regs pointer */
 	xorl %esi,%esi		/* no error code */
-	PER_CPU(init_tss, %rbp)
-	subq $EXCEPTION_STKSZ, TSS_ist + (\ist - 1) * 8(%rbp)
+	subq $EXCEPTION_STKSZ, INIT_TSS_IST(\ist)
 	call \do_sym
-	addq $EXCEPTION_STKSZ, TSS_ist + (\ist - 1) * 8(%rbp)
+	UNWIND_UNSAFE_STACK
+	addq $EXCEPTION_STKSZ, INIT_TSS_IST(\ist)
 	jmp paranoid_exit	/* %ebx: no swapgs flag */
 	CFI_ENDPROC
 END(\sym)
@@ -1174,27 +1194,41 @@ END(\sym)
 .macro errorentry sym do_sym
 ENTRY(\sym)
 	XCPT_FRAME
+	ASM_CLAC
 	PARAVIRT_ADJUST_EXCEPTION_FRAME
-	subq $15*8,%rsp
-	CFI_ADJUST_CFA_OFFSET 15*8
+	subq $ORIG_RAX-R15, %rsp
+	CFI_ADJUST_CFA_OFFSET ORIG_RAX-R15
 	call error_entry
 	DEFAULT_FRAME 0
 	movq %rsp,%rdi			/* pt_regs pointer */
 	movq ORIG_RAX(%rsp),%rsi	/* get error code */
 	movq $-1,ORIG_RAX(%rsp)		/* no syscall to restart */
 	call \do_sym
+	UNWIND_UNSAFE_STACK
 	jmp error_exit			/* %ebx: no swapgs flag */
 	CFI_ENDPROC
 END(\sym)
 .endm
 
+#ifdef CONFIG_TRACING
+.macro trace_errorentry sym do_sym
+errorentry trace(\sym) trace(\do_sym)
+errorentry \sym \do_sym
+.endm
+#else
+.macro trace_errorentry sym do_sym
+errorentry \sym \do_sym
+.endm
+#endif
+
 	/* error code is on the stack already */
 .macro paranoiderrorentry sym do_sym
 ENTRY(\sym)
 	XCPT_FRAME
+	ASM_CLAC
 	PARAVIRT_ADJUST_EXCEPTION_FRAME
-	subq $15*8,%rsp
-	CFI_ADJUST_CFA_OFFSET 15*8
+	subq $ORIG_RAX-R15, %rsp
+	CFI_ADJUST_CFA_OFFSET ORIG_RAX-R15
 	call save_paranoid
 	DEFAULT_FRAME 0
 	TRACE_IRQS_OFF
@@ -1202,6 +1236,7 @@ ENTRY(\sym)
 	movq ORIG_RAX(%rsp),%rsi	/* get error code */
 	movq $-1,ORIG_RAX(%rsp)		/* no syscall to restart */
 	call \do_sym
+	UNWIND_UNSAFE_STACK
 	jmp paranoid_exit		/* %ebx: no swapgs flag */
 	CFI_ENDPROC
 END(\sym)
@@ -1221,28 +1256,24 @@ zeroentry coprocessor_error do_coprocessor_error
 errorentry alignment_check do_alignment_check
 zeroentry simd_coprocessor_error do_simd_coprocessor_error
 
+
 	/* Reload gs selector with exception handling */
 	/* edi:  new selector */
 ENTRY(native_load_gs_index)
 	CFI_STARTPROC
-	pushf
-	CFI_ADJUST_CFA_OFFSET 8
+	pushfq_cfi
 	DISABLE_INTERRUPTS(CLBR_ANY & ~CLBR_RDI)
 	SWAPGS
 gs_change:
 	movl %edi,%gs
 2:	mfence		/* workaround */
 	SWAPGS
-	popf
-	CFI_ADJUST_CFA_OFFSET -8
+	popfq_cfi
 	ret
 	CFI_ENDPROC
 END(native_load_gs_index)
 
-	.section __ex_table,"a"
-	.align 8
-	.quad gs_change,bad_gs
-	.previous
+	_ASM_EXTABLE(gs_change,bad_gs)
 	.section .fixup,"ax"
 	/* running with kernelgs */
 bad_gs:
@@ -1252,100 +1283,10 @@ bad_gs:
 	jmp  2b
 	.previous
 
-/*
- * Create a kernel thread.
- *
- * C extern interface:
- *	extern long kernel_thread(int (*fn)(void *), void * arg, unsigned long flags)
- *
- * asm input arguments:
- *	rdi: fn, rsi: arg, rdx: flags
- */
-ENTRY(kernel_thread)
-	CFI_STARTPROC
-	FAKE_STACK_FRAME $child_rip
-	SAVE_ALL
-
-	# rdi: flags, rsi: usp, rdx: will be &pt_regs
-	movq %rdx,%rdi
-	orq  kernel_thread_flags(%rip),%rdi
-	movq $-1, %rsi
-	movq %rsp, %rdx
-
-	xorl %r8d,%r8d
-	xorl %r9d,%r9d
-
-	# clone now
-	call do_fork
-	movq %rax,RAX(%rsp)
-	xorl %edi,%edi
-
-	/*
-	 * It isn't worth to check for reschedule here,
-	 * so internally to the x86_64 port you can rely on kernel_thread()
-	 * not to reschedule the child before returning, this avoids the need
-	 * of hacks for example to fork off the per-CPU idle tasks.
-	 * [Hopefully no generic code relies on the reschedule -AK]
-	 */
-	RESTORE_ALL
-	UNFAKE_STACK_FRAME
-	ret
-	CFI_ENDPROC
-END(kernel_thread)
-
-ENTRY(child_rip)
-	pushq $0		# fake return address
-	CFI_STARTPROC
-	/*
-	 * Here we are in the child and the registers are set as they were
-	 * at kernel_thread() invocation in the parent.
-	 */
-	movq %rdi, %rax
-	movq %rsi, %rdi
-	CALL_NOSPEC %rax
-	# exit
-	mov %eax, %edi
-	call do_exit
-	ud2			# padding for call trace
-	CFI_ENDPROC
-END(child_rip)
-
-/*
- * execve(). This function needs to use IRET, not SYSRET, to set up all state properly.
- *
- * C extern interface:
- *	 extern long execve(char *name, char **argv, char **envp)
- *
- * asm input arguments:
- *	rdi: name, rsi: argv, rdx: envp
- *
- * We want to fallback into:
- *	extern long sys_execve(char *name, char **argv,char **envp, struct pt_regs *regs)
- *
- * do_sys_execve asm fallback arguments:
- *	rdi: name, rsi: argv, rdx: envp, rcx: fake frame on the stack
- */
-ENTRY(kernel_execve)
-	CFI_STARTPROC
-	FAKE_STACK_FRAME $0
-	SAVE_ALL
-	movq %rsp,%rcx
-	call sys_execve
-	movq %rax, RAX(%rsp)
-	RESTORE_REST
-	testq %rax,%rax
-	je int_ret_from_sys_call
-	RESTORE_ARGS
-	UNFAKE_STACK_FRAME
-	ret
-	CFI_ENDPROC
-END(kernel_execve)
-
 /* Call softirq on interrupt stack. Interrupts are off. */
 ENTRY(call_softirq)
 	CFI_STARTPROC
-	push %rbp
-	CFI_ADJUST_CFA_OFFSET	8
+	pushq_cfi %rbp
 	CFI_REL_OFFSET rbp,0
 	mov  %rsp,%rbp
 	CFI_DEF_CFA_REGISTER rbp
@@ -1354,6 +1295,7 @@ ENTRY(call_softirq)
 	push  %rbp			# backlink for old unwinder
 	call __do_softirq
 	leaveq
+	CFI_RESTORE		rbp
 	CFI_DEF_CFA_REGISTER	rsp
 	CFI_ADJUST_CFA_OFFSET   -8
 	decl PER_CPU_VAR(irq_count)
@@ -1452,7 +1394,7 @@ ENTRY(xen_failsafe_callback)
 	CFI_RESTORE r11
 	addq $0x30,%rsp
 	CFI_ADJUST_CFA_OFFSET -0x30
-	pushq_cfi $0
+	pushq_cfi $-1 /* orig_ax = -1 => not a system call */
 	SAVE_ALL
 	jmp error_exit
 	CFI_ENDPROC
@@ -1463,9 +1405,12 @@ apicinterrupt3 HYPERVISOR_CALLBACK_VECTOR \
 
 #endif /* CONFIG_XEN */
 
-#if defined(CONFIG_HYPERV) || defined(CONFIG_HYPERV_MODULE)
+#if IS_ENABLED(CONFIG_HYPERV)
 apicinterrupt3 HYPERVISOR_CALLBACK_VECTOR \
 	hyperv_callback_vector hyperv_vector_handler
+
+apicinterrupt3 HYPERV_STIMER0_VECTOR \
+	hv_stimer0_callback_vector hv_stimer0_vector_handler
 #endif /* CONFIG_HYPERV */
 
 /*
@@ -1482,7 +1427,10 @@ zeroentry xen_int3 do_int3
 errorentry xen_stack_segment do_stack_segment
 #endif
 errorentry general_protection do_general_protection
-errorentry page_fault do_page_fault
+trace_errorentry page_fault do_page_fault
+#ifdef CONFIG_KVM_GUEST
+errorentry async_page_fault do_async_page_fault
+#endif
 #ifdef CONFIG_X86_MCE
 paranoidzeroentry machine_check do_mce
 #endif
@@ -1498,35 +1446,34 @@ paranoidzeroentry machine_check do_mce
 	 * "trace" is 0 for the NMI handler only, because irq-tracing
 	 * is fundamentally NMI-unsafe. (we cannot change the soft and
 	 * hard flags at once, atomically)
-	 *
-	 * Since the exception stacks are visible to userland, we can
-	 * do the CR3 switch and swapgs before restoring the registers.
 	 */
 
 	/* ebx:	no swapgs flag */
 ENTRY(paranoid_exit)
-	INTR_FRAME
+	DEFAULT_FRAME
 	DISABLE_INTERRUPTS(CLBR_NONE)
-	TRACE_IRQS_OFF
+	TRACE_IRQS_OFF_DEBUG
 	testl %ebx,%ebx				/* swapgs needed? */
 	jnz paranoid_noswapgs_restore
 	testl $3,CS(%rsp)
 	jnz   paranoid_userspace
 paranoid_swapgs_restore:
+	/* return to kernel with swapgs */
 	TRACE_IRQS_IRETQ 0
 	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
 	RESTORE_CR3 scratch_reg=%rax save_reg=%r14
-	SWAPGS_UNSAFE_STACK
 	RESTORE_ALL 8
+	SWAPGS
 	/*
 	 * If swapgs needs to be called, there is a pretty good chance that
-	 * the exception happens right before returning to userspace. So
-	 * clear the CPU buffers just in case.
+	 * NMI/exception happen right before returning to userspace.
+	 * So clear the CPU buffers just in case.
 	 */
 	MDS_USER_CLEAR_CPU_BUFFERS
 	jmp irq_return
 paranoid_noswapgs_restore:
-	TRACE_IRQS_IRETQ 0
+	/* return to kernel */
+	TRACE_IRQS_IRETQ_DEBUG 0
 	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
 	RESTORE_CR3 scratch_reg=%rax save_reg=%r14
 	RESTORE_ALL 8
@@ -1553,7 +1500,7 @@ paranoid_userspace:
 paranoid_schedule:
 	TRACE_IRQS_ON
 	ENABLE_INTERRUPTS(CLBR_ANY)
-	call schedule
+	SCHEDULE_USER
 	DISABLE_INTERRUPTS(CLBR_ANY)
 	TRACE_IRQS_OFF
 	jmp paranoid_userspace
@@ -1591,8 +1538,11 @@ error_swapgs:
 	SWAPGS
 	FENCE_SWAPGS_USER_ENTRY
 	SWITCH_TO_KERNEL_CR3
+	movq %rsp, %rsi
+	movq PER_CPU_VAR(kernel_stack), %rsp
 	IBRS_ENTRY_CLOBBER /* no indirect jump allowed before IBRS */
 	FILL_RETURN_BUFFER_CLOBBER /* no ret allowed before stuffing the RSB */
+	movq %rsi, %rsp
 error_sti:
 	/* Check to see if we're on the trampoline stack. */
 	movq PER_CPU_VAR(init_tss + TSS_sp0), %rcx
@@ -1602,20 +1552,20 @@ error_sti:
 	cmpq %rsp, %rax
 	ja 1f
 	/*
-	 * We're on the trampoline stack.  Switch to the kernel task stack
-	 * and copy the trampoline stack's contents to it.
+	 * We're on the trampoline stack.  Copy the trampoline stack's
+	 * contents to the kernel task stack and switch to it.
 	 */
 	subq %rsp, %rcx
 	movq PER_CPU_VAR(kernel_stack), %rdi
 	addq $KERNEL_STACK_OFFSET, %rdi
 	subq %rcx, %rdi
+	movq %rdi, %rax
 	movq %rsp, %rsi
-	movq %rdi, %rsp
 	rep movsb
+	movq %rax, %rsp
 1:
 	TRACE_IRQS_OFF
 	ret
-	CFI_ENDPROC
 
 /*
  * There are two places in the kernel that can potentially fault with
@@ -1629,13 +1579,19 @@ error_kernelspace:
 	leaq irq_return(%rip),%rcx
 	cmpq %rcx,RIP+8(%rsp)
 	je error_swapgs
-	movl %ecx,%ecx	/* zero extend */
-	cmpq %rcx,RIP+8(%rsp)
-	je error_swapgs
+	movl %ecx,%eax	/* zero extend */
+	cmpq %rax,RIP+8(%rsp)
+	je bstep_iret
 	cmpq $gs_change,RIP+8(%rsp)
 	je error_swapgs
 	FENCE_SWAPGS_KERNEL_ENTRY
 	jmp error_sti
+
+bstep_iret:
+	/* Fix truncated RIP */
+	movq %rcx,RIP+8(%rsp)
+	jmp error_swapgs
+	CFI_ENDPROC
 END(error_entry)
 
 
@@ -1658,13 +1614,76 @@ ENTRY(error_exit)
 	CFI_ENDPROC
 END(error_exit)
 
+/*
+ * Test if a given stack is an NMI stack or not.
+ */
+	.macro test_in_nmi reg stack nmi_ret normal_ret
+	cmpq %\reg, \stack
+	ja \normal_ret
+	subq $EXCEPTION_STKSZ, %\reg
+	cmpq %\reg, \stack
+	jb \normal_ret
+	jmp \nmi_ret
+	.endm
 
 	/* runs on exception stack */
 ENTRY(nmi)
 	INTR_FRAME
+	/*
+	 * Fix up the exception frame if we're on Xen.
+	 * PARAVIRT_ADJUST_EXCEPTION_FRAME is guaranteed to push at most
+	 * one value to the stack on native, so it may clobber the rsi
+	 * scratch slot, but it won't clobber any of the important
+	 * slots past it.
+	 *
+	 * Xen is a different story, because the Xen frame itself overlaps
+	 * the "NMI executing" variable.
+	 */
 	PARAVIRT_ADJUST_EXCEPTION_FRAME
 
-	testb	$3, CS-RIP(%rsp)
+	/*
+	 * We allow breakpoints in NMIs. If a breakpoint occurs, then
+	 * the iretq it performs will take us out of NMI context.
+	 * This means that we can have nested NMIs where the next
+	 * NMI is using the top of the stack of the previous NMI. We
+	 * can't let it execute because the nested NMI will corrupt the
+	 * stack of the previous NMI. NMI handlers are not re-entrant
+	 * anyway.
+	 *
+	 * To handle this case we do the following:
+	 *  Check the a special location on the stack that contains
+	 *  a variable that is set when NMIs are executing.
+	 *  The interrupted task's stack is also checked to see if it
+	 *  is an NMI stack.
+	 *  If the variable is not set and the stack is not the NMI
+	 *  stack then:
+	 *    o Set the special variable on the stack
+	 *    o Copy the interrupt frame into an "outermost" location on the
+	 *      stack
+	 *    o Copy the interrupt frame into an "iret" location on the stack
+	 *    o Continue processing the NMI
+	 *  If the variable is set or the previous stack is the NMI stack:
+	 *    o Modify the "iret" location to jump to the repeat_nmi
+	 *    o return back to the first NMI
+	 *
+	 * Now on exit of the first NMI, we first clear the stack variable
+	 * The NMI stack will tell any nested NMIs at that point that it is
+	 * nested. Then we pop the stack normally with iret, and if there was
+	 * a nested NMI that updated the copy interrupt stack frame, a
+	 * jump will be made to the repeat_nmi code that will handle the second
+	 * NMI.
+	 *
+	 * However, espfix prevents us from directly returning to userspace
+	 * with a single IRET instruction.  Similarly, IRET to user mode
+	 * can fault.  We therefore handle NMIs from user space like
+	 * other IST entries.
+	 */
+
+	/* Use %rsi as out temp variable throughout */
+	pushq_cfi %rsi
+	CFI_REL_OFFSET rsi, 0
+
+	testb	$3, CS-RIP+8(%rsp)
 	jz	.Lnmi_from_kernel
 
 	/*
@@ -1678,8 +1697,6 @@ ENTRY(nmi)
 	 * stacks lest we corrupt the "NMI executing" variable.
 	 */
 
-	/* Use %rsi as out temp variable throughout */
-	pushq	%rsi
 	SWAPGS_UNSAFE_STACK
 	FENCE_SWAPGS_USER_ENTRY
 	SWITCH_TO_KERNEL_CR3
@@ -1712,9 +1729,16 @@ ENTRY(nmi)
 	IBRS_ENTRY_CLOBBER /* no indirect jump allowed before IBRS */
 	FILL_RETURN_BUFFER_CLOBBER /* no ret allowed before stuffing the RSB */
 
+	/*
+	 * At this point we no longer need to worry about stack damage
+	 * due to nesting -- we're on the normal thread stack and we're
+	 * done with the NMI stack.
+	 */
+
 	movq	%rsp, %rdi
 	movq	$-1, %rsi
 	call	do_nmi
+	UNWIND_UNSAFE_STACK
 
 	/*
 	 * Return back to user mode.  We must *not* do the normal exit
@@ -1722,41 +1746,254 @@ ENTRY(nmi)
 	 * do_nmi doesn't modify pt_regs.
 	 */
 	addq	$6*8, %rsp	/* skip bx, bp, and r12-r15 */
-	/*
-	 * The kernel_stack to trampoline stack switching isn't safe
-	 * with interrupt enabled.
-	 */
-	DISABLE_INTERRUPTS(CLBR_NONE)
 	jmp	retint_userspace_restore_args
 
 .Lnmi_from_kernel:
+	/*
+	 * Here's what our stack frame will look like:
+	 * +---------------------------------------------------------+
+	 * | original SS                                             |
+	 * | original Return RSP                                     |
+	 * | original RFLAGS                                         |
+	 * | original CS                                             |
+	 * | original RIP                                            |
+	 * +---------------------------------------------------------+
+	 * | temp storage for rsi                                    |
+	 * +---------------------------------------------------------+
+	 * | "NMI executing" variable                                |
+	 * +---------------------------------------------------------+
+	 * | iret SS          } Copied from "outermost" frame        |
+	 * | iret Return RSP  } on each loop iteration; overwritten  |
+	 * | iret RFLAGS      } by a nested NMI to force another     |
+	 * | iret CS          } iteration if needed.                 |
+	 * | iret RIP         }                                      |
+	 * +---------------------------------------------------------+
+	 * | outermost SS          } initialized in first_nmi;       |
+	 * | outermost Return RSP  } will not be changed before      |
+	 * | outermost RFLAGS      } NMI processing is done.         |
+	 * | outermost CS          } Copied to "iret" frame on each  |
+	 * | outermost RIP         } iteration.                      |
+	 * +---------------------------------------------------------+
+	 * | pt_regs                                                 |
+	 * +---------------------------------------------------------+
+	 *
+	 * The "original" frame is used by hardware.  Before re-enabling
+	 * NMIs, we need to be done with it, and we need to leave enough
+	 * space for the asm code here.
+	 *
+	 * We return by executing IRET while RSP points to the "iret" frame.
+	 * That will either return for real or it will loop back into NMI
+	 * processing.
+	 *
+	 * The "outermost" frame is copied to the "iret" frame on each
+	 * iteration of the loop, so each iteration starts with the "iret"
+	 * frame pointing to the final return target.
+	 */
 
-	pushq_cfi $-1
-	subq $15*8, %rsp
-	CFI_ADJUST_CFA_OFFSET 15*8
+	/*
+	 * Determine whether we're a nested NMI.
+	 *
+	 * If we interrupted kernel code between repeat_nmi and
+	 * end_repeat_nmi, then we are a nested NMI.  We must not
+	 * modify the "iret" frame because it's being written by
+	 * the outer NMI.  That's okay; the outer NMI handler is
+	 * about to about to call do_nmi anyway, so we can just
+	 * resume the outer NMI.
+	 */
+	movq	$repeat_nmi, %rsi
+	cmpq	8(%rsp), %rsi
+	ja	1f
+	movq	$end_repeat_nmi, %rsi
+	cmpq	8(%rsp), %rsi
+	ja	nested_nmi_out
+1:
+
+	/*
+	 * Now check "NMI executing".  If it's set, then we're nested.
+	 * This will not detect if we interrupted an outer NMI just
+	 * before IRET.
+	 */
+	cmpl $1, -8(%rsp)
+	je nested_nmi
+
+	/*
+	 * Now test if the previous stack was an NMI stack.  This covers
+	 * the case where we interrupt an outer NMI after it clears
+	 * "NMI executing" but before IRET.  We need to be careful, though:
+	 * there is one case in which RSP could point to the NMI stack
+	 * despite there being no NMI active: naughty userspace controls
+	 * RSP at the very beginning of the SYSCALL targets.  We can
+	 * pull a fast one on naughty userspace, though: we program
+	 * SYSCALL to mask DF, so userspace cannot cause DF to be set
+	 * if it controls the kernel's RSP.  We set DF before we clear
+	 * "NMI executing".
+	 */
+	lea 6*8(%rsp), %rsi
+	test_in_nmi rsi, 4*8(%rsp), nested_nmi, first_nmi
+
+	/* Ah, it is within the NMI stack. */
+
+	testb	$(X86_EFLAGS_DF >> 8), (3*8 + 1)(%rsp)
+	jz	first_nmi	/* RSP was user controlled. */
+
+	/* This is a nested NMI. */
+
+	CFI_REMEMBER_STATE
+
+nested_nmi:
+	/*
+	 * Modify the "iret" frame to point to repeat_nmi, forcing another
+	 * iteration of NMI handling.
+	 */
+	leaq -1*8(%rsp), %rsi
+	movq %rsi, %rsp
+	CFI_ADJUST_CFA_OFFSET 1*8
+	leaq -10*8(%rsp), %rsi
+	pushq_cfi $__KERNEL_DS
+	pushq_cfi %rsi
+	pushfq_cfi
+	pushq_cfi $__KERNEL_CS
+	pushq_cfi $repeat_nmi
+
+	/* Put stack back */
+	addq $(6*8), %rsp
+	CFI_ADJUST_CFA_OFFSET -6*8
+
+nested_nmi_out:
+	popq_cfi %rsi
+	CFI_RESTORE rsi
+
+	/* We are returning to kernel mode, so this cannot result in a fault. */
+	INTERRUPT_RETURN
+
+	CFI_RESTORE_STATE
+first_nmi:
+	/* Restore rsi. */
+	movq (%rsp), %rsi
+	CFI_RESTORE rsi
+
+	/* Set "NMI executing" on the stack. */
+	pushq_cfi $1
+
+	/* Leave room for the "iret" frame */
+	subq $(5*8), %rsp
+	CFI_ADJUST_CFA_OFFSET 5*8
+
+	/* Copy the "original" frame to the "outermost" frame */
+	.rept 5
+	pushq_cfi 11*8(%rsp)
+	.endr
+	CFI_DEF_CFA_OFFSET SS+8-RIP
+
+	/* Everything up to here is safe from nested NMIs */
+
+repeat_nmi:
+	/*
+	 * If there was a nested NMI, the first NMI's iret will return
+	 * here. But NMIs are still enabled and we can take another
+	 * nested NMI. The nested NMI checks the interrupted RIP to see
+	 * if it is between repeat_nmi and end_repeat_nmi, and if so
+	 * it will just return, as we are about to repeat an NMI anyway.
+	 * This makes it safe to copy to the stack frame that a nested
+	 * NMI will update.
+	 *
+	 * RSP is pointing to "outermost RIP".  gsbase is unknown, but, if
+	 * we're repeating an NMI, gsbase has the same value that it had on
+	 * the first iteration.  paranoid_entry will load the kernel
+	 * gsbase if needed before we call do_nmi.
+	 *
+	 * Set "NMI executing" in case we came back here via IRET.
+	 */
+	movq $1, 10*8(%rsp)
+
+	/*
+	 * Copy the "outermost" frame to the "iret" frame.  NMIs that nest
+	 * here must not modify the "iret" frame while we're writing to
+	 * it or it will end up containing garbage.
+	 */
+	addq $(10*8), %rsp
+	CFI_ADJUST_CFA_OFFSET -10*8
+	.rept 5
+	pushq_cfi -6*8(%rsp)
+	.endr
+	subq $(5*8), %rsp
+	CFI_DEF_CFA_OFFSET SS+8-RIP
+end_repeat_nmi:
+
+	/*
+	 * Everything below this point can be preempted by a nested NMI.
+	 * If this happens, then the inner NMI will change the "iret"
+	 * frame to point back to repeat_nmi.
+	 */
+	pushq_cfi $-1		/* ORIG_RAX: no syscall to restart */
+	subq $ORIG_RAX-R15, %rsp
+	CFI_ADJUST_CFA_OFFSET ORIG_RAX-R15
+	/*
+	 * Use save_paranoid to handle SWAPGS, but no need to use paranoid_exit
+	 * as we should not be calling schedule in NMI context.
+	 * Even with normal interrupts enabled. An NMI should not be
+	 * setting NEED_RESCHED or anything that normal interrupts and
+	 * exceptions might do.
+	 *
+	 * save_paranoid provides the necessary swapgs fencing. So no
+	 * explicit FENCE_SWAPGS_KERNEL_ENTRY is needed.
+	 */
 	call save_paranoid
 	DEFAULT_FRAME 0
+
+	/*
+	 * Save off the CR2 register. If we take a page fault in the NMI then
+	 * it could corrupt the CR2 value. If the NMI preempts a page fault
+	 * handler before it was able to read the CR2 register, and then the
+	 * NMI itself takes a page fault, the page fault that was preempted
+	 * will read the information from the NMI page fault and not the
+	 * origin fault. Save it off and restore it if it changes.
+	 * Use the r12 callee-saved register.
+	 */
+	movq %cr2, %r12
+
 	/* paranoidentry do_nmi, 0; without TRACE_IRQS_OFF */
 	movq %rsp,%rdi
 	movq $-1,%rsi
 	call do_nmi
-	/* paranoidexit; without TRACE_IRQS_OFF */
-	/* ebx:	no swapgs flag */
-	DISABLE_INTERRUPTS(CLBR_NONE)
+	UNWIND_UNSAFE_STACK
+
 	IBRS_EXIT_RESTORE_CLOBBER save_reg=%r13d
+
 	RESTORE_CR3 scratch_reg=%rax save_reg=%r14
+
+	/* Did the NMI take a page fault? Restore cr2 if it did */
+	movq %cr2, %rcx
+	cmpq %rcx, %r12
+	je 1f
+	movq %r12, %cr2
+1:
+	
 	testl %ebx,%ebx				/* swapgs needed? */
-	jnz nmi_noswapgs
+	jnz nmi_restore
+nmi_swapgs:
 	SWAPGS_UNSAFE_STACK
+nmi_restore:
+	/* Pop the extra iret frame at once */
+	RESTORE_ALL 6*8
+
 	/*
-	 * If swapgs needs to be called, there is a pretty good chance that
-	 * the NMI happens right before returning to userspace. So clear
-	 * the CPU buffers just in case.
+	 * Clear "NMI executing".  Set DF first so that we can easily
+	 * distinguish the remaining code between here and IRET from
+	 * the SYSCALL entry and exit paths.  On a native kernel, we
+	 * could just inspect RIP, but, on paravirt kernels,
+	 * INTERRUPT_RETURN can translate into a jump into a
+	 * hypercall page.
 	 */
-	MDS_USER_CLEAR_CPU_BUFFERS
-nmi_noswapgs:
-	RESTORE_ALL 8
-	jmp irq_return
+	std
+	movq	$0, 5*8(%rsp)		/* clear "NMI executing" */
+
+	/*
+	 * INTERRUPT_RETURN reads the "iret" frame and exits the NMI
+	 * stack in a single instruction.  We are returning to kernel
+	 * mode, so this cannot result in a fault.
+	 */
+	INTERRUPT_RETURN
 	CFI_ENDPROC
 END(nmi)
 

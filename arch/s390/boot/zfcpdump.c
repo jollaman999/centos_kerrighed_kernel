@@ -35,8 +35,8 @@
 #endif
 
 static struct globals g;
-static char *module_list[] = {"zfcp", "sd_mod", "ext2", "ext3", "zcore_mod",
-			      NULL};
+static char *module_list[] = {"zfcp", "sd_mod", "ext4",
+                              "zcore_mod", NULL};
 
 /*
  * parse one kernel parameter in the form keyword=value
@@ -222,7 +222,6 @@ static int write_to_file(const char *file, const char *command)
 
 static int read_file(const char *file, char *buf, int size)
 {
-	ssize_t count;
 	int fh;
 
 	PRINT_TRACE("Read: %s:\n", file);
@@ -231,39 +230,17 @@ static int read_file(const char *file, char *buf, int size)
 		PRINT_PERR("open %s failed\n", file);
 		return -1;
 	}
-	count = read(fh, buf, size - 1);
-	if (count < 0) {
+	if (read(fh, buf, size) < 0) {
 		PRINT_PERR("read %s failed\n", file);
 		close(fh);
 		return -1;
 	}
-	buf[count] = 0;
 	if (buf[strlen(buf) - 1] == '\n')
 		buf[strlen(buf) - 1] = 0; /* strip newline */
 	close(fh);
 	PRINT_TRACE("'%s'\n", buf);
 
 	return 0;
-}
-
-/*
- * Get HSA size
- */
-static __u64 get_hsa_size(void)
-{
-	char buf[128];
-
-	if (read_file(DEV_ZCORE_HSA, buf, sizeof(buf)))
-		return 0;
-	return strtoul(buf, NULL, 16);
-}
-
-/*
- * Release HSA
- */
-static void release_hsa(void)
-{
-	write_to_file(DEV_ZCORE_HSA, "0");
 }
 
 /*
@@ -276,6 +253,10 @@ static int enable_zfcp_device(void)
 	char command[1024], file[1024];
 	struct stat s;
 
+	/* Prevent setting all LUNs online for NPIV */
+	if (stat("/sys/module/zfcp/parameters/allow_lun_scan", &s) == 0)
+		write_to_file("/sys/module/zfcp/parameters/allow_lun_scan",
+			      "0\n");
 	/* device */
 	if (read_file(IPL_DEVNO, g.dump_devno, sizeof(g.dump_devno)))
 		return -1;
@@ -340,7 +321,9 @@ static int mount_dump_device(void)
 		return 0;
 	if (mount(dump_part, DUMP_DIR, "ext3", 0, NULL) == 0)
 		return 0;
-	if (mount(dump_part, DUMP_DIR, "ext2", 0, NULL) != 0) {
+	if (mount(dump_part, DUMP_DIR, "ext2", 0, NULL) == 0)
+		return 0;
+	if (mount(dump_part, DUMP_DIR, "xfs", 0, NULL) != 0) {
 		PRINT_PERR("mount failed\n");
 		return -1;
 	}
@@ -727,7 +710,7 @@ static int create_dump(void)
 	struct dump_page dp;
 	char buf[PAGE_SIZE], dpcpage[PAGE_SIZE];
 	char dump_name[1024];
-	__u64 mem_loc, mem_count, hsa_size;
+	__u64 mem_loc, mem_count;
 	__u32 buf_loc = 0, dp_size, dp_flags;
 	int size, fin, fout, fmap, rc = 0;
 	char c_info[CHUNK_INFO_SIZE];
@@ -814,9 +797,6 @@ static int create_dump(void)
 			chunk_prev = chunk;
 		} while (1);
 	}
-
-	hsa_size = get_hsa_size();
-	PRINT_TRACE("hsa size: %llx\n", (unsigned long long) hsa_size);
 
 	/* try to open the source device */
 	fin = open(DEV_ZCORE, O_RDONLY, 0);
@@ -915,10 +895,6 @@ static int create_dump(void)
 				rc = -1;
 				goto failed_close_fout;
 			}
-		}
-		if (hsa_size && mem_loc >= hsa_size) {
-			release_hsa();
-			hsa_size = 0;
 		}
 		if (read(fin, buf, PAGE_SIZE) != PAGE_SIZE) {
 			if (errno == EFAULT) {

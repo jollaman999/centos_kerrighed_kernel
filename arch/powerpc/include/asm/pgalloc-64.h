@@ -16,28 +16,39 @@ struct vmemmap_backing {
 	unsigned long phys;
 	unsigned long virt_addr;
 };
+extern struct vmemmap_backing *vmemmap_list;
 
-#ifndef CONFIG_PPC_SUBPAGE_PROT
-static inline void subpage_prot_free(pgd_t *pgd) {}
-#endif
+/*
+ * Functions that deal with pagetables that could be at any level of
+ * the table need to be passed an "index_size" so they know how to
+ * handle allocation.  For PTE pages (which are linked to a struct
+ * page for now, and drawn from the main get_free_pages() pool), the
+ * allocation size will be (2^index_size * sizeof(pointer)) and
+ * allocations are drawn from the kmem_cache in PGT_CACHE(index_size).
+ *
+ * The maximum index size needs to be big enough to allow any
+ * pagetable sizes we need, but small enough to fit in the low bits of
+ * any page table pointer.  In other words all pagetables, even tiny
+ * ones, must be aligned to allow at least enough low 0 bits to
+ * contain this value.  This value is also used as a mask, so it must
+ * be one less than a power of two.
+ */
+#define MAX_PGTABLE_INDEX_SIZE	0xf
 
 extern struct kmem_cache *pgtable_cache[];
-
-#define PGD_CACHE_NUM		0
-#define PUD_CACHE_NUM		1
-#define PMD_CACHE_NUM		1
-#define HUGEPTE_CACHE_NUM	2
-#define PTE_NONCACHE_NUM	7  /* from GFP rather than kmem_cache */
+#define PGT_CACHE(shift) ({				\
+			BUG_ON(!(shift));		\
+			pgtable_cache[(shift) - 1];	\
+		})
 
 static inline pgd_t *pgd_alloc(struct mm_struct *mm)
 {
-	return kmem_cache_alloc(pgtable_cache[PGD_CACHE_NUM], GFP_KERNEL);
+	return kmem_cache_alloc(PGT_CACHE(PGD_INDEX_SIZE), GFP_KERNEL);
 }
 
 static inline void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 {
-	subpage_prot_free(pgd);
-	kmem_cache_free(pgtable_cache[PGD_CACHE_NUM], pgd);
+	kmem_cache_free(PGT_CACHE(PGD_INDEX_SIZE), pgd);
 }
 
 #ifndef CONFIG_PPC_64K_PAGES
@@ -46,13 +57,13 @@ static inline void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 
 static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long addr)
 {
-	return kmem_cache_alloc(pgtable_cache[PUD_CACHE_NUM],
+	return kmem_cache_alloc(PGT_CACHE(PUD_INDEX_SIZE),
 				GFP_KERNEL|__GFP_REPEAT);
 }
 
 static inline void pud_free(struct mm_struct *mm, pud_t *pud)
 {
-	kmem_cache_free(pgtable_cache[PUD_CACHE_NUM], pud);
+	kmem_cache_free(PGT_CACHE(PUD_INDEX_SIZE), pud);
 }
 
 static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
@@ -65,8 +76,101 @@ static inline void pud_populate(struct mm_struct *mm, pud_t *pud, pmd_t *pmd)
 #define pmd_populate_kernel(mm, pmd, pte) pmd_set(pmd, (unsigned long)(pte))
 #define pmd_pgtable(pmd) pmd_page(pmd)
 
+static inline pte_t *pte_alloc_one_kernel(struct mm_struct *mm,
+					  unsigned long address)
+{
+	return (pte_t *)__get_free_page(GFP_KERNEL | __GFP_REPEAT | __GFP_ZERO);
+}
 
-#else /* CONFIG_PPC_64K_PAGES */
+static inline pgtable_t pte_alloc_one(struct mm_struct *mm,
+				      unsigned long address)
+{
+	struct page *page;
+	pte_t *pte;
+
+	pte = pte_alloc_one_kernel(mm, address);
+	if (!pte)
+		return NULL;
+	page = virt_to_page(pte);
+	if (!pgtable_page_ctor(page)) {
+		__free_page(page);
+		return NULL;
+	}
+	return page;
+}
+
+static inline void pte_free_kernel(struct mm_struct *mm, pte_t *pte)
+{
+	free_page((unsigned long)pte);
+}
+
+static inline void pte_free(struct mm_struct *mm, pgtable_t ptepage)
+{
+	pgtable_page_dtor(ptepage);
+	__free_page(ptepage);
+}
+
+static inline void pgtable_free(void *table, unsigned index_size)
+{
+	if (!index_size)
+		free_page((unsigned long)table);
+	else {
+		BUG_ON(index_size > MAX_PGTABLE_INDEX_SIZE);
+		kmem_cache_free(PGT_CACHE(index_size), table);
+	}
+}
+
+#ifdef CONFIG_SMP
+static inline void pgtable_free_tlb(struct mmu_gather *tlb,
+				    void *table, int shift)
+{
+	unsigned long pgf = (unsigned long)table;
+	BUG_ON(shift > MAX_PGTABLE_INDEX_SIZE);
+	pgf |= shift;
+	tlb_remove_table(tlb, (void *)pgf);
+}
+
+static inline void __tlb_remove_table(void *_table)
+{
+	void *table = (void *)((unsigned long)_table & ~MAX_PGTABLE_INDEX_SIZE);
+	unsigned shift = (unsigned long)_table & MAX_PGTABLE_INDEX_SIZE;
+
+	pgtable_free(table, shift);
+}
+#else /* !CONFIG_SMP */
+static inline void pgtable_free_tlb(struct mmu_gather *tlb,
+				    void *table, int shift)
+{
+	pgtable_free(table, shift);
+}
+#endif /* CONFIG_SMP */
+
+static inline void __pte_free_tlb(struct mmu_gather *tlb, pgtable_t table,
+				  unsigned long address)
+{
+	tlb_flush_pgtable(tlb, address);
+	pgtable_page_dtor(table);
+	pgtable_free_tlb(tlb, page_address(table), 0);
+}
+
+#else /* if CONFIG_PPC_64K_PAGES */
+/*
+ * we support 16 fragments per PTE page.
+ */
+#define PTE_FRAG_NR	16
+/*
+ * We use a 2K PTE page fragment and another 2K for storing
+ * real_pte_t hash index
+ */
+#define PTE_FRAG_SIZE_SHIFT  12
+#define PTE_FRAG_SIZE (2 * PTRS_PER_PTE * sizeof(pte_t))
+
+extern pte_t *page_table_alloc(struct mm_struct *, unsigned long, int);
+extern void page_table_free(struct mm_struct *, unsigned long *, int);
+extern void pgtable_free_tlb(struct mmu_gather *tlb, void *table, int shift);
+#ifdef CONFIG_SMP
+extern void __tlb_remove_table(void *_table);
+#endif
 
 #define pud_populate(mm, pud, pmd)	pud_set(pud, (unsigned long)pmd)
 
@@ -76,61 +180,64 @@ static inline void pmd_populate_kernel(struct mm_struct *mm, pmd_t *pmd,
 	pmd_set(pmd, (unsigned long)pte);
 }
 
-#define pmd_populate(mm, pmd, pte_page) \
-	pmd_populate_kernel(mm, pmd, page_address(pte_page))
-#define pmd_pgtable(pmd) pmd_page(pmd)
-
-#endif /* CONFIG_PPC_64K_PAGES */
-
-static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long addr)
+static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
+				pgtable_t pte_page)
 {
-	return kmem_cache_alloc(pgtable_cache[PMD_CACHE_NUM],
-				GFP_KERNEL|__GFP_REPEAT);
+	pmd_set(pmd, (unsigned long)pte_page);
 }
 
-static inline void pmd_free(struct mm_struct *mm, pmd_t *pmd)
+static inline pgtable_t pmd_pgtable(pmd_t pmd)
 {
-	kmem_cache_free(pgtable_cache[PMD_CACHE_NUM], pmd);
+	return (pgtable_t)(pmd_val(pmd) & ~PMD_MASKED_BITS);
 }
 
 static inline pte_t *pte_alloc_one_kernel(struct mm_struct *mm,
 					  unsigned long address)
 {
-        return (pte_t *)__get_free_page(GFP_KERNEL | __GFP_REPEAT | __GFP_ZERO);
+	return (pte_t *)page_table_alloc(mm, address, 1);
 }
 
 static inline pgtable_t pte_alloc_one(struct mm_struct *mm,
 					unsigned long address)
 {
-	struct page *page;
-	pte_t *pte;
-
-	pte = pte_alloc_one_kernel(mm, address);
-	if (!pte)
-		return NULL;
-	page = virt_to_page(pte);
-	pgtable_page_ctor(page);
-	return page;
+	return (pgtable_t)page_table_alloc(mm, address, 0);
 }
 
-static inline void pgtable_free(pgtable_free_t pgf)
+static inline void pte_free_kernel(struct mm_struct *mm, pte_t *pte)
 {
-	void *p = (void *)(pgf.val & ~PGF_CACHENUM_MASK);
-	int cachenum = pgf.val & PGF_CACHENUM_MASK;
-
-	if (cachenum == PTE_NONCACHE_NUM)
-		free_page((unsigned long)p);
-	else
-		kmem_cache_free(pgtable_cache[cachenum], p);
+	page_table_free(mm, (unsigned long *)pte, 1);
 }
 
-#define __pmd_free_tlb(tlb, pmd,addr)		      \
-	pgtable_free_tlb(tlb, pgtable_free_cache(pmd, \
-		PMD_CACHE_NUM, PMD_TABLE_SIZE-1))
+static inline void pte_free(struct mm_struct *mm, pgtable_t ptepage)
+{
+	page_table_free(mm, (unsigned long *)ptepage, 0);
+}
+
+static inline void __pte_free_tlb(struct mmu_gather *tlb, pgtable_t table,
+				  unsigned long address)
+{
+	tlb_flush_pgtable(tlb, address);
+	pgtable_free_tlb(tlb, table, 0);
+}
+#endif /* CONFIG_PPC_64K_PAGES */
+
+static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long addr)
+{
+	return kmem_cache_alloc(PGT_CACHE(PMD_CACHE_INDEX),
+				GFP_KERNEL|__GFP_REPEAT);
+}
+
+static inline void pmd_free(struct mm_struct *mm, pmd_t *pmd)
+{
+	kmem_cache_free(PGT_CACHE(PMD_CACHE_INDEX), pmd);
+}
+
+#define __pmd_free_tlb(tlb, pmd, addr)		      \
+	pgtable_free_tlb(tlb, pmd, PMD_CACHE_INDEX)
 #ifndef CONFIG_PPC_64K_PAGES
 #define __pud_free_tlb(tlb, pud, addr)		      \
-	pgtable_free_tlb(tlb, pgtable_free_cache(pud, \
-		PUD_CACHE_NUM, PUD_TABLE_SIZE-1))
+	pgtable_free_tlb(tlb, pud, PUD_INDEX_SIZE)
+
 #endif /* CONFIG_PPC_64K_PAGES */
 
 #define check_pgt_cache()	do { } while (0)

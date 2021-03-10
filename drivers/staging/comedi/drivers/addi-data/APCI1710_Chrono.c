@@ -8,7 +8,7 @@ Copyright (C) 2004,2005  ADDI-DATA GmbH for the source code of this module.
 	D-77833 Ottersweier
 	Tel: +19(0)7223/9493-0
 	Fax: +49(0)7223/9493-92
-	http://www.addi-data-com
+	http://www.addi-data.com
 	info@addi-data.com
 
 This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
@@ -17,7 +17,7 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 
 You should have received a copy of the GNU General Public License along with this program; if not, write to the Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
-You shoud also find the complete GPL in the COPYING file accompanying this source code.
+You should also find the complete GPL in the COPYING file accompanying this source code.
 
 @endverbatim
 */
@@ -52,12 +52,22 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
   +-----------------------------------------------------------------------+
 */
 
-/*
-+----------------------------------------------------------------------------+
-|                               Included files                               |
-+----------------------------------------------------------------------------+
-*/
-#include "APCI1710_Chrono.h"
+#define APCI1710_30MHZ			30
+#define APCI1710_33MHZ			33
+#define APCI1710_40MHZ			40
+
+#define APCI1710_SINGLE			0
+#define APCI1710_CONTINUOUS		1
+
+#define APCI1710_CHRONO_PROGRESS_STATUS	0
+#define APCI1710_CHRONO_READVALUE	1
+#define APCI1710_CHRONO_CONVERTVALUE	2
+#define APCI1710_CHRONO_READINTERRUPT	3
+
+#define APCI1710_CHRONO_SET_CHANNELON	0
+#define APCI1710_CHRONO_SET_CHANNELOFF	1
+#define APCI1710_CHRONO_READ_CHANNEL	2
+#define APCI1710_CHRONO_READ_PORT	3
 
 /*
 +----------------------------------------------------------------------------+
@@ -124,16 +134,18 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
 |                     -5: The selected PCI input clock is wrong              |
 |                     -6: Timing unity selection is wrong                    |
 |                     -7: Base timing selection is wrong                     |
-|                     -8: You can not used the 40MHz clock selection wich    |
+|                     -8: You can not used the 40MHz clock selection with    |
 |                         this board                                         |
-|                     -9: You can not used the 40MHz clock selection wich    |
+|                     -9: You can not used the 40MHz clock selection with    |
 |                         this CHRONOS version                               |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI1710_InsnConfigInitChrono(struct comedi_device *dev, struct comedi_subdevice *s,
-	struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnConfigInitChrono(struct comedi_device *dev,
+					   struct comedi_subdevice *s,
+					   struct comedi_insn *insn,
+					   unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int ul_TimerValue = 0;
 	unsigned int ul_TimingInterval = 0;
@@ -721,10 +733,10 @@ int i_APCI1710_InsnConfigInitChrono(struct comedi_device *dev, struct comedi_sub
 								}
 							} else {
 			     /**************************************************************/
-								/* You can not used the 40MHz clock selection wich this board */
+								/* You can not use the 40MHz clock selection with this board */
 			     /**************************************************************/
 
-								DPRINTK("You can not used the 40MHz clock selection wich this board\n");
+								DPRINTK("You can not used the 40MHz clock selection with this board\n");
 								i_ReturnValue =
 									-8;
 							}
@@ -839,10 +851,12 @@ struct comedi_subdevice *s,struct comedi_insn *insn,unsigned int *data)						 |
                       -8: data[0] wrong input    |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI1710_InsnWriteEnableDisableChrono(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnWriteEnableDisableChrono(struct comedi_device *dev,
+						   struct comedi_subdevice *s,
+						   struct comedi_insn *insn,
+						   unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned char b_ModulNbr, b_CycleMode, b_InterruptEnable, b_Action;
 	b_ModulNbr = CR_AREF(insn->chanspec);
@@ -1077,87 +1091,6 @@ int i_APCI1710_InsnWriteEnableDisableChrono(struct comedi_device *dev,
 
 /*
 +----------------------------------------------------------------------------+
-| Function Name     :INT	i_APCI1710_InsnReadChrono(struct comedi_device *dev,struct comedi_subdevice *s,
-struct comedi_insn *insn,unsigned int *data)                   |
-+----------------------------------------------------------------------------+
-| Task              : Read  functions for Timer                                     |
-+----------------------------------------------------------------------------+
-| Input Parameters  :
-+----------------------------------------------------------------------------+
-| Output Parameters : -                                                      |
-+----------------------------------------------------------------------------+
-| Return Value      :
-+----------------------------------------------------------------------------+
-*/
-
-int i_APCI1710_InsnReadChrono(struct comedi_device *dev, struct comedi_subdevice *s,
-	struct comedi_insn *insn, unsigned int *data)
-{
-	unsigned char b_ReadType;
-	int i_ReturnValue = insn->n;
-
-	b_ReadType = CR_CHAN(insn->chanspec);
-
-	switch (b_ReadType) {
-	case APCI1710_CHRONO_PROGRESS_STATUS:
-		i_ReturnValue = i_APCI1710_GetChronoProgressStatus(dev,
-			(unsigned char) CR_AREF(insn->chanspec), (unsigned char *) &data[0]);
-		break;
-
-	case APCI1710_CHRONO_READVALUE:
-		i_ReturnValue = i_APCI1710_ReadChronoValue(dev,
-			(unsigned char) CR_AREF(insn->chanspec),
-			(unsigned int) insn->unused[0],
-			(unsigned char *) &data[0], (unsigned int *) &data[1]);
-		break;
-
-	case APCI1710_CHRONO_CONVERTVALUE:
-		i_ReturnValue = i_APCI1710_ConvertChronoValue(dev,
-			(unsigned char) CR_AREF(insn->chanspec),
-			(unsigned int) insn->unused[0],
-			(unsigned int *) &data[0],
-			(unsigned char *) &data[1],
-			(unsigned char *) &data[2],
-			(unsigned int *) &data[3],
-			(unsigned int *) &data[4], (unsigned int *) &data[5]);
-		break;
-
-	case APCI1710_CHRONO_READINTERRUPT:
-		printk("In Chrono Read Interrupt\n");
-
-		data[0] = devpriv->s_InterruptParameters.
-			s_FIFOInterruptParameters[devpriv->
-			s_InterruptParameters.ui_Read].b_OldModuleMask;
-		data[1] = devpriv->s_InterruptParameters.
-			s_FIFOInterruptParameters[devpriv->
-			s_InterruptParameters.ui_Read].ul_OldInterruptMask;
-		data[2] = devpriv->s_InterruptParameters.
-			s_FIFOInterruptParameters[devpriv->
-			s_InterruptParameters.ui_Read].ul_OldCounterLatchValue;
-
-			     /**************************/
-		/* Increment the read FIFO */
-			     /***************************/
-
-		devpriv->
-			s_InterruptParameters.
-			ui_Read = (devpriv->
-			s_InterruptParameters.
-			ui_Read + 1) % APCI1710_SAVE_INTERRUPT;
-		break;
-
-	default:
-		printk("ReadType Parameter wrong\n");
-	}
-
-	if (i_ReturnValue >= 0)
-		i_ReturnValue = insn->n;
-	return i_ReturnValue;
-
-}
-
-/*
-+----------------------------------------------------------------------------+
 | Function Name     : _INT_ i_APCI1710_GetChronoProgressStatus               |
 |                               (unsigned char_    b_BoardHandle,                     |
 |                                unsigned char_    b_ModulNbr,                        |
@@ -1193,10 +1126,11 @@ int i_APCI1710_InsnReadChrono(struct comedi_device *dev, struct comedi_subdevice
 |                         "i_APCI1710_InitChrono"                            |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI1710_GetChronoProgressStatus(struct comedi_device *dev,
-	unsigned char b_ModulNbr, unsigned char *pb_ChronoStatus)
+static int i_APCI1710_GetChronoProgressStatus(struct comedi_device *dev,
+					      unsigned char b_ModulNbr,
+					      unsigned char *pb_ChronoStatus)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int dw_Status;
 
@@ -1354,11 +1288,13 @@ int i_APCI1710_GetChronoProgressStatus(struct comedi_device *dev,
 |                         directly the chronometer measured timing.          |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI1710_ReadChronoValue(struct comedi_device *dev,
-	unsigned char b_ModulNbr,
-	unsigned int ui_TimeOut, unsigned char *pb_ChronoStatus, unsigned int *pul_ChronoValue)
+static int i_APCI1710_ReadChronoValue(struct comedi_device *dev,
+				      unsigned char b_ModulNbr,
+				      unsigned int ui_TimeOut,
+				      unsigned char *pb_ChronoStatus,
+				      unsigned int *pul_ChronoValue)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int dw_Status;
 	unsigned int dw_TimeOut = 0;
@@ -1386,8 +1322,7 @@ int i_APCI1710_ReadChronoValue(struct comedi_device *dev,
 				/* Test the timout parameter */
 		 /*****************************/
 
-				if ((ui_TimeOut >= 0)
-					&& (ui_TimeOut <= 65535UL)) {
+				if (ui_TimeOut <= 65535UL) {
 
 					for (;;) {
 			  /*******************/
@@ -1618,15 +1553,17 @@ int i_APCI1710_ReadChronoValue(struct comedi_device *dev,
 |                         "i_APCI1710_InitChrono"                            |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI1710_ConvertChronoValue(struct comedi_device *dev,
-	unsigned char b_ModulNbr,
-	unsigned int ul_ChronoValue,
-	unsigned int *pul_Hour,
-	unsigned char *pb_Minute,
-	unsigned char *pb_Second,
-	unsigned int *pui_MilliSecond, unsigned int *pui_MicroSecond, unsigned int *pui_NanoSecond)
+static int i_APCI1710_ConvertChronoValue(struct comedi_device *dev,
+					 unsigned char b_ModulNbr,
+					 unsigned int ul_ChronoValue,
+					 unsigned int *pul_Hour,
+					 unsigned char *pb_Minute,
+					 unsigned char *pb_Second,
+					 unsigned int *pui_MilliSecond,
+					 unsigned int *pui_MicroSecond,
+					 unsigned int *pui_NanoSecond)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	double d_Hour;
 	double d_Minute;
@@ -1757,6 +1694,89 @@ int i_APCI1710_ConvertChronoValue(struct comedi_device *dev,
 
 /*
 +----------------------------------------------------------------------------+
+| Function Name     :INT	i_APCI1710_InsnReadChrono(struct comedi_device *dev,struct comedi_subdevice *s,
+struct comedi_insn *insn,unsigned int *data)                   |
++----------------------------------------------------------------------------+
+| Task              : Read  functions for Timer                                     |
++----------------------------------------------------------------------------+
+| Input Parameters  :
++----------------------------------------------------------------------------+
+| Output Parameters : -                                                      |
++----------------------------------------------------------------------------+
+| Return Value      :
++----------------------------------------------------------------------------+
+*/
+static int i_APCI1710_InsnReadChrono(struct comedi_device *dev,
+				     struct comedi_subdevice *s,
+				     struct comedi_insn *insn,
+				     unsigned int *data)
+{
+	struct addi_private *devpriv = dev->private;
+	unsigned char b_ReadType;
+	int i_ReturnValue = insn->n;
+
+	b_ReadType = CR_CHAN(insn->chanspec);
+
+	switch (b_ReadType) {
+	case APCI1710_CHRONO_PROGRESS_STATUS:
+		i_ReturnValue = i_APCI1710_GetChronoProgressStatus(dev,
+			(unsigned char) CR_AREF(insn->chanspec), (unsigned char *) &data[0]);
+		break;
+
+	case APCI1710_CHRONO_READVALUE:
+		i_ReturnValue = i_APCI1710_ReadChronoValue(dev,
+			(unsigned char) CR_AREF(insn->chanspec),
+			(unsigned int) insn->unused[0],
+			(unsigned char *) &data[0], (unsigned int *) &data[1]);
+		break;
+
+	case APCI1710_CHRONO_CONVERTVALUE:
+		i_ReturnValue = i_APCI1710_ConvertChronoValue(dev,
+			(unsigned char) CR_AREF(insn->chanspec),
+			(unsigned int) insn->unused[0],
+			(unsigned int *) &data[0],
+			(unsigned char *) &data[1],
+			(unsigned char *) &data[2],
+			(unsigned int *) &data[3],
+			(unsigned int *) &data[4], (unsigned int *) &data[5]);
+		break;
+
+	case APCI1710_CHRONO_READINTERRUPT:
+		printk("In Chrono Read Interrupt\n");
+
+		data[0] = devpriv->s_InterruptParameters.
+			s_FIFOInterruptParameters[devpriv->
+			s_InterruptParameters.ui_Read].b_OldModuleMask;
+		data[1] = devpriv->s_InterruptParameters.
+			s_FIFOInterruptParameters[devpriv->
+			s_InterruptParameters.ui_Read].ul_OldInterruptMask;
+		data[2] = devpriv->s_InterruptParameters.
+			s_FIFOInterruptParameters[devpriv->
+			s_InterruptParameters.ui_Read].ul_OldCounterLatchValue;
+
+			     /**************************/
+		/* Increment the read FIFO */
+			     /***************************/
+
+		devpriv->
+			s_InterruptParameters.
+			ui_Read = (devpriv->
+			s_InterruptParameters.
+			ui_Read + 1) % APCI1710_SAVE_INTERRUPT;
+		break;
+
+	default:
+		printk("ReadType Parameter wrong\n");
+	}
+
+	if (i_ReturnValue >= 0)
+		i_ReturnValue = insn->n;
+	return i_ReturnValue;
+
+}
+
+/*
++----------------------------------------------------------------------------+
 | Function Name     : int i_APCI1710_InsnBitsChronoDigitalIO(struct comedi_device *dev,struct comedi_subdevice *s,
 	struct comedi_insn *insn,unsigned int *data)                    |
 +----------------------------------------------------------------------------+
@@ -1875,10 +1895,12 @@ int i_APCI1710_ConvertChronoValue(struct comedi_device *dev,
 |                         "i_APCI1710_InitChrono"                            |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI1710_InsnBitsChronoDigitalIO(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnBitsChronoDigitalIO(struct comedi_device *dev,
+					      struct comedi_subdevice *s,
+					      struct comedi_insn *insn,
+					      unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned char b_ModulNbr, b_OutputChannel, b_InputChannel, b_IOType;
 	unsigned int dw_Status;

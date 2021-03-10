@@ -25,12 +25,12 @@
 #include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/spinlock.h>
-#include <linux/gfp.h>
-#include <linux/vmalloc.h>
 #include <linux/interrupt.h>
 #include <linux/dma-mapping.h>
 #include <linux/platform_device.h>
 #include <linux/io.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 
 #include <asm/ip32/ip32_ints.h>
 #include <asm/ip32/mace.h>
@@ -237,7 +237,7 @@ static int sgio2audio_source_put(struct snd_kcontrol *kcontrol,
 }
 
 /* dac1/pcm0 mixer control */
-static struct snd_kcontrol_new sgio2audio_ctrl_pcm0 __devinitdata = {
+static const struct snd_kcontrol_new sgio2audio_ctrl_pcm0 = {
 	.iface          = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name           = "PCM Playback Volume",
 	.index          = 0,
@@ -249,7 +249,7 @@ static struct snd_kcontrol_new sgio2audio_ctrl_pcm0 __devinitdata = {
 };
 
 /* dac2/pcm1 mixer control */
-static struct snd_kcontrol_new sgio2audio_ctrl_pcm1 __devinitdata = {
+static const struct snd_kcontrol_new sgio2audio_ctrl_pcm1 = {
 	.iface          = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name           = "PCM Playback Volume",
 	.index          = 1,
@@ -261,7 +261,7 @@ static struct snd_kcontrol_new sgio2audio_ctrl_pcm1 __devinitdata = {
 };
 
 /* record level mixer control */
-static struct snd_kcontrol_new sgio2audio_ctrl_reclevel __devinitdata = {
+static const struct snd_kcontrol_new sgio2audio_ctrl_reclevel = {
 	.iface          = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name           = "Capture Volume",
 	.access         = SNDRV_CTL_ELEM_ACCESS_READWRITE,
@@ -272,7 +272,7 @@ static struct snd_kcontrol_new sgio2audio_ctrl_reclevel __devinitdata = {
 };
 
 /* record level source control */
-static struct snd_kcontrol_new sgio2audio_ctrl_recsource __devinitdata = {
+static const struct snd_kcontrol_new sgio2audio_ctrl_recsource = {
 	.iface          = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name           = "Capture Source",
 	.access         = SNDRV_CTL_ELEM_ACCESS_READWRITE,
@@ -282,7 +282,7 @@ static struct snd_kcontrol_new sgio2audio_ctrl_recsource __devinitdata = {
 };
 
 /* line mixer control */
-static struct snd_kcontrol_new sgio2audio_ctrl_line __devinitdata = {
+static const struct snd_kcontrol_new sgio2audio_ctrl_line = {
 	.iface          = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name           = "Line Playback Volume",
 	.index          = 0,
@@ -294,7 +294,7 @@ static struct snd_kcontrol_new sgio2audio_ctrl_line __devinitdata = {
 };
 
 /* cd mixer control */
-static struct snd_kcontrol_new sgio2audio_ctrl_cd __devinitdata = {
+static const struct snd_kcontrol_new sgio2audio_ctrl_cd = {
 	.iface          = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name           = "Line Playback Volume",
 	.index          = 1,
@@ -306,7 +306,7 @@ static struct snd_kcontrol_new sgio2audio_ctrl_cd __devinitdata = {
 };
 
 /* mic mixer control */
-static struct snd_kcontrol_new sgio2audio_ctrl_mic __devinitdata = {
+static const struct snd_kcontrol_new sgio2audio_ctrl_mic = {
 	.iface          = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name           = "Mic Playback Volume",
 	.access         = SNDRV_CTL_ELEM_ACCESS_READWRITE,
@@ -317,7 +317,7 @@ static struct snd_kcontrol_new sgio2audio_ctrl_mic __devinitdata = {
 };
 
 
-static int __devinit snd_sgio2audio_new_mixer(struct snd_sgio2audio *chip)
+static int snd_sgio2audio_new_mixer(struct snd_sgio2audio *chip)
 {
 	int err;
 
@@ -603,25 +603,14 @@ static int snd_sgio2audio_pcm_close(struct snd_pcm_substream *substream)
 static int snd_sgio2audio_pcm_hw_params(struct snd_pcm_substream *substream,
 					struct snd_pcm_hw_params *hw_params)
 {
-	struct snd_pcm_runtime *runtime = substream->runtime;
-	int size = params_buffer_bytes(hw_params);
-
-	/* alloc virtual 'dma' area */
-	if (runtime->dma_area)
-		vfree(runtime->dma_area);
-	runtime->dma_area = vmalloc_user(size);
-	if (runtime->dma_area == NULL)
-		return -ENOMEM;
-	runtime->dma_bytes = size;
-	return 0;
+	return snd_pcm_lib_alloc_vmalloc_buffer(substream,
+						params_buffer_bytes(hw_params));
 }
 
 /* hw_free callback */
 static int snd_sgio2audio_pcm_hw_free(struct snd_pcm_substream *substream)
 {
-	vfree(substream->runtime->dma_area);
-	substream->runtime->dma_area = NULL;
-	return 0;
+	return snd_pcm_lib_free_vmalloc_buffer(substream);
 }
 
 /* prepare callback */
@@ -692,13 +681,6 @@ snd_sgio2audio_pcm_pointer(struct snd_pcm_substream *substream)
 			       chip->channel[chan->idx].pos);
 }
 
-/* get the physical page pointer on the given offset */
-static struct page *snd_sgio2audio_page(struct snd_pcm_substream *substream,
-					unsigned long offset)
-{
-	return vmalloc_to_page(substream->runtime->dma_area + offset);
-}
-
 /* operators */
 static struct snd_pcm_ops snd_sgio2audio_playback1_ops = {
 	.open =        snd_sgio2audio_playback1_open,
@@ -709,7 +691,7 @@ static struct snd_pcm_ops snd_sgio2audio_playback1_ops = {
 	.prepare =     snd_sgio2audio_pcm_prepare,
 	.trigger =     snd_sgio2audio_pcm_trigger,
 	.pointer =     snd_sgio2audio_pcm_pointer,
-	.page =        snd_sgio2audio_page,
+	.page =        snd_pcm_lib_get_vmalloc_page,
 };
 
 static struct snd_pcm_ops snd_sgio2audio_playback2_ops = {
@@ -721,7 +703,7 @@ static struct snd_pcm_ops snd_sgio2audio_playback2_ops = {
 	.prepare =     snd_sgio2audio_pcm_prepare,
 	.trigger =     snd_sgio2audio_pcm_trigger,
 	.pointer =     snd_sgio2audio_pcm_pointer,
-	.page =        snd_sgio2audio_page,
+	.page =        snd_pcm_lib_get_vmalloc_page,
 };
 
 static struct snd_pcm_ops snd_sgio2audio_capture_ops = {
@@ -733,7 +715,7 @@ static struct snd_pcm_ops snd_sgio2audio_capture_ops = {
 	.prepare =     snd_sgio2audio_pcm_prepare,
 	.trigger =     snd_sgio2audio_pcm_trigger,
 	.pointer =     snd_sgio2audio_pcm_pointer,
-	.page =        snd_sgio2audio_page,
+	.page =        snd_pcm_lib_get_vmalloc_page,
 };
 
 /*
@@ -741,7 +723,7 @@ static struct snd_pcm_ops snd_sgio2audio_capture_ops = {
  */
 
 /* create a pcm device */
-static int __devinit snd_sgio2audio_new_pcm(struct snd_sgio2audio *chip)
+static int snd_sgio2audio_new_pcm(struct snd_sgio2audio *chip)
 {
 	struct snd_pcm *pcm;
 	int err;
@@ -849,8 +831,8 @@ static struct snd_device_ops ops = {
 	.dev_free = snd_sgio2audio_dev_free,
 };
 
-static int __devinit snd_sgio2audio_create(struct snd_card *card,
-					   struct snd_sgio2audio **rchip)
+static int snd_sgio2audio_create(struct snd_card *card,
+				 struct snd_sgio2audio **rchip)
 {
 	struct snd_sgio2audio *chip;
 	int i, err;
@@ -929,13 +911,13 @@ static int __devinit snd_sgio2audio_create(struct snd_card *card,
 	return 0;
 }
 
-static int __devinit snd_sgio2audio_probe(struct platform_device *pdev)
+static int snd_sgio2audio_probe(struct platform_device *pdev)
 {
 	struct snd_card *card;
 	struct snd_sgio2audio *chip;
 	int err;
 
-	err = snd_card_create(index, id, THIS_MODULE, 0, &card);
+	err = snd_card_new(&pdev->dev, index, id, THIS_MODULE, 0, &card);
 	if (err < 0)
 		return err;
 
@@ -944,7 +926,6 @@ static int __devinit snd_sgio2audio_probe(struct platform_device *pdev)
 		snd_card_free(card);
 		return err;
 	}
-	snd_card_set_dev(card, &pdev->dev);
 
 	err = snd_sgio2audio_new_pcm(chip);
 	if (err < 0) {
@@ -973,33 +954,21 @@ static int __devinit snd_sgio2audio_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int __devexit snd_sgio2audio_remove(struct platform_device *pdev)
+static int snd_sgio2audio_remove(struct platform_device *pdev)
 {
 	struct snd_card *card = platform_get_drvdata(pdev);
 
 	snd_card_free(card);
-	platform_set_drvdata(pdev, NULL);
 	return 0;
 }
 
 static struct platform_driver sgio2audio_driver = {
 	.probe	= snd_sgio2audio_probe,
-	.remove	= __devexit_p(snd_sgio2audio_remove),
+	.remove	= snd_sgio2audio_remove,
 	.driver = {
 		.name	= "sgio2audio",
 		.owner	= THIS_MODULE,
 	}
 };
 
-static int __init alsa_card_sgio2audio_init(void)
-{
-	return platform_driver_register(&sgio2audio_driver);
-}
-
-static void __exit alsa_card_sgio2audio_exit(void)
-{
-	platform_driver_unregister(&sgio2audio_driver);
-}
-
-module_init(alsa_card_sgio2audio_init)
-module_exit(alsa_card_sgio2audio_exit)
+module_platform_driver(sgio2audio_driver);

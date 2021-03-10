@@ -12,6 +12,7 @@
 #include <asm/processor.h>
 #include <asm/uaccess.h>
 #include <asm/compat.h>
+#include <asm/oprofile_impl.h>
 
 #define STACK_SP(STACK)		*(STACK)
 
@@ -105,7 +106,7 @@ void op_powerpc_backtrace(struct pt_regs * const regs, unsigned int depth)
 		}
 	} else {
 #ifdef CONFIG_PPC64
-		if (!test_thread_flag(TIF_32BIT)) {
+		if (!is_32bit_task()) {
 			while (depth--) {
 				sp = user_getsp64(sp, first_frame);
 				if (!sp)

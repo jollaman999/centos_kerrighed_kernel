@@ -31,6 +31,8 @@
  * SOFTWARE.
  */
 
+#include <linux/slab.h>
+
 #include <rdma/ib_umem.h>
 #include <rdma/ib_pack.h>
 #include <rdma/ib_smi.h>
@@ -96,10 +98,6 @@ static struct ipath_mr *alloc_mr(int count,
 	}
 	mr->mr.mapsz = m;
 
-	/*
-	 * ib_reg_phys_mr() will initialize mr->ibmr except for
-	 * lkey and rkey.
-	 */
 	if (!ipath_alloc_lkey(lk_table, &mr->mr))
 		goto bail;
 	mr->ibmr.rkey = mr->ibmr.lkey = mr->mr.lkey;
@@ -116,57 +114,6 @@ bail:
 
 done:
 	return mr;
-}
-
-/**
- * ipath_reg_phys_mr - register a physical memory region
- * @pd: protection domain for this memory region
- * @buffer_list: pointer to the list of physical buffers to register
- * @num_phys_buf: the number of physical buffers to register
- * @iova_start: the starting address passed over IB which maps to this MR
- *
- * Returns the memory region on success, otherwise returns an errno.
- */
-struct ib_mr *ipath_reg_phys_mr(struct ib_pd *pd,
-				struct ib_phys_buf *buffer_list,
-				int num_phys_buf, int acc, u64 *iova_start)
-{
-	struct ipath_mr *mr;
-	int n, m, i;
-	struct ib_mr *ret;
-
-	mr = alloc_mr(num_phys_buf, &to_idev(pd->device)->lk_table);
-	if (mr == NULL) {
-		ret = ERR_PTR(-ENOMEM);
-		goto bail;
-	}
-
-	mr->mr.pd = pd;
-	mr->mr.user_base = *iova_start;
-	mr->mr.iova = *iova_start;
-	mr->mr.length = 0;
-	mr->mr.offset = 0;
-	mr->mr.access_flags = acc;
-	mr->mr.max_segs = num_phys_buf;
-	mr->umem = NULL;
-
-	m = 0;
-	n = 0;
-	for (i = 0; i < num_phys_buf; i++) {
-		mr->mr.map[m]->segs[n].vaddr = (void *) buffer_list[i].addr;
-		mr->mr.map[m]->segs[n].length = buffer_list[i].size;
-		mr->mr.length += buffer_list[i].size;
-		n++;
-		if (n == IPATH_SEGSZ) {
-			m++;
-			n = 0;
-		}
-	}
-
-	ret = &mr->ibmr;
-
-bail:
-	return ret;
 }
 
 /**
@@ -228,7 +175,7 @@ struct ib_mr *ipath_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 			goto bail;
 		}
 		mr->mr.map[m]->segs[n].vaddr = vaddr;
-		mr->mr.map[m]->segs[n].length = umem->page_size;
+		mr->mr.map[m]->segs[n].length = 1<<umem->page_shift;
 		n++;
 		if (n == IPATH_SEGSZ) {
 			m++;

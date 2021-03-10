@@ -9,6 +9,7 @@
 
 #include <linux/netrom.h>
 #include <linux/list.h>
+#include <linux/slab.h>
 #include <net/sock.h>
 
 #define	NR_NETWORK_LEN			15
@@ -132,6 +133,8 @@ static __inline__ void nr_node_put(struct nr_node *nr_node)
 static __inline__ void nr_neigh_put(struct nr_neigh *nr_neigh)
 {
 	if (atomic_dec_and_test(&nr_neigh->refcount)) {
+		if (nr_neigh->ax25)
+			ax25_cb_put(nr_neigh->ax25);
 		kfree(nr_neigh->digipeat);
 		kfree(nr_neigh);
 	}
@@ -151,17 +154,17 @@ static __inline__ void nr_node_unlock(struct nr_node *nr_node)
 	nr_node_put(nr_node);
 }
 
-#define nr_neigh_for_each(__nr_neigh, node, list) \
-	hlist_for_each_entry(__nr_neigh, node, list, neigh_node)
+#define nr_neigh_for_each(__nr_neigh, list) \
+	hlist_for_each_entry(__nr_neigh, list, neigh_node)
 
-#define nr_neigh_for_each_safe(__nr_neigh, node, node2, list) \
-	hlist_for_each_entry_safe(__nr_neigh, node, node2, list, neigh_node)
+#define nr_neigh_for_each_safe(__nr_neigh, node2, list) \
+	hlist_for_each_entry_safe(__nr_neigh, node2, list, neigh_node)
 
-#define nr_node_for_each(__nr_node, node, list) \
-	hlist_for_each_entry(__nr_node, node, list, node_node)
+#define nr_node_for_each(__nr_node, list) \
+	hlist_for_each_entry(__nr_node, list, node_node)
 
-#define nr_node_for_each_safe(__nr_node, node, node2, list) \
-	hlist_for_each_entry_safe(__nr_node, node, node2, list, node_node)
+#define nr_node_for_each_safe(__nr_node, node2, list) \
+	hlist_for_each_entry_safe(__nr_node, node2, list, node_node)
 
 
 /*********************************************************************/

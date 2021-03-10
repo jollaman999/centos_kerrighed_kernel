@@ -14,12 +14,11 @@
 # 3)  create one <module>.mod.c file pr. module
 # 4)  create one Module.symvers file with CRC for all exported symbols
 # 5) compile all <module>.mod.c files
-# 6) final link of the module to a <module.ko> (or <module.unsigned>) file
-# 7) signs the modules to a <module.ko> file
+# 6) final link of the module to a <module.ko> file
 
 # Step 3 is used to place certain information in the module's ELF
 # section, including information such as:
-#   Version magic (see include/vermagic.h for full details)
+#   Version magic (see include/linux/vermagic.h for full details)
 #     - Kernel release
 #     - SMP is CONFIG_SMP
 #     - PREEMPT is CONFIG_PREEMPT
@@ -31,21 +30,19 @@
 #     - See include/linux/module.h for more details
 
 # Step 4 is solely used to allow module versioning in external modules,
-# where the CRC of each module is retrieved from the Module.symers file.
-
-# Step 7 is dependent on CONFIG_MODULE_SIG being enabled.
+# where the CRC of each module is retrieved from the Module.symvers file.
 
 # KBUILD_MODPOST_WARN can be set to avoid error out in case of undefined
 # symbols in the final module linking stage
 # KBUILD_MODPOST_NOFINAL can be set to skip the final link of modules.
-# This is solely usefull to speed up test compiles
+# This is solely useful to speed up test compiles
 PHONY := _modpost
 _modpost: __modpost
 
 include include/config/auto.conf
 include scripts/Kbuild.include
 
-# When building external modules load the Kbuild file to retreive EXTRA_SYMBOLS info
+# When building external modules load the Kbuild file to retrieve EXTRA_SYMBOLS info
 ifneq ($(KBUILD_EXTMOD),)
 
 # set src + obj - they may be used when building the .mod.c file
@@ -63,15 +60,12 @@ kernelsymfile := $(objtree)/Module.symvers
 modulesymfile := $(firstword $(KBUILD_EXTMOD))/Module.symvers
 
 # Step 1), find all modules listed in $(MODVERDIR)/
-__modules := $(sort $(shell grep -h '\.ko' /dev/null $(wildcard $(MODVERDIR)/*.mod)))
+MODLISTCMD := find $(MODVERDIR) -name '*.mod' | xargs -r grep -h '\.ko$$' | sort -u
+__modules := $(shell $(MODLISTCMD))
 modules   := $(patsubst %.o,%.ko, $(wildcard $(__modules:.ko=.o)))
 
 # Stop after building .o files if NOFINAL is set. Makes compile tests quicker
 _modpost: $(if $(KBUILD_MODPOST_NOFINAL), $(modules:.ko:.o),$(modules))
-
-ifneq ($(KBUILD_BUILDHOST),$(ARCH))
-        cross_build := 1
-endif
 
 # Step 2), invoke modpost
 #  Includes step 3,4
@@ -83,15 +77,15 @@ modpost = scripts/mod/modpost                    \
  $(if $(KBUILD_EXTRA_SYMBOLS), $(patsubst %, -e %,$(KBUILD_EXTRA_SYMBOLS))) \
  $(if $(KBUILD_EXTMOD),-o $(modulesymfile))      \
  $(if $(CONFIG_DEBUG_SECTION_MISMATCH),,-S)      \
- $(if $(KBUILD_EXTMOD)$(KBUILD_MODPOST_WARN),-w) \
- $(if $(cross_build),-c)
+ $(if $(KBUILD_EXTMOD)$(KBUILD_MODPOST_WARN),-w)
 
+# We can go over command line length here, so be careful.
 quiet_cmd_modpost = MODPOST $(words $(filter-out vmlinux FORCE, $^)) modules
-      cmd_modpost = $(modpost) -s
+      cmd_modpost = $(MODLISTCMD) | sed 's/\.ko$$/.o/' | $(modpost) -s -T -
 
 PHONY += __modpost
 __modpost: $(modules:.ko=.o) FORCE
-	$(call cmd,modpost) $(wildcard vmlinux) $(filter-out FORCE,$^)
+	$(call cmd,modpost) $(wildcard vmlinux)
 
 quiet_cmd_kernel-mod = MODPOST $@
       cmd_kernel-mod = $(modpost) $@
@@ -110,7 +104,7 @@ $(modules:.ko=.mod.c): __modpost ;
 modname = $(notdir $(@:.mod.o=))
 
 quiet_cmd_cc_o_c = CC      $@
-      cmd_cc_o_c = $(CC) $(c_flags) $(CFLAGS_MODULE)	\
+      cmd_cc_o_c = $(CC) $(c_flags) $(KBUILD_CFLAGS_MODULE) $(CFLAGS_MODULE) \
 		   -c -o $@ $<
 
 $(modules:.ko=.mod.o): %.mod.o: %.mod.c FORCE
@@ -119,72 +113,16 @@ $(modules:.ko=.mod.o): %.mod.o: %.mod.c FORCE
 targets += $(modules:.ko=.mod.o)
 
 # Step 6), final link of the modules
-ifneq ($(CONFIG_MODULE_SIG),y)
 quiet_cmd_ld_ko_o = LD [M]  $@
-      cmd_ld_ko_o = $(LD) -r $(LDFLAGS) $(LDFLAGS_MODULE) -o $@		\
-			  $(filter-out FORCE,$^)
+      cmd_ld_ko_o = $(LD) -r $(LDFLAGS)                                 \
+                             $(KBUILD_LDFLAGS_MODULE) $(LDFLAGS_MODULE) \
+                             -o $@ $(filter-out FORCE,$^)
 
 $(modules): %.ko :%.o %.mod.o FORCE
 	$(call if_changed,ld_ko_o)
 
 targets += $(modules)
-else
-quiet_cmd_ld_ko_unsigned_o = LD [M]  $@
-      cmd_ld_ko_unsigned_o = \
-		$(LD) -r $(LDFLAGS) $(LDFLAGS_MODULE) -o $@ \
-			$(filter-out FORCE,$^) \
-		$(if $(AFTER_LINK),; $(AFTER_LINK))
 
-$(modules:.ko=.ko.unsigned): %.ko.unsigned :%.o %.mod.o FORCE
-	$(call if_changed,ld_ko_unsigned_o)
-
-targets += $(modules:.ko=.ko.unsigned)
-
-# Step 7), sign the modules
-MODSECKEY = ./kernel.sec
-MODPUBKEY = ./kernel.pub
-KEYFLAGS = --no-default-keyring --secret-keyring $(MODSECKEY) --keyring $(MODPUBKEY) --no-default-keyring --homedir . --no-options --no-auto-check-trustdb --no-permission-warning --digest-algo sha256
-ifdef MODKEYNAME
-KEYFLAGS += --default-key $(MODKEYNAME)
-endif
-
-ifeq ($(wildcard $(MODSECKEY))+$(wildcard $(MODPUBKEY)),$(MODSECKEY)+$(MODPUBKEY))
-ifeq ($(KBUILD_SRC),)
-	# no O= is being used
-	SCRIPTS_DIR := scripts
-else
-	SCRIPTS_DIR := $(KBUILD_SRC)/scripts
-endif
-SIGN_MODULES := 1
-else
-SIGN_MODULES := 0
-endif
-
-# only sign if it's an in-tree module
-ifneq ($(KBUILD_EXTMOD),)
-SIGN_MODULES := 0
-endif
-
-ifeq ($(SIGN_MODULES),1)
-quiet_cmd_sign_ko_ko_unsigned = SIGN [M] $@
-      cmd_sign_ko_ko_unsigned = \
-		scripts/mod/mod-extract $< $@.digest && \
-		rm -f $@.digest.sig && \
-		gpg --batch --no-greeting $(KEYFLAGS) -b $@.digest && \
-		sh $(SCRIPTS_DIR)/mod/modsign-note.sh $@.digest.sig | \
-		  $(CC) -x assembler-with-cpp $(c_flags) $(CFLAGS_MODULE) -c -o $@.note.o - && \
-		$(LD) -r $(LDFLAGS) -o $@ $< $@.note.o
-else
-quiet_cmd_sign_ko_ko_unsigned = NO SIGN [M] $@
-      cmd_sign_ko_ko_unsigned = \
-		cp $< $@
-endif
-
-$(modules): %.ko :%.ko.unsigned FORCE
-	$(call if_changed,sign_ko_ko_unsigned)
-
-targets += $(modules)
-endif
 
 # Add FORCE to the prequisites of a target to force it to be always rebuilt.
 # ---------------------------------------------------------------------------

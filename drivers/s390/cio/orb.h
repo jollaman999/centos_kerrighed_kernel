@@ -1,7 +1,7 @@
 /*
  * Orb related data structures.
  *
- * Copyright IBM Corp. 2007, 2012
+ * Copyright IBM Corp. 2007, 2011
  *
  * Author(s): Cornelia Huck <cornelia.huck@de.ibm.com>
  *	      Peter Oberparleiter <peter.oberparleiter@de.ibm.com>

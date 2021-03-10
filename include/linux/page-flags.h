@@ -6,9 +6,11 @@
 #define PAGE_FLAGS_H
 
 #include <linux/types.h>
+#include <linux/bug.h>
+#include <linux/mmdebug.h>
 #ifndef __GENERATING_BOUNDS_H
 #include <linux/mm_types.h>
-#include <linux/bounds.h>
+#include <generated/bounds.h>
 #endif /* !__GENERATING_BOUNDS_H */
 
 /*
@@ -47,9 +49,6 @@
  * space, they need to be kmapped separately for doing IO on the pages.  The
  * struct page (these bits with information) are always mapped into kernel
  * address space...
- *
- * PG_buddy is set to indicate that the page is free and in the buddy system
- * (see mm/page_alloc.c).
  *
  * PG_hwpoison indicates that a page got corrupted in hardware and contains
  * data with incorrect ECC bits that triggered a machine check. Accessing is
@@ -96,7 +95,6 @@ enum pageflags {
 	PG_swapcache,		/* Swap page: swp_entry_t in private */
 	PG_mappedtodisk,	/* Has blocks allocated on-disk */
 	PG_reclaim,		/* To be reclaimed asap */
-	PG_buddy,		/* Page is free, on buddy lists */
 	PG_swapbacked,		/* Page is backed by RAM/swap */
 	PG_unevictable,		/* Page is "unevictable"  */
 #ifdef CONFIG_MMU
@@ -111,6 +109,12 @@ enum pageflags {
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	PG_compound_lock,
 #endif
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
+	PG_young,
+	PG_idle,
+#endif
+	PG_kmemcg,
+
 	__NR_PAGEFLAGS,
 
 	/* Filesystems */
@@ -128,10 +132,6 @@ enum pageflags {
 
 	/* SLOB */
 	PG_slob_free = PG_private,
-
-	/* SLUB */
-	PG_slub_frozen = PG_active,
-	PG_slub_debug = PG_error,
 };
 
 #ifndef __GENERATING_BOUNDS_H
@@ -140,7 +140,7 @@ enum pageflags {
  * Macros to create function definitions for page flags
  */
 #define TESTPAGEFLAG(uname, lname)					\
-static inline int Page##uname(struct page *page) 			\
+static inline int Page##uname(const struct page *page)			\
 			{ return test_bit(PG_##lname, &page->flags); }
 
 #define SETPAGEFLAG(uname, lname)					\
@@ -177,12 +177,11 @@ static inline int __TestClearPage##uname(struct page *page)		\
 #define __PAGEFLAG(uname, lname) TESTPAGEFLAG(uname, lname)		\
 	__SETPAGEFLAG(uname, lname)  __CLEARPAGEFLAG(uname, lname)
 
-#define PAGEFLAG_FALSE(uname) 						\
-static inline int Page##uname(struct page *page) 			\
-			{ return 0; }
-
 #define TESTSCFLAG(uname, lname)					\
 	TESTSETFLAG(uname, lname) TESTCLEARFLAG(uname, lname)
+
+#define TESTPAGEFLAG_FALSE(uname)					\
+static inline int Page##uname(const struct page *page) { return 0; }
 
 #define SETPAGEFLAG_NOOP(uname)						\
 static inline void SetPage##uname(struct page *page) {  }
@@ -193,15 +192,24 @@ static inline void ClearPage##uname(struct page *page) {  }
 #define __CLEARPAGEFLAG_NOOP(uname)					\
 static inline void __ClearPage##uname(struct page *page) {  }
 
+#define TESTSETFLAG_FALSE(uname)					\
+static inline int TestSetPage##uname(struct page *page) { return 0; }
+
 #define TESTCLEARFLAG_FALSE(uname)					\
 static inline int TestClearPage##uname(struct page *page) { return 0; }
 
 #define __TESTCLEARFLAG_FALSE(uname)					\
 static inline int __TestClearPage##uname(struct page *page) { return 0; }
 
+#define PAGEFLAG_FALSE(uname) TESTPAGEFLAG_FALSE(uname)			\
+	SETPAGEFLAG_NOOP(uname) CLEARPAGEFLAG_NOOP(uname)
+
+#define TESTSCFLAG_FALSE(uname)						\
+	TESTSETFLAG_FALSE(uname) TESTCLEARFLAG_FALSE(uname)
+
 struct page;	/* forward declaration */
 
-TESTPAGEFLAG(Locked, locked) TESTSETFLAG(Locked, locked)
+TESTPAGEFLAG(Locked, locked)
 PAGEFLAG(Error, error) TESTCLEARFLAG(Error, error)
 PAGEFLAG(Referenced, referenced) TESTCLEARFLAG(Referenced, referenced)
 PAGEFLAG(Dirty, dirty) TESTSCFLAG(Dirty, dirty) __CLEARPAGEFLAG(Dirty, dirty)
@@ -214,11 +222,9 @@ PAGEFLAG(Pinned, pinned) TESTSCFLAG(Pinned, pinned)	/* Xen */
 PAGEFLAG(SavePinned, savepinned);			/* Xen */
 PAGEFLAG(Reserved, reserved) __CLEARPAGEFLAG(Reserved, reserved)
 PAGEFLAG(SwapBacked, swapbacked) __CLEARPAGEFLAG(SwapBacked, swapbacked)
+	__SETPAGEFLAG(SwapBacked, swapbacked)
 
 __PAGEFLAG(SlobFree, slob_free)
-
-__PAGEFLAG(SlubFrozen, slub_frozen)
-__PAGEFLAG(SlubDebug, slub_debug)
 
 /*
  * Private page markings that may be used by the filesystem that owns the page
@@ -230,17 +236,23 @@ PAGEFLAG(Private, private) __SETPAGEFLAG(Private, private)
 PAGEFLAG(Private2, private_2) TESTSCFLAG(Private2, private_2)
 PAGEFLAG(OwnerPriv1, owner_priv_1) TESTCLEARFLAG(OwnerPriv1, owner_priv_1)
 
+#if defined(CONFIG_IDLE_PAGE_TRACKING) && defined(CONFIG_64BIT)
+TESTPAGEFLAG(Young, young)
+SETPAGEFLAG(Young, young)
+TESTCLEARFLAG(Young, young)
+PAGEFLAG(Idle, idle)
+#endif
+
 /*
  * Only test-and-set exist for PG_writeback.  The unconditional operators are
  * risky: they bypass page accounting.
  */
 TESTPAGEFLAG(Writeback, writeback) TESTSCFLAG(Writeback, writeback)
-__PAGEFLAG(Buddy, buddy)
 PAGEFLAG(MappedToDisk, mappedtodisk)
 
-/* PG_readahead is only used for file reads; PG_reclaim is only for writes */
+/* PG_readahead is only used for reads; PG_reclaim is only for writes */
 PAGEFLAG(Reclaim, reclaim) TESTCLEARFLAG(Reclaim, reclaim)
-PAGEFLAG(Readahead, reclaim)		/* Reminder to do async read-ahead */
+PAGEFLAG(Readahead, reclaim) TESTCLEARFLAG(Readahead, reclaim)
 
 #ifdef CONFIG_HIGHMEM
 /*
@@ -256,7 +268,6 @@ PAGEFLAG_FALSE(HighMem)
 PAGEFLAG(SwapCache, swapcache)
 #else
 PAGEFLAG_FALSE(SwapCache)
-	SETPAGEFLAG_NOOP(SwapCache) CLEARPAGEFLAG_NOOP(SwapCache)
 #endif
 
 PAGEFLAG(Unevictable, unevictable) __CLEARPAGEFLAG(Unevictable, unevictable)
@@ -266,8 +277,8 @@ PAGEFLAG(Unevictable, unevictable) __CLEARPAGEFLAG(Unevictable, unevictable)
 PAGEFLAG(Mlocked, mlocked) __CLEARPAGEFLAG(Mlocked, mlocked)
 	TESTSCFLAG(Mlocked, mlocked) __TESTCLEARFLAG(Mlocked, mlocked)
 #else
-PAGEFLAG_FALSE(Mlocked) SETPAGEFLAG_NOOP(Mlocked)
-	TESTCLEARFLAG_FALSE(Mlocked) __TESTCLEARFLAG_FALSE(Mlocked)
+PAGEFLAG_FALSE(Mlocked) __CLEARPAGEFLAG_NOOP(Mlocked)
+	TESTSCFLAG_FALSE(Mlocked) __TESTCLEARFLAG_FALSE(Mlocked)
 #endif
 
 #ifdef CONFIG_ARCH_USES_PG_UNCACHED
@@ -283,6 +294,50 @@ TESTSCFLAG(HWPoison, hwpoison)
 #else
 PAGEFLAG_FALSE(HWPoison)
 #define __PG_HWPOISON 0
+#endif
+
+PAGEFLAG(Kmemcg, kmemcg)
+#define __PG_KMEMCG (1UL << PG_kmemcg)
+
+/*
+ * On an anonymous page mapped into a user virtual memory area,
+ * page->mapping points to its anon_vma, not to a struct address_space;
+ * with the PAGE_MAPPING_ANON bit set to distinguish it.  See rmap.h.
+ *
+ * On an anonymous page in a VM_MERGEABLE area, if CONFIG_KSM is enabled,
+ * the PAGE_MAPPING_KSM bit may be set along with the PAGE_MAPPING_ANON bit;
+ * and then page->mapping points, not to an anon_vma, but to a private
+ * structure which KSM associates with that merged page.  See ksm.h.
+ *
+ * PAGE_MAPPING_KSM without PAGE_MAPPING_ANON is currently never used.
+ *
+ * Please note that, confusingly, "page_mapping" refers to the inode
+ * address_space which maps the page from disk; whereas "page_mapped"
+ * refers to user virtual address space into which the page is mapped.
+ */
+#define PAGE_MAPPING_ANON	1
+#define PAGE_MAPPING_KSM	2
+#define PAGE_MAPPING_FLAGS	(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM)
+
+static inline int PageAnon(struct page *page)
+{
+	return ((unsigned long)page->mapping & PAGE_MAPPING_ANON) != 0;
+}
+
+#ifdef CONFIG_KSM
+/*
+ * A KSM page is one of those write-protected "shared pages" or "merged pages"
+ * which KSM maps into multiple mms, wherever identical anonymous page content
+ * is found in VM_MERGEABLE vmas.  It's a PageAnon page, pointing not to any
+ * anon_vma, but to that page's node of the stable tree.
+ */
+static inline int PageKsm(struct page *page)
+{
+	return ((unsigned long)page->mapping & PAGE_MAPPING_FLAGS) ==
+				(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM);
+}
+#else
+TESTPAGEFLAG_FALSE(Ksm)
 #endif
 
 u64 stable_page_flags(struct page *page);
@@ -313,21 +368,13 @@ static inline void __SetPageUptodate(struct page *page)
 
 static inline void SetPageUptodate(struct page *page)
 {
-#ifdef CONFIG_S390
-	if (!test_and_set_bit(PG_uptodate, &page->flags))
-		page_clear_dirty(page);
-#else
 	/*
 	 * Memory barrier must be issued before setting the PG_uptodate bit,
 	 * so that all previous stores issued in order to bring the page
 	 * uptodate are actually visible before PageUptodate becomes true.
-	 *
-	 * s390 doesn't need an explicit smp_wmb here because the test and
-	 * set bit already provides full barriers.
 	 */
 	smp_wmb();
 	set_bit(PG_uptodate, &(page)->flags);
-#endif
 }
 
 CLEARPAGEFLAG(Uptodate, uptodate)
@@ -335,9 +382,10 @@ CLEARPAGEFLAG(Uptodate, uptodate)
 extern void cancel_dirty_page(struct page *page, unsigned int account_size);
 
 int test_clear_page_writeback(struct page *page);
-int test_set_page_writeback(struct page *page);
 int __test_set_page_writeback(struct page *page, bool keep_write);
 
+#define test_set_page_writeback(page)			\
+	__test_set_page_writeback(page, false)
 #define test_set_page_writeback_keepwrite(page)	\
 	__test_set_page_writeback(page, true)
 
@@ -429,6 +477,148 @@ static inline void ClearPageCompound(struct page *page)
 
 #endif /* !PAGEFLAGS_EXTENDED */
 
+#ifdef CONFIG_HUGETLB_PAGE
+int PageHuge(struct page *page);
+int PageHeadHuge(struct page *page);
+bool page_huge_active(struct page *page);
+#else
+TESTPAGEFLAG_FALSE(Huge)
+TESTPAGEFLAG_FALSE(HeadHuge)
+static inline bool page_huge_active(struct page *page)
+{
+       return 0;
+}
+#endif
+
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+/*
+ * PageHuge() only returns true for hugetlbfs pages, but not for
+ * normal or transparent huge pages.
+ *
+ * PageTransHuge() returns true for both transparent huge and
+ * hugetlbfs pages, but not normal pages. PageTransHuge() can only be
+ * called only in the core VM paths where hugetlbfs pages can't exist.
+ */
+static inline int PageTransHuge(struct page *page)
+{
+	VM_BUG_ON_PAGE(PageTail(page), page);
+	return PageHead(page);
+}
+
+/*
+ * PageTransCompound returns true for both transparent huge pages
+ * and hugetlbfs pages, so it should only be called when it's known
+ * that hugetlbfs pages aren't involved.
+ */
+static inline int PageTransCompound(struct page *page)
+{
+	return PageCompound(page);
+}
+
+/*
+ * PageTransTail returns true for both transparent huge pages
+ * and hugetlbfs pages, so it should only be called when it's known
+ * that hugetlbfs pages aren't involved.
+ */
+static inline int PageTransTail(struct page *page)
+{
+	return PageTail(page);
+}
+
+#else
+
+static inline int PageTransHuge(struct page *page)
+{
+	return 0;
+}
+
+static inline int PageTransCompound(struct page *page)
+{
+	return 0;
+}
+
+static inline int PageTransTail(struct page *page)
+{
+	return 0;
+}
+#endif
+
+/*
+ * For pages that are never mapped to userspace, page->mapcount may be
+ * used for storing extra information about page type. Any value used
+ * for this purpose must be <= -2, but it's better start not too close
+ * to -2 so that an underflow of the page_mapcount() won't be mistaken
+ * for a special page.
+ */
+#define PAGE_MAPCOUNT_OPS(uname, lname)					\
+static __always_inline int Page##uname(struct page *page)		\
+{									\
+	return atomic_read(&page->_mapcount) ==				\
+				PAGE_##lname##_MAPCOUNT_VALUE;		\
+}									\
+static __always_inline void __SetPage##uname(struct page *page)		\
+{									\
+	VM_BUG_ON_PAGE(atomic_read(&page->_mapcount) != -1, page);	\
+	atomic_set(&page->_mapcount, PAGE_##lname##_MAPCOUNT_VALUE);	\
+}									\
+static __always_inline void __ClearPage##uname(struct page *page)	\
+{									\
+	VM_BUG_ON_PAGE(!Page##uname(page), page);			\
+	atomic_set(&page->_mapcount, -1);				\
+}
+
+/*
+ * PageBuddy() indicate that the page is free and in the buddy system
+ * (see mm/page_alloc.c).
+ */
+#define PAGE_BUDDY_MAPCOUNT_VALUE		(-128)
+PAGE_MAPCOUNT_OPS(Buddy, BUDDY)
+
+/*
+ * PageBalloon() is set on pages that are on the balloon page list
+ * (see mm/balloon_compaction.c).
+ */
+#define PAGE_BALLOON_MAPCOUNT_VALUE		(-256)
+PAGE_MAPCOUNT_OPS(Balloon, BALLOON)
+
+/*
+ * PageOffline() indicates that the page is logically offline although the
+ * containing section is online. (e.g. inflated in a balloon driver or
+ * not onlined when onlining the section).
+ * The content of these pages is effectively stale. Such pages should not
+ * be touched (read/write/dump/save) except by their owner.
+ */
+#define PAGE_OFFLINE_MAPCOUNT_VALUE		(-512)
+PAGE_MAPCOUNT_OPS(Offline, OFFLINE)
+
+/*
+ * If network-based swap is enabled, sl*b must keep track of whether pages
+ * were allocated from pfmemalloc reserves.
+ */
+static inline int PageSlabPfmemalloc(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageSlab(page), page);
+	return PageActive(page);
+}
+
+static inline void SetPageSlabPfmemalloc(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageSlab(page), page);
+	SetPageActive(page);
+}
+
+static inline void __ClearPageSlabPfmemalloc(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageSlab(page), page);
+	__ClearPageActive(page);
+}
+
+static inline void ClearPageSlabPfmemalloc(struct page *page)
+{
+	VM_BUG_ON_PAGE(!PageSlab(page), page);
+	ClearPageActive(page);
+}
+
 #ifdef CONFIG_MMU
 #define __PG_MLOCKED		(1 << PG_mlocked)
 #else
@@ -448,7 +638,7 @@ static inline void ClearPageCompound(struct page *page)
 #define PAGE_FLAGS_CHECK_AT_FREE \
 	(1 << PG_lru	 | 1 << PG_locked    | \
 	 1 << PG_private | 1 << PG_private_2 | \
-	 1 << PG_buddy	 | 1 << PG_writeback | 1 << PG_reserved | \
+	 1 << PG_writeback | 1 << PG_reserved | \
 	 1 << PG_slab	 | 1 << PG_swapcache | 1 << PG_active | \
 	 1 << PG_unevictable | __PG_MLOCKED | __PG_HWPOISON | \
 	 __PG_COMPOUND_LOCK)

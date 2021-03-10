@@ -1,11 +1,6 @@
 addnote
-dtc
 empty.c
 hack-coff
-infblock.c
-infblock.h
-infcodes.c
-infcodes.h
 inffast.c
 inffast.h
 inffixed.h
@@ -21,6 +16,7 @@ mktree
 uImage
 cuImage.*
 dtbImage.*
+*.dtb
 treeImage.*
 zImage
 zImage.initrd
@@ -28,7 +24,6 @@ zImage.bin.*
 zImage.chrp
 zImage.coff
 zImage.holly
-zImage.iseries
 zImage.*lds
 zImage.miboot
 zImage.pmac

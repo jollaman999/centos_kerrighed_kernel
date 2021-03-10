@@ -1,5 +1,5 @@
 /*
- * 	connector.c
+ *	connector.c
  *
  * 2004+ Copyright (c) Evgeniy Polyakov <zbr@ioremap.net>
  * All rights reserved.
@@ -23,9 +23,10 @@
 #include <linux/module.h>
 #include <linux/list.h>
 #include <linux/skbuff.h>
-#include <linux/netlink.h>
+#include <net/netlink.h>
 #include <linux/moduleparam.h>
 #include <linux/connector.h>
+#include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/spinlock.h>
@@ -35,6 +36,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Evgeniy Polyakov <zbr@ioremap.net>");
 MODULE_DESCRIPTION("Generic userspace <-> kernelspace connector.");
+MODULE_ALIAS_NET_PF_PROTO(PF_NETLINK, NETLINK_CONNECTOR);
 
 static struct cn_dev cdev;
 
@@ -93,25 +95,25 @@ int cn_netlink_send(struct cn_msg *msg, u32 __group, gfp_t gfp_mask)
 	if (!netlink_has_listeners(dev->nls, group))
 		return -ESRCH;
 
-	size = NLMSG_SPACE(sizeof(*msg) + msg->len);
+	size = sizeof(*msg) + msg->len;
 
-	skb = alloc_skb(size, gfp_mask);
+	skb = nlmsg_new(size, gfp_mask);
 	if (!skb)
 		return -ENOMEM;
 
-	nlh = NLMSG_PUT(skb, 0, msg->seq, NLMSG_DONE, size - sizeof(*nlh));
+	nlh = nlmsg_put(skb, 0, msg->seq, NLMSG_DONE, size, 0);
+	if (!nlh) {
+		kfree_skb(skb);
+		return -EMSGSIZE;
+	}
 
-	data = NLMSG_DATA(nlh);
+	data = nlmsg_data(nlh);
 
 	memcpy(data, msg, sizeof(*data) + msg->len);
 
 	NETLINK_CB(skb).dst_group = group;
 
 	return netlink_broadcast(dev->nls, skb, 0, group, gfp_mask);
-
-nlmsg_failure:
-	kfree_skb(skb);
-	return -EINVAL;
 }
 EXPORT_SYMBOL_GPL(cn_netlink_send);
 
@@ -120,51 +122,29 @@ EXPORT_SYMBOL_GPL(cn_netlink_send);
  */
 static int cn_call_callback(struct sk_buff *skb)
 {
-	struct cn_callback_entry *__cbq, *__new_cbq;
+	struct cn_callback_entry *i, *cbq = NULL;
 	struct cn_dev *dev = &cdev;
-	struct cn_msg *msg = NLMSG_DATA(nlmsg_hdr(skb));
+	struct cn_msg *msg = nlmsg_data(nlmsg_hdr(skb));
+	struct netlink_skb_parms *nsp = &NETLINK_CB(skb);
 	int err = -ENODEV;
 
 	spin_lock_bh(&dev->cbdev->queue_lock);
-	list_for_each_entry(__cbq, &dev->cbdev->queue_list, callback_entry) {
-		if (cn_cb_equal(&__cbq->id.id, &msg->id)) {
-			if (likely(!work_pending(&__cbq->work) &&
-					__cbq->data.skb == NULL)) {
-				__cbq->data.skb = skb;
-
-				if (queue_cn_work(__cbq, &__cbq->work))
-					err = 0;
-				else
-					err = -EINVAL;
-			} else {
-				struct cn_callback_data *d;
-
-				err = -ENOMEM;
-				__new_cbq = kzalloc(sizeof(struct cn_callback_entry), GFP_ATOMIC);
-				if (__new_cbq) {
-					d = &__new_cbq->data;
-					d->skb = skb;
-					d->callback = __cbq->data.callback;
-					d->free = __new_cbq;
-
-					__new_cbq->pdev = __cbq->pdev;
-
-					INIT_WORK(&__new_cbq->work,
-							&cn_queue_wrapper);
-
-					if (queue_cn_work(__new_cbq,
-						    &__new_cbq->work))
-						err = 0;
-					else {
-						kfree(__new_cbq);
-						err = -EINVAL;
-					}
-				}
-			}
+	list_for_each_entry(i, &dev->cbdev->queue_list, callback_entry) {
+		if (cn_cb_equal(&i->id.id, &msg->id)) {
+			atomic_inc(&i->refcnt);
+			cbq = i;
 			break;
 		}
 	}
 	spin_unlock_bh(&dev->cbdev->queue_lock);
+
+	if (cbq != NULL) {
+		err = 0;
+		cbq->callback(msg, nsp);
+		kfree_skb(skb);
+		cn_queue_release_callback(cbq);
+		err = 0;
+	}
 
 	return err;
 }
@@ -177,17 +157,18 @@ static int cn_call_callback(struct sk_buff *skb)
 static void cn_rx_skb(struct sk_buff *__skb)
 {
 	struct nlmsghdr *nlh;
-	int err;
 	struct sk_buff *skb;
+	int len, err;
 
 	skb = skb_get(__skb);
 
-	if (skb->len >= NLMSG_SPACE(0)) {
+	if (skb->len >= NLMSG_HDRLEN) {
 		nlh = nlmsg_hdr(skb);
+		len = nlmsg_len(nlh);
 
-		if (nlh->nlmsg_len < sizeof(struct cn_msg) ||
+		if (len < (int)sizeof(struct cn_msg) ||
 		    skb->len < nlh->nlmsg_len ||
-		    nlh->nlmsg_len > CONNECTOR_MAX_MSG_SIZE) {
+		    len > CONNECTOR_MAX_MSG_SIZE) {
 			kfree_skb(skb);
 			return;
 		}
@@ -204,8 +185,9 @@ static void cn_rx_skb(struct sk_buff *__skb)
  *
  * May sleep.
  */
-int cn_add_callback(struct cb_id *id, char *name,
-		    void (*callback)(struct cn_msg *, struct netlink_skb_parms *))
+int cn_add_callback(struct cb_id *id, const char *name,
+		    void (*callback)(struct cn_msg *,
+				     struct netlink_skb_parms *))
 {
 	int err;
 	struct cn_dev *dev = &cdev;
@@ -271,15 +253,19 @@ static const struct file_operations cn_file_ops = {
 	.release = single_release
 };
 
-static int __devinit cn_init(void)
+static struct cn_dev cdev = {
+	.input   = cn_rx_skb,
+};
+
+static int cn_init(void)
 {
 	struct cn_dev *dev = &cdev;
+	struct netlink_kernel_cfg cfg = {
+		.groups	= CN_NETLINK_USERS + 0xf,
+		.input	= dev->input,
+	};
 
-	dev->input = cn_rx_skb;
-
-	dev->nls = netlink_kernel_create(&init_net, NETLINK_CONNECTOR,
-					 CN_NETLINK_USERS + 0xf,
-					 dev->input, NULL, THIS_MODULE);
+	dev->nls = netlink_kernel_create(&init_net, NETLINK_CONNECTOR, &cfg);
 	if (!dev->nls)
 		return -EIO;
 
@@ -291,18 +277,18 @@ static int __devinit cn_init(void)
 
 	cn_already_initialized = 1;
 
-	proc_net_fops_create(&init_net, "connector", S_IRUGO, &cn_file_ops);
+	proc_create("connector", S_IRUGO, init_net.proc_net, &cn_file_ops);
 
 	return 0;
 }
 
-static void __devexit cn_fini(void)
+static void cn_fini(void)
 {
 	struct cn_dev *dev = &cdev;
 
 	cn_already_initialized = 0;
 
-	proc_net_remove(&init_net, "connector");
+	remove_proc_entry("connector", init_net.proc_net);
 
 	cn_queue_free_dev(dev->cbdev);
 	netlink_kernel_release(dev->nls);

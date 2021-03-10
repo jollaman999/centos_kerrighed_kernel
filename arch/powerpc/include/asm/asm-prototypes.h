@@ -18,7 +18,7 @@
 /* SMP */
 extern struct thread_info *current_set[NR_CPUS];
 extern struct thread_info *secondary_ti;
-int start_secondary(void *unused);
+void start_secondary(void *unused);
 
 /* kexec */
 struct paca_struct;
@@ -76,7 +76,9 @@ void __kprobes emulation_assist_interrupt(struct pt_regs *regs);
 extern s32 patch__call_flush_count_cache;
 extern s32 patch__flush_count_cache_return;
 extern s32 patch__flush_link_stack_return;
+extern s32 patch__call_kvm_flush_link_stack;
 
 extern long flush_count_cache;
+extern long kvm_flush_link_stack;
 
 #endif /* _ASM_POWERPC_ASM_PROTOTYPES_H */

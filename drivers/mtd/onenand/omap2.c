@@ -34,34 +34,34 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/io.h>
+#include <linux/slab.h>
+#include <linux/regulator/consumer.h>
 
 #include <asm/mach/flash.h>
-#include <mach/gpmc.h>
-#include <mach/onenand.h>
-#include <mach/gpio.h>
+#include <linux/platform_data/mtd-onenand-omap2.h>
+#include <asm/gpio.h>
 
-#include <mach/dma.h>
-
-#include <mach/board.h>
+#include <linux/omap-dma.h>
 
 #define DRIVER_NAME "omap2-onenand"
 
-#define ONENAND_IO_SIZE		SZ_128K
 #define ONENAND_BUFRAM_SIZE	(1024 * 5)
 
 struct omap2_onenand {
 	struct platform_device *pdev;
 	int gpmc_cs;
 	unsigned long phys_base;
+	unsigned int mem_size;
 	int gpio_irq;
 	struct mtd_info mtd;
-	struct mtd_partition *parts;
 	struct onenand_chip onenand;
 	struct completion irq_done;
 	struct completion dma_done;
 	int dma_channel;
 	int freq;
-	int (*setup)(void __iomem *base, int freq);
+	int (*setup)(void __iomem *base, int *freq_ptr);
+	struct regulator *regulator;
+	u8 flags;
 };
 
 static void omap2_onenand_dma_cb(int lch, u16 ch_status, void *data)
@@ -107,15 +107,30 @@ static void wait_warn(char *msg, int state, unsigned int ctrl,
 static int omap2_onenand_wait(struct mtd_info *mtd, int state)
 {
 	struct omap2_onenand *c = container_of(mtd, struct omap2_onenand, mtd);
+	struct onenand_chip *this = mtd->priv;
 	unsigned int intr = 0;
-	unsigned int ctrl;
+	unsigned int ctrl, ctrl_mask;
 	unsigned long timeout;
 	u32 syscfg;
 
-	if (state == FL_RESETING) {
-		int i;
+	if (state == FL_RESETING || state == FL_PREPARING_ERASE ||
+	    state == FL_VERIFYING_ERASE) {
+		int i = 21;
+		unsigned int intr_flags = ONENAND_INT_MASTER;
 
-		for (i = 0; i < 20; i++) {
+		switch (state) {
+		case FL_RESETING:
+			intr_flags |= ONENAND_INT_RESET;
+			break;
+		case FL_PREPARING_ERASE:
+			intr_flags |= ONENAND_INT_ERASE;
+			break;
+		case FL_VERIFYING_ERASE:
+			i = 101;
+			break;
+		}
+
+		while (--i) {
 			udelay(1);
 			intr = read_reg(c, ONENAND_REG_INTERRUPT);
 			if (intr & ONENAND_INT_MASTER)
@@ -126,11 +141,9 @@ static int omap2_onenand_wait(struct mtd_info *mtd, int state)
 			wait_err("controller error", state, ctrl, intr);
 			return -EIO;
 		}
-		if (!(intr & ONENAND_INT_RESET)) {
-			wait_err("timeout", state, ctrl, intr);
-			return -EIO;
-		}
-		return 0;
+		if ((intr & intr_flags) == intr_flags)
+			return 0;
+		/* Continue in wait for interrupt branch */
 	}
 
 	if (state != FL_READING) {
@@ -141,7 +154,7 @@ static int omap2_onenand_wait(struct mtd_info *mtd, int state)
 		if (!(syscfg & ONENAND_SYS_CFG1_IOBE)) {
 			syscfg |= ONENAND_SYS_CFG1_IOBE;
 			write_reg(c, syscfg, ONENAND_REG_SYS_CFG1);
-			if (cpu_is_omap34xx())
+			if (c->flags & ONENAND_IN_OMAP34XX)
 				/* Add a delay to let GPIO settle */
 				syscfg = read_reg(c, ONENAND_REG_SYS_CFG1);
 		}
@@ -165,7 +178,8 @@ retry:
 			if (result == 0) {
 				/* Timeout after 20ms */
 				ctrl = read_reg(c, ONENAND_REG_CTRL_STATUS);
-				if (ctrl & ONENAND_CTRL_ONGO) {
+				if (ctrl & ONENAND_CTRL_ONGO &&
+				    !this->ongoing) {
 					/*
 					 * The operation seems to be still going
 					 * so give it some more time.
@@ -254,7 +268,11 @@ retry:
 		return -EIO;
 	}
 
-	if (ctrl & 0xFE9F)
+	ctrl_mask = 0xFE9F;
+	if (this->ongoing)
+		ctrl_mask &= ~0x8000;
+
+	if (ctrl & ctrl_mask)
 		wait_warn("unexpected controller status", state, ctrl, intr);
 
 	return 0;
@@ -294,7 +312,7 @@ static int omap3_onenand_read_bufferram(struct mtd_info *mtd, int area,
 		goto out_copy;
 
 	/* panic_write() may be in an interrupt context */
-	if (in_interrupt())
+	if (in_interrupt() || oops_in_progress)
 		goto out_copy;
 
 	if (buf >= high_memory) {
@@ -371,7 +389,7 @@ static int omap3_onenand_write_bufferram(struct mtd_info *mtd, int area,
 		goto out_copy;
 
 	/* panic_write() may be in an interrupt context */
-	if (in_interrupt())
+	if (in_interrupt() || oops_in_progress)
 		goto out_copy;
 
 	if (buf >= high_memory) {
@@ -388,7 +406,7 @@ static int omap3_onenand_write_bufferram(struct mtd_info *mtd, int area,
 
 	dma_src = dma_map_single(&c->pdev->dev, buf, count, DMA_TO_DEVICE);
 	dma_dst = c->phys_base + bram_offset;
-	if (dma_mapping_error(&c->pdev->dev, dma_dst)) {
+	if (dma_mapping_error(&c->pdev->dev, dma_src)) {
 		dev_err(&c->pdev->dev,
 			"Couldn't DMA map a %d byte buffer\n",
 			count);
@@ -411,7 +429,7 @@ static int omap3_onenand_write_bufferram(struct mtd_info *mtd, int area,
 		if (*done)
 			break;
 
-	dma_unmap_single(&c->pdev->dev, dma_dst, count, DMA_TO_DEVICE);
+	dma_unmap_single(&c->pdev->dev, dma_src, count, DMA_TO_DEVICE);
 
 	if (!*done) {
 		dev_err(&c->pdev->dev, "timeout waiting for DMA\n");
@@ -427,13 +445,19 @@ out_copy:
 
 #else
 
-int omap3_onenand_read_bufferram(struct mtd_info *mtd, int area,
-				 unsigned char *buffer, int offset,
-				 size_t count);
+static int omap3_onenand_read_bufferram(struct mtd_info *mtd, int area,
+					unsigned char *buffer, int offset,
+					size_t count)
+{
+	return -ENOSYS;
+}
 
-int omap3_onenand_write_bufferram(struct mtd_info *mtd, int area,
-				  const unsigned char *buffer,
-				  int offset, size_t count);
+static int omap3_onenand_write_bufferram(struct mtd_info *mtd, int area,
+					 const unsigned char *buffer,
+					 int offset, size_t count)
+{
+	return -ENOSYS;
+}
 
 #endif
 
@@ -506,7 +530,7 @@ static int omap2_onenand_write_bufferram(struct mtd_info *mtd, int area,
 	dma_src = dma_map_single(&c->pdev->dev, (void *) buffer, count,
 				 DMA_TO_DEVICE);
 	dma_dst = c->phys_base + bram_offset;
-	if (dma_mapping_error(&c->pdev->dev, dma_dst)) {
+	if (dma_mapping_error(&c->pdev->dev, dma_src)) {
 		dev_err(&c->pdev->dev,
 			"Couldn't DMA map a %d byte buffer\n",
 			count);
@@ -524,20 +548,26 @@ static int omap2_onenand_write_bufferram(struct mtd_info *mtd, int area,
 	omap_start_dma(c->dma_channel);
 	wait_for_completion(&c->dma_done);
 
-	dma_unmap_single(&c->pdev->dev, dma_dst, count, DMA_TO_DEVICE);
+	dma_unmap_single(&c->pdev->dev, dma_src, count, DMA_TO_DEVICE);
 
 	return 0;
 }
 
 #else
 
-int omap2_onenand_read_bufferram(struct mtd_info *mtd, int area,
-				 unsigned char *buffer, int offset,
-				 size_t count);
+static int omap2_onenand_read_bufferram(struct mtd_info *mtd, int area,
+					unsigned char *buffer, int offset,
+					size_t count)
+{
+	return -ENOSYS;
+}
 
-int omap2_onenand_write_bufferram(struct mtd_info *mtd, int area,
-				  const unsigned char *buffer,
-				  int offset, size_t count);
+static int omap2_onenand_write_bufferram(struct mtd_info *mtd, int area,
+					 const unsigned char *buffer,
+					 int offset, size_t count)
+{
+	return -ENOSYS;
+}
 
 #endif
 
@@ -554,7 +584,7 @@ static int __adjust_timing(struct device *dev, void *data)
 
 	/* DMA is not in use so this is all that is needed */
 	/* Revisit for OMAP3! */
-	ret = c->setup(c->onenand.base, c->freq);
+	ret = c->setup(c->onenand.base, &c->freq);
 
 	return ret;
 }
@@ -576,11 +606,38 @@ static void omap2_onenand_shutdown(struct platform_device *pdev)
 	memset((__force void *)c->onenand.base, 0, ONENAND_BUFRAM_SIZE);
 }
 
-static int __devinit omap2_onenand_probe(struct platform_device *pdev)
+static int omap2_onenand_enable(struct mtd_info *mtd)
+{
+	int ret;
+	struct omap2_onenand *c = container_of(mtd, struct omap2_onenand, mtd);
+
+	ret = regulator_enable(c->regulator);
+	if (ret != 0)
+		dev_err(&c->pdev->dev, "can't enable regulator\n");
+
+	return ret;
+}
+
+static int omap2_onenand_disable(struct mtd_info *mtd)
+{
+	int ret;
+	struct omap2_onenand *c = container_of(mtd, struct omap2_onenand, mtd);
+
+	ret = regulator_disable(c->regulator);
+	if (ret != 0)
+		dev_err(&c->pdev->dev, "can't disable regulator\n");
+
+	return ret;
+}
+
+static int omap2_onenand_probe(struct platform_device *pdev)
 {
 	struct omap_onenand_platform_data *pdata;
 	struct omap2_onenand *c;
+	struct onenand_chip *this;
 	int r;
+	struct resource *res;
+	struct mtd_part_parser_data ppdata = {};
 
 	pdata = pdev->dev.platform_data;
 	if (pdata == NULL) {
@@ -594,6 +651,7 @@ static int __devinit omap2_onenand_probe(struct platform_device *pdev)
 
 	init_completion(&c->irq_done);
 	init_completion(&c->dma_done);
+	c->flags = pdata->flags;
 	c->gpmc_cs = pdata->cs;
 	c->gpio_irq = pdata->gpio_irq;
 	c->dma_channel = pdata->dma_channel;
@@ -602,27 +660,31 @@ static int __devinit omap2_onenand_probe(struct platform_device *pdev)
 		c->gpio_irq = 0;
 	}
 
-	r = gpmc_cs_request(c->gpmc_cs, ONENAND_IO_SIZE, &c->phys_base);
-	if (r < 0) {
-		dev_err(&pdev->dev, "Cannot request GPMC CS\n");
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (res == NULL) {
+		r = -EINVAL;
+		dev_err(&pdev->dev, "error getting memory resource\n");
 		goto err_kfree;
 	}
 
-	if (request_mem_region(c->phys_base, ONENAND_IO_SIZE,
+	c->phys_base = res->start;
+	c->mem_size = resource_size(res);
+
+	if (request_mem_region(c->phys_base, c->mem_size,
 			       pdev->dev.driver->name) == NULL) {
-		dev_err(&pdev->dev, "Cannot reserve memory region at 0x%08lx, "
-			"size: 0x%x\n",	c->phys_base, ONENAND_IO_SIZE);
+		dev_err(&pdev->dev, "Cannot reserve memory region at 0x%08lx, size: 0x%x\n",
+						c->phys_base, c->mem_size);
 		r = -EBUSY;
-		goto err_free_cs;
+		goto err_kfree;
 	}
-	c->onenand.base = ioremap(c->phys_base, ONENAND_IO_SIZE);
+	c->onenand.base = ioremap(c->phys_base, c->mem_size);
 	if (c->onenand.base == NULL) {
 		r = -ENOMEM;
 		goto err_release_mem_region;
 	}
 
 	if (pdata->onenand_setup != NULL) {
-		r = pdata->onenand_setup(c->onenand.base, c->freq);
+		r = pdata->onenand_setup(c->onenand.base, &c->freq);
 		if (r < 0) {
 			dev_err(&pdev->dev, "Onenand platform setup failed: "
 				"%d\n", r);
@@ -667,8 +729,8 @@ static int __devinit omap2_onenand_probe(struct platform_device *pdev)
 	}
 
 	dev_info(&pdev->dev, "initializing on CS%d, phys base 0x%08lx, virtual "
-		 "base %p\n", c->gpmc_cs, c->phys_base,
-		 c->onenand.base);
+		 "base %p, freq %d MHz\n", c->gpmc_cs, c->phys_base,
+		 c->onenand.base, c->freq);
 
 	c->pdev = pdev;
 	c->mtd.name = dev_name(&pdev->dev);
@@ -677,11 +739,10 @@ static int __devinit omap2_onenand_probe(struct platform_device *pdev)
 
 	c->mtd.dev.parent = &pdev->dev;
 
+	this = &c->onenand;
 	if (c->dma_channel >= 0) {
-		struct onenand_chip *this = &c->onenand;
-
 		this->wait = omap2_onenand_wait;
-		if (cpu_is_omap34xx()) {
+		if (c->flags & ONENAND_IN_OMAP34XX) {
 			this->read_bufferram = omap3_onenand_read_bufferram;
 			this->write_bufferram = omap3_onenand_write_bufferram;
 		} else {
@@ -690,32 +751,28 @@ static int __devinit omap2_onenand_probe(struct platform_device *pdev)
 		}
 	}
 
-	if ((r = onenand_scan(&c->mtd, 1)) < 0)
-		goto err_release_dma;
-
-	switch ((c->onenand.version_id >> 4) & 0xf) {
-	case 0:
-		c->freq = 40;
-		break;
-	case 1:
-		c->freq = 54;
-		break;
-	case 2:
-		c->freq = 66;
-		break;
-	case 3:
-		c->freq = 83;
-		break;
+	if (pdata->regulator_can_sleep) {
+		c->regulator = regulator_get(&pdev->dev, "vonenand");
+		if (IS_ERR(c->regulator)) {
+			dev_err(&pdev->dev,  "Failed to get regulator\n");
+			r = PTR_ERR(c->regulator);
+			goto err_release_dma;
+		}
+		c->onenand.enable = omap2_onenand_enable;
+		c->onenand.disable = omap2_onenand_disable;
 	}
 
-#ifdef CONFIG_MTD_PARTITIONS
-	if (pdata->parts != NULL)
-		r = add_mtd_partitions(&c->mtd, pdata->parts,
-				       pdata->nr_parts);
-	else
-#endif
-		r = add_mtd_device(&c->mtd);
-	if (r < 0)
+	if (pdata->skip_initial_unlocking)
+		this->options |= ONENAND_SKIP_INITIAL_UNLOCKING;
+
+	if ((r = onenand_scan(&c->mtd, 1)) < 0)
+		goto err_release_regulator;
+
+	ppdata.of_node = pdata->of_node;
+	r = mtd_device_parse_register(&c->mtd, NULL, &ppdata,
+				      pdata ? pdata->parts : NULL,
+				      pdata ? pdata->nr_parts : 0);
+	if (r)
 		goto err_release_onenand;
 
 	platform_set_drvdata(pdev, c);
@@ -724,6 +781,8 @@ static int __devinit omap2_onenand_probe(struct platform_device *pdev)
 
 err_release_onenand:
 	onenand_release(&c->mtd);
+err_release_regulator:
+	regulator_put(c->regulator);
 err_release_dma:
 	if (c->dma_channel != -1)
 		omap_free_dma(c->dma_channel);
@@ -735,31 +794,19 @@ err_release_gpio:
 err_iounmap:
 	iounmap(c->onenand.base);
 err_release_mem_region:
-	release_mem_region(c->phys_base, ONENAND_IO_SIZE);
-err_free_cs:
-	gpmc_cs_free(c->gpmc_cs);
+	release_mem_region(c->phys_base, c->mem_size);
 err_kfree:
 	kfree(c);
 
 	return r;
 }
 
-static int __devexit omap2_onenand_remove(struct platform_device *pdev)
+static int omap2_onenand_remove(struct platform_device *pdev)
 {
 	struct omap2_onenand *c = dev_get_drvdata(&pdev->dev);
 
-	BUG_ON(c == NULL);
-
-#ifdef CONFIG_MTD_PARTITIONS
-	if (c->parts)
-		del_mtd_partitions(&c->mtd);
-	else
-		del_mtd_device(&c->mtd);
-#else
-	del_mtd_device(&c->mtd);
-#endif
-
 	onenand_release(&c->mtd);
+	regulator_put(c->regulator);
 	if (c->dma_channel != -1)
 		omap_free_dma(c->dma_channel);
 	omap2_onenand_shutdown(pdev);
@@ -769,8 +816,7 @@ static int __devexit omap2_onenand_remove(struct platform_device *pdev)
 		gpio_free(c->gpio_irq);
 	}
 	iounmap(c->onenand.base);
-	release_mem_region(c->phys_base, ONENAND_IO_SIZE);
-	gpmc_cs_free(c->gpmc_cs);
+	release_mem_region(c->phys_base, c->mem_size);
 	kfree(c);
 
 	return 0;
@@ -778,7 +824,7 @@ static int __devexit omap2_onenand_remove(struct platform_device *pdev)
 
 static struct platform_driver omap2_onenand_driver = {
 	.probe		= omap2_onenand_probe,
-	.remove		= __devexit_p(omap2_onenand_remove),
+	.remove		= omap2_onenand_remove,
 	.shutdown	= omap2_onenand_shutdown,
 	.driver		= {
 		.name	= DRIVER_NAME,
@@ -786,21 +832,9 @@ static struct platform_driver omap2_onenand_driver = {
 	},
 };
 
-static int __init omap2_onenand_init(void)
-{
-	printk(KERN_INFO "OneNAND driver initializing\n");
-	return platform_driver_register(&omap2_onenand_driver);
-}
+module_platform_driver(omap2_onenand_driver);
 
-static void __exit omap2_onenand_exit(void)
-{
-	platform_driver_unregister(&omap2_onenand_driver);
-}
-
-module_init(omap2_onenand_init);
-module_exit(omap2_onenand_exit);
-
-MODULE_ALIAS(DRIVER_NAME);
+MODULE_ALIAS("platform:" DRIVER_NAME);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Jarkko Lavinen <jarkko.lavinen@nokia.com>");
 MODULE_DESCRIPTION("Glue layer for OneNAND flash on OMAP2 / OMAP3");

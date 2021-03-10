@@ -14,8 +14,10 @@
 #include <asm/current.h>
 #include <asm/asm-offsets.h>
 #include <asm/thread_info.h>
-#include <asm/cpufeature.h>
+#include <asm/cpufeatures.h>
 #include <asm/alternative-asm.h>
+#include <asm/asm.h>
+#include <asm/smap.h>
 
 /*
  * By placing feature2 after feature1 in altinstructions section, we logically
@@ -37,8 +39,8 @@
 	.previous
 
 	.section .altinstructions,"a"
-	altinstruction_entry 0b,2b,\feature1,5,5,0
-	altinstruction_entry 0b,3b,\feature2,5,5,0
+	altinstruction_entry 0b,2b,\feature1,5,5
+	altinstruction_entry 0b,3b,\feature2,5,5
 	.previous
 	.endm
 
@@ -63,43 +65,40 @@
 	jmp copy_user_handle_tail
 	.previous
 
-	.section __ex_table,"a"
-	.align 8
-	.quad 100b,103b
-	.quad 101b,103b
-	.previous
+	_ASM_EXTABLE(100b,103b)
+	_ASM_EXTABLE(101b,103b)
 #endif
 	.endm
 
 /* Standard copy_to_user with segment limit checking */
-ENTRY(copy_to_user)
+ENTRY(_copy_to_user)
 	CFI_STARTPROC
 	GET_THREAD_INFO(%rax)
 	movq %rdi,%rcx
 	addq %rdx,%rcx
 	jc bad_to_user
 	cmpq TI_addr_limit(%rax),%rcx
-	jae bad_to_user
+	ja bad_to_user
 	ALTERNATIVE_JUMP X86_FEATURE_REP_GOOD,X86_FEATURE_ERMS,	\
 		copy_user_generic_unrolled,copy_user_generic_string,	\
 		copy_user_enhanced_fast_string
 	CFI_ENDPROC
-ENDPROC(copy_to_user)
+ENDPROC(_copy_to_user)
 
 /* Standard copy_from_user with segment limit checking */
-ENTRY(copy_from_user)
+ENTRY(_copy_from_user)
 	CFI_STARTPROC
 	GET_THREAD_INFO(%rax)
 	movq %rsi,%rcx
 	addq %rdx,%rcx
 	jc bad_from_user
 	cmpq TI_addr_limit(%rax),%rcx
-	jae bad_from_user
+	ja bad_from_user
 	ALTERNATIVE_JUMP X86_FEATURE_REP_GOOD,X86_FEATURE_ERMS,	\
 		copy_user_generic_unrolled,copy_user_generic_string,	\
 		copy_user_enhanced_fast_string
 	CFI_ENDPROC
-ENDPROC(copy_from_user)
+ENDPROC(_copy_from_user)
 
 	.section .fixup,"ax"
 	/* must zero dest */
@@ -128,10 +127,11 @@ ENDPROC(bad_from_user)
  * rdx count
  *
  * Output:
- * eax uncopied bytes or 0 if successfull.
+ * eax uncopied bytes or 0 if successful.
  */
 ENTRY(copy_user_generic_unrolled)
 	CFI_STARTPROC
+	ASM_STAC
 	cmpl $8,%edx
 	jb 20f		/* less then 8 bytes, go to byte copy loop */
 	ALIGN_DESTINATION
@@ -179,6 +179,7 @@ ENTRY(copy_user_generic_unrolled)
 	decl %ecx
 	jnz 21b
 23:	xor %eax,%eax
+	ASM_CLAC
 	ret
 
 	.section .fixup,"ax"
@@ -191,29 +192,26 @@ ENTRY(copy_user_generic_unrolled)
 60:	jmp copy_user_handle_tail /* ecx is zerorest also */
 	.previous
 
-	.section __ex_table,"a"
-	.align 8
-	.quad 1b,30b
-	.quad 2b,30b
-	.quad 3b,30b
-	.quad 4b,30b
-	.quad 5b,30b
-	.quad 6b,30b
-	.quad 7b,30b
-	.quad 8b,30b
-	.quad 9b,30b
-	.quad 10b,30b
-	.quad 11b,30b
-	.quad 12b,30b
-	.quad 13b,30b
-	.quad 14b,30b
-	.quad 15b,30b
-	.quad 16b,30b
-	.quad 18b,40b
-	.quad 19b,40b
-	.quad 21b,50b
-	.quad 22b,50b
-	.previous
+	_ASM_EXTABLE(1b,30b)
+	_ASM_EXTABLE(2b,30b)
+	_ASM_EXTABLE(3b,30b)
+	_ASM_EXTABLE(4b,30b)
+	_ASM_EXTABLE(5b,30b)
+	_ASM_EXTABLE(6b,30b)
+	_ASM_EXTABLE(7b,30b)
+	_ASM_EXTABLE(8b,30b)
+	_ASM_EXTABLE(9b,30b)
+	_ASM_EXTABLE(10b,30b)
+	_ASM_EXTABLE(11b,30b)
+	_ASM_EXTABLE(12b,30b)
+	_ASM_EXTABLE(13b,30b)
+	_ASM_EXTABLE(14b,30b)
+	_ASM_EXTABLE(15b,30b)
+	_ASM_EXTABLE(16b,30b)
+	_ASM_EXTABLE(18b,40b)
+	_ASM_EXTABLE(19b,40b)
+	_ASM_EXTABLE(21b,50b)
+	_ASM_EXTABLE(22b,50b)
 	CFI_ENDPROC
 ENDPROC(copy_user_generic_unrolled)
 
@@ -237,6 +235,7 @@ ENDPROC(copy_user_generic_unrolled)
  */
 ENTRY(copy_user_generic_string)
 	CFI_STARTPROC
+	ASM_STAC
 	andl %edx,%edx
 	jz 4f
 	cmpl $8,%edx
@@ -251,6 +250,7 @@ ENTRY(copy_user_generic_string)
 3:	rep
 	movsb
 4:	xorl %eax,%eax
+	ASM_CLAC
 	ret
 
 	.section .fixup,"ax"
@@ -259,11 +259,8 @@ ENTRY(copy_user_generic_string)
 	jmp copy_user_handle_tail
 	.previous
 
-	.section __ex_table,"a"
-	.align 8
-	.quad 1b,11b
-	.quad 3b,12b
-	.previous
+	_ASM_EXTABLE(1b,11b)
+	_ASM_EXTABLE(3b,12b)
 	CFI_ENDPROC
 ENDPROC(copy_user_generic_string)
 
@@ -281,12 +278,14 @@ ENDPROC(copy_user_generic_string)
  */
 ENTRY(copy_user_enhanced_fast_string)
 	CFI_STARTPROC
+	ASM_STAC
 	andl %edx,%edx
 	jz 2f
 	movl %edx,%ecx
 1:	rep
 	movsb
 2:	xorl %eax,%eax
+	ASM_CLAC
 	ret
 
 	.section .fixup,"ax"
@@ -294,9 +293,6 @@ ENTRY(copy_user_enhanced_fast_string)
 	jmp copy_user_handle_tail
 	.previous
 
-	.section __ex_table,"a"
-	.align 8
-	.quad 1b,12b
-	.previous
+	_ASM_EXTABLE(1b,12b)
 	CFI_ENDPROC
 ENDPROC(copy_user_enhanced_fast_string)

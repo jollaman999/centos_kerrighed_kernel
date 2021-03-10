@@ -10,6 +10,7 @@
 #include <linux/mm.h>
 #include <linux/pagemap.h>
 #include <linux/vmalloc.h>
+#include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/dm-io.h>
 
@@ -69,8 +70,7 @@ static void transient_usage(struct dm_exception_store *store,
 	*metadata_sectors = 0;
 }
 
-static int transient_ctr(struct dm_exception_store *store,
-			 unsigned argc, char **argv)
+static int transient_ctr(struct dm_exception_store *store, char *options)
 {
 	struct transient_c *tc;
 

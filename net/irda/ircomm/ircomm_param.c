@@ -28,6 +28,7 @@
  *
  ********************************************************************/
 
+#include <linux/gfp.h>
 #include <linux/workqueue.h>
 #include <linux/interrupt.h>
 
@@ -98,7 +99,6 @@ pi_param_info_t ircomm_param_info = { pi_major_call_table, 3, 0x0f, 4 };
  */
 int ircomm_param_request(struct ircomm_tty_cb *self, __u8 pi, int flush)
 {
-	struct tty_struct *tty;
 	unsigned long flags;
 	struct sk_buff *skb;
 	int count;
@@ -107,10 +107,6 @@ int ircomm_param_request(struct ircomm_tty_cb *self, __u8 pi, int flush)
 
 	IRDA_ASSERT(self != NULL, return -1;);
 	IRDA_ASSERT(self->magic == IRCOMM_TTY_MAGIC, return -1;);
-
-	tty = self->tty;
-	if (!tty)
-		return 0;
 
 	/* Make sure we don't send parameters for raw mode */
 	if (self->service_type == IRCOMM_3_WIRE_RAW)
@@ -474,7 +470,7 @@ static int ircomm_param_dce(void *instance, irda_param_t *param, int get)
 	/* Check if any of the settings have changed */
 	if (dce & 0x0f) {
 		if (dce & IRCOMM_DELTA_CTS) {
-			IRDA_DEBUG(2, "%s(), CTS \n", __func__ );
+			IRDA_DEBUG(2, "%s(), CTS\n", __func__ );
 		}
 	}
 

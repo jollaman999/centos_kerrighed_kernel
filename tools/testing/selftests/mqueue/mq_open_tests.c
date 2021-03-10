@@ -304,7 +304,7 @@ int main(int argc, char *argv[])
 		printf("\tDefault Queue Size:\t\tNot Supported\n");
 	}
 	printf("\n");
-	
+
 	validate_current_settings();
 
 	printf("Adjusted system state for testing:\n");

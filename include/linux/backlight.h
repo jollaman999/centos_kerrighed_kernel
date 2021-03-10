@@ -39,6 +39,11 @@ enum backlight_type {
 	BACKLIGHT_TYPE_MAX,
 };
 
+enum backlight_notification {
+	BACKLIGHT_REGISTERED,
+	BACKLIGHT_UNREGISTERED,
+};
+
 struct backlight_device;
 struct fb_info;
 
@@ -54,7 +59,7 @@ struct backlight_ops {
 	int (*get_brightness)(struct backlight_device *);
 	/* Check if given framebuffer device is the one bound to this backlight;
 	   return 0 if not, !=0 if it is. If NULL, backlight always matches the fb. */
-	int (*check_fb)(struct fb_info *);
+	int (*check_fb)(struct backlight_device *, struct fb_info *);
 };
 
 /* This structure defines all the properties of a backlight */
@@ -69,6 +74,8 @@ struct backlight_properties {
 	/* FB Blanking active? (values as for power) */
 	/* Due to be removed, please use (state & BL_CORE_FBBLANK) */
 	int fb_blank;
+	/* Backlight type */
+	enum backlight_type type;
 	/* Flags used to signal drivers of state changes */
 	/* Upper 4 bits are reserved for driver internal use */
 	unsigned int state;
@@ -93,7 +100,7 @@ struct backlight_device {
 	   registered this device has been unloaded, and if class_get_devdata()
 	   points to something in the body of that driver, it is also invalid. */
 	struct mutex ops_lock;
-	struct backlight_ops *ops;
+	const struct backlight_ops *ops;
 
 	/* The framebuffer notifier block */
 	struct notifier_block fb_notif;
@@ -108,9 +115,6 @@ struct backlight_device {
 
 	/* list entry of all registered backlight devices */
 	struct list_head entry;
-
-	/* Backlight type */
-	enum backlight_type type;
 #endif
 };
 
@@ -123,11 +127,14 @@ static inline void backlight_update_status(struct backlight_device *bd)
 }
 
 extern struct backlight_device *backlight_device_register(const char *name,
-	struct device *dev, void *devdata, struct backlight_ops *ops);
+	struct device *dev, void *devdata, const struct backlight_ops *ops,
+	const struct backlight_properties *props);
 extern void backlight_device_unregister(struct backlight_device *bd);
 extern void backlight_force_update(struct backlight_device *bd,
 				   enum backlight_update_reason reason);
 extern bool backlight_device_registered(enum backlight_type type);
+extern int backlight_register_notifier(struct notifier_block *nb);
+extern int backlight_unregister_notifier(struct notifier_block *nb);
 
 #define to_backlight_device(obj) container_of(obj, struct backlight_device, dev)
 
@@ -144,5 +151,15 @@ struct generic_bl_info {
 	void (*set_bl_intensity)(int intensity);
 	void (*kick_battery)(void);
 };
+
+#ifdef CONFIG_OF
+struct backlight_device *of_find_backlight_by_node(struct device_node *node);
+#else
+static inline struct backlight_device *
+of_find_backlight_by_node(struct device_node *node)
+{
+	return NULL;
+}
+#endif
 
 #endif

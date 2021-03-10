@@ -41,7 +41,7 @@ static struct nf_conntrack_expect_policy exp_policy = {
 };
 
 static int netbios_ns_help(struct sk_buff *skb, unsigned int protoff,
-                  struct nf_conn *ct, enum ip_conntrack_info ctinfo)
+		   struct nf_conn *ct, enum ip_conntrack_info ctinfo)
 {
 	return nf_conntrack_broadcast_help(skb, protoff, ct, ctinfo, timeout);
 }

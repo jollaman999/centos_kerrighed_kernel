@@ -13,6 +13,7 @@
 #include <linux/device.h>
 #include <linux/types.h>
 #include <linux/delay.h>
+#include <linux/slab.h>
 #ifdef CONFIG_W1_SLAVE_DS2433_CRC
 #include <linux/crc16.h>
 
@@ -106,7 +107,7 @@ static ssize_t w1_f23_read_bin(struct file *filp, struct kobject *kobj,
 	if ((count = w1_f23_fix_count(off, count, W1_EEPROM_SIZE)) == 0)
 		return 0;
 
-	mutex_lock(&sl->master->mutex);
+	mutex_lock(&sl->master->bus_mutex);
 
 #ifdef CONFIG_W1_SLAVE_DS2433_CRC
 
@@ -137,7 +138,7 @@ static ssize_t w1_f23_read_bin(struct file *filp, struct kobject *kobj,
 #endif	/* CONFIG_W1_SLAVE_DS2433_CRC */
 
 out_up:
-	mutex_unlock(&sl->master->mutex);
+	mutex_unlock(&sl->master->bus_mutex);
 
 	return count;
 }
@@ -232,7 +233,7 @@ static ssize_t w1_f23_write_bin(struct file *filp, struct kobject *kobj,
 	}
 #endif	/* CONFIG_W1_SLAVE_DS2433_CRC */
 
-	mutex_lock(&sl->master->mutex);
+	mutex_lock(&sl->master->bus_mutex);
 
 	/* Can only write data to one page at a time */
 	idx = 0;
@@ -250,7 +251,7 @@ static ssize_t w1_f23_write_bin(struct file *filp, struct kobject *kobj,
 	}
 
 out_up:
-	mutex_unlock(&sl->master->mutex);
+	mutex_unlock(&sl->master->bus_mutex);
 
 	return count;
 }

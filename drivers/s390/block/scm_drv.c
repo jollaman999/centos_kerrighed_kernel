@@ -9,7 +9,6 @@
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
 #include <linux/module.h>
-#include <linux/spinlock.h>
 #include <linux/slab.h>
 #include <asm/eadm.h>
 #include "scm_blk.h"
@@ -20,7 +19,7 @@ static void scm_notify(struct scm_device *scmdev, enum scm_event event)
 
 	switch (event) {
 	case SCM_CHANGE:
-		pr_info("%lu: The capabilities of the SCM increment changed\n",
+		pr_info("%lx: The capabilities of the SCM increment changed\n",
 			(unsigned long) scmdev->address);
 		SCM_LOG(2, "State changed");
 		SCM_LOG_STATE(2, scmdev);
@@ -48,15 +47,10 @@ static int scm_probe(struct scm_device *scmdev)
 	if (!bdev)
 		return -ENOMEM;
 
-	spin_lock_irq(&scmdev->lock);
 	dev_set_drvdata(&scmdev->dev, bdev);
-	spin_unlock_irq(&scmdev->lock);
-
 	ret = scm_blk_dev_setup(bdev, scmdev);
 	if (ret) {
-		spin_lock_irq(&scmdev->lock);
 		dev_set_drvdata(&scmdev->dev, NULL);
-		spin_unlock_irq(&scmdev->lock);
 		kfree(bdev);
 		goto out;
 	}
@@ -67,15 +61,10 @@ out:
 
 static int scm_remove(struct scm_device *scmdev)
 {
-	struct scm_blk_dev *bdev;
+	struct scm_blk_dev *bdev = dev_get_drvdata(&scmdev->dev);
 
-	spin_lock_irq(&scmdev->lock);
-	bdev = dev_get_drvdata(&scmdev->dev);
-	spin_unlock_irq(&scmdev->lock);
 	scm_blk_dev_cleanup(bdev);
-	spin_lock_irq(&scmdev->lock);
 	dev_set_drvdata(&scmdev->dev, NULL);
-	spin_unlock_irq(&scmdev->lock);
 	kfree(bdev);
 
 	return 0;

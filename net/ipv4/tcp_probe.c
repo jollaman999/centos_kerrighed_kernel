@@ -18,10 +18,13 @@
  * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/socket.h>
 #include <linux/tcp.h>
+#include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/module.h>
 #include <linux/ktime.h>
@@ -80,7 +83,6 @@ static struct {
 	struct tcp_log	*log;
 } tcp_probe;
 
-
 static inline int tcp_probe_used(void)
 {
 	return (tcp_probe.head - tcp_probe.tail) & (bufsize - 1);
@@ -94,41 +96,24 @@ static inline int tcp_probe_avail(void)
 #define tcp_probe_copy_fl_to_si4(inet, si4, mem)		\
 	do {							\
 		si4.sin_family = AF_INET;			\
-		si4.sin_port = inet->mem##port;			\
-		si4.sin_addr.s_addr = inet->mem##addr;		\
+		si4.sin_port = inet->inet_##mem##port;		\
+		si4.sin_addr.s_addr = inet->inet_##mem##addr;	\
 	} while (0)						\
-
-#if IS_ENABLED(CONFIG_IPV6)
-#define tcp_probe_copy_fl_to_si6(inet, si6, mem)		\
-	do {							\
-		struct ipv6_pinfo *pi6 = inet->pinet6;		\
-		si6.sin6_family = AF_INET6;			\
-		si6.sin6_port = inet->mem##port;		\
-		si6.sin6_addr = pi6->mem##addr;			\
-		si6.sin6_flowinfo = 0; /* No need here. */	\
-		si6.sin6_scope_id = 0;	/* No need here. */	\
-	} while (0)
-#else
-#define tcp_probe_copy_fl_to_si6(fl, si6, mem)			\
-	do {							\
-		memset(&si6, 0, sizeof(si6));			\
-	} while (0)
-#endif
 
 /*
  * Hook inserted to be called before each receive packet.
  * Note: arguments must match tcp_rcv_established()!
  */
-static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb,
-			       struct tcphdr *th, unsigned len)
+static void jtcp_rcv_established(struct sock *sk, struct sk_buff *skb,
+				 const struct tcphdr *th, unsigned int len)
 {
 	const struct tcp_sock *tp = tcp_sk(sk);
 	const struct inet_sock *inet = inet_sk(sk);
 
 	/* Only update if port or skb mark matches */
 	if (((port == 0 && fwmark == 0) ||
-	     ntohs(inet->dport) == port ||
-	     ntohs(inet->sport) == port ||
+	     ntohs(inet->inet_dport) == port ||
+	     ntohs(inet->inet_sport) == port ||
 	     (fwmark > 0 && skb->mark == fwmark)) &&
 	    (full || tp->snd_cwnd != tcp_probe.lastcwnd)) {
 
@@ -144,8 +129,17 @@ static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 				tcp_probe_copy_fl_to_si4(inet, p->dst.v4, d);
 				break;
 			case AF_INET6:
-				tcp_probe_copy_fl_to_si6(inet, p->src.v6, s);
-				tcp_probe_copy_fl_to_si6(inet, p->dst.v6, d);
+				memset(&p->src.v6, 0, sizeof(p->src.v6));
+				memset(&p->dst.v6, 0, sizeof(p->dst.v6));
+#if IS_ENABLED(CONFIG_IPV6)
+				p->src.v6.sin6_family = AF_INET6;
+				p->src.v6.sin6_port = inet->inet_sport;
+				p->src.v6.sin6_addr = inet6_sk(sk)->saddr;
+
+				p->dst.v6.sin6_family = AF_INET6;
+				p->dst.v6.sin6_port = inet->inet_dport;
+				p->dst.v6.sin6_addr = sk->sk_v6_daddr;
+#endif
 				break;
 			default:
 				BUG();
@@ -158,7 +152,7 @@ static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 			p->snd_wnd = tp->snd_wnd;
 			p->rcv_wnd = tp->rcv_wnd;
 			p->ssthresh = tcp_current_ssthresh(sk);
-			p->srtt = tp->srtt >> 3;
+			p->srtt = tp->srtt_us >> 3;
 
 			tcp_probe.head = (tcp_probe.head + 1) & (bufsize - 1);
 		}
@@ -169,7 +163,6 @@ static int jtcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 	}
 
 	jprobe_return();
-	return 0;
 }
 
 static struct jprobe tcp_jprobe = {
@@ -179,7 +172,7 @@ static struct jprobe tcp_jprobe = {
 	.entry	= jtcp_rcv_established,
 };
 
-static int tcpprobe_open(struct inode * inode, struct file * file)
+static int tcpprobe_open(struct inode *inode, struct file *file)
 {
 	/* Reset (empty) log */
 	spin_lock_bh(&tcp_probe.lock);
@@ -199,8 +192,8 @@ static int tcpprobe_sprint(char *tbuf, int n)
 
 	return scnprintf(tbuf, n,
 			"%lu.%09lu %pISpc %pISpc %d %#x %#x %u %u %u %u %u\n",
-			(unsigned long) tv.tv_sec,
-			(unsigned long) tv.tv_nsec,
+			(unsigned long)tv.tv_sec,
+			(unsigned long)tv.tv_nsec,
 			&p->src, &p->dst, p->length, p->snd_nxt, p->snd_una,
 			p->snd_cwnd, p->ssthresh, p->snd_wnd, p->srtt, p->rcv_wnd);
 }
@@ -255,6 +248,7 @@ static const struct file_operations tcpprobe_fops = {
 	.owner	 = THIS_MODULE,
 	.open	 = tcpprobe_open,
 	.read    = tcpprobe_read,
+	.llseek  = noop_llseek,
 };
 
 static __init int tcpprobe_init(void)
@@ -279,7 +273,7 @@ static __init int tcpprobe_init(void)
 	if (!tcp_probe.log)
 		goto err0;
 
-	if (!proc_net_fops_create(&init_net, procname, S_IRUSR, &tcpprobe_fops))
+	if (!proc_create(procname, S_IRUSR, init_net.proc_net, &tcpprobe_fops))
 		goto err0;
 
 	ret = register_jprobe(&tcp_jprobe);
@@ -290,7 +284,7 @@ static __init int tcpprobe_init(void)
 		port, fwmark, bufsize);
 	return 0;
  err1:
-	proc_net_remove(&init_net, procname);
+	remove_proc_entry(procname, init_net.proc_net);
  err0:
 	kfree(tcp_probe.log);
 	return ret;
@@ -299,7 +293,7 @@ module_init(tcpprobe_init);
 
 static __exit void tcpprobe_exit(void)
 {
-	proc_net_remove(&init_net, procname);
+	remove_proc_entry(procname, init_net.proc_net);
 	unregister_jprobe(&tcp_jprobe);
 	kfree(tcp_probe.log);
 }

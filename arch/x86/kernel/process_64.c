@@ -14,7 +14,6 @@
  * This file handles the architecture-dependent parts of process handling..
  */
 
-#include <linux/stackprotector.h>
 #include <linux/cpu.h>
 #include <linux/errno.h>
 #include <linux/sched.h>
@@ -32,14 +31,12 @@
 #include <linux/notifier.h>
 #include <linux/kprobes.h>
 #include <linux/kdebug.h>
-#include <linux/tick.h>
 #include <linux/prctl.h>
 #include <linux/uaccess.h>
 #include <linux/io.h>
 #include <linux/ftrace.h>
 
 #include <asm/pgtable.h>
-#include <asm/system.h>
 #include <asm/processor.h>
 #include <asm/i387.h>
 #include <asm/fpu-internal.h>
@@ -50,111 +47,13 @@
 #include <asm/ia32.h>
 #include <asm/idle.h>
 #include <asm/syscalls.h>
-#include <asm/spec_ctrl.h>
+#include <asm/debugreg.h>
+#include <asm/switch_to.h>
+#include <asm/intel_rdt_sched.h>
 
 asmlinkage extern void ret_from_fork(void);
 
 DEFINE_PER_CPU(unsigned long, old_rsp);
-static DEFINE_PER_CPU(unsigned char, is_idle);
-
-unsigned long kernel_thread_flags = CLONE_VM | CLONE_UNTRACED;
-
-static ATOMIC_NOTIFIER_HEAD(idle_notifier);
-
-void idle_notifier_register(struct notifier_block *n)
-{
-	atomic_notifier_chain_register(&idle_notifier, n);
-}
-EXPORT_SYMBOL_GPL(idle_notifier_register);
-
-void idle_notifier_unregister(struct notifier_block *n)
-{
-	atomic_notifier_chain_unregister(&idle_notifier, n);
-}
-EXPORT_SYMBOL_GPL(idle_notifier_unregister);
-
-void enter_idle(void)
-{
-	percpu_write(is_idle, 1);
-	atomic_notifier_call_chain(&idle_notifier, IDLE_START, NULL);
-}
-
-static void __exit_idle(void)
-{
-	if (x86_test_and_clear_bit_percpu(0, is_idle) == 0)
-		return;
-	atomic_notifier_call_chain(&idle_notifier, IDLE_END, NULL);
-}
-
-/* Called from interrupts to signify idle end */
-void exit_idle(void)
-{
-	/* idle loop has pid 0 */
-	if (current->pid)
-		return;
-	__exit_idle();
-}
-
-#ifndef CONFIG_SMP
-static inline void play_dead(void)
-{
-	BUG();
-}
-#endif
-
-/*
- * The idle thread. There's no useful work to be
- * done, so just try to conserve power and have a
- * low exit latency (ie sit in a loop waiting for
- * somebody to say that they'd like to reschedule)
- */
-void cpu_idle(void)
-{
-	current_thread_info()->status |= TS_POLLING;
-
-	/*
-	 * If we're the non-boot CPU, nothing set the stack canary up
-	 * for us.  CPU0 already has it initialized but no harm in
-	 * doing it again.  This is a good place for updating it, as
-	 * we wont ever return from this function (so the invalid
-	 * canaries already on the stack wont ever trigger).
-	 */
-	boot_init_stack_canary();
-
-	/* endless idle loop with no priority at all */
-	while (1) {
-		tick_nohz_stop_sched_tick(1);
-		spec_ctrl_ibrs_off();
-		while (!need_resched()) {
-
-			rmb();
-
-			if (cpu_is_offline(smp_processor_id()))
-				play_dead();
-			/*
-			 * Idle routines should keep interrupts disabled
-			 * from here on, until they go to idle.
-			 * Otherwise, idle callbacks can misfire.
-			 */
-			local_irq_disable();
-			enter_idle();
-			/* Don't trace irqs off for idle */
-			stop_critical_timings();
-			pm_idle();
-			start_critical_timings();
-			/* In many cases the interrupt that ended idle
-			   has already called exit_idle. But some idle
-			   loops can be woken up without interrupt. */
-			__exit_idle();
-		}
-
-		spec_ctrl_ibrs_on();
-		tick_nohz_restart_sched_tick();
-		preempt_enable_no_resched();
-		schedule();
-		preempt_disable();
-	}
-}
 
 /* Prints also some state that isn't saved in the pt_regs */
 void __show_regs(struct pt_regs *regs, int all)
@@ -164,9 +63,8 @@ void __show_regs(struct pt_regs *regs, int all)
 	unsigned int fsindex, gsindex;
 	unsigned int ds, cs, es;
 
-	show_regs_common();
 	printk(KERN_DEFAULT "RIP: %04lx:[<%016lx>] ", regs->cs & 0xffff, regs->ip);
-	printk_address(regs->ip, 1);
+	printk_address(regs->ip);
 	printk(KERN_DEFAULT "RSP: %04lx:%016lx  EFLAGS: %08lx\n", regs->ss,
 			regs->sp, regs->flags);
 	printk(KERN_DEFAULT "RAX: %016lx RBX: %016lx RCX: %016lx\n",
@@ -208,27 +106,31 @@ void __show_regs(struct pt_regs *regs, int all)
 	get_debugreg(d0, 0);
 	get_debugreg(d1, 1);
 	get_debugreg(d2, 2);
-	printk(KERN_DEFAULT "DR0: %016lx DR1: %016lx DR2: %016lx\n", d0, d1, d2);
 	get_debugreg(d3, 3);
 	get_debugreg(d6, 6);
 	get_debugreg(d7, 7);
-	printk(KERN_DEFAULT "DR3: %016lx DR6: %016lx DR7: %016lx\n", d3, d6, d7);
-}
 
-void show_regs(struct pt_regs *regs)
-{
-	show_registers(regs);
-	show_trace(NULL, regs, (void *)(regs + 1));
+	/* Only print out debug registers if they are in their non-default state. */
+	if (!((d0 == 0) && (d1 == 0) && (d2 == 0) && (d3 == 0) &&
+	    (d6 == DR6_RESERVED) && (d7 == 0x400))) {
+		printk(KERN_DEFAULT "DR0: %016lx DR1: %016lx DR2: %016lx\n",
+		       d0, d1, d2);
+		printk(KERN_DEFAULT "DR3: %016lx DR6: %016lx DR7: %016lx\n",
+		       d3, d6, d7);
+	}
+
+	if (boot_cpu_has(X86_FEATURE_OSPKE))
+		printk(KERN_DEFAULT "PKRU: %08x\n", read_pkru());
 }
 
 void release_thread(struct task_struct *dead_task)
 {
 	if (dead_task->mm) {
-		if (dead_task->mm->context.size) {
-			printk("WARNING: dead process %8s still has LDT? <%p/%d>\n",
-					dead_task->comm,
-					dead_task->mm->context.ldt,
-					dead_task->mm->context.size);
+		if (dead_task->mm->context.ldt) {
+			pr_warn("WARNING: dead process %s still has LDT? <%p/%d>\n",
+				dead_task->comm,
+				dead_task->mm->context.ldt->entries,
+				dead_task->mm->context.ldt->size);
 			BUG();
 		}
 	}
@@ -253,39 +155,20 @@ static inline u32 read_32bit_tls(struct task_struct *t, int tls)
 	return get_desc_base(&t->thread.tls_array[tls]);
 }
 
-/*
- * This gets called before we allocate a new thread and copy
- * the current task into it.
- */
-void prepare_to_copy(struct task_struct *tsk)
-{
-	unlazy_fpu(tsk);
-}
-
 int copy_thread(unsigned long clone_flags, unsigned long sp,
-		unsigned long unused,
-	struct task_struct *p, struct pt_regs *regs)
+		unsigned long arg, struct task_struct *p)
 {
 	int err;
 	struct pt_regs *childregs;
 	struct task_struct *me = current;
 
-	childregs = ((struct pt_regs *)
-			(THREAD_SIZE + task_stack_page(p))) - 1;
-	*childregs = *regs;
-
-	childregs->ax = 0;
-	childregs->sp = sp;
-	if (sp == ~0UL)
-		childregs->sp = (unsigned long)childregs;
-
+	p->thread.sp0 = (unsigned long)task_stack_page(p) + THREAD_SIZE;
+	childregs = task_pt_regs(p);
 	p->thread.sp = (unsigned long) childregs;
-	p->thread.sp0 = (unsigned long) (childregs+1);
 	p->thread.usersp = me->thread.usersp;
-
 	set_tsk_thread_flag(p, TIF_FORK);
-
 	p->fpu_counter = 0;
+	p->thread.io_bitmap_ptr = NULL;
 
 	savesegment(gs, p->thread.gsindex);
 	p->thread.gs = p->thread.gsindex ? 0 : me->thread.gs;
@@ -293,15 +176,36 @@ int copy_thread(unsigned long clone_flags, unsigned long sp,
 	p->thread.fs = p->thread.fsindex ? 0 : me->thread.fs;
 	savesegment(es, p->thread.es);
 	savesegment(ds, p->thread.ds);
+	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
+
+	if (unlikely(p->flags & PF_KTHREAD)) {
+		/* kernel thread */
+		memset(childregs, 0, sizeof(struct pt_regs));
+		childregs->sp = (unsigned long)childregs;
+		childregs->ss = __KERNEL_DS;
+		childregs->bx = sp; /* function */
+		childregs->bp = arg;
+		childregs->orig_ax = -1;
+		childregs->cs = __KERNEL_CS | get_kernel_rpl();
+		childregs->flags = X86_EFLAGS_IF | X86_EFLAGS_FIXED;
+		return 0;
+	}
+	*childregs = *current_pt_regs();
+
+	childregs->ax = 0;
+	if (sp)
+		childregs->sp = sp;
+
+	err = -ENOMEM;
+	memset(p->thread.ptrace_bps, 0, sizeof(p->thread.ptrace_bps));
 
 	if (unlikely(test_tsk_thread_flag(me, TIF_IO_BITMAP))) {
-		p->thread.io_bitmap_ptr = kmalloc(IO_BITMAP_BYTES, GFP_KERNEL);
+		p->thread.io_bitmap_ptr = kmemdup(me->thread.io_bitmap_ptr,
+						  IO_BITMAP_BYTES, GFP_KERNEL);
 		if (!p->thread.io_bitmap_ptr) {
 			p->thread.io_bitmap_max = 0;
 			return -ENOMEM;
 		}
-		memcpy(p->thread.io_bitmap_ptr, me->thread.io_bitmap_ptr,
-				IO_BITMAP_BYTES);
 		set_tsk_thread_flag(p, TIF_IO_BITMAP);
 	}
 
@@ -325,25 +229,44 @@ out:
 		kfree(p->thread.io_bitmap_ptr);
 		p->thread.io_bitmap_max = 0;
 	}
+
 	return err;
+}
+
+static void
+start_thread_common(struct pt_regs *regs, unsigned long new_ip,
+		    unsigned long new_sp,
+		    unsigned int _cs, unsigned int _ss, unsigned int _ds)
+{
+	loadsegment(fs, 0);
+	loadsegment(es, _ds);
+	loadsegment(ds, _ds);
+	load_gs_index(0);
+	current->thread.usersp	= new_sp;
+	regs->ip		= new_ip;
+	regs->sp		= new_sp;
+	this_cpu_write(old_rsp, new_sp);
+	regs->cs		= _cs;
+	regs->ss		= _ss;
+	regs->flags		= X86_EFLAGS_IF;
 }
 
 void
 start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
 {
-	loadsegment(fs, 0);
-	loadsegment(es, 0);
-	loadsegment(ds, 0);
-	load_gs_index(0);
-	regs->ip		= new_ip;
-	regs->sp		= new_sp;
-	percpu_write(old_rsp, new_sp);
-	regs->cs		= __USER_CS;
-	regs->ss		= __USER_DS;
-	regs->flags		= 0x200;
-	set_fs(USER_DS);
+	start_thread_common(regs, new_ip, new_sp,
+			    __USER_CS, __USER_DS, 0);
 }
-EXPORT_SYMBOL_GPL(start_thread);
+
+#ifdef CONFIG_IA32_EMULATION
+void start_thread_ia32(struct pt_regs *regs, u32 new_ip, u32 new_sp)
+{
+	start_thread_common(regs, new_ip, new_sp,
+			    test_thread_flag(TIF_X32)
+			    ? __USER_CS : __USER32_CS,
+			    __USER_DS, __USER_DS);
+}
+#endif
 
 /*
  *	switch_to(x,y) should switch tasks from x to y.
@@ -366,11 +289,6 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	fpu_switch_t fpu;
 
 	fpu = switch_fpu_prepare(prev_p, next_p, cpu);
-
-#ifdef CONFIG_X86_32
-	/* Reload esp0 and ss1. */
-	load_sp0(tss, next);
-#endif
 
 	/* We must save %fs and %gs before load_TLS() because
 	 * %fs and %gs may be cleared by load_TLS().
@@ -467,7 +385,6 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 		if (fsindex)
 			prev->fs = 0;
 	}
-	/* when next process has a 64bit base use it */
 	if (next->fs)
 		wrmsrl(MSR_FS_BASE, next->fs);
 	prev->fsindex = fsindex;
@@ -488,17 +405,16 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 	/*
 	 * Switch the PDA and FPU contexts.
 	 */
-	prev->usersp = percpu_read(old_rsp);
-	percpu_write(old_rsp, next->usersp);
-	percpu_write(current_task, next_p);
+	prev->usersp = this_cpu_read(old_rsp);
+	this_cpu_write(old_rsp, next->usersp);
+	this_cpu_write(current_task, next_p);
 
-	percpu_write(kernel_stack,
+	this_cpu_write(kernel_stack,
 		  (unsigned long)task_stack_page(next_p) +
 		  THREAD_SIZE - KERNEL_STACK_OFFSET);
-	percpu_write(kernel_stack8k,
+	this_cpu_write(__kernel_stack_70__,
 		  (unsigned long)task_stack_page(next_p) +
 		  THREAD_SIZE - 8192 - KERNEL_STACK_OFFSET);
-
 
 	/*
 	 * Now maybe reload the debug registers and handle I/O bitmaps
@@ -507,26 +423,10 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 		     task_thread_info(prev_p)->flags & _TIF_WORK_CTXSW_PREV))
 		__switch_to_xtra(prev_p, next_p, tss);
 
+	/* Load the Intel cache allocation PQR MSR. */
+	intel_rdt_sched_in();
+
 	return prev_p;
-}
-
-/*
- * sys_execve() executes a new program.
- */
-asmlinkage
-long sys_execve(char __user *name, char __user * __user *argv,
-		char __user * __user *envp, struct pt_regs *regs)
-{
-	long error;
-	struct filename *filename;
-
-	filename = getname(name);
-	error = PTR_ERR(filename);
-	if (IS_ERR(filename))
-		return error;
-	error = do_execve(filename->name, argv, envp, regs);
-	putname(filename);
-	return error;
 }
 
 void set_personality_64bit(void)
@@ -535,9 +435,12 @@ void set_personality_64bit(void)
 
 	/* Make sure to be in 64bit mode */
 	clear_thread_flag(TIF_IA32);
+	clear_thread_flag(TIF_ADDR32);
+	clear_thread_flag(TIF_X32);
 
 	/* Ensure the corresponding mm is not marked. */
-	clear_bit(MMF_COMPAT, &current->mm->flags);
+	if (current->mm)
+		current->mm->context.ia32_compat = 0;
 
 	/* TBD: overwrites user setup. Should have two bits.
 	   But 64bit processes have always behaved this way,
@@ -546,29 +449,34 @@ void set_personality_64bit(void)
 	current->personality &= ~READ_IMPLIES_EXEC;
 }
 
-asmlinkage long
-sys_clone(unsigned long clone_flags, unsigned long newsp,
-	  void __user *parent_tid, void __user *child_tid, struct pt_regs *regs)
-{
-	if (!newsp)
-		newsp = regs->sp;
-	return do_fork(clone_flags, newsp, regs, 0, parent_tid, child_tid);
-}
-
-void set_personality_ia32(void)
+void set_personality_ia32(bool x32)
 {
 	/* inherit personality from parent */
 
 	/* Make sure to be in 32bit mode */
-	set_thread_flag(TIF_IA32);
-	current->personality |= force_personality32;
+	set_thread_flag(TIF_ADDR32);
 
 	/* Mark the associated mm as containing 32-bit tasks. */
-	set_bit(MMF_COMPAT, &current->mm->flags);
-
-	/* Prepare the first "return" to user space */
-	current_thread_info()->status |= TS_COMPAT;
+	if (x32) {
+		clear_thread_flag(TIF_IA32);
+		set_thread_flag(TIF_X32);
+		if (current->mm)
+			current->mm->context.ia32_compat = TIF_X32;
+		current->personality &= ~READ_IMPLIES_EXEC;
+		/* is_compat_task() uses the presence of the x32
+		   syscall bit flag to determine compat status */
+		current_thread_info()->status &= ~TS_COMPAT;
+	} else {
+		set_thread_flag(TIF_IA32);
+		clear_thread_flag(TIF_X32);
+		if (current->mm)
+			current->mm->context.ia32_compat = TIF_IA32;
+		current->personality |= force_personality32;
+		/* Prepare the first "return" to user space */
+		current_thread_info()->status |= TS_COMPAT;
+	}
 }
+EXPORT_SYMBOL_GPL(set_personality_ia32);
 
 unsigned long get_wchan(struct task_struct *p)
 {
@@ -620,7 +528,7 @@ long do_arch_prctl(struct task_struct *task, int code, unsigned long addr)
 			task->thread.gs = addr;
 			if (doit) {
 				load_gs_index(0);
-				ret = checking_wrmsrl(MSR_KERNEL_GS_BASE, addr);
+				ret = wrmsrl_safe(MSR_KERNEL_GS_BASE, addr);
 			}
 		}
 		put_cpu();
@@ -648,7 +556,7 @@ long do_arch_prctl(struct task_struct *task, int code, unsigned long addr)
 				/* set the selector to 0 to not confuse
 				   __switch_to */
 				loadsegment(fs, 0);
-				ret = checking_wrmsrl(MSR_FS_BASE, addr);
+				ret = wrmsrl_safe(MSR_FS_BASE, addr);
 			}
 		}
 		put_cpu();

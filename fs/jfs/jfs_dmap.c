@@ -1,5 +1,6 @@
 /*
  *   Copyright (C) International Business Machines Corp., 2000-2004
+ *   Portions Copyright (C) Tino Reichardt, 2012
  *
  *   This program is free software;  you can redistribute it and/or modify
  *   it under the terms of the GNU General Public License as published by
@@ -17,6 +18,7 @@
  */
 
 #include <linux/fs.h>
+#include <linux/slab.h>
 #include "jfs_incore.h"
 #include "jfs_superblock.h"
 #include "jfs_dmap.h"
@@ -24,6 +26,7 @@
 #include "jfs_lock.h"
 #include "jfs_metapage.h"
 #include "jfs_debug.h"
+#include "jfs_discard.h"
 
 /*
  *	SERIALIZATION of the Block Allocation Map.
@@ -103,7 +106,6 @@ static int dbFreeBits(struct bmap * bmp, struct dmap * dp, s64 blkno,
 static int dbFreeDmap(struct bmap * bmp, struct dmap * dp, s64 blkno,
 		      int nblocks);
 static int dbMaxBud(u8 * cp);
-s64 dbMapFileSizeToMapSize(struct inode *ipbmap);
 static int blkstol2(s64 nb);
 
 static int cntlz(u32 value);
@@ -143,7 +145,6 @@ static const s8 budtab[256] = {
 	2, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
 	2, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -1
 };
-
 
 /*
  * NAME:	dbMount()
@@ -195,7 +196,7 @@ int dbMount(struct inode *ipbmap)
 	bmp->db_maxag = le32_to_cpu(dbmp_le->dn_maxag);
 	bmp->db_agpref = le32_to_cpu(dbmp_le->dn_agpref);
 	bmp->db_aglevel = le32_to_cpu(dbmp_le->dn_aglevel);
-	bmp->db_agheigth = le32_to_cpu(dbmp_le->dn_agheigth);
+	bmp->db_agheight = le32_to_cpu(dbmp_le->dn_agheight);
 	bmp->db_agwidth = le32_to_cpu(dbmp_le->dn_agwidth);
 	bmp->db_agstart = le32_to_cpu(dbmp_le->dn_agstart);
 	bmp->db_agl2size = le32_to_cpu(dbmp_le->dn_agl2size);
@@ -287,7 +288,7 @@ int dbSync(struct inode *ipbmap)
 	dbmp_le->dn_maxag = cpu_to_le32(bmp->db_maxag);
 	dbmp_le->dn_agpref = cpu_to_le32(bmp->db_agpref);
 	dbmp_le->dn_aglevel = cpu_to_le32(bmp->db_aglevel);
-	dbmp_le->dn_agheigth = cpu_to_le32(bmp->db_agheigth);
+	dbmp_le->dn_agheight = cpu_to_le32(bmp->db_agheight);
 	dbmp_le->dn_agwidth = cpu_to_le32(bmp->db_agwidth);
 	dbmp_le->dn_agstart = cpu_to_le32(bmp->db_agstart);
 	dbmp_le->dn_agl2size = cpu_to_le32(bmp->db_agl2size);
@@ -308,7 +309,6 @@ int dbSync(struct inode *ipbmap)
 
 	return (0);
 }
-
 
 /*
  * NAME:	dbFree()
@@ -336,6 +336,7 @@ int dbFree(struct inode *ip, s64 blkno, s64 nblocks)
 	s64 lblkno, rem;
 	struct inode *ipbmap = JFS_SBI(ip->i_sb)->ipbmap;
 	struct bmap *bmp = JFS_SBI(ip->i_sb)->bmap;
+	struct super_block *sb = ipbmap->i_sb;
 
 	IREAD_LOCK(ipbmap, RDWRLOCK_DMAP);
 
@@ -349,6 +350,13 @@ int dbFree(struct inode *ip, s64 blkno, s64 nblocks)
 			  "dbFree: block to be freed is outside the map");
 		return -EIO;
 	}
+
+	/**
+	 * TRIM the blocks, when mounted with discard option
+	 */
+	if (JFS_SBI(sb)->flag & JFS_DISCARD)
+		if (JFS_SBI(sb)->minblks_trim <= nblocks)
+			jfs_issue_discard(ipbmap, blkno, nblocks);
 
 	/*
 	 * free the blocks a dmap at a time.
@@ -755,7 +763,7 @@ int dbAlloc(struct inode *ip, s64 hint, s64 nblocks, s64 * results)
 	 * allocation group.
 	 */
 	if ((blkno & (bmp->db_agsize - 1)) == 0)
-		/* check if the AG is currenly being written to.
+		/* check if the AG is currently being written to.
 		 * if so, call dbNextAG() to find a non-busy
 		 * AG with sufficient free space.
 		 */
@@ -1093,7 +1101,6 @@ static int dbExtend(struct inode *ip, s64 blkno, s64 nblocks, s64 addnblocks)
 	else
 		/* we were not successful */
 		release_metapage(mp);
-
 
 	return (rc);
 }
@@ -1440,7 +1447,7 @@ dbAllocAG(struct bmap * bmp, int agno, s64 nblocks, int l2nb, s64 * results)
 	 * tree index of this allocation group within the control page.
 	 */
 	agperlev =
-	    (1 << (L2LPERCTL - (bmp->db_agheigth << 1))) / bmp->db_agwidth;
+	    (1 << (L2LPERCTL - (bmp->db_agheight << 1))) / bmp->db_agwidth;
 	ti = bmp->db_agstart + bmp->db_agwidth * (agno & (agperlev - 1));
 
 	/* dmap control page trees fan-out by 4 and a single allocation
@@ -1459,7 +1466,7 @@ dbAllocAG(struct bmap * bmp, int agno, s64 nblocks, int l2nb, s64 * results)
 		 * the subtree to find the leftmost leaf that describes this
 		 * free space.
 		 */
-		for (k = bmp->db_agheigth; k > 0; k--) {
+		for (k = bmp->db_agheight; k > 0; k--) {
 			for (n = 0, m = (ti << 2) + 1; n < 4; n++) {
 				if (l2nb <= dcp->stree[m + n]) {
 					ti = m + n;
@@ -1589,6 +1596,118 @@ static int dbAllocAny(struct bmap * bmp, s64 nblocks, int l2nb, s64 * results)
 
 
 /*
+ * NAME:	dbDiscardAG()
+ *
+ * FUNCTION:	attempt to discard (TRIM) all free blocks of specific AG
+ *
+ *		algorithm:
+ *		1) allocate blocks, as large as possible and save them
+ *		   while holding IWRITE_LOCK on ipbmap
+ *		2) trim all these saved block/length values
+ *		3) mark the blocks free again
+ *
+ *		benefit:
+ *		- we work only on one ag at some time, minimizing how long we
+ *		  need to lock ipbmap
+ *		- reading / writing the fs is possible most time, even on
+ *		  trimming
+ *
+ *		downside:
+ *		- we write two times to the dmapctl and dmap pages
+ *		- but for me, this seems the best way, better ideas?
+ *		/TR 2012
+ *
+ * PARAMETERS:
+ *	ip	- pointer to in-core inode
+ *	agno	- ag to trim
+ *	minlen	- minimum value of contiguous blocks
+ *
+ * RETURN VALUES:
+ *	s64	- actual number of blocks trimmed
+ */
+s64 dbDiscardAG(struct inode *ip, int agno, s64 minlen)
+{
+	struct inode *ipbmap = JFS_SBI(ip->i_sb)->ipbmap;
+	struct bmap *bmp = JFS_SBI(ip->i_sb)->bmap;
+	s64 nblocks, blkno;
+	u64 trimmed = 0;
+	int rc, l2nb;
+	struct super_block *sb = ipbmap->i_sb;
+
+	struct range2trim {
+		u64 blkno;
+		u64 nblocks;
+	} *totrim, *tt;
+
+	/* max blkno / nblocks pairs to trim */
+	int count = 0, range_cnt;
+	u64 max_ranges;
+
+	/* prevent others from writing new stuff here, while trimming */
+	IWRITE_LOCK(ipbmap, RDWRLOCK_DMAP);
+
+	nblocks = bmp->db_agfree[agno];
+	max_ranges = nblocks;
+	do_div(max_ranges, minlen);
+	range_cnt = min_t(u64, max_ranges + 1, 32 * 1024);
+	totrim = kmalloc(sizeof(struct range2trim) * range_cnt, GFP_NOFS);
+	if (totrim == NULL) {
+		jfs_error(bmp->db_ipbmap->i_sb,
+			  "dbDiscardAG: no memory for trim array");
+		IWRITE_UNLOCK(ipbmap);
+		return 0;
+	}
+
+	tt = totrim;
+	while (nblocks >= minlen) {
+		l2nb = BLKSTOL2(nblocks);
+
+		/* 0 = okay, -EIO = fatal, -ENOSPC -> try smaller block */
+		rc = dbAllocAG(bmp, agno, nblocks, l2nb, &blkno);
+		if (rc == 0) {
+			tt->blkno = blkno;
+			tt->nblocks = nblocks;
+			tt++; count++;
+
+			/* the whole ag is free, trim now */
+			if (bmp->db_agfree[agno] == 0)
+				break;
+
+			/* give a hint for the next while */
+			nblocks = bmp->db_agfree[agno];
+			continue;
+		} else if (rc == -ENOSPC) {
+			/* search for next smaller log2 block */
+			l2nb = BLKSTOL2(nblocks) - 1;
+			nblocks = 1 << l2nb;
+		} else {
+			/* Trim any already allocated blocks */
+			jfs_error(bmp->db_ipbmap->i_sb,
+				"dbDiscardAG: -EIO");
+			break;
+		}
+
+		/* check, if our trim array is full */
+		if (unlikely(count >= range_cnt - 1))
+			break;
+	}
+	IWRITE_UNLOCK(ipbmap);
+
+	tt->nblocks = 0; /* mark the current end */
+	for (tt = totrim; tt->nblocks != 0; tt++) {
+		/* when mounted with online discard, dbFree() will
+		 * call jfs_issue_discard() itself */
+		if (!(JFS_SBI(sb)->flag & JFS_DISCARD))
+			jfs_issue_discard(ip, tt->blkno, tt->nblocks);
+		dbFree(ip, tt->blkno, tt->nblocks);
+		trimmed += tt->nblocks;
+	}
+	kfree(totrim);
+
+	return trimmed;
+}
+
+/*
  * NAME:	dbFindCtl()
  *
  * FUNCTION:	starting at a specified dmap control page level and block
@@ -1648,7 +1767,7 @@ static int dbFindCtl(struct bmap * bmp, int l2nb, int level, s64 * blkno)
 		}
 
 		/* search the tree within the dmap control page for
-		 * sufficent free space.  if sufficient free space is found,
+		 * sufficient free space.  if sufficient free space is found,
 		 * dbFindLeaf() returns the index of the leaf at which
 		 * free space was found.
 		 */
@@ -2437,7 +2556,7 @@ dbAdjCtl(struct bmap * bmp, s64 blkno, int newval, int alloc, int level)
 
 	/* check if this is a control page update for an allocation.
 	 * if so, update the leaf to reflect the new leaf value using
-	 * dbSplit(); otherwise (deallocation), use dbJoin() to udpate
+	 * dbSplit(); otherwise (deallocation), use dbJoin() to update
 	 * the leaf with the new value.  in addition to updating the
 	 * leaf, dbSplit() will also split the binary buddy system of
 	 * the leaves, if required, and bubble new values within the
@@ -2743,7 +2862,7 @@ static int dbJoin(dmtree_t * tp, int leafno, int newval)
 			/* check which (leafno or buddy) is the left buddy.
 			 * the left buddy gets to claim the blocks resulting
 			 * from the join while the right gets to claim none.
-			 * the left buddy is also eligable to participate in
+			 * the left buddy is also eligible to participate in
 			 * a join at the next higher level while the right
 			 * is not.
 			 *
@@ -3160,16 +3279,13 @@ static int dbAllocDmapBU(struct bmap * bmp, struct dmap * dp, s64 blkno,
 {
 	int rc;
 	int dbitno, word, rembits, nb, nwords, wbitno, agno;
-	s8 oldroot, *leaf;
+	s8 oldroot;
 	struct dmaptree *tp = (struct dmaptree *) & dp->tree;
 
 	/* save the current value of the root (i.e. maximum free string)
 	 * of the dmap tree.
 	 */
 	oldroot = tp->stree[ROOT];
-
-	/* pick up a pointer to the leaves of the dmap tree */
-	leaf = tp->stree + LEAFIND;
 
 	/* determine the bit number and word within the dmap of the
 	 * starting block.
@@ -3337,7 +3453,7 @@ int dbExtendFS(struct inode *ipbmap, s64 blkno,	s64 nblocks)
 	for (i = 0, n = 0; i < agno; n++) {
 		bmp->db_agfree[n] = 0;	/* init collection point */
 
-		/* coalesce cotiguous k AGs; */
+		/* coalesce contiguous k AGs; */
 		for (j = 0; j < k && i < agno; j++, i++) {
 			/* merge AGi to AGn */
 			bmp->db_agfree[n] += bmp->db_agfree[i];
@@ -3606,7 +3722,7 @@ void dbFinalizeBmap(struct inode *ipbmap)
 	}
 
 	/*
-	 * compute db_aglevel, db_agheigth, db_width, db_agstart:
+	 * compute db_aglevel, db_agheight, db_width, db_agstart:
 	 * an ag is covered in aglevel dmapctl summary tree,
 	 * at agheight level height (from leaf) with agwidth number of nodes
 	 * each, which starts at agstart index node of the smmary tree node
@@ -3615,9 +3731,9 @@ void dbFinalizeBmap(struct inode *ipbmap)
 	bmp->db_aglevel = BMAPSZTOLEV(bmp->db_agsize);
 	l2nl =
 	    bmp->db_agl2size - (L2BPERDMAP + bmp->db_aglevel * L2LPERCTL);
-	bmp->db_agheigth = l2nl >> 1;
-	bmp->db_agwidth = 1 << (l2nl - (bmp->db_agheigth << 1));
-	for (i = 5 - bmp->db_agheigth, bmp->db_agstart = 0, n = 1; i > 0;
+	bmp->db_agheight = l2nl >> 1;
+	bmp->db_agwidth = 1 << (l2nl - (bmp->db_agheight << 1));
+	for (i = 5 - bmp->db_agheight, bmp->db_agstart = 0, n = 1; i > 0;
 	     i--) {
 		bmp->db_agstart += n;
 		n <<= 2;

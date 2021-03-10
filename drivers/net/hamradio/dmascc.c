@@ -32,10 +32,11 @@
 #include <linux/kernel.h>
 #include <linux/mm.h>
 #include <linux/netdevice.h>
+#include <linux/slab.h>
 #include <linux/rtnetlink.h>
 #include <linux/sockios.h>
 #include <linux/workqueue.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <asm/dma.h>
 #include <asm/io.h>
 #include <asm/irq.h>
@@ -331,8 +332,8 @@ static int __init dmascc_init(void)
 			for (i = 0; i < MAX_NUM_DEVS && io[i]; i++) {
 				j = (io[i] -
 				     hw[h].io_region) / hw[h].io_delta;
-				if (j >= 0 && j < hw[h].num_devs
-				    && hw[h].io_region +
+				if (j >= 0 && j < hw[h].num_devs &&
+				    hw[h].io_region +
 				    j * hw[h].io_delta == io[i]) {
 					base[j] = io[i];
 				}
@@ -396,8 +397,8 @@ static int __init dmascc_init(void)
 					t_val =
 					    inb(t1[i]) + (inb(t1[i]) << 8);
 					/* Also check whether counter did wrap */
-					if (t_val == 0
-					    || t_val > TMR_0_HZ / HZ * 10)
+					if (t_val == 0 ||
+					    t_val > TMR_0_HZ / HZ * 10)
 						counting[i] = 0;
 					delay[i] = jiffies - start[i];
 				}
@@ -462,13 +463,8 @@ static int __init setup_adapter(int card_base, int type, int n)
 
 	/* Initialize what is necessary for write_scc and write_scc_data */
 	info = kzalloc(sizeof(struct scc_info), GFP_KERNEL | GFP_DMA);
-	if (!info) {
-		printk(KERN_ERR "dmascc: "
-		       "could not allocate memory for %s at %#3x\n",
-		       hw[type].name, card_base);
+	if (!info)
 		goto out;
-	}
-
 
 	info->dev[0] = alloc_netdev(0, "", dev_setup);
 	if (!info->dev[0]) {

@@ -286,8 +286,11 @@ local_event(struct seq_oss_devinfo *dp, union evrec *q, struct snd_seq_event *ev
 static int
 note_on_event(struct seq_oss_devinfo *dp, int dev, int ch, int note, int vel, struct snd_seq_event *ev)
 {
-	struct seq_oss_synthinfo *info = \
-		&dp->synths[array_index_nospec(dev, SNDRV_SEQ_OSS_MAX_SYNTH_DEVS)];
+	struct seq_oss_synthinfo *info;
+
+	info = snd_seq_oss_synth_info(dp, dev);
+	if (!info)
+		return -ENXIO;
 
 	switch (info->arg.event_passing) {
 	case SNDRV_SEQ_OSS_PROCESS_EVENTS:
@@ -344,8 +347,12 @@ note_on_event(struct seq_oss_devinfo *dp, int dev, int ch, int note, int vel, st
 static int
 note_off_event(struct seq_oss_devinfo *dp, int dev, int ch, int note, int vel, struct snd_seq_event *ev)
 {
-	struct seq_oss_synthinfo *info = \
-		&dp->synths[array_index_nospec(dev, SNDRV_SEQ_OSS_MAX_SYNTH_DEVS)];
+	struct seq_oss_synthinfo *info;
+
+	info = snd_seq_oss_synth_info(dp, dev);
+	if (!info)
+		return -ENXIO;
+
 	switch (info->arg.event_passing) {
 	case SNDRV_SEQ_OSS_PROCESS_EVENTS:
 		if (! info->ch || ch < 0 || ch >= info->nr_voices) {

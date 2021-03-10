@@ -2,11 +2,7 @@ ENTRY(sys_call_table)
 	.long sys_restart_syscall	/* 0 - old "setup()" system call,
 					 * used for restarting */
 	.long sys_exit
-#ifdef CONFIG_MMU
-	.long sys_fork_wrapper
-#else
-	.long sys_ni_syscall
-#endif
+	.long sys_fork
 	.long sys_read
 	.long sys_write
 	.long sys_open			/* 5 */
@@ -173,7 +169,7 @@ ENTRY(sys_call_table)
 	.long sys_ni_syscall		/* sys_vm86 */
 	.long sys_ni_syscall		/* Old sys_query_module */
 	.long sys_poll
-	.long sys_nfsservctl
+	.long sys_ni_syscall		/* old nfsservctl */
 	.long sys_setresgid		/* 170 */
 	.long sys_getresgid
 	.long sys_prctl
@@ -183,7 +179,7 @@ ENTRY(sys_call_table)
 	.long sys_rt_sigpending
 	.long sys_rt_sigtimedwait
 	.long sys_rt_sigqueueinfo
-	.long sys_rt_sigsuspend_wrapper
+	.long sys_rt_sigsuspend
 	.long sys_pread64		/* 180 */
 	.long sys_pwrite64
 	.long sys_chown
@@ -303,7 +299,7 @@ ENTRY(sys_call_table)
 	.long sys_mkdirat
 	.long sys_mknodat
 	.long sys_fchownat
-	.long sys_ni_syscall
+	.long sys_futimesat
 	.long sys_fstatat64		/* 300 */
 	.long sys_unlinkat
 	.long sys_renameat
@@ -366,9 +362,22 @@ ENTRY(sys_call_table)
 	.long sys_shutdown
 	.long sys_sendmsg		/* 360 */
 	.long sys_recvmsg
-	.long sys_ni_syscall
+	.long sys_accept4
 	.long sys_ni_syscall
 	.long sys_ni_syscall
 	.long sys_rt_tgsigqueueinfo	/* 365 */
 	.long sys_perf_event_open
 	.long sys_recvmmsg
+	.long sys_fanotify_init
+	.long sys_fanotify_mark
+	.long sys_prlimit64	/* 370 */
+	.long sys_name_to_handle_at
+	.long sys_open_by_handle_at
+	.long sys_clock_adjtime
+	.long sys_syncfs
+	.long sys_setns			/* 375 */
+	.long sys_sendmmsg
+	.long sys_process_vm_readv
+	.long sys_process_vm_writev
+	.long sys_kcmp
+	.long sys_finit_module

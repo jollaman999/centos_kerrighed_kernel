@@ -5,23 +5,37 @@
  *  the COPYING file in the top-level directory.
  */
 
-#include <linux/cpu.h>
 #include <linux/percpu.h>
 #include <linux/debugfs.h>
 #include <linux/uaccess.h>
-#include <linux/sched.h>
+#include <linux/module.h>
+#include <linux/sched/smt.h>
 #include <asm/spec_ctrl.h>
 #include <asm/cpufeature.h>
 #include <asm/nospec-branch.h>
-#include <asm/cpu.h>
+#include <asm/intel-family.h>
 #include "cpu/cpu.h"
 
 static DEFINE_MUTEX(spec_ctrl_mutex);
 
 static bool noibrs_cmdline __read_mostly;
 static bool ibp_disabled __read_mostly;
-unsigned int ibrs_mode __read_mostly;
-EXPORT_SYMBOL(ibrs_mode);
+static bool unsafe_module __read_mostly;
+static unsigned int ibrs_mode __read_mostly;
+
+/*
+ * The ssbd_userset_key is set to true if the SSDB mode is user settable.
+ */
+struct static_key ssbd_userset_key = STATIC_KEY_INIT_FALSE;
+struct static_key retp_enabled_key = STATIC_KEY_INIT_FALSE;
+struct static_key ibrs_present_key = STATIC_KEY_INIT_FALSE;
+struct static_key ibrs_entry_key   = STATIC_KEY_INIT_FALSE;
+struct static_key ibrs_exit_key    = STATIC_KEY_INIT_FALSE;
+struct static_key ibpb_enabled_key = STATIC_KEY_INIT_FALSE;
+EXPORT_SYMBOL(ssbd_userset_key);
+EXPORT_SYMBOL(retp_enabled_key);
+EXPORT_SYMBOL(ibrs_present_key);
+EXPORT_SYMBOL(ibpb_enabled_key);
 
 /*
  * The vendor and possibly platform specific bits which can be modified in
@@ -58,11 +72,27 @@ EXPORT_SYMBOL_GPL(x86_spec_ctrl_base);
 static bool spec_ctrl_msr_write;
 
 /*
- * AMD specific MSR info for Store Bypass control.
- * x86_amd_ls_cfg_ssbd_mask is initialized in identify_boot_cpu().
+ * AMD specific MSR info for Store Bypass control.  x86_amd_ls_cfg_ssbd_mask
+ * is initialized in identify_boot_cpu().
  */
 u64 __read_mostly x86_amd_ls_cfg_base;
 u64 __read_mostly x86_amd_ls_cfg_ssbd_mask;
+
+static inline bool ssb_is_user_settable(unsigned int mode)
+{
+	return mode >= SPEC_STORE_BYPASS_PRCTL;
+}
+
+/*
+ * Set the static key to match the given boolean flag
+ */
+static inline void set_static_key(struct static_key *key, bool enable)
+{
+	if (enable && !static_key_enabled(key))
+		static_key_slow_inc(key);
+	else if (!enable && static_key_enabled(key))
+		static_key_slow_dec(key);
+}
 
 void spec_ctrl_save_msr(void)
 {
@@ -129,9 +159,9 @@ static void set_spec_ctrl_value(unsigned int *ptr, unsigned int value)
 
 static void set_spec_ctrl_pcp(bool entry, bool exit)
 {
-	unsigned int enabled   = percpu_read(spec_ctrl_pcp.enabled);
-	unsigned int entry_val = percpu_read(spec_ctrl_pcp.entry);
-	unsigned int exit_val  = percpu_read(spec_ctrl_pcp.exit);
+	unsigned int enabled   = this_cpu_read(spec_ctrl_pcp.enabled);
+	unsigned int entry_val = this_cpu_read(spec_ctrl_pcp.entry);
+	unsigned int exit_val  = this_cpu_read(spec_ctrl_pcp.exit);
 	int cpu, redo_cnt;
 	/*
 	 * Set if the SSBD bit of the SPEC_CTRL MSR is user settable.
@@ -156,14 +186,22 @@ static void set_spec_ctrl_pcp(bool entry, bool exit)
 
 	/*
 	 * For ibrs_always, we only need to write the MSR at kernel entry
-	 * to fulfill the barrier semantics for some CPUs.
+	 * to fulfill the barrier semantics for some CPUs. For enhanced
+	 * IBRS, we don't need to write the MSR at kernel entry/exit anymore.
 	 */
 	if (entry && exit)
-		enabled = SPEC_CTRL_PCP_IBRS_ENTRY;
+		enabled = (ibrs_mode == IBRS_ENHANCED)
+			? 0 : SPEC_CTRL_PCP_IBRS_ENTRY;
 	else if (entry != exit)
 		enabled = SPEC_CTRL_PCP_IBRS_ENTRY|SPEC_CTRL_PCP_IBRS_EXIT;
 	else
 		enabled = 0;
+
+	/*
+	 * Set ibrs_entry_key and ibrs_exit_key to match the enabled flag.
+	 */
+	set_static_key(&ibrs_entry_key, enabled & SPEC_CTRL_PCP_IBRS_ENTRY);
+	set_static_key(&ibrs_exit_key , enabled & SPEC_CTRL_PCP_IBRS_EXIT);
 
 	if (entry)
 		entry_val |= SPEC_CTRL_IBRS;
@@ -225,56 +263,57 @@ recheck:
 		goto recheck;
 }
 
+static void set_spec_ctrl_ibpb(bool enable)
+{
+	if (boot_cpu_has(X86_FEATURE_IBPB))
+		set_static_key(&ibpb_enabled_key, enable);
+}
+
 /*
  * The following values are written to IBRS on kernel entry/exit:
  *
  *		entry	exit
  * ibrs		  1	 0
- * ibrs_always	  1	 1
+ * ibrs_always	  1	 x (not written on exit)
  * ibrs_user	  0	 1
  */
 
 static void set_spec_ctrl_pcp_ibrs(void)
 {
 	set_spec_ctrl_pcp(true, false);
+	set_spec_ctrl_ibpb(true);
 	ibrs_mode = IBRS_ENABLED;
 }
 
 static void set_spec_ctrl_pcp_ibrs_always(void)
 {
 	set_spec_ctrl_pcp(true, true);
+	set_spec_ctrl_ibpb(true);
 	ibrs_mode = IBRS_ENABLED_ALWAYS;
 }
 
 static void set_spec_ctrl_pcp_ibrs_user(void)
 {
 	set_spec_ctrl_pcp(false, true);
+	set_spec_ctrl_ibpb(true);
 	ibrs_mode = IBRS_ENABLED_USER;
 }
 
 void clear_spec_ctrl_pcp(void)
 {
-	set_spec_ctrl_pcp(false, false);
 	ibrs_mode = IBRS_DISABLED;
-}
-
-static void __sync_all_cpus_msr(u32 msr_no, u64 val)
-{
-	int cpu;
-	get_online_cpus();
-	for_each_online_cpu(cpu)
-		wrmsrl_on_cpu(cpu, msr_no, val);
-	put_online_cpus();
+	set_spec_ctrl_pcp(false, false);
+	if (!static_key_enabled(&retp_enabled_key))
+		set_spec_ctrl_ibpb(false);
 }
 
 static void sync_all_cpus_spec_ctrl(void)
 {
-	__sync_all_cpus_msr(MSR_IA32_SPEC_CTRL, SPEC_CTRL_MSR_REFRESH);
-}
-
-static void sync_all_cpus_srbds(u64 val)
-{
-	__sync_all_cpus_msr(MSR_IA32_MCU_OPT_CTRL, val);
+	int cpu;
+	get_online_cpus();
+	for_each_online_cpu(cpu)
+		wrmsrl_on_cpu(cpu, MSR_IA32_SPEC_CTRL, SPEC_CTRL_MSR_REFRESH);
+	put_online_cpus();
 }
 
 static void __sync_this_cpu_ibp(void *data)
@@ -304,13 +343,27 @@ static void sync_all_cpus_ibp(bool enable)
 	put_online_cpus();
 }
 
+static void set_spec_ctrl_retp(bool enable)
+{
+	/*
+	 * Make sure that IBPB is enabled if either IBRS or retpoline
+	 * is enabled. ibrs_mode should be properly set before calling
+	 * set_spec_ctrl_retp().
+	 */
+	set_static_key(&retp_enabled_key, enable);
+	if (enable || (ibrs_mode == IBRS_DISABLED))
+		set_spec_ctrl_ibpb(enable);
+}
+
 static void spec_ctrl_disable_all(void)
 {
 	int cpu;
 
 	for_each_possible_cpu(cpu)
 		WRITE_ONCE(per_cpu(spec_ctrl_pcp.enabled, cpu), 0);
-	spectre_v2_retpoline_reset();
+
+	set_spec_ctrl_retp(false);
+	set_spec_ctrl_ibpb(false);
 }
 
 static int __init noibrs(char *str)
@@ -328,11 +381,40 @@ static int __init noibpb(char *str)
 }
 early_param("noibpb", noibpb);
 
+static bool is_skylake_era(void)
+{
+	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
+	    boot_cpu_data.x86 == 6) {
+		switch (boot_cpu_data.x86_model) {
+		case INTEL_FAM6_SKYLAKE_MOBILE:
+		case INTEL_FAM6_SKYLAKE_DESKTOP:
+		case INTEL_FAM6_SKYLAKE_X:
+		case INTEL_FAM6_KABYLAKE_MOBILE:
+		case INTEL_FAM6_KABYLAKE_DESKTOP:
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * The caller should have checked X86_FEATURE_IBRS_ENHANCED before calling
+ * it, Which also implies X86_FEATURE_IBRS is present.
+ */
+void spec_ctrl_enable_ibrs_enhanced(void)
+{
+	ibrs_mode = IBRS_ENHANCED;
+	set_spec_ctrl_pcp(true, true);
+	set_spec_ctrl_ibpb(true);
+}
+
 bool spec_ctrl_force_enable_ibrs(void)
 {
 	if (cpu_has_spec_ctrl()) {
-		set_spec_ctrl_pcp_ibrs();
-		spectre_v2_set_mitigation(SPECTRE_V2_IBRS);
+		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED))
+			spec_ctrl_enable_ibrs_enhanced();
+		else
+			set_spec_ctrl_pcp_ibrs();
 		return true;
 	}
 
@@ -343,14 +425,17 @@ bool spec_ctrl_cond_enable_ibrs(bool full_retp)
 {
 	if (cpu_has_spec_ctrl() && (is_skylake_era() || !full_retp) &&
 	    !noibrs_cmdline) {
-		set_spec_ctrl_pcp_ibrs();
-		spectre_v2_set_mitigation(SPECTRE_V2_IBRS);
-		/*
-		 * Print a warning message about performance
-		 * impact of enabling IBRS vs. retpoline.
-		 */
-		pr_warn_once("Using IBRS as the default Spectre v2 mitigation for a Skylake-\n");
-		pr_warn_once("generation CPU.  This may have a negative performance impact.\n");
+		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
+			spec_ctrl_enable_ibrs_enhanced();
+		} else {
+			set_spec_ctrl_pcp_ibrs();
+			/*
+			 * Print a warning message about performance
+			 * impact of enabling IBRS vs. retpoline.
+			 */
+			pr_warn_once("Using IBRS as the default Spectre v2 mitigation for a Skylake-\n");
+			pr_warn_once("generation CPU.  This may have a negative performance impact.\n");
+		}
 		return true;
 	}
 
@@ -360,8 +445,10 @@ bool spec_ctrl_cond_enable_ibrs(bool full_retp)
 bool spec_ctrl_enable_ibrs_always(void)
 {
 	if (cpu_has_spec_ctrl()) {
-		set_spec_ctrl_pcp_ibrs_always();
-		spectre_v2_set_mitigation(SPECTRE_V2_IBRS_ALWAYS);
+		if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED))
+			spec_ctrl_enable_ibrs_enhanced();
+		else
+			set_spec_ctrl_pcp_ibrs_always();
 		return true;
 	}
 
@@ -377,7 +464,6 @@ bool spec_ctrl_force_enable_ibp_disabled(void)
 	 */
 	if (boot_cpu_has(X86_FEATURE_IBP_DISABLE)) {
 		ibp_disabled = true;
-		spectre_v2_set_mitigation(SPECTRE_V2_IBP_DISABLED);
 		return true;
 	}
 
@@ -389,7 +475,6 @@ bool spec_ctrl_cond_enable_ibp_disabled(void)
 {
 	if (boot_cpu_has(X86_FEATURE_IBP_DISABLE) && !noibrs_cmdline) {
 		ibp_disabled = true;
-		spectre_v2_set_mitigation(SPECTRE_V2_IBP_DISABLED);
 		return true;
 	}
 
@@ -397,33 +482,81 @@ bool spec_ctrl_cond_enable_ibp_disabled(void)
 	return false;
 }
 
-void spec_ctrl_enable_retpoline_ibrs_user(void)
+void spec_ctrl_enable_retpoline(void)
 {
-	if (!cpu_has_spec_ctrl() || !spectre_v2_has_full_retpoline())
-		return;
+	set_spec_ctrl_retp(true);
+}
 
+bool spec_ctrl_enable_retpoline_ibrs_user(void)
+{
+	if (!cpu_has_spec_ctrl())
+		return false;
+
+	if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED)) {
+		spec_ctrl_enable_ibrs_enhanced();
+		return true;
+	}
+
+	set_spec_ctrl_retp(true);
 	set_spec_ctrl_pcp_ibrs_user();
-	spectre_v2_set_mitigation(SPECTRE_V2_RETPOLINE_IBRS_USER);
-	return;
+	return true;
+}
+
+void spec_ctrl_report_unsafe_module(struct module *mod)
+{
+	if (retp_compiler() && !is_skylake_era())
+		pr_warn_once("WARNING: module '%s' built without retpoline-enabled compiler, may affect Spectre v2 mitigation\n",
+			     mod->name);
+
+	unsafe_module = true;
+}
+
+enum spectre_v2_mitigation spec_ctrl_get_mitigation(void)
+{
+	enum spectre_v2_mitigation mode = SPECTRE_V2_NONE;
+
+	if (ibp_disabled)
+		mode = SPECTRE_V2_IBP_DISABLED;
+	else if (ibrs_mode == IBRS_ENABLED_ALWAYS)
+		mode = SPECTRE_V2_IBRS_ALWAYS;
+	else if (ibrs_mode == IBRS_ENABLED)
+		mode = SPECTRE_V2_IBRS;
+	else if (ibrs_mode == IBRS_ENHANCED)
+		mode = SPECTRE_V2_IBRS_ENHANCED;
+	else if (retp_enabled()) {
+		if (!retp_enabled_full())
+			mode = SPECTRE_V2_RETPOLINE_MINIMAL;
+		else if (!boot_cpu_has(X86_FEATURE_IBPB))
+			mode = SPECTRE_V2_RETPOLINE_NO_IBPB;
+		else if (unsafe_module)
+			mode = SPECTRE_V2_RETPOLINE_UNSAFE_MODULE;
+		else if (ibrs_mode == IBRS_ENABLED_USER)
+			mode = SPECTRE_V2_RETPOLINE_IBRS_USER;
+		else
+			mode = SPECTRE_V2_RETPOLINE;
+	}
+
+	spectre_v2_enabled = mode;	/* Update spectre_v2_enabled */
+	return spectre_v2_enabled;
 }
 
 static void spec_ctrl_print_features(void)
 {
 	if (boot_cpu_has(X86_FEATURE_IBP_DISABLE)) {
-		printk_once(KERN_INFO "FEATURE SPEC_CTRL Present (Implicit)\n");
-		printk_once(KERN_INFO "FEATURE IBPB_SUPPORT Present (Implicit)\n");
+		printk(KERN_INFO "FEATURE SPEC_CTRL Present (Implicit)\n");
+		printk(KERN_INFO "FEATURE IBPB_SUPPORT Present (Implicit)\n");
 		return;
 	}
 
-	if (cpu_has_spec_ctrl())
-		printk_once(KERN_INFO "FEATURE SPEC_CTRL Present\n");
+	if (boot_cpu_has(X86_FEATURE_IBRS))
+		printk(KERN_INFO "FEATURE SPEC_CTRL Present\n");
 	else
-		printk_once(KERN_INFO "FEATURE SPEC_CTRL Not Present\n");
+		printk(KERN_INFO "FEATURE SPEC_CTRL Not Present\n");
 
 	if (boot_cpu_has(X86_FEATURE_IBPB))
-		printk_once(KERN_INFO "FEATURE IBPB_SUPPORT Present\n");
+		printk(KERN_INFO "FEATURE IBPB_SUPPORT Present\n");
 	else
-		printk_once(KERN_INFO "FEATURE IBPB_SUPPORT Not Present\n");
+		printk(KERN_INFO "FEATURE IBPB_SUPPORT Not Present\n");
 }
 
 void spec_ctrl_cpu_init(void)
@@ -435,10 +568,11 @@ void spec_ctrl_cpu_init(void)
 	}
 
 	if ((ibrs_mode == IBRS_ENABLED_ALWAYS) ||
+	    (ibrs_mode == IBRS_ENHANCED) ||
 	    (spec_ctrl_msr_write && (system_state == SYSTEM_BOOTING)))
 		native_wrmsr(MSR_IA32_SPEC_CTRL,
-			     percpu_read(spec_ctrl_pcp.entry),
-			     percpu_read(spec_ctrl_pcp.hi32));
+			     this_cpu_read(spec_ctrl_pcp.entry),
+			     this_cpu_read(spec_ctrl_pcp.hi32));
 }
 
 static void spec_ctrl_reinit_all_cpus(void)
@@ -457,13 +591,14 @@ static void spec_ctrl_reinit_all_cpus(void)
 
 void spec_ctrl_init(void)
 {
+	set_static_key(&ibrs_present_key, boot_cpu_has(X86_FEATURE_IBRS));
 	spec_ctrl_print_features();
 }
 
 void spec_ctrl_rescan_cpuid(void)
 {
 	enum spectre_v2_mitigation old_mode;
-	bool old_ibrs, old_ibpb, old_ssbd, old_l1df, old_mds, old_srbds;
+	bool old_ibrs, old_ibpb, old_ssbd, old_mds;
 	bool ssbd_changed;
 	int cpu;
 
@@ -476,43 +611,29 @@ void spec_ctrl_rescan_cpuid(void)
 		old_ibrs = boot_cpu_has(X86_FEATURE_IBRS);
 		old_ibpb = boot_cpu_has(X86_FEATURE_IBPB);
 		old_ssbd = boot_cpu_has(X86_FEATURE_SSBD);
-		old_l1df = boot_cpu_has(X86_FEATURE_FLUSH_L1D);
 		old_mds  = boot_cpu_has(X86_FEATURE_MD_CLEAR);
-		old_mode = spectre_v2_get_mitigation();
-		old_srbds = boot_cpu_has(X86_FEATURE_SRBDS_CTRL);
+		old_mode = spec_ctrl_get_mitigation();
 
 		/* detect spec ctrl related cpuid additions */
 		get_cpu_cap(&boot_cpu_data);
 
 		/*
-		 * Populate the FLUSH_L1D cap bit to each CPU if it changes.
-		 */
-		if (!old_l1df && boot_cpu_has(X86_FEATURE_FLUSH_L1D))
-			for_each_online_cpu(cpu)
-				set_cpu_cap(&cpu_data(cpu), X86_FEATURE_FLUSH_L1D);
-
-		/*
-		 * If there were no spec ctrl or mds related changes,
-		 * we're done.
+		 * If there were no spec ctrl or MDS related changes,
+		 * we're done
 		 */
 		ssbd_changed = (old_ssbd != boot_cpu_has(X86_FEATURE_SSBD));
 		if (old_ibrs == boot_cpu_has(X86_FEATURE_IBRS) &&
 		    old_ibpb == boot_cpu_has(X86_FEATURE_IBPB) &&
 		    old_mds  == boot_cpu_has(X86_FEATURE_MD_CLEAR) &&
-		    old_srbds == boot_cpu_has(X86_FEATURE_SRBDS_CTRL) &&
 		    !ssbd_changed)
 			goto done;
 
-		/* Update the boot CPU microcode version */
-		boot_cpu_data.microcode = cpu_data(0).microcode;
-		check_bad_spectre_microcode(&boot_cpu_data);
-
 		/*
-		 * The IBRS, IBPB & SSBD cpuid bits may have
+		 * The IBRS, IBPB, SSBD & MDS cpuid bits may have
 		 * just been set in the boot_cpu_data, transfer them
 		 * to the per-cpu data too.
 		 */
-		if (cpu_has_spec_ctrl())
+		if (boot_cpu_has(X86_FEATURE_IBRS))
 			for_each_online_cpu(cpu)
 				set_cpu_cap(&cpu_data(cpu), X86_FEATURE_IBRS);
 		if (boot_cpu_has(X86_FEATURE_IBPB))
@@ -526,14 +647,14 @@ void spec_ctrl_rescan_cpuid(void)
 				set_cpu_cap(&cpu_data(cpu),
 					    X86_FEATURE_MD_CLEAR);
 
-		/* print the changed IBRS/IBPB features */
-		spec_ctrl_print_features();
+		/* update static key, print the changed IBRS/IBPB features */
+		spec_ctrl_init();
 
 		if (ssbd_changed) {
 			u64 old_spec_ctrl = x86_spec_ctrl_base;
 
 			/*
-			 * Redo speculation store bypass setup.
+			 * Redo speculative store bypass setup.
 			 */
 			ssb_select_mitigation();
 			if (x86_spec_ctrl_base != old_spec_ctrl) {
@@ -541,7 +662,7 @@ void spec_ctrl_rescan_cpuid(void)
 				 * Need to propagate the new baseline to all
 				 * the percpu spec_ctrl structures. The
 				 * spectre v2 re-initialization below will
-				 * reset the right percpu values.
+				 * reset to the right percpu values.
 				 */
 				spec_ctrl_save_msr();
 				spec_ctrl_msr_write = true;
@@ -562,57 +683,29 @@ void spec_ctrl_rescan_cpuid(void)
 		spec_ctrl_reinit_all_cpus();
 
 		/* print any mitigation changes */
-		if (old_mode != spectre_v2_get_mitigation())
+		if (old_mode != spec_ctrl_get_mitigation())
 			spectre_v2_print_mitigation();
 
 		/*
 		 * Look for X86_FEATURE_MD_CLEAR change for CPUs that are
-		 * vulnerable to MDS & reflect that in the mds and taa
-		 * vulnerabilities files.
+		 * vulnerable to MDS & reflect that in the mds vulnerabilities
+		 * file.
 		 */
 		if (boot_cpu_has_bug(X86_BUG_MDS) &&
-		   ((mds_mitigation != MDS_MITIGATION_OFF) ||
-		    (taa_mitigation != TAA_MITIGATION_OFF))) {
-			enum mds_mitigations new_mds;
-			enum taa_mitigations new_taa;
+		   (mds_mitigation != MDS_MITIGATION_OFF)) {
+			enum mds_mitigations new;
 
-			new_mds = boot_cpu_has(X86_FEATURE_MD_CLEAR)
-				? MDS_MITIGATION_FULL : MDS_MITIGATION_VMWERV;
-			new_taa = boot_cpu_has(X86_FEATURE_MD_CLEAR)
-				? TAA_MITIGATION_VERW
-				: TAA_MITIGATION_UCODE_NEEDED;
-			if (new_mds != mds_mitigation) {
-				mds_mitigation = new_mds;
+			new = boot_cpu_has(X86_FEATURE_MD_CLEAR)
+			    ? MDS_MITIGATION_FULL : MDS_MITIGATION_VMWERV;
+			if (new != mds_mitigation) {
+				mds_mitigation = new;
 				mds_print_mitigation();
-			}
-			if (boot_cpu_has_bug(X86_BUG_TAA) &&
-			    (new_taa != taa_mitigation)) {
-				taa_mitigation = new_taa;
-				taa_print_mitigation();
-			}
-		}
-
-		/*
-		 * Update setting when SRBDS mitigation MSR first appears.
-		 */
-		if (!old_srbds && boot_cpu_has(X86_FEATURE_SRBDS_CTRL)) {
-			srbds_select_mitigation();
-			if (srbds_mitigation_off()) {
-				/*
-				 * Turn off SRBDS mitigation for all CPUs.
-				 */
-				u64 mcu_ctrl;
-
-				rdmsrl(MSR_IA32_MCU_OPT_CTRL, mcu_ctrl);
-				mcu_ctrl |= RNGDS_MITG_DIS;
-				sync_all_cpus_srbds(mcu_ctrl);
 			}
 		}
 	}
 done:
 	mutex_unlock(&spec_ctrl_mutex);
 }
-EXPORT_SYMBOL_GPL(spec_ctrl_rescan_cpuid);
 
 /*
  * Change the SSBD bit of the spec_ctrl structure of the current CPU.
@@ -629,11 +722,11 @@ EXPORT_SYMBOL_GPL(spec_ctrl_rescan_cpuid);
 void spec_ctrl_set_ssbd(bool ssbd_on)
 {
 	if (ssbd_on) {
-		percpu_or(spec_ctrl_pcp.entry, SPEC_CTRL_SSBD);
-		percpu_or(spec_ctrl_pcp.exit,  SPEC_CTRL_SSBD);
+		this_cpu_or(spec_ctrl_pcp.entry, SPEC_CTRL_SSBD);
+		this_cpu_or(spec_ctrl_pcp.exit,  SPEC_CTRL_SSBD);
 	} else {
-		percpu_and(spec_ctrl_pcp.entry, ~SPEC_CTRL_SSBD);
-		percpu_and(spec_ctrl_pcp.exit,  ~SPEC_CTRL_SSBD);
+		this_cpu_and(spec_ctrl_pcp.entry, ~(int)SPEC_CTRL_SSBD);
+		this_cpu_and(spec_ctrl_pcp.exit,  ~(int)SPEC_CTRL_SSBD);
 	}
 }
 
@@ -691,12 +784,11 @@ static ssize_t ibrs_enabled_write(struct file *file,
 		if (enable == IBRS_DISABLED) {
 			sync_all_cpus_ibp(true);
 			ibp_disabled = false;
-			spectre_v2_retpoline_reset();
 		} else {
 			WARN_ON(enable != IBRS_ENABLED_ALWAYS);
 			sync_all_cpus_ibp(false);
 			ibp_disabled = true;
-			spectre_v2_set_mitigation(SPECTRE_V2_IBP_DISABLED);
+			set_spec_ctrl_retp(false);
 		}
 		goto out_unlock;
 	}
@@ -706,26 +798,41 @@ static ssize_t ibrs_enabled_write(struct file *file,
 		goto out_unlock;
 	}
 
+	/*
+	 * With enhanced IBRS, it is either IBRS_ENHANCED or IBRS_DISABLED.
+	 * Other options are not supported.
+	 */
+	if (boot_cpu_has(X86_FEATURE_IBRS_ENHANCED) &&
+	   (enable != IBRS_DISABLED) && (enable != IBRS_ENHANCED)) {
+		count = -EINVAL;
+		goto out_unlock;
+	}
+	if (!boot_cpu_has(X86_FEATURE_IBRS_ENHANCED) &&
+	   (enable == IBRS_ENHANCED)) {
+		count = -EINVAL;
+		goto out_unlock;
+	}
+
 	if (enable == IBRS_DISABLED) {
 		clear_spec_ctrl_pcp();
 		sync_all_cpus_spec_ctrl();
-		spectre_v2_retpoline_reset();
 	} else if (enable == IBRS_ENABLED) {
 		set_spec_ctrl_pcp_ibrs();
-		spectre_v2_set_mitigation(SPECTRE_V2_IBRS);
+		set_spec_ctrl_retp(false);
 	} else if (enable == IBRS_ENABLED_ALWAYS) {
 		set_spec_ctrl_pcp_ibrs_always();
+		set_spec_ctrl_retp(false);
 		sync_all_cpus_spec_ctrl();
-		spectre_v2_set_mitigation(SPECTRE_V2_IBRS_ALWAYS);
+	} else if (enable == IBRS_ENHANCED) {
+		spec_ctrl_enable_ibrs_enhanced();
+		set_spec_ctrl_retp(false);
+		sync_all_cpus_spec_ctrl();
 	} else {
 		WARN_ON(enable != IBRS_ENABLED_USER);
-		if (!spectre_v2_has_full_retpoline()) {
-			count = -ENODEV;
-			goto out_unlock;
-		}
 		set_spec_ctrl_pcp_ibrs_user();
-		spectre_v2_set_mitigation(SPECTRE_V2_RETPOLINE_IBRS_USER);
+		set_spec_ctrl_retp(true);
 	}
+	spec_ctrl_get_mitigation();
 
 out_unlock:
 	mutex_unlock(&spec_ctrl_mutex);
@@ -757,13 +864,60 @@ static const struct file_operations fops_ibpb_enabled = {
 static ssize_t retp_enabled_read(struct file *file, char __user *user_buf,
 				 size_t count, loff_t *ppos)
 {
-	unsigned int enabled = !!boot_cpu_has(X86_FEATURE_RETPOLINE);
-
+	unsigned int enabled = retp_enabled();
 	return __enabled_read(file, user_buf, count, ppos, &enabled);
 }
 
+static ssize_t retp_enabled_write(struct file *file,
+				  const char __user *user_buf,
+				  size_t count, loff_t *ppos)
+{
+	char buf[32];
+	ssize_t len;
+	unsigned int enable;
+
+	len = min(count, sizeof(buf) - 1);
+	if (copy_from_user(buf, user_buf, len))
+		return -EFAULT;
+
+	buf[len] = '\0';
+	if (kstrtouint(buf, 0, &enable))
+		return -EINVAL;
+
+	if (enable > 1)
+		return -EINVAL;
+
+	mutex_lock(&spec_ctrl_mutex);
+
+	if (enable == retp_enabled())
+		goto out_unlock;
+
+	set_spec_ctrl_retp(enable);
+
+	if (enable) {
+		/* enforce sane combinations */
+		if (ibp_disabled) {
+			sync_all_cpus_ibp(true);
+			ibp_disabled = false;
+		} else if ((ibrs_mode == IBRS_ENABLED) ||
+			   (ibrs_mode == IBRS_ENHANCED)) {
+			clear_spec_ctrl_pcp();
+			sync_all_cpus_spec_ctrl();
+		} else if (ibrs_mode == IBRS_ENABLED_ALWAYS) {
+			set_spec_ctrl_pcp_ibrs_user();
+		}
+	}
+	spec_ctrl_get_mitigation();
+
+out_unlock:
+	mutex_unlock(&spec_ctrl_mutex);
+	return count;
+}
+
+
 static const struct file_operations fops_retp_enabled = {
 	.read = retp_enabled_read,
+	.write = retp_enabled_write,
 	.llseek = default_llseek,
 };
 
@@ -791,7 +945,7 @@ static void ssbd_spec_ctrl_write(unsigned int mode)
 	 * the existing SSBD bit in the spec_ctrl_pcp won't carry over.
 	 */
 	if (!ssb_is_user_settable(mode))
-		set_mb(ssb_mode, mode);
+		smp_store_mb(ssb_mode, mode);
 
 	switch (ibrs_mode) {
 		case IBRS_DISABLED:
@@ -805,6 +959,9 @@ static void ssbd_spec_ctrl_write(unsigned int mode)
 			break;
 		case IBRS_ENABLED_USER:
 			set_spec_ctrl_pcp_ibrs_user();
+			break;
+		case IBRS_ENHANCED:
+			spec_ctrl_enable_ibrs_enhanced();
 			break;
 	}
 	sync_all_cpus_spec_ctrl();
@@ -831,7 +988,7 @@ static void ssbd_amd_write(unsigned int mode)
 	 * ssb_mode first.
 	 */
 	if (!ssb_is_user_settable(mode))
-		set_mb(ssb_mode, mode);
+		smp_store_mb(ssb_mode, mode);
 
 	/*
 	 * If the old mode isn't user settable, it is assumed that no
@@ -875,6 +1032,17 @@ static ssize_t ssbd_enabled_write(struct file *file,
 	if (mode == ssb_mode)
 		goto out_unlock;
 
+	WARN_ON_ONCE(ssb_is_user_settable(ssb_mode) !=
+		     static_key_enabled(&ssbd_userset_key));
+
+	/*
+	 * User settable  => !settable: clear ssbd_userset_key early
+	 * User !settable => settable : set ssbd_userset_key late
+	 */
+	if (static_key_enabled(&ssbd_userset_key) &&
+	   !ssb_is_user_settable(mode))
+		static_key_slow_dec(&ssbd_userset_key);
+
 	/* Set/clear the SSBD bit in x86_spec_ctrl_base accordingly */
 	if (mode == SPEC_STORE_BYPASS_DISABLE)
 		x86_spec_ctrl_base |= SPEC_CTRL_SSBD;
@@ -900,6 +1068,8 @@ static ssize_t ssbd_enabled_write(struct file *file,
 
 out:
 	WRITE_ONCE(ssb_mode, mode);
+	if (!static_key_enabled(&ssbd_userset_key) && ssb_is_user_settable(mode))
+		static_key_slow_inc(&ssbd_userset_key);
 	ssb_print_mitigation();
 out_unlock:
 	mutex_unlock(&spec_ctrl_mutex);
@@ -915,7 +1085,7 @@ static const struct file_operations fops_ssbd_enabled = {
 static ssize_t smt_present_read(struct file *file, char __user *user_buf,
 				 size_t count, loff_t *ppos)
 {
-	unsigned int present = atomic_read(&sched_smt_present);
+	unsigned int present = atomic_read(&sched_smt_present.enabled);
 
 	return __enabled_read(file, user_buf, count, ppos, &present);
 }
@@ -931,7 +1101,7 @@ static int __init debugfs_spec_ctrl(void)
 			    arch_debugfs_dir, NULL, &fops_ibrs_enabled);
 	debugfs_create_file("ibpb_enabled", S_IRUSR,
 			    arch_debugfs_dir, NULL, &fops_ibpb_enabled);
-	debugfs_create_file("retp_enabled", S_IRUSR,
+	debugfs_create_file("retp_enabled", S_IRUSR | S_IWUSR,
 			    arch_debugfs_dir, NULL, &fops_retp_enabled);
 	debugfs_create_file("ssbd_enabled", S_IRUSR,
 			    arch_debugfs_dir, NULL, &fops_ssbd_enabled);

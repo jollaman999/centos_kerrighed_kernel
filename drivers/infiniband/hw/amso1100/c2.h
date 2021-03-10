@@ -250,7 +250,7 @@ struct c2_array {
 struct sp_chunk {
 	struct sp_chunk *next;
 	dma_addr_t dma_addr;
-	DECLARE_PCI_UNMAP_ADDR(mapping);
+	DEFINE_DMA_UNMAP_ADDR(mapping);
 	u16 head;
 	u16 shared_ptr[0];
 };
@@ -265,7 +265,6 @@ struct c2_pd_table {
 struct c2_qp_table {
 	struct idr idr;
 	spinlock_t lock;
-	int last;
 };
 
 struct c2_element {
@@ -498,16 +497,16 @@ extern int c2_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
 			struct ib_send_wr **bad_wr);
 extern int c2_post_receive(struct ib_qp *ibqp, struct ib_recv_wr *ib_wr,
 			   struct ib_recv_wr **bad_wr);
-extern void __devinit c2_init_qp_table(struct c2_dev *c2dev);
-extern void __devexit c2_cleanup_qp_table(struct c2_dev *c2dev);
+extern void c2_init_qp_table(struct c2_dev *c2dev);
+extern void c2_cleanup_qp_table(struct c2_dev *c2dev);
 extern void c2_set_qp_state(struct c2_qp *, int);
 extern struct c2_qp *c2_find_qpn(struct c2_dev *c2dev, int qpn);
 
 /* PDs */
 extern int c2_pd_alloc(struct c2_dev *c2dev, int privileged, struct c2_pd *pd);
 extern void c2_pd_free(struct c2_dev *c2dev, struct c2_pd *pd);
-extern int __devinit c2_init_pd_table(struct c2_dev *c2dev);
-extern void __devexit c2_cleanup_pd_table(struct c2_dev *c2dev);
+extern int c2_init_pd_table(struct c2_dev *c2dev);
+extern void c2_cleanup_pd_table(struct c2_dev *c2dev);
 
 /* CQs */
 extern int c2_init_cq(struct c2_dev *c2dev, int entries,

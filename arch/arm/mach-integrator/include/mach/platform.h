@@ -13,18 +13,12 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
-/* DO NOT EDIT!! - this file automatically generated
- *                 from .s file by awk -f s2h.awk
- */
 /**************************************************************************
  * * Copyright © ARM Limited 1998.  All rights reserved.
  * ***********************************************************************/
 /* ************************************************************************
  *
  *   Integrator address map
- *
- * 	NOTE: This is a multi-hosted header file for use with uHAL and
- * 	      supported debuggers.
  *
  * ***********************************************************************/
 
@@ -196,7 +190,6 @@
 #define INTEGRATOR_SC_CTRLC_OFFSET      0x0C
 #define INTEGRATOR_SC_DEC_OFFSET        0x10
 #define INTEGRATOR_SC_ARB_OFFSET        0x14
-#define INTEGRATOR_SC_PCIENABLE_OFFSET  0x18
 #define INTEGRATOR_SC_LOCK_OFFSET       0x1C
 
 #define INTEGRATOR_SC_BASE              0x11000000
@@ -290,12 +283,14 @@
 #define INTEGRATOR_DBG_LEDS             (INTEGRATOR_DBG_BASE + INTEGRATOR_DBG_LEDS_OFFSET)
 #define INTEGRATOR_DBG_SWITCH           (INTEGRATOR_DBG_BASE + INTEGRATOR_DBG_SWITCH_OFFSET)
 
+#define INTEGRATOR_AP_GPIO_BASE		0x1B000000	/* GPIO */
 
-#if defined(CONFIG_ARCH_INTEGRATOR_AP)
-#define INTEGRATOR_GPIO_BASE            0x1B000000	 /*  GPIO */
-#elif defined(CONFIG_ARCH_INTEGRATOR_CP)
-#define INTEGRATOR_GPIO_BASE            0xC9000000	 /*  GPIO */
-#endif
+#define INTEGRATOR_CP_MMC_BASE		0x1C000000	/* MMC */
+#define INTEGRATOR_CP_AACI_BASE		0x1D000000	/* AACI */
+#define INTEGRATOR_CP_ETH_BASE		0xC8000000	/* Ethernet */
+#define INTEGRATOR_CP_GPIO_BASE		0xC9000000	/* GPIO */
+#define INTEGRATOR_CP_SIC_BASE		0xCA000000	/* SIC */
+#define INTEGRATOR_CP_CTL_BASE		0xCB000000	/* CP system control */
 
 /* ------------------------------------------------------------------------
  *  KMI keyboard/mouse definitions
@@ -328,19 +323,9 @@
  */
 #define PHYS_PCI_V3_BASE                0x62000000
 
-#define PCI_DRAMSIZE                    INTEGRATOR_SSRAM_SIZE
-
-/* 'export' these to UHAL */
-#define UHAL_PCI_IO                     PCI_IO_BASE
-#define UHAL_PCI_MEM                    PCI_MEM_BASE
-#define UHAL_PCI_ALLOC_IO_BASE          0x00004000
-#define UHAL_PCI_ALLOC_MEM_BASE         PCI_MEM_BASE
-#define UHAL_PCI_MAX_SLOT               20
-
-/* ========================================================================
- *  Start of uHAL definitions
- * ========================================================================
- */
+#define PCI_MEMORY_VADDR		IOMEM(0xe8000000)
+#define PCI_CONFIG_VADDR		IOMEM(0xec000000)
+#define PCI_V3_VADDR			IOMEM(0xed000000)
 
 /* ------------------------------------------------------------------------
  *  Integrator Interrupt Controllers
@@ -389,7 +374,7 @@
  */
 
 /* ------------------------------------------------------------------------
- *  LED's - The header LED is not accessible via the uHAL API
+ *  LED's
  * ------------------------------------------------------------------------
  *
  */
@@ -402,49 +387,19 @@
 #define LED_BANK                        INTEGRATOR_DBG_LEDS
 
 /*
- *  Memory definitions - run uHAL out of SSRAM.
- *
- */
-#define uHAL_MEMORY_SIZE                INTEGRATOR_SSRAM_SIZE
-
-/*
- *  Clean base - dummy
- *
- */
-#define CLEAN_BASE                      INTEGRATOR_BOOT_ROM_HI
-
-/*
  *  Timer definitions
  *
  *  Only use timer 1 & 2
  *  (both run at 24MHz and will need the clock divider set to 16).
  *
- *  Timer 0 runs at bus frequency and therefore could vary and currently
- *  uHAL can't handle that.
- *
+ *  Timer 0 runs at bus frequency
  */
 
 #define INTEGRATOR_TIMER0_BASE          INTEGRATOR_CT_BASE
 #define INTEGRATOR_TIMER1_BASE          (INTEGRATOR_CT_BASE + 0x100)
 #define INTEGRATOR_TIMER2_BASE          (INTEGRATOR_CT_BASE + 0x200)
 
-#define MAX_TIMER                       2
-#define MAX_PERIOD                      699050
-#define TICKS_PER_uSEC                  24
-
-/*
- *  These are useconds NOT ticks.
- *
- */
-#define mSEC_1                          1000
-#define mSEC_5                          (mSEC_1 * 5)
-#define mSEC_10                         (mSEC_1 * 10)
-#define mSEC_25                         (mSEC_1 * 25)
-#define SEC_1                           (mSEC_1 * 1000)
-
 #define INTEGRATOR_CSR_BASE             0x10000000
 #define INTEGRATOR_CSR_SIZE             0x10000000
 
 #endif
-
-/* 	END */

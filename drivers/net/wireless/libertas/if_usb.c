@@ -10,9 +10,7 @@
 #include <linux/netdevice.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
-#if 0 /* Not in RHEL */
 #include <linux/olpc-ec.h>
-#endif
 
 #ifdef CONFIG_OLPC
 #include <asm/olpc.h>
@@ -846,7 +844,7 @@ static void if_usb_prog_firmware(struct lbs_private *priv, int ret,
 	cardp->fw = fw;
 	if (check_fwfile_format(cardp->fw->data, cardp->fw->size)) {
 		ret = -EINVAL;
-		goto done;
+		goto release_fw;
 	}
 
 	/* Cancel any pending usb business */
@@ -863,7 +861,7 @@ restart:
 	if (if_usb_submit_rx_urb_fwload(cardp) < 0) {
 		lbs_deb_usbd(&cardp->udev->dev, "URB submission is failed\n");
 		ret = -EIO;
-		goto done;
+		goto release_fw;
 	}
 
 	cardp->bootcmdresp = 0;
@@ -885,14 +883,14 @@ restart:
 		usb_kill_urb(cardp->tx_urb);
 		if (if_usb_submit_rx_urb(cardp) < 0)
 			ret = -EIO;
-		goto done;
+		goto release_fw;
 	} else if (cardp->bootcmdresp <= 0) {
 		if (--reset_count >= 0) {
 			if_usb_reset_device(cardp);
 			goto restart;
 		}
 		ret = -EIO;
-		goto done;
+		goto release_fw;
 	}
 
 	i = 0;
@@ -923,14 +921,14 @@ restart:
 
 		pr_info("FW download failure, time = %d ms\n", i * 100);
 		ret = -EIO;
-		goto done;
+		goto release_fw;
 	}
 
 	cardp->priv->fw_ready = 1;
 	if_usb_submit_rx_urb(cardp);
 
 	if (lbs_start_card(priv))
-		goto done;
+		goto release_fw;
 
 	if_usb_setup_firmware(priv);
 
@@ -941,8 +939,11 @@ restart:
 	if (lbs_host_sleep_cfg(priv, priv->wol_criteria, NULL))
 		priv->ehs_remove_supported = false;
 
- done:
+ release_fw:
+	release_firmware(cardp->fw);
 	cardp->fw = NULL;
+
+ done:
 	lbs_deb_leave(LBS_DEB_USB);
 }
 
@@ -963,12 +964,10 @@ static int if_usb_suspend(struct usb_interface *intf, pm_message_t message)
 
 #ifdef CONFIG_OLPC
 	if (machine_is_olpc()) {
-#if 0 /* Not in RHEL */
 		if (priv->wol_criteria == EHS_REMOVE_WAKEUP)
 			olpc_ec_wakeup_clear(EC_SCI_SRC_WLAN);
 		else
 			olpc_ec_wakeup_set(EC_SCI_SRC_WLAN);
-#endif
 	}
 #endif
 

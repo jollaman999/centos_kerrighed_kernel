@@ -325,7 +325,7 @@ void *cont_thread(void *arg)
 	printf("\tStarted continuous mode thread %d on CPU %d\n", i,
 	       cpus_to_pin[i]);
 	while (1) {
-		while(mq_send(queue, buff, sizeof(buff), 0) == 0)
+		while (mq_send(queue, buff, sizeof(buff), 0) == 0)
 			;
 		mq_receive(queue, buff, sizeof(buff), &priority);
 	}

@@ -13,6 +13,7 @@
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/errno.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include "base.h"
 
@@ -79,7 +80,7 @@ struct device *driver_find_device(struct device_driver *drv,
 	struct klist_iter i;
 	struct device *dev;
 
-	if (!drv)
+	if (!drv || !drv->p)
 		return NULL;
 
 	klist_iter_init_node(&drv->p->klist_devices, &i,
@@ -98,7 +99,7 @@ EXPORT_SYMBOL_GPL(driver_find_device);
  * @attr: driver attribute descriptor.
  */
 int driver_create_file(struct device_driver *drv,
-		       struct driver_attribute *attr)
+		       const struct driver_attribute *attr)
 {
 	int error;
 	if (drv)
@@ -115,79 +116,21 @@ EXPORT_SYMBOL_GPL(driver_create_file);
  * @attr: driver attribute descriptor.
  */
 void driver_remove_file(struct device_driver *drv,
-			struct driver_attribute *attr)
+			const struct driver_attribute *attr)
 {
 	if (drv)
 		sysfs_remove_file(&drv->p->kobj, &attr->attr);
 }
 EXPORT_SYMBOL_GPL(driver_remove_file);
 
-/**
- * driver_add_kobj - add a kobject below the specified driver
- * @drv: requesting device driver
- * @kobj: kobject to add below this driver
- * @fmt: format string that names the kobject
- *
- * You really don't want to do this, this is only here due to one looney
- * iseries driver, go poke those developers if you are annoyed about
- * this...
- */
-int driver_add_kobj(struct device_driver *drv, struct kobject *kobj,
-		    const char *fmt, ...)
-{
-	va_list args;
-	char *name;
-	int ret;
-
-	va_start(args, fmt);
-	name = kvasprintf(GFP_KERNEL, fmt, args);
-	va_end(args);
-
-	if (!name)
-		return -ENOMEM;
-
-	ret = kobject_add(kobj, &drv->p->kobj, "%s", name);
-	kfree(name);
-	return ret;
-}
-EXPORT_SYMBOL_GPL(driver_add_kobj);
-
-/**
- * get_driver - increment driver reference count.
- * @drv: driver.
- */
-struct device_driver *get_driver(struct device_driver *drv)
-{
-	if (drv) {
-		struct driver_private *priv;
-		struct kobject *kobj;
-
-		kobj = kobject_get(&drv->p->kobj);
-		priv = to_driver(kobj);
-		return priv->driver;
-	}
-	return NULL;
-}
-EXPORT_SYMBOL_GPL(get_driver);
-
-/**
- * put_driver - decrement driver's refcount.
- * @drv: driver.
- */
-void put_driver(struct device_driver *drv)
-{
-	kobject_put(&drv->p->kobj);
-}
-EXPORT_SYMBOL_GPL(put_driver);
-
-static int driver_add_groups(struct device_driver *drv,
-			     const struct attribute_group **groups)
+int driver_add_groups(struct device_driver *drv,
+		      const struct attribute_group **groups)
 {
 	return sysfs_create_groups(&drv->p->kobj, groups);
 }
 
-static void driver_remove_groups(struct device_driver *drv,
-				 const struct attribute_group **groups)
+void driver_remove_groups(struct device_driver *drv,
+			  const struct attribute_group **groups)
 {
 	sysfs_remove_groups(&drv->p->kobj, groups);
 }
@@ -215,7 +158,6 @@ int driver_register(struct device_driver *drv)
 
 	other = driver_find(drv->name, drv->bus);
 	if (other) {
-		put_driver(other);
 		printk(KERN_ERR "Error: Driver '%s' is already registered, "
 			"aborting...\n", drv->name);
 		return -EBUSY;
@@ -225,8 +167,12 @@ int driver_register(struct device_driver *drv)
 	if (ret)
 		return ret;
 	ret = driver_add_groups(drv, drv->groups);
-	if (ret)
+	if (ret) {
 		bus_remove_driver(drv);
+		return ret;
+	}
+	kobject_uevent(&drv->p->kobj, KOBJ_ADD);
+
 	return ret;
 }
 EXPORT_SYMBOL_GPL(driver_register);
@@ -256,7 +202,9 @@ EXPORT_SYMBOL_GPL(driver_unregister);
  * Call kset_find_obj() to iterate over list of drivers on
  * a bus to find driver by name. Return driver if found.
  *
- * Note that kset_find_obj increments driver's reference count.
+ * This routine provides no locking to prevent the driver it returns
+ * from being unregistered or unloaded while the caller is using it.
+ * The caller is responsible for preventing this.
  */
 struct device_driver *driver_find(const char *name, struct bus_type *bus)
 {
@@ -264,6 +212,8 @@ struct device_driver *driver_find(const char *name, struct bus_type *bus)
 	struct driver_private *priv;
 
 	if (k) {
+		/* Drop reference added by kset_find_obj() */
+		kobject_put(k);
 		priv = to_driver(k);
 		return priv->driver;
 	}

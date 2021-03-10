@@ -7,7 +7,6 @@
  * address space, e.g. all NOMMU machines.
  */
 #include <linux/sched.h>
-#include <linux/mm.h>
 #include <linux/string.h>
 
 #include <asm/segment.h>
@@ -32,7 +31,9 @@ static inline void set_fs(mm_segment_t fs)
 }
 #endif
 
+#ifndef segment_eq
 #define segment_eq(a, b) ((a).seg == (b).seg)
+#endif
 
 #define VERIFY_READ	0
 #define VERIFY_WRITE	1
@@ -78,6 +79,7 @@ extern unsigned long search_exception_table(unsigned long);
 static inline __must_check long __copy_from_user(void *to,
 		const void __user * from, unsigned long n)
 {
+	check_object_size(to, n, false);
 	if (__builtin_constant_p(n)) {
 		switch(n) {
 		case 1:
@@ -108,6 +110,7 @@ static inline __must_check long __copy_from_user(void *to,
 static inline __must_check long __copy_to_user(void __user *to,
 		const void *from, unsigned long n)
 {
+	check_object_size(from, n, true);
 	if (__builtin_constant_p(n)) {
 		switch(n) {
 		case 1:
@@ -162,17 +165,23 @@ static inline __must_check long __copy_to_user(void __user *to,
 
 #define put_user(x, ptr)					\
 ({								\
-	might_sleep();						\
+	might_fault();						\
 	access_ok(VERIFY_WRITE, ptr, sizeof(*ptr)) ?		\
 		__put_user(x, ptr) :				\
 		-EFAULT;					\
 })
+
+#ifndef __put_user_fn
 
 static inline int __put_user_fn(size_t size, void __user *ptr, void *x)
 {
 	size = __copy_to_user(ptr, x, size);
 	return size ? -EFAULT : size;
 }
+
+#define __put_user_fn(sz, u, k)	__put_user_fn(sz, u, k)
+
+#endif
 
 extern int __put_user_bad(void) __attribute__((noreturn));
 
@@ -218,17 +227,22 @@ extern int __put_user_bad(void) __attribute__((noreturn));
 
 #define get_user(x, ptr)					\
 ({								\
-	might_sleep();						\
+	might_fault();						\
 	access_ok(VERIFY_READ, ptr, sizeof(*ptr)) ?		\
 		__get_user(x, ptr) :				\
 		-EFAULT;					\
 })
 
+#ifndef __get_user_fn
 static inline int __get_user_fn(size_t size, const void __user *ptr, void *x)
 {
 	size = __copy_from_user(x, ptr, size);
 	return size ? -EFAULT : size;
 }
+
+#define __get_user_fn(sz, u, k)	__get_user_fn(sz, u, k)
+
+#endif
 
 extern int __get_user_bad(void) __attribute__((noreturn));
 
@@ -243,7 +257,7 @@ extern int __get_user_bad(void) __attribute__((noreturn));
 static inline long copy_from_user(void *to,
 		const void __user * from, unsigned long n)
 {
-	might_sleep();
+	might_fault();
 	if (access_ok(VERIFY_READ, from, n))
 		return __copy_from_user(to, from, n);
 	else
@@ -253,7 +267,7 @@ static inline long copy_from_user(void *to,
 static inline long copy_to_user(void __user *to,
 		const void *from, unsigned long n)
 {
-	might_sleep();
+	might_fault();
 	if (access_ok(VERIFY_WRITE, to, n))
 		return __copy_to_user(to, from, n);
 	else
@@ -288,14 +302,21 @@ strncpy_from_user(char *dst, const char __user *src, long count)
  *
  * Return 0 on exception, a value greater than N if too long
  */
-#ifndef strnlen_user
+#ifndef __strnlen_user
+#define __strnlen_user(s, n) (strnlen((s), (n)) + 1)
+#endif
+
+/*
+ * Unlike strnlen, strnlen_user includes the nul terminator in
+ * its returned count. Callers should check for a returned value
+ * greater than N as an indication the string is too long.
+ */
 static inline long strnlen_user(const char __user *src, long n)
 {
 	if (!access_ok(VERIFY_READ, src, 1))
 		return 0;
-	return strlen((void * __force)src) + 1;
+	return __strnlen_user(src, n);
 }
-#endif
 
 static inline long strlen_user(const char __user *src)
 {
@@ -317,7 +338,7 @@ __clear_user(void __user *to, unsigned long n)
 static inline __must_check unsigned long
 clear_user(void __user *to, unsigned long n)
 {
-	might_sleep();
+	might_fault();
 	if (!access_ok(VERIFY_WRITE, to, n))
 		return n;
 

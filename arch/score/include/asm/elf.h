@@ -52,16 +52,10 @@ typedef elf_fpreg_t	elf_fpregset_t;
 #define ELF_DATA	ELFDATA2LSB
 #define ELF_ARCH	EM_SCORE7
 
-#define SET_PERSONALITY(ex)					\
-do {								\
-	set_personality(PER_LINUX);				\
-} while (0)
-
 struct task_struct;
 struct pt_regs;
 
 #define CORE_DUMP_USE_REGSET
-#define USE_ELF_CORE_DUMP
 #define ELF_EXEC_PAGESIZE	PAGE_SIZE
 
 /* This yields a mask that user programs can use to figure out what

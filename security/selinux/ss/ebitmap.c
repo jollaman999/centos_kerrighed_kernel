@@ -4,7 +4,7 @@
  * Author : Stephen Smalley, <sds@epoch.ncsc.mil>
  */
 /*
- * Updated: Hewlett-Packard <paul.moore@hp.com>
+ * Updated: Hewlett-Packard <paul@paul-moore.com>
  *
  *      Added support to import/export the NetLabel category bitmap
  *
@@ -86,7 +86,7 @@ int ebitmap_cpy(struct ebitmap *dst, struct ebitmap *src)
  *
  */
 int ebitmap_netlbl_export(struct ebitmap *ebmap,
-			  struct netlbl_lsm_secattr_catmap **catmap)
+			  struct netlbl_lsm_catmap **catmap)
 {
 	struct ebitmap_node *e_iter = ebmap->node;
 	unsigned long e_map;
@@ -100,7 +100,7 @@ int ebitmap_netlbl_export(struct ebitmap *ebmap,
 	}
 
 	if (*catmap != NULL)
-		netlbl_secattr_catmap_free(*catmap);
+		netlbl_catmap_free(*catmap);
 	*catmap = NULL;
 
 	while (e_iter) {
@@ -108,10 +108,10 @@ int ebitmap_netlbl_export(struct ebitmap *ebmap,
 		for (iter = 0; iter < EBITMAP_UNIT_NUMS; iter++) {
 			e_map = e_iter->maps[iter];
 			if (e_map != 0) {
-				rc = netlbl_secattr_catmap_setlong(catmap,
-								   offset,
-								   e_map,
-								   GFP_ATOMIC);
+				rc = netlbl_catmap_setlong(catmap,
+							   offset,
+							   e_map,
+							   GFP_ATOMIC);
 				if (rc != 0)
 					goto netlbl_export_failure;
 			}
@@ -123,7 +123,7 @@ int ebitmap_netlbl_export(struct ebitmap *ebmap,
 	return 0;
 
 netlbl_export_failure:
-	netlbl_secattr_catmap_free(*catmap);
+	netlbl_catmap_free(*catmap);
 	return -ENOMEM;
 }
 
@@ -138,7 +138,7 @@ netlbl_export_failure:
  *
  */
 int ebitmap_netlbl_import(struct ebitmap *ebmap,
-			  struct netlbl_lsm_secattr_catmap *catmap)
+			  struct netlbl_lsm_catmap *catmap)
 {
 	int rc;
 	struct ebitmap_node *e_iter = NULL;
@@ -147,7 +147,7 @@ int ebitmap_netlbl_import(struct ebitmap *ebmap,
 	unsigned long bitmap;
 
 	for (;;) {
-		rc = netlbl_secattr_catmap_getlong(catmap, &offset, &bitmap);
+		rc = netlbl_catmap_getlong(catmap, &offset, &bitmap);
 		if (rc < 0)
 			goto netlbl_import_failure;
 		if (offset == (u32)-1)
@@ -165,7 +165,7 @@ int ebitmap_netlbl_import(struct ebitmap *ebmap,
 			e_iter = kzalloc(sizeof(*e_iter), GFP_ATOMIC);
 			if (e_iter == NULL)
 				goto netlbl_import_failure;
-			e_iter->startbit = offset & ~(EBITMAP_SIZE - 1);
+			e_iter->startbit = offset - (offset % EBITMAP_SIZE);
 			if (e_prev == NULL)
 				ebmap->node = e_iter;
 			else
@@ -190,7 +190,12 @@ netlbl_import_failure:
 }
 #endif /* CONFIG_NETLABEL */
 
-int ebitmap_contains(struct ebitmap *e1, struct ebitmap *e2)
+/*
+ * Check to see if all the bits set in e2 are also set in e1. Optionally,
+ * if last_e2bit is non-zero, the highest set bit in e2 cannot exceed
+ * last_e2bit.
+ */
+int ebitmap_contains(struct ebitmap *e1, struct ebitmap *e2, u32 last_e2bit)
 {
 	struct ebitmap_node *n1, *n2;
 	int i;
@@ -200,14 +205,25 @@ int ebitmap_contains(struct ebitmap *e1, struct ebitmap *e2)
 
 	n1 = e1->node;
 	n2 = e2->node;
+
 	while (n1 && n2 && (n1->startbit <= n2->startbit)) {
 		if (n1->startbit < n2->startbit) {
 			n1 = n1->next;
 			continue;
 		}
-		for (i = 0; i < EBITMAP_UNIT_NUMS; i++) {
+		for (i = EBITMAP_UNIT_NUMS - 1; (i >= 0) && !n2->maps[i]; )
+			i--;	/* Skip trailing NULL map entries */
+		if (last_e2bit && (i >= 0)) {
+			u32 lastsetbit = n2->startbit + i * EBITMAP_UNIT_SIZE +
+					 __fls(n2->maps[i]);
+			if (lastsetbit > last_e2bit)
+				return 0;
+		}
+
+		while (i >= 0) {
 			if ((n1->maps[i] & n2->maps[i]) != n2->maps[i])
 				return 0;
+			i--;
 		}
 
 		n1 = n1->next;

@@ -51,7 +51,7 @@
 /* AEN severity table */
 static char *twl_aen_severity_table[] =
 {
-	"None", "ERROR", "WARNING", "INFO", "DEBUG", (char*) 0
+	"None", "ERROR", "WARNING", "INFO", "DEBUG", NULL
 };
 
 /* Liberator register offsets */
@@ -102,10 +102,6 @@ static char *twl_aen_severity_table[] =
 #define TW_CURRENT_DRIVER_SRL 40
 #define TW_CURRENT_DRIVER_BUILD 0
 #define TW_CURRENT_DRIVER_BRANCH 0
-
-/* Phase defines */
-#define TW_PHASE_INITIAL 0
-#define TW_PHASE_SGLIST  2
 
 /* Misc defines */
 #define TW_SECTOR_SIZE                        512

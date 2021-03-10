@@ -6,13 +6,14 @@
  * This file may be distributed under the terms of the GNU General Public
  * License version 2.
  *
- * Copyright (c) 2010:  Borislav Petkov <borislav.petkov@amd.com>
+ * Copyright (c) 2010:  Borislav Petkov <bp@alien8.de>
  *			Advanced Micro Devices Inc.
  */
 
 #include <linux/kobject.h>
-#include <linux/sysdev.h>
+#include <linux/device.h>
 #include <linux/edac.h>
+#include <linux/module.h>
 #include <asm/mce.h>
 
 #include "mce_amd.h"
@@ -90,7 +91,7 @@ static ssize_t edac_inject_bank_store(struct kobject *kobj,
 
 	if (value > 5)
 		if (boot_cpu_data.x86 != 0x15 || value > 6) {
-			printk(KERN_ERR "Non-existant MCE bank: %lu\n", value);
+			printk(KERN_ERR "Non-existent MCE bank: %lu\n", value);
 			return -EINVAL;
 		}
 
@@ -115,14 +116,14 @@ static struct edac_mce_attr *sysfs_attrs[] = { &mce_attr_status, &mce_attr_misc,
 
 static int __init edac_init_mce_inject(void)
 {
-	struct sysdev_class *edac_class = NULL;
+	struct bus_type *edac_subsys = NULL;
 	int i, err = 0;
 
-	edac_class = edac_get_sysfs_class();
-	if (!edac_class)
+	edac_subsys = edac_get_sysfs_subsys();
+	if (!edac_subsys)
 		return -EINVAL;
 
-	mce_kobj = kobject_create_and_add("mce", &edac_class->kset.kobj);
+	mce_kobj = kobject_create_and_add("mce", &edac_subsys->dev_root->kobj);
 	if (!mce_kobj) {
 		printk(KERN_ERR "Error creating a mce kset.\n");
 		err = -ENOMEM;
@@ -146,7 +147,7 @@ err_sysfs_create:
 	kobject_del(mce_kobj);
 
 err_mce_kobj:
-	edac_put_sysfs_class();
+	edac_put_sysfs_subsys();
 
 	return err;
 }
@@ -160,13 +161,13 @@ static void __exit edac_exit_mce_inject(void)
 
 	kobject_del(mce_kobj);
 
-	edac_put_sysfs_class();
+	edac_put_sysfs_subsys();
 }
 
 module_init(edac_init_mce_inject);
 module_exit(edac_exit_mce_inject);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Borislav Petkov <borislav.petkov@amd.com>");
+MODULE_AUTHOR("Borislav Petkov <bp@alien8.de>");
 MODULE_AUTHOR("AMD Inc.");
 MODULE_DESCRIPTION("MCE injection facility for testing MCE decoding");

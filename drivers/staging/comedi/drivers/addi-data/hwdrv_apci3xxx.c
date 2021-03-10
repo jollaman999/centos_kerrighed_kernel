@@ -8,7 +8,7 @@ Copyright (C) 2004,2005  ADDI-DATA GmbH for the source code of this module.
 	D-77833 Ottersweier
 	Tel: +19(0)7223/9493-0
 	Fax: +49(0)7223/9493-92
-	http://www.addi-data-com
+	http://www.addi-data.com
 	info@addi-data.com
 
 This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
@@ -17,7 +17,7 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 
 You should have received a copy of the GNU General Public License along with this program; if not, write to the Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
-You shoud also find the complete GPL in the COPYING file accompanying this source code.
+You should also find the complete GPL in the COPYING file accompanying this source code.
 
 @endverbatim
 */
@@ -44,7 +44,35 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
   +----------+-----------+------------------------------------------------+
 */
 
-#include "hwdrv_apci3xxx.h"
+#ifndef COMEDI_SUBD_TTLIO
+#define COMEDI_SUBD_TTLIO	11	/* Digital Input Output But TTL */
+#endif
+
+#define APCI3XXX_SINGLE				0
+#define APCI3XXX_DIFF				1
+#define APCI3XXX_CONFIGURATION			0
+
+#define APCI3XXX_TTL_INIT_DIRECTION_PORT2	0
+
+static const struct comedi_lrange range_apci3XXX_ai = {
+	8, {
+		BIP_RANGE(10),
+		BIP_RANGE(5),
+		BIP_RANGE(2),
+		BIP_RANGE(1),
+		UNI_RANGE(10),
+		UNI_RANGE(5),
+		UNI_RANGE(2),
+		UNI_RANGE(1)
+	}
+};
+
+static const struct comedi_lrange range_apci3XXX_ao = {
+	2, {
+		BIP_RANGE(10),
+		UNI_RANGE(10)
+	}
+};
 
 /*
 +----------------------------------------------------------------------------+
@@ -67,10 +95,11 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
 |                     1 : Conversion started                                 |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_TestConversionStarted(struct comedi_device *dev)
+static int i_APCI3XXX_TestConversionStarted(struct comedi_device *dev)
 {
-	if ((readl((void *)(devpriv->dw_AiBase + 8)) & 0x80000UL) == 0x80000UL)
+	struct addi_private *devpriv = dev->private;
+
+	if ((readl(devpriv->dw_AiBase + 8) & 0x80000UL) == 0x80000UL)
 		return 1;
 	else
 		return 0;
@@ -104,10 +133,13 @@ int i_APCI3XXX_TestConversionStarted(struct comedi_device *dev)
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_AnalogInputConfigOperatingMode(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_AnalogInputConfigOperatingMode(struct comedi_device *dev,
+						     struct comedi_subdevice *s,
+						     struct comedi_insn *insn,
+						     unsigned int *data)
 {
+	const struct addi_board *this_board = comedi_board(dev);
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = insn->n;
 	unsigned char b_TimeBase = 0;
 	unsigned char b_SingleDiff = 0;
@@ -141,14 +173,13 @@ int i_APCI3XXX_AnalogInputConfigOperatingMode(struct comedi_device *dev,
 		/* Test the time base */
 	   /**********************/
 
-		if ((devpriv->ps_BoardInfo->
-				b_AvailableConvertUnit & (1 << b_TimeBase)) !=
+		if ((this_board->b_AvailableConvertUnit & (1 << b_TimeBase)) !=
 			0) {
 	      /*******************************/
 			/* Test the convert time value */
 	      /*******************************/
 
-			if ((dw_ReloadValue >= 0) && (dw_ReloadValue <= 65535)) {
+			if (dw_ReloadValue <= 65535) {
 				dw_TestReloadValue = dw_ReloadValue;
 
 				if (b_TimeBase == 1) {
@@ -165,12 +196,16 @@ int i_APCI3XXX_AnalogInputConfigOperatingMode(struct comedi_device *dev,
 		 /*******************************/
 
 				if (dw_TestReloadValue >=
-					devpriv->ps_BoardInfo->
+					devpriv->s_EeParameters.
 					ui_MinAcquisitiontimeNs) {
 					if ((b_SingleDiff == APCI3XXX_SINGLE)
 						|| (b_SingleDiff ==
 							APCI3XXX_DIFF)) {
-						if (((b_SingleDiff == APCI3XXX_SINGLE) && (devpriv->ps_BoardInfo->i_NbrAiChannel == 0)) || ((b_SingleDiff == APCI3XXX_DIFF) && (devpriv->ps_BoardInfo->i_NbrAiChannelDiff == 0))) {
+						if (((b_SingleDiff == APCI3XXX_SINGLE)
+						        && (devpriv->s_EeParameters.i_NbrAiChannel == 0))
+						    || ((b_SingleDiff == APCI3XXX_DIFF)
+							&& (this_board->i_NbrAiChannelDiff == 0))
+						    ) {
 			   /*******************************/
 							/* Single/Diff selection error */
 			   /*******************************/
@@ -204,19 +239,14 @@ int i_APCI3XXX_AnalogInputConfigOperatingMode(struct comedi_device *dev,
 								/* Set the convert timing unit */
 			      /*******************************/
 
-								writel((unsigned int)
-									b_TimeBase,
-									(void *)
-									(devpriv->
-										dw_AiBase
-										+
-										36));
+								writel((unsigned int)b_TimeBase,
+									devpriv->dw_AiBase + 36);
 
 			      /**************************/
 								/* Set the convert timing */
 			      /*************************/
 
-								writel(dw_ReloadValue, (void *)(devpriv->dw_AiBase + 32));
+								writel(dw_ReloadValue, devpriv->dw_AiBase + 32);
 							} else {
 			      /**************************/
 								/* Any conversion started */
@@ -294,9 +324,10 @@ int i_APCI3XXX_AnalogInputConfigOperatingMode(struct comedi_device *dev,
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_InsnConfigAnalogInput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_InsnConfigAnalogInput(struct comedi_device *dev,
+					    struct comedi_subdevice *s,
+					    struct comedi_insn *insn,
+					    unsigned int *data)
 {
 	int i_ReturnValue = insn->n;
 
@@ -354,10 +385,13 @@ int i_APCI3XXX_InsnConfigAnalogInput(struct comedi_device *dev,
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_InsnReadAnalogInput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_InsnReadAnalogInput(struct comedi_device *dev,
+					  struct comedi_subdevice *s,
+					  struct comedi_insn *insn,
+					  unsigned int *data)
 {
+	const struct addi_board *this_board = comedi_board(dev);
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = insn->n;
 	unsigned char b_Configuration = (unsigned char) CR_RANGE(insn->chanspec);
 	unsigned char b_Channel = (unsigned char) CR_CHAN(insn->chanspec);
@@ -375,10 +409,9 @@ int i_APCI3XXX_InsnReadAnalogInput(struct comedi_device *dev,
 		/* Test the channel number */
 	   /***************************/
 
-		if (((b_Channel < devpriv->ps_BoardInfo->i_NbrAiChannel)
+		if (((b_Channel < devpriv->s_EeParameters.i_NbrAiChannel)
 				&& (devpriv->b_SingelDiff == APCI3XXX_SINGLE))
-			|| ((b_Channel < devpriv->ps_BoardInfo->
-					i_NbrAiChannelDiff)
+			|| ((b_Channel < this_board->i_NbrAiChannelDiff)
 				&& (devpriv->b_SingelDiff == APCI3XXX_DIFF))) {
 	      /**********************************/
 			/* Test the channel configuration */
@@ -422,26 +455,20 @@ int i_APCI3XXX_InsnReadAnalogInput(struct comedi_device *dev,
 					/* Clear the FIFO */
 		    /******************/
 
-					writel(0x10000UL,
-						(void *)(devpriv->dw_AiBase +
-							12));
+					writel(0x10000UL, devpriv->dw_AiBase + 12);
 
 		    /*******************************/
 					/* Get and save the delay mode */
 		    /*******************************/
 
-					dw_Temp =
-						readl((void *)(devpriv->
-							dw_AiBase + 4));
+					dw_Temp = readl(devpriv->dw_AiBase + 4);
 					dw_Temp = dw_Temp & 0xFFFFFEF0UL;
 
 		    /***********************************/
 					/* Channel configuration selection */
 		    /***********************************/
 
-					writel(dw_Temp,
-						(void *)(devpriv->dw_AiBase +
-							4));
+					writel(dw_Temp, devpriv->dw_AiBase + 4);
 
 		    /**************************/
 					/* Make the configuration */
@@ -458,35 +485,28 @@ int i_APCI3XXX_InsnReadAnalogInput(struct comedi_device *dev,
 		    /***************************/
 
 					writel(dw_Configuration,
-						(void *)(devpriv->dw_AiBase +
-							0));
+					       devpriv->dw_AiBase + 0);
 
 		    /*********************/
 					/* Channel selection */
 		    /*********************/
 
 					writel(dw_Temp | 0x100UL,
-						(void *)(devpriv->dw_AiBase +
-							4));
+					       devpriv->dw_AiBase + 4);
 					writel((unsigned int) b_Channel,
-						(void *)(devpriv->dw_AiBase +
-							0));
+					       devpriv->dw_AiBase + 0);
 
 		    /***********************/
 					/* Restaure delay mode */
 		    /***********************/
 
-					writel(dw_Temp,
-						(void *)(devpriv->dw_AiBase +
-							4));
+					writel(dw_Temp, devpriv->dw_AiBase + 4);
 
 		    /***********************************/
 					/* Set the number of sequence to 1 */
 		    /***********************************/
 
-					writel(1,
-						(void *)(devpriv->dw_AiBase +
-							48));
+					writel(1, devpriv->dw_AiBase + 48);
 
 		    /***************************/
 					/* Save the interrupt flag */
@@ -514,50 +534,29 @@ int i_APCI3XXX_InsnReadAnalogInput(struct comedi_device *dev,
 							/* Start the conversion */
 			  /************************/
 
-							writel(0x80000UL,
-								(void *)
-								(devpriv->
-									dw_AiBase
-									+ 8));
+							writel(0x80000UL, devpriv->dw_AiBase + 8);
 
 			  /****************/
 							/* Wait the EOS */
 			  /****************/
 
 							do {
-								dw_Temp =
-									readl(
-									(void *)
-									(devpriv->
-										dw_AiBase
-										+
-										20));
-								dw_Temp =
-									dw_Temp
-									& 1;
+								dw_Temp = readl(devpriv->dw_AiBase + 20);
+								dw_Temp = dw_Temp & 1;
 							} while (dw_Temp != 1);
 
 			  /*************************/
 							/* Read the analog value */
 			  /*************************/
 
-							data[dw_AcquisitionCpt]
-								=
-								(unsigned int)
-								readl((void
-									*)
-								(devpriv->
-									dw_AiBase
-									+ 28));
+							data[dw_AcquisitionCpt] = (unsigned int)readl(devpriv->dw_AiBase + 28);
 						}
 					} else {
 		       /************************/
 						/* Start the conversion */
 		       /************************/
 
-						writel(0x180000UL,
-							(void *)(devpriv->
-								dw_AiBase + 8));
+						writel(0x180000UL, devpriv->dw_AiBase + 8);
 					}
 				} else {
 		    /**************************/
@@ -603,9 +602,10 @@ int i_APCI3XXX_InsnReadAnalogInput(struct comedi_device *dev,
 +----------------------------------------------------------------------------+
 */
 
-void v_APCI3XXX_Interrupt(int irq, void *d)
+static void v_APCI3XXX_Interrupt(int irq, void *d)
 {
 	struct comedi_device *dev = d;
+	struct addi_private *devpriv = dev->private;
 	unsigned char b_CopyCpt = 0;
 	unsigned int dw_Status = 0;
 
@@ -613,13 +613,13 @@ void v_APCI3XXX_Interrupt(int irq, void *d)
 	/* Test if interrupt occur */
 	/***************************/
 
-	dw_Status = readl((void *)(devpriv->dw_AiBase + 16));
+	dw_Status = readl(devpriv->dw_AiBase + 16);
 	if ( (dw_Status & 0x2UL) == 0x2UL) {
 	   /***********************/
 		/* Reset the interrupt */
 	   /***********************/
 
-		writel(dw_Status, (void *)(devpriv->dw_AiBase + 16));
+		writel(dw_Status, devpriv->dw_AiBase + 16);
 
 	   /*****************************/
 		/* Test if interrupt enabled */
@@ -634,8 +634,7 @@ void v_APCI3XXX_Interrupt(int irq, void *d)
 				b_CopyCpt < devpriv->ui_AiNbrofChannels;
 				b_CopyCpt++) {
 				devpriv->ui_AiReadData[b_CopyCpt] =
-					(unsigned int) readl((void *)(devpriv->
-						dw_AiBase + 28));
+					(unsigned int)readl(devpriv->dw_AiBase + 28);
 			}
 
 	      /**************************/
@@ -682,10 +681,12 @@ void v_APCI3XXX_Interrupt(int irq, void *d)
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_InsnWriteAnalogOutput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_InsnWriteAnalogOutput(struct comedi_device *dev,
+					    struct comedi_subdevice *s,
+					    struct comedi_insn *insn,
+					    unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	unsigned char b_Range = (unsigned char) CR_RANGE(insn->chanspec);
 	unsigned char b_Channel = (unsigned char) CR_CHAN(insn->chanspec);
 	unsigned int dw_Status = 0;
@@ -700,7 +701,7 @@ int i_APCI3XXX_InsnWriteAnalogOutput(struct comedi_device *dev,
 		/* Test the channel number */
 	   /***************************/
 
-		if (b_Channel < devpriv->ps_BoardInfo->i_NbrAoChannel) {
+		if (b_Channel < devpriv->s_EeParameters.i_NbrAoChannel) {
 	      /**********************************/
 			/* Test the channel configuration */
 	      /**********************************/
@@ -710,24 +711,21 @@ int i_APCI3XXX_InsnWriteAnalogOutput(struct comedi_device *dev,
 				/* Set the range selection */
 		 /***************************/
 
-				writel(b_Range,
-					(void *)(devpriv->dw_AiBase + 96));
+				writel(b_Range, devpriv->dw_AiBase + 96);
 
 		 /**************************************************/
 				/* Write the analog value to the selected channel */
 		 /**************************************************/
 
 				writel((data[0] << 8) | b_Channel,
-					(void *)(devpriv->dw_AiBase + 100));
+					devpriv->dw_AiBase + 100);
 
 		 /****************************/
 				/* Wait the end of transfer */
 		 /****************************/
 
 				do {
-					dw_Status =
-						readl((void *)(devpriv->
-							dw_AiBase + 96));
+					dw_Status = readl(devpriv->dw_AiBase + 96);
 				} while ((dw_Status & 0x100) != 0x100);
 			} else {
 		 /***************************/
@@ -788,10 +786,12 @@ int i_APCI3XXX_InsnWriteAnalogOutput(struct comedi_device *dev,
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_InsnConfigInitTTLIO(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_InsnConfigInitTTLIO(struct comedi_device *dev,
+					  struct comedi_subdevice *s,
+					  struct comedi_insn *insn,
+					  unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = insn->n;
 	unsigned char b_Command = 0;
 
@@ -916,10 +916,12 @@ int i_APCI3XXX_InsnConfigInitTTLIO(struct comedi_device *dev,
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_InsnBitsTTLIO(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_InsnBitsTTLIO(struct comedi_device *dev,
+				    struct comedi_subdevice *s,
+				    struct comedi_insn *insn,
+				    unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = insn->n;
 	unsigned char b_ChannelCpt = 0;
 	unsigned int dw_ChannelMask = 0;
@@ -1071,10 +1073,12 @@ int i_APCI3XXX_InsnBitsTTLIO(struct comedi_device *dev,
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_InsnReadTTLIO(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_InsnReadTTLIO(struct comedi_device *dev,
+				    struct comedi_subdevice *s,
+				    struct comedi_insn *insn,
+				    unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	unsigned char b_Channel = (unsigned char) CR_CHAN(insn->chanspec);
 	int i_ReturnValue = insn->n;
 	unsigned int *pls_ReadData = data;
@@ -1184,10 +1188,12 @@ int i_APCI3XXX_InsnReadTTLIO(struct comedi_device *dev,
 |                    -101 : Data size error                                  |
 +----------------------------------------------------------------------------+
 */
-
-int i_APCI3XXX_InsnWriteTTLIO(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI3XXX_InsnWriteTTLIO(struct comedi_device *dev,
+				     struct comedi_subdevice *s,
+				     struct comedi_insn *insn,
+				     unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = insn->n;
 	unsigned char b_Channel = (unsigned char) CR_CHAN(insn->chanspec);
 	unsigned char b_State = 0;
@@ -1206,7 +1212,7 @@ int i_APCI3XXX_InsnWriteTTLIO(struct comedi_device *dev,
 
 		if (b_Channel < 8) {
 	      /*****************************************************************************/
-			/* Read port 0 (first digital output port) and set/reset the selcted channel */
+			/* Read port 0 (first digital output port) and set/reset the selected channel */
 	      /*****************************************************************************/
 
 			dw_Status = inl(devpriv->iobase + 80);
@@ -1228,7 +1234,7 @@ int i_APCI3XXX_InsnWriteTTLIO(struct comedi_device *dev,
 				if ((devpriv->ul_TTLPortConfiguration[0] & 0xFF)
 					== 0xFF) {
 		    /*****************************************************************************/
-					/* Read port 2 (first digital output port) and set/reset the selcted channel */
+					/* Read port 2 (first digital output port) and set/reset the selected channel */
 		    /*****************************************************************************/
 
 					dw_Status = inl(devpriv->iobase + 112);
@@ -1270,357 +1276,38 @@ int i_APCI3XXX_InsnWriteTTLIO(struct comedi_device *dev,
 	return i_ReturnValue;
 }
 
-/*
-+----------------------------------------------------------------------------+
-|                           DIGITAL INPUT SUBDEVICE                          |
-+----------------------------------------------------------------------------+
-*/
-
-/*
-+----------------------------------------------------------------------------+
-| Function name     :int i_APCI3XXX_InsnReadDigitalInput                     |
-|                                          (struct comedi_device *dev,              |
-|                                           struct comedi_subdevice *s,             |
-|                                           struct comedi_insn *insn,               |
-|                                           unsigned int *data)                  |
-+----------------------------------------------------------------------------+
-| Task              : Reads the value of the specified Digital input channel |
-+----------------------------------------------------------------------------+
-| Input Parameters  : b_Channel = CR_CHAN(insn->chanspec) (0 to 3)           |
-+----------------------------------------------------------------------------+
-| Output Parameters : data[0] : Channel value                                |
-+----------------------------------------------------------------------------+
-| Return Value      : 0   : No error                                         |
-|                    -3   : Channel selection error                          |
-|                    -101 : Data size error                                  |
-+----------------------------------------------------------------------------+
-*/
-
-int i_APCI3XXX_InsnReadDigitalInput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int apci3xxx_di_insn_bits(struct comedi_device *dev,
+				 struct comedi_subdevice *s,
+				 struct comedi_insn *insn,
+				 unsigned int *data)
 {
-	int i_ReturnValue = insn->n;
-	unsigned char b_Channel = (unsigned char) CR_CHAN(insn->chanspec);
-	unsigned int dw_Temp = 0;
+	struct addi_private *devpriv = dev->private;
 
-	/***************************/
-	/* Test the channel number */
-	/***************************/
+	data[1] = inl(devpriv->iobase + 32) & 0xf;
 
-	if (b_Channel <= devpriv->ps_BoardInfo->i_NbrDiChannel) {
-	   /************************/
-		/* Test the buffer size */
-	   /************************/
-
-		if (insn->n >= 1) {
-			dw_Temp = inl(devpriv->iobase + 32);
-			*data = (dw_Temp >> b_Channel) & 1;
-		} else {
-	      /*******************/
-			/* Data size error */
-	      /*******************/
-
-			printk("Buffer size error\n");
-			i_ReturnValue = -101;
-		}
-	} else {
-	   /***************************/
-		/* Channel selection error */
-	   /***************************/
-
-		printk("Channel selection error\n");
-		i_ReturnValue = -3;
-	}
-
-	return i_ReturnValue;
+	return insn->n;
 }
 
-/*
-+----------------------------------------------------------------------------+
-| Function name     :int i_APCI3XXX_InsnBitsDigitalInput                     |
-|                                          (struct comedi_device *dev,              |
-|                                           struct comedi_subdevice *s,             |
-|                                           struct comedi_insn *insn,               |
-|                                           unsigned int *data)                  |
-+----------------------------------------------------------------------------+
-| Task              : Reads the value of the Digital input Port i.e.4channels|
-+----------------------------------------------------------------------------+
-| Input Parameters  : -                                                      |
-+----------------------------------------------------------------------------+
-| Output Parameters : data[0] : Port value                                   |
-+----------------------------------------------------------------------------+
-| Return Value      :>0: No error                                            |
-|                    ....                                                    |
-|                    -101 : Data size error                                  |
-+----------------------------------------------------------------------------+
-*/
-int i_APCI3XXX_InsnBitsDigitalInput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int apci3xxx_do_insn_bits(struct comedi_device *dev,
+				 struct comedi_subdevice *s,
+				 struct comedi_insn *insn,
+				 unsigned int *data)
 {
-	int i_ReturnValue = insn->n;
-	unsigned int dw_Temp = 0;
+	struct addi_private *devpriv = dev->private;
+	unsigned int mask = data[0];
+	unsigned int bits = data[1];
 
-	/************************/
-	/* Test the buffer size */
-	/************************/
+	s->state = inl(devpriv->iobase + 48) & 0xf;
+	if (mask) {
+		s->state &= ~mask;
+		s->state |= (bits & mask);
 
-	if (insn->n >= 1) {
-		dw_Temp = inl(devpriv->iobase + 32);
-		*data = dw_Temp & 0xf;
-	} else {
-	   /*******************/
-		/* Data size error */
-	   /*******************/
-
-		printk("Buffer size error\n");
-		i_ReturnValue = -101;
+		outl(s->state, devpriv->iobase + 48);
 	}
 
-	return i_ReturnValue;
-}
+	data[1] = s->state;
 
-/*
-+----------------------------------------------------------------------------+
-|                           DIGITAL OUTPUT SUBDEVICE                         |
-+----------------------------------------------------------------------------+
-
-*/
-
-/*
-+----------------------------------------------------------------------------+
-| Function name     :int i_APCI3XXX_InsnBitsDigitalOutput                    |
-|                                          (struct comedi_device *dev,              |
-|                                           struct comedi_subdevice *s,             |
-|                                           struct comedi_insn *insn,               |
-|                                           unsigned int *data)                  |
-+----------------------------------------------------------------------------+
-| Task              : Write the selected output mask and read the status from|
-|                     all digital output channles                            |
-+----------------------------------------------------------------------------+
-| Input Parameters  : dw_ChannelMask = data [0];                             |
-|                     dw_BitMask     = data [1];                             |
-+----------------------------------------------------------------------------+
-| Output Parameters : data[1] : All digital output channles states           |
-+----------------------------------------------------------------------------+
-| Return Value      : >0  : No error                                         |
-|                    -4   : Channel mask error                               |
-|                    -101 : Data size error                                  |
-+----------------------------------------------------------------------------+
-*/
-int i_APCI3XXX_InsnBitsDigitalOutput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
-{
-	int i_ReturnValue = insn->n;
-	unsigned char b_ChannelCpt = 0;
-	unsigned int dw_ChannelMask = 0;
-	unsigned int dw_BitMask = 0;
-	unsigned int dw_Status = 0;
-
-	/************************/
-	/* Test the buffer size */
-	/************************/
-
-	if (insn->n >= 2) {
-	   /*******************************/
-		/* Get the channe and bit mask */
-	   /*******************************/
-
-		dw_ChannelMask = data[0];
-		dw_BitMask = data[1];
-
-	   /*************************/
-		/* Test the channel mask */
-	   /*************************/
-
-		if ((dw_ChannelMask & 0XFFFFFFF0) == 0) {
-	      /*********************************/
-			/* Test if set/reset any channel */
-	      /*********************************/
-
-			if (dw_ChannelMask & 0xF) {
-		 /********************************/
-				/* Read the digital output port */
-		 /********************************/
-
-				dw_Status = inl(devpriv->iobase + 48);
-
-				for (b_ChannelCpt = 0; b_ChannelCpt < 4;
-					b_ChannelCpt++) {
-					if ((dw_ChannelMask >> b_ChannelCpt) &
-						1) {
-						dw_Status =
-							(dw_Status & (0xF -
-								(1 << b_ChannelCpt))) | (dw_BitMask & (1 << b_ChannelCpt));
-					}
-				}
-
-				outl(dw_Status, devpriv->iobase + 48);
-			}
-
-	      /********************************/
-			/* Read the digital output port */
-	      /********************************/
-
-			data[1] = inl(devpriv->iobase + 48);
-		} else {
-	      /************************/
-			/* Config command error */
-	      /************************/
-
-			printk("Channel mask error\n");
-			i_ReturnValue = -4;
-		}
-	} else {
-	   /*******************/
-		/* Data size error */
-	   /*******************/
-
-		printk("Buffer size error\n");
-		i_ReturnValue = -101;
-	}
-
-	return i_ReturnValue;
-}
-
-/*
-+----------------------------------------------------------------------------+
-| Function name     :int i_APCI3XXX_InsnWriteDigitalOutput                   |
-|                                          (struct comedi_device *dev,              |
-|                                           struct comedi_subdevice *s,             |
-|                                           struct comedi_insn *insn,               |
-|                                           unsigned int *data)                  |
-+----------------------------------------------------------------------------+
-| Task              : Set the state from digital output channel              |
-+----------------------------------------------------------------------------+
-| Input Parameters  : b_Channel = CR_CHAN(insn->chanspec)                    |
-|                     b_State   = data [0]                                   |
-+----------------------------------------------------------------------------+
-| Output Parameters : -                                                      |
-+----------------------------------------------------------------------------+
-| Return Value      : >0  : No error                                         |
-|                    -3   : Channel selection error                          |
-|                    -101 : Data size error                                  |
-+----------------------------------------------------------------------------+
-*/
-
-int i_APCI3XXX_InsnWriteDigitalOutput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
-{
-	int i_ReturnValue = insn->n;
-	unsigned char b_Channel = CR_CHAN(insn->chanspec);
-	unsigned char b_State = 0;
-	unsigned int dw_Status = 0;
-
-	/************************/
-	/* Test the buffer size */
-	/************************/
-
-	if (insn->n >= 1) {
-	   /***************************/
-		/* Test the channel number */
-	   /***************************/
-
-		if (b_Channel < devpriv->ps_BoardInfo->i_NbrDoChannel) {
-	      /*******************/
-			/* Get the command */
-	      /*******************/
-
-			b_State = (unsigned char) data[0];
-
-	      /********************************/
-			/* Read the digital output port */
-	      /********************************/
-
-			dw_Status = inl(devpriv->iobase + 48);
-
-			dw_Status =
-				(dw_Status & (0xF -
-					(1 << b_Channel))) | ((b_State & 1) <<
-				b_Channel);
-			outl(dw_Status, devpriv->iobase + 48);
-		} else {
-	      /***************************/
-			/* Channel selection error */
-	      /***************************/
-
-			printk("Channel selection error\n");
-			i_ReturnValue = -3;
-		}
-	} else {
-	   /*******************/
-		/* Data size error */
-	   /*******************/
-
-		printk("Buffer size error\n");
-		i_ReturnValue = -101;
-	}
-
-	return i_ReturnValue;
-}
-
-/*
-+----------------------------------------------------------------------------+
-| Function name     :int i_APCI3XXX_InsnReadDigitalOutput                    |
-|                                          (struct comedi_device *dev,              |
-|                                           struct comedi_subdevice *s,             |
-|                                           struct comedi_insn *insn,               |
-|                                           unsigned int *data)                  |
-+----------------------------------------------------------------------------+
-| Task              : Read the state from digital output channel             |
-+----------------------------------------------------------------------------+
-| Input Parameters  : b_Channel = CR_CHAN(insn->chanspec)                    |
-+----------------------------------------------------------------------------+
-| Output Parameters : b_State   = data [0]                                   |
-+----------------------------------------------------------------------------+
-| Return Value      : >0  : No error                                         |
-|                    -3   : Channel selection error                          |
-|                    -101 : Data size error                                  |
-+----------------------------------------------------------------------------+
-*/
-
-int i_APCI3XXX_InsnReadDigitalOutput(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
-{
-	int i_ReturnValue = insn->n;
-	unsigned char b_Channel = CR_CHAN(insn->chanspec);
-	unsigned int dw_Status = 0;
-
-	/************************/
-	/* Test the buffer size */
-	/************************/
-
-	if (insn->n >= 1) {
-	   /***************************/
-		/* Test the channel number */
-	   /***************************/
-
-		if (b_Channel < devpriv->ps_BoardInfo->i_NbrDoChannel) {
-	      /********************************/
-			/* Read the digital output port */
-	      /********************************/
-
-			dw_Status = inl(devpriv->iobase + 48);
-
-			dw_Status = (dw_Status >> b_Channel) & 1;
-			*data = dw_Status;
-		} else {
-	      /***************************/
-			/* Channel selection error */
-	      /***************************/
-
-			printk("Channel selection error\n");
-			i_ReturnValue = -3;
-		}
-	} else {
-	   /*******************/
-		/* Data size error */
-	   /*******************/
-
-		printk("Buffer size error\n");
-		i_ReturnValue = -101;
-	}
-
-	return i_ReturnValue;
+	return insn->n;
 }
 
 /*
@@ -1636,8 +1323,9 @@ int i_APCI3XXX_InsnReadDigitalOutput(struct comedi_device *dev,
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI3XXX_Reset(struct comedi_device *dev)
+static int i_APCI3XXX_Reset(struct comedi_device *dev)
 {
+	struct addi_private *devpriv = dev->private;
 	unsigned char b_Cpt = 0;
 
 	/*************************/
@@ -1656,27 +1344,26 @@ int i_APCI3XXX_Reset(struct comedi_device *dev)
 	/* Clear the start command */
 	/***************************/
 
-	writel(0, (void *)(devpriv->dw_AiBase + 8));
+	writel(0, devpriv->dw_AiBase + 8);
 
 	/*****************************/
 	/* Reset the interrupt flags */
 	/*****************************/
 
-	writel(readl((void *)(devpriv->dw_AiBase + 16)),
-		(void *)(devpriv->dw_AiBase + 16));
+	writel(readl(devpriv->dw_AiBase + 16), devpriv->dw_AiBase + 16);
 
 	/*****************/
 	/* clear the EOS */
 	/*****************/
 
-	readl((void *)(devpriv->dw_AiBase + 20));
+	readl(devpriv->dw_AiBase + 20);
 
 	/******************/
 	/* Clear the FIFO */
 	/******************/
 
 	for (b_Cpt = 0; b_Cpt < 16; b_Cpt++) {
-		readl((void *)(devpriv->dw_AiBase + 28));
+		readl(devpriv->dw_AiBase + 28);
 	}
 
 	/************************/

@@ -12,13 +12,24 @@
 #ifndef _ASM_SYSCALL_H
 #define _ASM_SYSCALL_H	1
 
+#include <uapi/linux/audit.h>
 #include <linux/sched.h>
+#include <linux/err.h>
 #include <asm/ptrace.h>
+
+/*
+ * The syscall table always contains 32 bit pointers since we know that the
+ * address of the function to be called is (way) below 4GB.  So the "int"
+ * type here is what we want [need] for both 32 bit and 64 bit systems.
+ */
+extern const unsigned int sys_call_table[];
+extern const unsigned int sys_call_table_emu[];
 
 static inline long syscall_get_nr(struct task_struct *task,
 				  struct pt_regs *regs)
 {
-	return regs->svcnr ? regs->svcnr : -1;
+	return test_tsk_thread_flag(task, TIF_SYSCALL) ?
+		(regs->int_code & 0xffff) : -1;
 }
 
 static inline void syscall_rollback(struct task_struct *task,
@@ -30,7 +41,7 @@ static inline void syscall_rollback(struct task_struct *task,
 static inline long syscall_get_error(struct task_struct *task,
 				     struct pt_regs *regs)
 {
-	return (regs->gprs[2] >= -4096UL) ? -regs->gprs[2] : 0;
+	return IS_ERR_VALUE(regs->gprs[2]) ? regs->gprs[2] : 0;
 }
 
 static inline long syscall_get_return_value(struct task_struct *task,
@@ -43,7 +54,7 @@ static inline void syscall_set_return_value(struct task_struct *task,
 					    struct pt_regs *regs,
 					    int error, long val)
 {
-	regs->gprs[2] = error ? -error : val;
+	regs->gprs[2] = error ? error : val;
 }
 
 static inline void syscall_get_arguments(struct task_struct *task,
@@ -53,13 +64,17 @@ static inline void syscall_get_arguments(struct task_struct *task,
 {
 	unsigned long mask = -1UL;
 
+	/*
+	 * No arguments for this syscall, there's nothing to do.
+	 */
+	if (!n)
+		return;
+
 	BUG_ON(i + n > 6);
 #ifdef CONFIG_COMPAT
 	if (test_tsk_thread_flag(task, TIF_31BIT))
 		mask = 0xffffffff;
 #endif
-	if (i + n == 6)
-		args[--n] = regs->args[0] & mask;
 	while (n-- > 0)
 		if (i + n > 0)
 			args[n] = regs->gprs[2 + i + n] & mask;
@@ -73,8 +88,6 @@ static inline void syscall_set_arguments(struct task_struct *task,
 					 const unsigned long *args)
 {
 	BUG_ON(i + n > 6);
-	if (i + n == 6)
-		regs->args[0] = args[--n];
 	while (n-- > 0)
 		if (i + n > 0)
 			regs->gprs[2 + i + n] = args[n];
@@ -82,4 +95,12 @@ static inline void syscall_set_arguments(struct task_struct *task,
 		regs->orig_gpr2 = args[0];
 }
 
+static inline int syscall_get_arch(void)
+{
+#ifdef CONFIG_COMPAT
+	if (test_tsk_thread_flag(current, TIF_31BIT))
+		return AUDIT_ARCH_S390;
+#endif
+	return sizeof(long) == 8 ? AUDIT_ARCH_S390X : AUDIT_ARCH_S390;
+}
 #endif	/* _ASM_SYSCALL_H */

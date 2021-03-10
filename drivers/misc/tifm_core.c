@@ -10,8 +10,10 @@
  */
 
 #include <linux/tifm.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/idr.h>
+#include <linux/module.h>
 
 #define DRIVER_NAME "tifm_core"
 #define DRIVER_VERSION "0.8"
@@ -194,13 +196,14 @@ int tifm_add_adapter(struct tifm_adapter *fm)
 {
 	int rc;
 
-	if (!idr_pre_get(&tifm_adapter_idr, GFP_KERNEL))
-		return -ENOMEM;
-
+	idr_preload(GFP_KERNEL);
 	spin_lock(&tifm_adapter_lock);
-	rc = idr_get_new(&tifm_adapter_idr, fm, &fm->id);
+	rc = idr_alloc(&tifm_adapter_idr, fm, 0, 0, GFP_NOWAIT);
+	if (rc >= 0)
+		fm->id = rc;
 	spin_unlock(&tifm_adapter_lock);
-	if (rc)
+	idr_preload_end();
+	if (rc < 0)
 		return rc;
 
 	dev_set_name(&fm->dev, "tifm%u", fm->id);
@@ -328,7 +331,7 @@ static int __init tifm_init(void)
 {
 	int rc;
 
-	workqueue = create_freezeable_workqueue("tifm");
+	workqueue = create_freezable_workqueue("tifm");
 	if (!workqueue)
 		return -ENOMEM;
 

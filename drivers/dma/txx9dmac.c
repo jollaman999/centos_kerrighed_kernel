@@ -15,6 +15,8 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/scatterlist.h>
+
+#include "dmaengine.h"
 #include "txx9dmac.h"
 
 static struct txx9dmac_chan *to_txx9dmac_chan(struct dma_chan *chan)
@@ -279,21 +281,6 @@ static void txx9dmac_desc_put(struct txx9dmac_chan *dc,
 	}
 }
 
-/* Called with dc->lock held and bh disabled */
-static dma_cookie_t
-txx9dmac_assign_cookie(struct txx9dmac_chan *dc, struct txx9dmac_desc *desc)
-{
-	dma_cookie_t cookie = dc->chan.cookie;
-
-	if (++cookie < 0)
-		cookie = 1;
-
-	dc->chan.cookie = cookie;
-	desc->txd.cookie = cookie;
-
-	return cookie;
-}
-
 /*----------------------------------------------------------------------*/
 
 static void txx9dmac_dump_regs(struct txx9dmac_chan *dc)
@@ -424,7 +411,7 @@ txx9dmac_descriptor_complete(struct txx9dmac_chan *dc,
 	dev_vdbg(chan2dev(&dc->chan), "descriptor %u %p complete\n",
 		 txd->cookie, desc);
 
-	dc->completed = txd->cookie;
+	dma_cookie_complete(txd);
 	callback = txd->callback;
 	param = txd->callback_param;
 
@@ -432,6 +419,7 @@ txx9dmac_descriptor_complete(struct txx9dmac_chan *dc,
 	list_splice_init(&desc->tx_list, &dc->free_list);
 	list_move(&desc->desc_node, &dc->free_list);
 
+	dma_descriptor_unmap(txd);
 	if (!ds) {
 		dma_addr_t dmaaddr;
 		if (!(txd->flags & DMA_COMPL_SKIP_DEST_UNMAP)) {
@@ -738,7 +726,7 @@ static dma_cookie_t txx9dmac_tx_submit(struct dma_async_tx_descriptor *tx)
 	dma_cookie_t cookie;
 
 	spin_lock_bh(&dc->lock);
-	cookie = txx9dmac_assign_cookie(dc, desc);
+	cookie = dma_cookie_assign(tx);
 
 	dev_vdbg(chan2dev(tx->chan), "tx_submit: queued %u %p\n",
 		 desc->txd.cookie, desc);
@@ -845,8 +833,8 @@ txx9dmac_prep_dma_memcpy(struct dma_chan *chan, dma_addr_t dest, dma_addr_t src,
 
 static struct dma_async_tx_descriptor *
 txx9dmac_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
-		unsigned int sg_len, enum dma_data_direction direction,
-		unsigned long flags)
+		unsigned int sg_len, enum dma_transfer_direction direction,
+		unsigned long flags, void *context)
 {
 	struct txx9dmac_chan *dc = to_txx9dmac_chan(chan);
 	struct txx9dmac_dev *ddev = dc->ddev;
@@ -860,9 +848,9 @@ txx9dmac_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 
 	BUG_ON(!ds || !ds->reg_width);
 	if (ds->tx_reg)
-		BUG_ON(direction != DMA_TO_DEVICE);
+		BUG_ON(direction != DMA_MEM_TO_DEV);
 	else
-		BUG_ON(direction != DMA_FROM_DEVICE);
+		BUG_ON(direction != DMA_DEV_TO_MEM);
 	if (unlikely(!sg_len))
 		return NULL;
 
@@ -882,7 +870,7 @@ txx9dmac_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 		mem = sg_dma_address(sg);
 
 		if (__is_dmac64(ddev)) {
-			if (direction == DMA_TO_DEVICE) {
+			if (direction == DMA_MEM_TO_DEV) {
 				desc->hwdesc.SAR = mem;
 				desc->hwdesc.DAR = ds->tx_reg;
 			} else {
@@ -891,7 +879,7 @@ txx9dmac_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 			}
 			desc->hwdesc.CNTR = sg_dma_len(sg);
 		} else {
-			if (direction == DMA_TO_DEVICE) {
+			if (direction == DMA_MEM_TO_DEV) {
 				desc->hwdesc32.SAR = mem;
 				desc->hwdesc32.DAR = ds->tx_reg;
 			} else {
@@ -900,7 +888,7 @@ txx9dmac_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 			}
 			desc->hwdesc32.CNTR = sg_dma_len(sg);
 		}
-		if (direction == DMA_TO_DEVICE) {
+		if (direction == DMA_MEM_TO_DEV) {
 			sai = ds->reg_width;
 			dai = 0;
 		} else {
@@ -938,11 +926,16 @@ txx9dmac_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 	return &first->txd;
 }
 
-static void txx9dmac_terminate_all(struct dma_chan *chan)
+static int txx9dmac_control(struct dma_chan *chan, enum dma_ctrl_cmd cmd,
+			    unsigned long arg)
 {
 	struct txx9dmac_chan *dc = to_txx9dmac_chan(chan);
 	struct txx9dmac_desc *desc, *_desc;
 	LIST_HEAD(list);
+
+	/* Only supports DMA_TERMINATE_ALL */
+	if (cmd != DMA_TERMINATE_ALL)
+		return -EINVAL;
 
 	dev_vdbg(chan2dev(chan), "terminate_all\n");
 	spin_lock_bh(&dc->lock);
@@ -958,37 +951,25 @@ static void txx9dmac_terminate_all(struct dma_chan *chan)
 	/* Flush all pending and queued descriptors */
 	list_for_each_entry_safe(desc, _desc, &list, desc_node)
 		txx9dmac_descriptor_complete(dc, desc);
+
+	return 0;
 }
 
 static enum dma_status
-txx9dmac_is_tx_complete(struct dma_chan *chan,
-			dma_cookie_t cookie,
-		dma_cookie_t *done, dma_cookie_t *used)
+txx9dmac_tx_status(struct dma_chan *chan, dma_cookie_t cookie,
+		   struct dma_tx_state *txstate)
 {
 	struct txx9dmac_chan *dc = to_txx9dmac_chan(chan);
-	dma_cookie_t last_used;
-	dma_cookie_t last_complete;
-	int ret;
+	enum dma_status ret;
 
-	last_complete = dc->completed;
-	last_used = chan->cookie;
-
-	ret = dma_async_is_complete(cookie, last_complete, last_used);
+	ret = dma_cookie_status(chan, cookie, txstate);
 	if (ret != DMA_SUCCESS) {
 		spin_lock_bh(&dc->lock);
 		txx9dmac_scan_descriptors(dc);
 		spin_unlock_bh(&dc->lock);
 
-		last_complete = dc->completed;
-		last_used = chan->cookie;
-
-		ret = dma_async_is_complete(cookie, last_complete, last_used);
+		ret = dma_cookie_status(chan, cookie, txstate);
 	}
-
-	if (done)
-		*done = last_complete;
-	if (used)
-		*used = last_used;
 
 	return ret;
 }
@@ -1054,7 +1035,7 @@ static int txx9dmac_alloc_chan_resources(struct dma_chan *chan)
 		return -EIO;
 	}
 
-	dc->completed = chan->cookie = 1;
+	dma_cookie_init(chan);
 
 	dc->ccr = TXX9_DMA_CCR_IMMCHN | TXX9_DMA_CCR_INTENE | CCR_LE;
 	txx9dmac_chan_set_SMPCHN(dc);
@@ -1153,8 +1134,8 @@ static int __init txx9dmac_chan_probe(struct platform_device *pdev)
 	dc->dma.dev = &pdev->dev;
 	dc->dma.device_alloc_chan_resources = txx9dmac_alloc_chan_resources;
 	dc->dma.device_free_chan_resources = txx9dmac_free_chan_resources;
-	dc->dma.device_terminate_all = txx9dmac_terminate_all;
-	dc->dma.device_is_tx_complete = txx9dmac_is_tx_complete;
+	dc->dma.device_control = txx9dmac_control;
+	dc->dma.device_tx_status = txx9dmac_tx_status;
 	dc->dma.device_issue_pending = txx9dmac_issue_pending;
 	if (pdata && pdata->memcpy_chan == ch) {
 		dc->dma.device_prep_dma_memcpy = txx9dmac_prep_dma_memcpy;
@@ -1183,7 +1164,7 @@ static int __init txx9dmac_chan_probe(struct platform_device *pdev)
 	dc->ddev->chan[ch] = dc;
 	dc->chan.device = &dc->dma;
 	list_add_tail(&dc->chan.device_node, &dc->chan.device->channels);
-	dc->chan.cookie = dc->completed = 1;
+	dma_cookie_init(&dc->chan);
 
 	if (is_dmac64(dc))
 		dc->ch_regs = &__txx9dmac_regs(dc->ddev)->CHAN[ch];
@@ -1210,7 +1191,7 @@ static int __init txx9dmac_chan_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int __exit txx9dmac_chan_remove(struct platform_device *pdev)
+static int txx9dmac_chan_remove(struct platform_device *pdev)
 {
 	struct txx9dmac_chan *dc = platform_get_drvdata(pdev);
 
@@ -1272,7 +1253,7 @@ static int __init txx9dmac_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int __exit txx9dmac_remove(struct platform_device *pdev)
+static int txx9dmac_remove(struct platform_device *pdev)
 {
 	struct txx9dmac_dev *ddev = platform_get_drvdata(pdev);
 
@@ -1313,20 +1294,20 @@ static int txx9dmac_resume_noirq(struct device *dev)
 
 }
 
-static struct dev_pm_ops txx9dmac_dev_pm_ops = {
+static const struct dev_pm_ops txx9dmac_dev_pm_ops = {
 	.suspend_noirq = txx9dmac_suspend_noirq,
 	.resume_noirq = txx9dmac_resume_noirq,
 };
 
 static struct platform_driver txx9dmac_chan_driver = {
-	.remove		= __exit_p(txx9dmac_chan_remove),
+	.remove		= txx9dmac_chan_remove,
 	.driver = {
 		.name	= "txx9dmac-chan",
 	},
 };
 
 static struct platform_driver txx9dmac_driver = {
-	.remove		= __exit_p(txx9dmac_remove),
+	.remove		= txx9dmac_remove,
 	.shutdown	= txx9dmac_shutdown,
 	.driver = {
 		.name	= "txx9dmac",
@@ -1359,3 +1340,5 @@ module_exit(txx9dmac_exit);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("TXx9 DMA Controller driver");
 MODULE_AUTHOR("Atsushi Nemoto <anemo@mba.ocn.ne.jp>");
+MODULE_ALIAS("platform:txx9dmac");
+MODULE_ALIAS("platform:txx9dmac-chan");

@@ -53,23 +53,9 @@ int fnic_debugfs_init(void)
 {
 	int rc = -1;
 	fnic_trace_debugfs_root = debugfs_create_dir("fnic", NULL);
-	if (!fnic_trace_debugfs_root) {
-		printk(KERN_DEBUG "Cannot create debugfs root\n");
-		return rc;
-	}
-
-	if (!fnic_trace_debugfs_root) {
-		printk(KERN_DEBUG
-			"fnic root directory doesn't exist in debugfs\n");
-		return rc;
-	}
 
 	fnic_stats_debugfs_root = debugfs_create_dir("statistics",
 						fnic_trace_debugfs_root);
-	if (!fnic_stats_debugfs_root) {
-		printk(KERN_DEBUG "Cannot create Statistics directory\n");
-		return rc;
-	}
 
 	/* Allocate memory to structure */
 	fc_trc_flag = (struct fc_trace_flag_type *)
@@ -104,24 +90,6 @@ void fnic_debugfs_terminate(void)
 
 	if (fc_trc_flag)
 		vfree(fc_trc_flag);
-}
-
-/*
- * fnic_trace_ctrl_open - Open the trace_enable file for fnic_trace
- *               Or Open fc_trace_enable file for fc_trace
- * @inode: The inode pointer.
- * @file: The file pointer to attach the trace enable/disable flag.
- *
- * Description:
- * This routine opens a debugsfs file trace_enable or fc_trace_enable.
- *
- * Returns:
- * This function returns zero if successful.
- */
-static int fnic_trace_ctrl_open(struct inode *inode, struct file *filp)
-{
-	filp->private_data = inode->i_private;
-	return 0;
 }
 
 /*
@@ -210,7 +178,7 @@ static ssize_t fnic_trace_ctrl_write(struct file *filp,
 	else if (*trace_type == fc_trc_flag->fc_clear)
 		fnic_fc_trace_cleared = val;
 	else
-		pr_err("fnic: cannot write to any debugfs file\n");
+		pr_err("fnic: cannot write to any debufs file\n");
 
 	(*ppos)++;
 
@@ -219,7 +187,7 @@ static ssize_t fnic_trace_ctrl_write(struct file *filp,
 
 static const struct file_operations fnic_trace_ctrl_fops = {
 	.owner = THIS_MODULE,
-	.open = fnic_trace_ctrl_open,
+	.open = simple_open,
 	.read = fnic_trace_ctrl_read,
 	.write = fnic_trace_ctrl_write,
 };
@@ -298,20 +266,8 @@ static loff_t fnic_trace_debugfs_lseek(struct file *file,
 					int howto)
 {
 	fnic_dbgfs_t *fnic_dbg_prt = file->private_data;
-	loff_t pos = -1;
-
-	switch (howto) {
-	case 0:
-		pos = offset;
-		break;
-	case 1:
-		pos = file->f_pos + offset;
-		break;
-	case 2:
-		pos = fnic_dbg_prt->buffer_len + offset;
-	}
-	return (pos < 0 || pos > fnic_dbg_prt->buffer_len) ?
-			  -EINVAL : (file->f_pos = pos);
+	return fixed_size_llseek(file, offset, howto,
+				fnic_dbg_prt->buffer_len);
 }
 
 /*
@@ -384,39 +340,19 @@ static const struct file_operations fnic_trace_debugfs_fops = {
  * it will also create file trace_enable to control enable/disable of
  * trace logging into trace buffer.
  */
-int fnic_trace_debugfs_init(void)
+void fnic_trace_debugfs_init(void)
 {
-	int rc = -1;
-	if (!fnic_trace_debugfs_root) {
-		printk(KERN_DEBUG
-			"FNIC Debugfs root directory doesn't exist\n");
-		return rc;
-	}
 	fnic_trace_enable = debugfs_create_file("tracing_enable",
 					S_IFREG|S_IRUGO|S_IWUSR,
 					fnic_trace_debugfs_root,
 					&(fc_trc_flag->fnic_trace),
 					&fnic_trace_ctrl_fops);
 
-	if (!fnic_trace_enable) {
-		printk(KERN_DEBUG
-			"Cannot create trace_enable file under debugfs\n");
-		return rc;
-	}
-
 	fnic_trace_debugfs_file = debugfs_create_file("trace",
 					S_IFREG|S_IRUGO|S_IWUSR,
 					fnic_trace_debugfs_root,
 					&(fc_trc_flag->fnic_trace),
 					&fnic_trace_debugfs_fops);
-
-	if (!fnic_trace_debugfs_file) {
-		printk(KERN_DEBUG
-			"Cannot create trace file under debugfs\n");
-		return rc;
-	}
-	rc = 0;
-	return rc;
 }
 
 /*
@@ -447,36 +383,19 @@ void fnic_trace_debugfs_terminate(void)
  * trace logging into trace buffer.
  */
 
-int fnic_fc_trace_debugfs_init(void)
+void fnic_fc_trace_debugfs_init(void)
 {
-	int rc = -1;
-
-	if (!fnic_trace_debugfs_root) {
-		pr_err("fnic:Debugfs root directory doesn't exist\n");
-		return rc;
-	}
-
 	fnic_fc_trace_enable = debugfs_create_file("fc_trace_enable",
 					S_IFREG|S_IRUGO|S_IWUSR,
 					fnic_trace_debugfs_root,
 					&(fc_trc_flag->fc_trace),
 					&fnic_trace_ctrl_fops);
 
-	if (!fnic_fc_trace_enable) {
-		pr_err("fnic: Failed create fc_trace_enable file\n");
-		return rc;
-	}
-
 	fnic_fc_trace_clear = debugfs_create_file("fc_trace_clear",
 					S_IFREG|S_IRUGO|S_IWUSR,
 					fnic_trace_debugfs_root,
 					&(fc_trc_flag->fc_clear),
 					&fnic_trace_ctrl_fops);
-
-	if (!fnic_fc_trace_clear) {
-		pr_err("fnic: Failed to create fc_trace_enable file\n");
-		return rc;
-	}
 
 	fnic_fc_rdata_trace_debugfs_file =
 		debugfs_create_file("fc_trace_rdata",
@@ -485,24 +404,12 @@ int fnic_fc_trace_debugfs_init(void)
 				    &(fc_trc_flag->fc_normal_file),
 				    &fnic_trace_debugfs_fops);
 
-	if (!fnic_fc_rdata_trace_debugfs_file) {
-		pr_err("fnic: Failed create fc_rdata_trace file\n");
-		return rc;
-	}
-
 	fnic_fc_trace_debugfs_file =
 		debugfs_create_file("fc_trace",
 				    S_IFREG|S_IRUGO|S_IWUSR,
 				    fnic_trace_debugfs_root,
 				    &(fc_trc_flag->fc_row_file),
 				    &fnic_trace_debugfs_fops);
-
-	if (!fnic_fc_trace_debugfs_file) {
-		pr_err("fnic: Failed to create fc_trace file\n");
-		return rc;
-	}
-	rc = 0;
-	return rc;
 }
 
 /*
@@ -643,6 +550,7 @@ static ssize_t fnic_reset_stats_write(struct file *file,
 			sizeof(struct io_path_stats) - sizeof(u64));
 		memset(fw_stats_p+1, 0,
 			sizeof(struct fw_stats) - sizeof(u64));
+		getnstimeofday(&stats->stats_timestamps.last_reset_time);
 	}
 
 	(*ppos)++;
@@ -784,45 +692,26 @@ static const struct file_operations fnic_reset_debugfs_fops = {
  * It will create file stats and reset_stats under statistics/host# directory
  * to log per fnic stats.
  */
-int fnic_stats_debugfs_init(struct fnic *fnic)
+void fnic_stats_debugfs_init(struct fnic *fnic)
 {
-	int rc = -1;
 	char name[16];
 
 	snprintf(name, sizeof(name), "host%d", fnic->lport->host->host_no);
 
-	if (!fnic_stats_debugfs_root) {
-		printk(KERN_DEBUG "fnic_stats root doesn't exist\n");
-		return rc;
-	}
 	fnic->fnic_stats_debugfs_host = debugfs_create_dir(name,
 						fnic_stats_debugfs_root);
-	if (!fnic->fnic_stats_debugfs_host) {
-		printk(KERN_DEBUG "Cannot create host directory\n");
-		return rc;
-	}
 
 	fnic->fnic_stats_debugfs_file = debugfs_create_file("stats",
 						S_IFREG|S_IRUGO|S_IWUSR,
 						fnic->fnic_stats_debugfs_host,
 						fnic,
 						&fnic_stats_debugfs_fops);
-	if (!fnic->fnic_stats_debugfs_file) {
-		printk(KERN_DEBUG "Cannot create host stats file\n");
-		return rc;
-	}
 
 	fnic->fnic_reset_debugfs_file = debugfs_create_file("reset_stats",
 						S_IFREG|S_IRUGO|S_IWUSR,
 						fnic->fnic_stats_debugfs_host,
 						fnic,
 						&fnic_reset_debugfs_fops);
-	if (!fnic->fnic_reset_debugfs_file) {
-		printk(KERN_DEBUG "Cannot create host stats file\n");
-		return rc;
-	}
-	rc = 0;
-	return rc;
 }
 
 /*

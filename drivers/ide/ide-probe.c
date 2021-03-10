@@ -273,7 +273,7 @@ int ide_dev_read_id(ide_drive_t *drive, u8 cmd, u16 *id, int irq_ctx)
 	    (hwif->host_flags & IDE_HFLAG_BROKEN_ALTSTATUS) == 0) {
 		a = tp_ops->read_altstatus(hwif);
 		s = tp_ops->read_status(hwif);
-		if ((a ^ s) & ~ATA_IDX)
+		if ((a ^ s) & ~ATA_SENSE)
 			/* ancient Seagate drives, broken interfaces */
 			printk(KERN_INFO "%s: probing with STATUS(0x%02x) "
 					 "instead of ALTSTATUS(0x%02x)\n",
@@ -545,7 +545,7 @@ static int ide_register_port(ide_hwif_t *hwif)
 	int ret;
 
 	/* register with global device tree */
-	dev_set_name(&hwif->gendev, hwif->name);
+	dev_set_name(&hwif->gendev, "%s", hwif->name);
 	dev_set_drvdata(&hwif->gendev, hwif);
 	if (hwif->gendev.parent == NULL)
 		hwif->gendev.parent = hwif->dev;
@@ -559,7 +559,7 @@ static int ide_register_port(ide_hwif_t *hwif)
 	}
 
 	hwif->portdev = device_create(ide_port_class, &hwif->gendev,
-				      MKDEV(0, 0), hwif, hwif->name);
+				      MKDEV(0, 0), hwif, "%s", hwif->name);
 	if (IS_ERR(hwif->portdev)) {
 		ret = PTR_ERR(hwif->portdev);
 		device_unregister(&hwif->gendev);
@@ -695,14 +695,8 @@ static int ide_probe_port(ide_hwif_t *hwif)
 	if (irqd)
 		disable_irq(hwif->irq);
 
-	rc = ide_port_wait_ready(hwif);
-	if (rc == -ENODEV) {
-		printk(KERN_INFO "%s: no devices on the port\n", hwif->name);
-		goto out;
-	} else if (rc == -EBUSY)
-		printk(KERN_ERR "%s: not ready before the probe\n", hwif->name);
-	else
-		rc = -ENODEV;
+	if (ide_port_wait_ready(hwif) == -EBUSY)
+		printk(KERN_DEBUG "%s: Wait for ready failed before probe !\n", hwif->name);
 
 	/*
 	 * Second drive should only exist if first drive was found,
@@ -713,7 +707,7 @@ static int ide_probe_port(ide_hwif_t *hwif)
 		if (drive->dev_flags & IDE_DFLAG_PRESENT)
 			rc = 0;
 	}
-out:
+
 	/*
 	 * Use cached IRQ number. It might be (and is...) changed by probe
 	 * code above
@@ -768,6 +762,7 @@ static int ide_init_queue(ide_drive_t *drive)
 	q = blk_init_queue_node(do_ide_request, NULL, hwif_to_node(hwif));
 	if (!q)
 		return 1;
+	queue_flag_set_unlocked(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
 
 	q->queuedata = drive;
 	blk_queue_segment_boundary(q, 0xffff);
@@ -1041,6 +1036,8 @@ static void ide_port_init_devices(ide_hwif_t *hwif)
 			drive->dev_flags |= IDE_DFLAG_UNMASK;
 		if (hwif->host_flags & IDE_HFLAG_NO_UNMASK_IRQS)
 			drive->dev_flags |= IDE_DFLAG_NO_UNMASK;
+
+		drive->pio_mode = XFER_PIO_0;
 
 		if (port_ops && port_ops->init_dev)
 			port_ops->init_dev(drive);
@@ -1452,19 +1449,13 @@ int ide_host_register(struct ide_host *host, const struct ide_port_info *d,
 		if (hwif == NULL)
 			continue;
 
-		if (hwif->present)
-			hwif_register_devices(hwif);
-	}
-
-	ide_host_for_each_port(i, hwif, host) {
-		if (hwif == NULL)
-			continue;
-
 		ide_sysfs_register_port(hwif);
 		ide_proc_register_port(hwif);
 
-		if (hwif->present)
+		if (hwif->present) {
 			ide_proc_port_register_devices(hwif);
+			hwif_register_devices(hwif);
+		}
 	}
 
 	return j ? 0 : -1;

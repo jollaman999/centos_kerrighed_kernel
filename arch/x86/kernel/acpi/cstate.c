@@ -14,6 +14,7 @@
 #include <acpi/processor.h>
 #include <asm/acpi.h>
 #include <asm/mwait.h>
+#include <asm/special_insns.h>
 
 /*
  * Initialize bm_flags based on the CPU cache properties
@@ -62,7 +63,7 @@ struct cstate_entry {
 		unsigned int ecx;
 	} states[ACPI_PROCESSOR_MAX_POWER];
 };
-static struct cstate_entry *cpu_cstate_entry;	/* per CPU ptr */
+static struct cstate_entry __percpu *cpu_cstate_entry;	/* per CPU ptr */
 
 static short mwait_supported[ACPI_PROCESSOR_MAX_POWER];
 
@@ -105,7 +106,7 @@ static long acpi_processor_ffh_cstate_probe_cpu(void *_cx)
 			"state\n", cx->type);
 	}
 	snprintf(cx->desc,
-			ACPI_CX_DESC_LEN, "ACPI FFH INTEL MWAIT 0x%x",
+			ACPI_CX_DESC_LEN, "ACPI FFH MWAIT 0x%x",
 			cx->address);
 out:
 	return retval;
@@ -149,7 +150,7 @@ int acpi_processor_ffh_cstate_probe(unsigned int cpu,
 }
 EXPORT_SYMBOL_GPL(acpi_processor_ffh_cstate_probe);
 
-void acpi_processor_ffh_cstate_enter(struct acpi_processor_cx *cx)
+void __cpuidle acpi_processor_ffh_cstate_enter(struct acpi_processor_cx *cx)
 {
 	unsigned int cpu = smp_processor_id();
 	struct cstate_entry *percpu_entry;
@@ -163,7 +164,8 @@ EXPORT_SYMBOL_GPL(acpi_processor_ffh_cstate_enter);
 static int __init ffh_cstate_init(void)
 {
 	struct cpuinfo_x86 *c = &boot_cpu_data;
-	if (c->x86_vendor != X86_VENDOR_INTEL)
+	if (c->x86_vendor != X86_VENDOR_INTEL &&
+	    c->x86_vendor != X86_VENDOR_AMD)
 		return -1;
 
 	cpu_cstate_entry = alloc_percpu(struct cstate_entry);

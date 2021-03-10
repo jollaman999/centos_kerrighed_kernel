@@ -34,17 +34,12 @@
 #ifndef __WMGR_H__
 #define __WMGR_H__
 
-#include "ttype.h"
 #include "80211mgr.h"
 #include "80211hdr.h"
 #include "wcmd.h"
 #include "bssdb.h"
 #include "wpa2.h"
 #include "card.h"
-
-/*---------------------  Export Definitions -------------------------*/
-
-
 
 // Scan time
 #define PROBE_DELAY                  100  // (us)
@@ -57,7 +52,6 @@
 #define WCMD_ACTIVE_SCAN_TIME   20 //(ms)
 #define WCMD_PASSIVE_SCAN_TIME  100 //(ms)
 
-
 #define DEFAULT_MSDU_LIFETIME           512  // ms
 #define DEFAULT_MSDU_LIFETIME_RES_64us  8000 // 64us
 
@@ -65,7 +59,6 @@
 #define DEFAULT_MGN_LIFETIME_RES_64us   125  // 64us
 
 #define MAKE_BEACON_RESERVED            10  //(us)
-
 
 #define TIM_MULTICAST_MASK           0x01
 #define TIM_BITMAPOFFSET_MASK        0xFE
@@ -75,60 +68,48 @@
 
 #define DEFAULT_IBSS_CHANNEL            6  //2.4G
 
-
-/*---------------------  Export Classes  ----------------------------*/
-
-/*---------------------  Export Variables  --------------------------*/
-
-/*---------------------  Export Types  ------------------------------*/
 //mike define: make timer  to expire after desired times
-#define timer_expire(timer,next_tick)   mod_timer(&timer, RUN_AT(next_tick))
+#define timer_expire(timer, next_tick) mod_timer(&timer, RUN_AT(next_tick))
 
-typedef void (*TimerFunction)(ULONG);
-
+typedef void (*TimerFunction)(unsigned long);
 
 //+++ NDIS related
 
-typedef UCHAR   NDIS_802_11_MAC_ADDRESS[6];
+typedef u8 NDIS_802_11_MAC_ADDRESS[ETH_ALEN];
 typedef struct _NDIS_802_11_AI_REQFI
 {
-    USHORT Capabilities;
-    USHORT ListenInterval;
+	u16 Capabilities;
+	u16 ListenInterval;
     NDIS_802_11_MAC_ADDRESS  CurrentAPAddress;
 } NDIS_802_11_AI_REQFI, *PNDIS_802_11_AI_REQFI;
 
 typedef struct _NDIS_802_11_AI_RESFI
 {
-    USHORT Capabilities;
-    USHORT StatusCode;
-    USHORT AssociationId;
+	u16 Capabilities;
+	u16 StatusCode;
+	u16 AssociationId;
 } NDIS_802_11_AI_RESFI, *PNDIS_802_11_AI_RESFI;
 
 typedef struct _NDIS_802_11_ASSOCIATION_INFORMATION
 {
-    ULONG                   Length;
-    USHORT                  AvailableRequestFixedIEs;
-    NDIS_802_11_AI_REQFI    RequestFixedIEs;
-    ULONG                   RequestIELength;
-    ULONG                   OffsetRequestIEs;
-    USHORT                  AvailableResponseFixedIEs;
-    NDIS_802_11_AI_RESFI    ResponseFixedIEs;
-    ULONG                   ResponseIELength;
-    ULONG                   OffsetResponseIEs;
+	u32 Length;
+	u16 AvailableRequestFixedIEs;
+	NDIS_802_11_AI_REQFI RequestFixedIEs;
+	u32 RequestIELength;
+	u32 OffsetRequestIEs;
+	u16 AvailableResponseFixedIEs;
+	NDIS_802_11_AI_RESFI ResponseFixedIEs;
+	u32 ResponseIELength;
+	u32 OffsetResponseIEs;
 } NDIS_802_11_ASSOCIATION_INFORMATION, *PNDIS_802_11_ASSOCIATION_INFORMATION;
 
-
-
 typedef struct tagSAssocInfo {
-    NDIS_802_11_ASSOCIATION_INFORMATION     AssocInfo;
-    BYTE                                    abyIEs[WLAN_BEACON_FR_MAXLEN+WLAN_BEACON_FR_MAXLEN];
-    // store ReqIEs set by OID_802_11_ASSOCIATION_INFORMATION
-    ULONG                                   RequestIELength;
-    BYTE                                    abyReqIEs[WLAN_BEACON_FR_MAXLEN];
+	NDIS_802_11_ASSOCIATION_INFORMATION AssocInfo;
+	u8 abyIEs[WLAN_BEACON_FR_MAXLEN+WLAN_BEACON_FR_MAXLEN];
+	/* store ReqIEs set by OID_802_11_ASSOCIATION_INFORMATION */
+	u32 RequestIELength;
+	u8 abyReqIEs[WLAN_BEACON_FR_MAXLEN];
 } SAssocInfo, *PSAssocInfo;
-//---
-
-
 
 typedef enum tagWMAC_AUTHENTICATION_MODE {
 
@@ -143,8 +124,6 @@ typedef enum tagWMAC_AUTHENTICATION_MODE {
     WMAC_AUTH_MAX       // Not a real mode, defined as upper bound
 } WMAC_AUTHENTICATION_MODE, *PWMAC_AUTHENTICATION_MODE;
 
-
-
 // Pre-configured Mode (from XP)
 
 typedef enum tagWMAC_CONFIG_MODE {
@@ -155,7 +134,6 @@ typedef enum tagWMAC_CONFIG_MODE {
 
 } WMAC_CONFIG_MODE, *PWMAC_CONFIG_MODE;
 
-
 typedef enum tagWMAC_SCAN_TYPE {
 
     WMAC_SCAN_ACTIVE,
@@ -164,7 +142,6 @@ typedef enum tagWMAC_SCAN_TYPE {
 
 } WMAC_SCAN_TYPE, *PWMAC_SCAN_TYPE;
 
-
 typedef enum tagWMAC_SCAN_STATE {
 
     WMAC_NO_SCANNING,
@@ -172,8 +149,6 @@ typedef enum tagWMAC_SCAN_STATE {
     WMAC_IS_PROBEPENDING
 
 } WMAC_SCAN_STATE, *PWMAC_SCAN_STATE;
-
-
 
 // Notes:
 // Basic Service Set state explained as following:
@@ -207,7 +182,6 @@ typedef enum tagWMAC_CURRENT_MODE {
 
 } WMAC_CURRENT_MODE, *PWMAC_CURRENT_MODE;
 
-
 typedef enum tagWMAC_POWER_MODE {
 
     WMAC_POWER_CAM,
@@ -216,287 +190,211 @@ typedef enum tagWMAC_POWER_MODE {
 
 } WMAC_POWER_MODE, *PWMAC_POWER_MODE;
 
+/* Tx Management Packet descriptor */
+struct vnt_tx_mgmt {
+	PUWLAN_80211HDR p80211Header;
+	u32 cbMPDULen;
+	u32 cbPayloadLen;
+};
 
+/* Rx Management Packet descriptor */
+struct vnt_rx_mgmt {
+	PUWLAN_80211HDR p80211Header;
+	u64 qwLocalTSF;
+	u32 cbMPDULen;
+	u32 cbPayloadLen;
+	u32 uRSSI;
+	u8 bySQ;
+	u8 byRxRate;
+	u8 byRxChannel;
+};
 
-// Tx Managment Packet descriptor
-typedef struct tagSTxMgmtPacket {
+struct vnt_manager {
+	void *pAdapter;
 
-    PUWLAN_80211HDR     p80211Header;
-    UINT                cbMPDULen;
-    UINT                cbPayloadLen;
+	/* MAC address */
+	u8  abyMACAddr[WLAN_ADDR_LEN];
 
-} STxMgmtPacket, *PSTxMgmtPacket;
+	/* Configuration Mode */
+	WMAC_CONFIG_MODE eConfigMode; /* MAC pre-configed mode */
 
+	CARD_PHY_TYPE eCurrentPHYMode;
 
-// Rx Managment Packet descriptor
-typedef struct tagSRxMgmtPacket {
+	/* Operation state variables */
+	WMAC_CURRENT_MODE eCurrMode; /* MAC current connection mode */
+	WMAC_BSS_STATE eCurrState; /* MAC current BSS state */
+	WMAC_BSS_STATE eLastState; /* MAC last BSS state */
 
-    PUWLAN_80211HDR     p80211Header;
-    QWORD               qwLocalTSF;
-    UINT                cbMPDULen;
-    UINT                cbPayloadLen;
-    UINT                uRSSI;
-    BYTE                bySQ;
-    BYTE                byRxRate;
-    BYTE                byRxChannel;
+	PKnownBSS pCurrBSS;
+	u8 byCSSGK;
+	u8 byCSSPK;
 
-} SRxMgmtPacket, *PSRxMgmtPacket;
+	int bCurrBSSIDFilterOn;
 
+	/* Current state vars */
+	u32 uCurrChannel;
+	u8 abyCurrSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN + 1];
+	u8 abyCurrExtSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN + 1];
+	u8 abyCurrSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
+	u8 abyCurrBSSID[WLAN_BSSID_LEN];
+	u16 wCurrCapInfo;
+	u16 wCurrAID;
+	u32 uRSSITrigger;
+	u16 wCurrATIMWindow;
+	u16 wCurrBeaconPeriod;
+	int bIsDS;
+	u8 byERPContext;
 
+	CMD_STATE eCommandState;
+	u32 uScanChannel;
 
-typedef struct tagSMgmtObject
-{
+	/* Desire joinning BSS vars */
+	u8 abyDesireSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
+	u8 abyDesireBSSID[WLAN_BSSID_LEN];
 
-    PVOID                   pAdapter;
-    // MAC address
-    BYTE                    abyMACAddr[WLAN_ADDR_LEN];
+	/*restore BSS info for Ad-Hoc mode */
+	u8 abyAdHocSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
 
-    // Configuration Mode
-    WMAC_CONFIG_MODE        eConfigMode; // MAC pre-configed mode
+	/* Adhoc or AP configuration vars */
+	u16 wIBSSBeaconPeriod;
+	u16 wIBSSATIMWindow;
+	u32 uIBSSChannel;
+	u8 abyIBSSSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN + 1];
+	u8 byAPBBType;
+	u8 abyWPAIE[MAX_WPA_IE_LEN];
+	u16 wWPAIELen;
 
-    CARD_PHY_TYPE           eCurrentPHYMode;
+	u32 uAssocCount;
+	int bMoreData;
 
+	/* Scan state vars */
+	WMAC_SCAN_STATE eScanState;
+	WMAC_SCAN_TYPE eScanType;
+	u32 uScanStartCh;
+	u32 uScanEndCh;
+	u16 wScanSteps;
+	u32 uScanBSSType;
+	/* Desire scannig vars */
+	u8 abyScanSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
+	u8 abyScanBSSID[WLAN_BSSID_LEN];
 
-    // Operation state variables
-    WMAC_CURRENT_MODE       eCurrMode;   // MAC current connection mode
-    WMAC_BSS_STATE          eCurrState;  // MAC current BSS state
-    #ifdef SndEvt_ToAPI
-    WMAC_BSS_STATE          eLastState;  // MAC last BSS state
-    #endif
+	/* Privacy */
+	WMAC_AUTHENTICATION_MODE eAuthenMode;
+	int bShareKeyAlgorithm;
+	u8 abyChallenge[WLAN_CHALLENGE_LEN];
+	int bPrivacyInvoked;
 
-    PKnownBSS               pCurrBSS;
-    BYTE                    byCSSGK;
-    BYTE                    byCSSPK;
+	/* Received beacon state vars */
+	int bInTIM;
+	int bMulticastTIM;
+	u8 byDTIMCount;
+	u8 byDTIMPeriod;
 
-//    BYTE                    abyNewSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN];
-//    BYTE                    abyNewExtSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN];
-    BOOL                    bCurrBSSIDFilterOn;
+	/* Power saving state vars */
+	WMAC_POWER_MODE ePSMode;
+	u16 wListenInterval;
+	u16 wCountToWakeUp;
+	int bInTIMWake;
+	u8 *pbyPSPacketPool;
+	u8 byPSPacketPool[sizeof(struct vnt_tx_mgmt)
+		+ WLAN_NULLDATA_FR_MAXLEN];
+	int bRxBeaconInTBTTWake;
+	u8 abyPSTxMap[MAX_NODE_NUM + 1];
 
-    // Current state vars
-    UINT                    uCurrChannel;
-    BYTE                    abyCurrSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN + 1];
-    BYTE                    abyCurrExtSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN + 1];
-    BYTE                    abyCurrSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
-    BYTE                    abyCurrBSSID[WLAN_BSSID_LEN];
-    WORD                    wCurrCapInfo;
-    WORD                    wCurrAID;
-    UINT                    uRSSITrigger;
-    WORD                    wCurrATIMWindow;
-    WORD                    wCurrBeaconPeriod;
-    BOOL                    bIsDS;
-    BYTE                    byERPContext;
+	/* management command related */
+	u32 uCmdBusy;
+	u32 uCmdHostAPBusy;
 
-    CMD_STATE               eCommandState;
-    UINT                    uScanChannel;
+	/* management packet pool */
+	u8 *pbyMgmtPacketPool;
+	u8 byMgmtPacketPool[sizeof(struct vnt_tx_mgmt)
+		+ WLAN_A3FR_MAXLEN];
 
-    // Desire joinning BSS vars
-    BYTE                    abyDesireSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
-    BYTE                    abyDesireBSSID[WLAN_BSSID_LEN];
+	/* One second callback timer */
+	struct timer_list sTimerSecondCallback;
 
-//restore BSS info for Ad-Hoc mode
-//20080131-05,<Add> by Mike Liu
-#ifdef Adhoc_STA
-     BYTE                    abyAdHocSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
-#endif
+	/* Temporarily Rx Mgmt Packet Descriptor */
+	struct vnt_rx_mgmt sRxPacket;
 
-    // Adhoc or AP configuration vars
-    WORD                    wIBSSBeaconPeriod;
-    WORD                    wIBSSATIMWindow;
-    UINT                    uIBSSChannel;
-    BYTE                    abyIBSSSuppRates[WLAN_IEHDR_LEN + WLAN_RATES_MAXLEN + 1];
-    BYTE                    byAPBBType;
-    BYTE                    abyWPAIE[MAX_WPA_IE_LEN];
-    WORD                    wWPAIELen;
+	/* link list of known bss's (scan results) */
+	KnownBSS sBSSList[MAX_BSS_NUM];
+	/* link list of same bss's */
+	KnownBSS pSameBSS[6];
+	int Cisco_cckm;
+	u8 Roam_dbm;
 
-    UINT                    uAssocCount;
-    BOOL                    bMoreData;
+	/* table list of known node */
+	/* sNodeDBList[0] is reserved for AP under Infra mode */
+	/* sNodeDBList[0] is reserved for Multicast under adhoc/AP mode */
+	KnownNodeDB sNodeDBTable[MAX_NODE_NUM + 1];
 
-    // Scan state vars
-    WMAC_SCAN_STATE         eScanState;
-    WMAC_SCAN_TYPE          eScanType;
-    UINT                    uScanStartCh;
-    UINT                    uScanEndCh;
-    WORD                    wScanSteps;
-    UINT                    uScanBSSType;
-    // Desire scannig vars
-    BYTE                    abyScanSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
-    BYTE                    abyScanBSSID[WLAN_BSSID_LEN];
+	/* WPA2 PMKID Cache */
+	SPMKIDCache gsPMKIDCache;
+	int bRoaming;
 
-    // Privacy
-    WMAC_AUTHENTICATION_MODE eAuthenMode;
-    BOOL                    bShareKeyAlgorithm;
-    BYTE                    abyChallenge[WLAN_CHALLENGE_LEN];
-    BOOL                    bPrivacyInvoked;
+	/* associate info */
+	SAssocInfo sAssocInfo;
 
-    // Received beacon state vars
-    BOOL                    bInTIM;
-    BOOL                    bMulticastTIM;
-    BYTE                    byDTIMCount;
-    BYTE                    byDTIMPeriod;
+	/* for 802.11h */
+	int b11hEnable;
+	int bSwitchChannel;
+	u8 byNewChannel;
+	PWLAN_IE_MEASURE_REP    pCurrMeasureEIDRep;
+	u32 uLengthOfRepEIDs;
+	u8 abyCurrentMSRReq[sizeof(struct vnt_tx_mgmt)
+		+ WLAN_A3FR_MAXLEN];
+	u8 abyCurrentMSRRep[sizeof(struct vnt_tx_mgmt)
+		+ WLAN_A3FR_MAXLEN];
+	u8 abyIECountry[WLAN_A3FR_MAXLEN];
+	u8 abyIBSSDFSOwner[6];
+	u8 byIBSSDFSRecovery;
 
-    // Power saving state vars
-    WMAC_POWER_MODE         ePSMode;
-    WORD                    wListenInterval;
-    WORD                    wCountToWakeUp;
-    BOOL                    bInTIMWake;
-    PBYTE                   pbyPSPacketPool;
-    BYTE                    byPSPacketPool[sizeof(STxMgmtPacket) + WLAN_NULLDATA_FR_MAXLEN];
-    BOOL                    bRxBeaconInTBTTWake;
-    BYTE                    abyPSTxMap[MAX_NODE_NUM + 1];
+	struct sk_buff skb;
 
-    // managment command related
-    UINT                    uCmdBusy;
-    UINT                    uCmdHostAPBusy;
+};
 
-    // managment packet pool
-    PBYTE                   pbyMgmtPacketPool;
-    BYTE                    byMgmtPacketPool[sizeof(STxMgmtPacket) + WLAN_A3FR_MAXLEN];
+void vMgrObjectInit(struct vnt_private *pDevice);
 
+void vMgrAssocBeginSta(struct vnt_private *pDevice,
+		struct vnt_manager *, PCMD_STATUS pStatus);
 
-    // One second callback timer
-	struct timer_list	    sTimerSecondCallback;
+void vMgrReAssocBeginSta(struct vnt_private *pDevice,
+		struct vnt_manager *, PCMD_STATUS pStatus);
 
-    // Temporarily Rx Mgmt Packet Descriptor
-    SRxMgmtPacket           sRxPacket;
+void vMgrDisassocBeginSta(struct vnt_private *pDevice,
+	struct vnt_manager *, u8 *abyDestAddress, u16 wReason,
+	PCMD_STATUS pStatus);
 
-    // link list of known bss's (scan results)
-    KnownBSS                sBSSList[MAX_BSS_NUM];
-   //link list of same bss's  //DavidWang
-    KnownBSS				pSameBSS[6] ;
-    BOOL          Cisco_cckm ;
-    BYTE          Roam_dbm;
+void vMgrAuthenBeginSta(struct vnt_private *pDevice,
+	struct vnt_manager *, PCMD_STATUS pStatus);
 
-    // table list of known node
-    // sNodeDBList[0] is reserved for AP under Infra mode
-    // sNodeDBList[0] is reserved for Multicast under adhoc/AP mode
-    KnownNodeDB             sNodeDBTable[MAX_NODE_NUM + 1];
+void vMgrCreateOwnIBSS(struct vnt_private *pDevice,
+	PCMD_STATUS pStatus);
 
+void vMgrJoinBSSBegin(struct vnt_private *pDevice,
+	PCMD_STATUS pStatus);
 
-
-    // WPA2 PMKID Cache
-    SPMKIDCache             gsPMKIDCache;
-    BOOL                    bRoaming;
-
-    // rate fall back vars
-
-
-
-    // associate info
-    SAssocInfo              sAssocInfo;
-
-
-    // for 802.11h
-    BOOL                    b11hEnable;
-    BOOL                    bSwitchChannel;
-    BYTE                    byNewChannel;
-    PWLAN_IE_MEASURE_REP    pCurrMeasureEIDRep;
-    UINT                    uLengthOfRepEIDs;
-    BYTE                    abyCurrentMSRReq[sizeof(STxMgmtPacket) + WLAN_A3FR_MAXLEN];
-    BYTE                    abyCurrentMSRRep[sizeof(STxMgmtPacket) + WLAN_A3FR_MAXLEN];
-    BYTE                    abyIECountry[WLAN_A3FR_MAXLEN];
-    BYTE                    abyIBSSDFSOwner[6];
-    BYTE                    byIBSSDFSRecovery;
-
-    struct sk_buff  skb;
-
-} SMgmtObject, *PSMgmtObject;
-
-
-/*---------------------  Export Macros ------------------------------*/
-
-
-/*---------------------  Export Functions  --------------------------*/
-
-
-void
-vMgrObjectInit(
-    IN  HANDLE hDeviceContext
-    );
-
-
-void
-vMgrAssocBeginSta(
-    IN  HANDLE hDeviceContext,
-    IN  PSMgmtObject pMgmt,
-    OUT PCMD_STATUS pStatus
-    );
-
-VOID
-vMgrReAssocBeginSta(
-    IN  HANDLE hDeviceContext,
-    IN  PSMgmtObject pMgmt,
-    OUT PCMD_STATUS pStatus
-    );
-
-VOID
-vMgrDisassocBeginSta(
-    IN  HANDLE hDeviceContext,
-    IN  PSMgmtObject pMgmt,
-    IN  PBYTE  abyDestAddress,
-    IN  WORD    wReason,
-    OUT PCMD_STATUS pStatus
-    );
-
-VOID
-vMgrAuthenBeginSta(
-    IN  HANDLE hDeviceContext,
-    IN  PSMgmtObject pMgmt,
-    OUT PCMD_STATUS pStatus
-    );
-
-VOID
-vMgrCreateOwnIBSS(
-    IN  HANDLE hDeviceContext,
-    OUT PCMD_STATUS pStatus
-    );
-
-VOID
-vMgrJoinBSSBegin(
-    IN  HANDLE hDeviceContext,
-    OUT PCMD_STATUS pStatus
-    );
-
-VOID
-vMgrRxManagePacket(
-    IN  HANDLE hDeviceContext,
-    IN  PSMgmtObject pMgmt,
-    IN  PSRxMgmtPacket pRxPacket
-    );
+void vMgrRxManagePacket(struct vnt_private *pDevice,
+	struct vnt_manager *, struct vnt_rx_mgmt *);
 
 /*
-VOID
+void
 vMgrScanBegin(
-    IN  HANDLE hDeviceContext,
-    OUT PCMD_STATUS pStatus
+      void *hDeviceContext,
+     PCMD_STATUS pStatus
     );
 */
 
-VOID
-vMgrDeAuthenBeginSta(
-    IN  HANDLE hDeviceContext,
-    IN  PSMgmtObject  pMgmt,
-    IN  PBYTE   abyDestAddress,
-    IN  WORD    wReason,
-    OUT PCMD_STATUS pStatus
-    );
+void vMgrDeAuthenBeginSta(struct vnt_private *pDevice,
+	struct vnt_manager *, u8 *abyDestAddress, u16 wReason,
+	PCMD_STATUS pStatus);
 
-BOOL
-bMgrPrepareBeaconToSend(
-    IN  HANDLE hDeviceContext,
-    IN  PSMgmtObject pMgmt
-    );
+int bMgrPrepareBeaconToSend(struct vnt_private *pDevice,
+	struct vnt_manager *);
 
+int bAdd_PMKID_Candidate(struct vnt_private *pDevice,
+	u8 *pbyBSSID, PSRSNCapObject psRSNCapObj);
 
-BOOL
-bAdd_PMKID_Candidate (
-    IN HANDLE    hDeviceContext,
-    IN PBYTE          pbyBSSID,
-    IN PSRSNCapObject psRSNCapObj
-    );
+void vFlush_PMKID_Candidate(struct vnt_private *pDevice);
 
-VOID
-vFlush_PMKID_Candidate (
-    IN HANDLE hDeviceContext
-    );
-
-#endif // __WMGR_H__
+#endif /* __WMGR_H__ */

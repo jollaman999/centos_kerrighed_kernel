@@ -9,38 +9,41 @@
 #include <net/ip_vs.h>
 
 static int
-sctp_conn_schedule(int af, struct sk_buff *skb, struct ip_vs_protocol *pp,
-		   int *verdict, struct ip_vs_conn **cpp)
+sctp_conn_schedule(int af, struct sk_buff *skb, struct ip_vs_proto_data *pd,
+		   int *verdict, struct ip_vs_conn **cpp,
+		   struct ip_vs_iphdr *iph)
 {
+	struct net *net;
 	struct ip_vs_service *svc;
 	sctp_chunkhdr_t _schunkh, *sch;
 	sctp_sctphdr_t *sh, _sctph;
-	struct ip_vs_iphdr iph;
 
-	ip_vs_fill_iphdr(af, skb_network_header(skb), &iph);
-
-	sh = skb_header_pointer(skb, iph.len, sizeof(_sctph), &_sctph);
+	sh = skb_header_pointer(skb, iph->len, sizeof(_sctph), &_sctph);
 	if (sh == NULL) {
 		*verdict = NF_DROP;
 		return 0;
 	}
 
-	sch = skb_header_pointer(skb, iph.len + sizeof(sctp_sctphdr_t),
+	sch = skb_header_pointer(skb, iph->len + sizeof(sctp_sctphdr_t),
 				 sizeof(_schunkh), &_schunkh);
 	if (sch == NULL) {
 		*verdict = NF_DROP;
 		return 0;
 	}
 
+	net = skb_net(skb);
+	rcu_read_lock();
 	if ((sch->type == SCTP_CID_INIT) &&
-	    (svc = ip_vs_service_get(af, skb->mark, iph.protocol,
-				     &iph.daddr, sh->dest))) {
-		if (ip_vs_todrop()) {
+	    (svc = ip_vs_service_find(net, af, skb->mark, iph->protocol,
+				      &iph->daddr, sh->dest))) {
+		int ignored;
+
+		if (ip_vs_todrop(net_ipvs(net))) {
 			/*
 			 * It seems that we are very loaded.
 			 * We have to drop this packet :(
 			 */
-			ip_vs_service_put(svc);
+			rcu_read_unlock();
 			*verdict = NF_DROP;
 			return 0;
 		}
@@ -48,14 +51,18 @@ sctp_conn_schedule(int af, struct sk_buff *skb, struct ip_vs_protocol *pp,
 		 * Let the virtual server select a real server for the
 		 * incoming connection, and create a connection entry.
 		 */
-		*cpp = ip_vs_schedule(svc, skb);
-		if (!*cpp) {
-			*verdict = ip_vs_leave(svc, skb, pp);
+		*cpp = ip_vs_schedule(svc, skb, pd, &ignored, iph);
+		if (!*cpp && ignored <= 0) {
+			if (!ignored)
+				*verdict = ip_vs_leave(svc, skb, pd, iph);
+			else
+				*verdict = NF_DROP;
+			rcu_read_unlock();
 			return 0;
 		}
-		ip_vs_service_put(svc);
 	}
-
+	rcu_read_unlock();
+	/* NF_ACCEPT */
 	return 1;
 }
 
@@ -67,19 +74,17 @@ static void sctp_nat_csum(struct sk_buff *skb, sctp_sctphdr_t *sctph,
 }
 
 static int
-sctp_snat_handler(struct sk_buff *skb,
-		  struct ip_vs_protocol *pp, struct ip_vs_conn *cp)
+sctp_snat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
+		  struct ip_vs_conn *cp, struct ip_vs_iphdr *iph)
 {
 	sctp_sctphdr_t *sctph;
-	unsigned int sctphoff;
+	unsigned int sctphoff = iph->len;
 	bool payload_csum = false;
 
 #ifdef CONFIG_IP_VS_IPV6
-	if (cp->af == AF_INET6)
-		sctphoff = sizeof(struct ipv6hdr);
-	else
+	if (cp->af == AF_INET6 && iph->fragoffs)
+		return 1;
 #endif
-		sctphoff = ip_hdrlen(skb);
 
 	/* csum_check requires unshared skb */
 	if (!skb_make_writable(skb, sctphoff + sizeof(*sctph)))
@@ -116,19 +121,17 @@ sctp_snat_handler(struct sk_buff *skb,
 }
 
 static int
-sctp_dnat_handler(struct sk_buff *skb,
-		  struct ip_vs_protocol *pp, struct ip_vs_conn *cp)
+sctp_dnat_handler(struct sk_buff *skb, struct ip_vs_protocol *pp,
+		  struct ip_vs_conn *cp, struct ip_vs_iphdr *iph)
 {
 	sctp_sctphdr_t *sctph;
-	unsigned int sctphoff;
+	unsigned int sctphoff = iph->len;
 	bool payload_csum = false;
 
 #ifdef CONFIG_IP_VS_IPV6
-	if (cp->af == AF_INET6)
-		sctphoff = sizeof(struct ipv6hdr);
-	else
+	if (cp->af == AF_INET6 && iph->fragoffs)
+		return 1;
 #endif
-		sctphoff = ip_hdrlen(skb);
 
 	/* csum_check requires unshared skb */
 	if (!skb_make_writable(skb, sctphoff + sizeof(*sctph)))
@@ -155,7 +158,7 @@ sctp_dnat_handler(struct sk_buff *skb,
 	/* Only update csum if we really have to */
 	if (sctph->dest != cp->dport || payload_csum ||
 	    (skb->ip_summed == CHECKSUM_PARTIAL &&
-	     !(skb_dst(skb)->dev->features & NETIF_F_SCTP_CSUM))) {
+	     !(skb_dst(skb)->dev->features & NETIF_F_SCTP_CRC))) {
 		sctph->dest = cp->dport;
 		sctp_nat_csum(skb, sctph, sctphoff);
 	} else if (skb->ip_summed != CHECKSUM_PARTIAL) {
@@ -188,7 +191,7 @@ sctp_csum_check(int af, struct sk_buff *skb, struct ip_vs_protocol *pp)
 
 	if (val != cmp) {
 		/* CRC failure, dump it. */
-		IP_VS_DBG_RL_PKT(0, pp, skb, 0,
+		IP_VS_DBG_RL_PKT(0, af, pp, skb, 0,
 				"Failed checksum for");
 		return 0;
 	}
@@ -220,7 +223,7 @@ enum ipvs_sctp_event_t {
 	IP_VS_SCTP_EVE_LAST
 };
 
-static enum ipvs_sctp_event_t sctp_events[255] = {
+static enum ipvs_sctp_event_t sctp_events[256] = {
 	IP_VS_SCTP_EVE_DATA_CLI,
 	IP_VS_SCTP_EVE_INIT_CLI,
 	IP_VS_SCTP_EVE_INIT_ACK_CLI,
@@ -571,7 +574,7 @@ static struct ipvs_sctp_nextstate
 	 * SHUTDOWN sent from the client, waitinf for SHUT ACK from the server
 	 */
 	/*
-	 * We recieved the data chuck, keep the state unchanged. I assume
+	 * We received the data chuck, keep the state unchanged. I assume
 	 * that still data chuncks  can be received by both the peers in
 	 * SHUDOWN state
 	 */
@@ -638,7 +641,7 @@ static struct ipvs_sctp_nextstate
 	 * SHUTDOWN sent from the server, waitinf for SHUTDOWN ACK from client
 	 */
 	/*
-	 * We recieved the data chuck, keep the state unchanged. I assume
+	 * We received the data chuck, keep the state unchanged. I assume
 	 * that still data chuncks  can be received by both the peers in
 	 * SHUDOWN state
 	 */
@@ -706,7 +709,7 @@ static struct ipvs_sctp_nextstate
 	 * SHUTDOWN ACK from the client, awaiting for SHUTDOWN COM from server
 	 */
 	/*
-	 * We recieved the data chuck, keep the state unchanged. I assume
+	 * We received the data chuck, keep the state unchanged. I assume
 	 * that still data chuncks  can be received by both the peers in
 	 * SHUDOWN state
 	 */
@@ -776,7 +779,7 @@ static struct ipvs_sctp_nextstate
 	 * SHUTDOWN ACK from the server, awaiting for SHUTDOWN COM from client
 	 */
 	/*
-	 * We recieved the data chuck, keep the state unchanged. I assume
+	 * We received the data chuck, keep the state unchanged. I assume
 	 * that still data chuncks  can be received by both the peers in
 	 * SHUDOWN state
 	 */
@@ -867,7 +870,7 @@ static struct ipvs_sctp_nextstate
 /*
  *      Timeout table[state]
  */
-static int sctp_timeouts[IP_VS_SCTP_S_LAST + 1] = {
+static const int sctp_timeouts[IP_VS_SCTP_S_LAST + 1] = {
 	[IP_VS_SCTP_S_NONE]         =     2 * HZ,
 	[IP_VS_SCTP_S_INIT_CLI]     =     1 * 60 * HZ,
 	[IP_VS_SCTP_S_INIT_SER]     =     1 * 60 * HZ,
@@ -911,26 +914,14 @@ static const char *sctp_state_name(int state)
 	return "?";
 }
 
-static void sctp_timeout_change(struct ip_vs_protocol *pp, int flags)
-{
-}
-
-static int
-sctp_set_state_timeout(struct ip_vs_protocol *pp, char *sname, int to)
-{
-
-return ip_vs_set_state_timeout(pp->timeout_table, IP_VS_SCTP_S_LAST,
-				sctp_state_name_table, sname, to);
-}
-
-static inline int
-set_sctp_state(struct ip_vs_protocol *pp, struct ip_vs_conn *cp,
+static inline void
+set_sctp_state(struct ip_vs_proto_data *pd, struct ip_vs_conn *cp,
 		int direction, const struct sk_buff *skb)
 {
 	sctp_chunkhdr_t _sctpch, *sch;
 	unsigned char chunk_type;
 	int event, next_state;
-	int ihl;
+	int ihl, cofs;
 
 #ifdef CONFIG_IP_VS_IPV6
 	ihl = cp->af == AF_INET ? ip_hdrlen(skb) : sizeof(struct ipv6hdr);
@@ -938,10 +929,10 @@ set_sctp_state(struct ip_vs_protocol *pp, struct ip_vs_conn *cp,
 	ihl = ip_hdrlen(skb);
 #endif
 
-	sch = skb_header_pointer(skb, ihl + sizeof(sctp_sctphdr_t),
-				sizeof(_sctpch), &_sctpch);
+	cofs = ihl + sizeof(sctp_sctphdr_t);
+	sch = skb_header_pointer(skb, cofs, sizeof(_sctpch), &_sctpch);
 	if (sch == NULL)
-		return 0;
+		return;
 
 	chunk_type = sch->type;
 	/*
@@ -957,10 +948,12 @@ set_sctp_state(struct ip_vs_protocol *pp, struct ip_vs_conn *cp,
 	 */
 	if ((sch->type == SCTP_CID_COOKIE_ECHO) ||
 	    (sch->type == SCTP_CID_COOKIE_ACK)) {
-		sch = skb_header_pointer(skb, (ihl + sizeof(sctp_sctphdr_t) +
-				sch->length), sizeof(_sctpch), &_sctpch);
-		if (sch) {
-			if (sch->type == SCTP_CID_ABORT)
+		int clen = ntohs(sch->length);
+
+		if (clen >= sizeof(sctp_chunkhdr_t)) {
+			sch = skb_header_pointer(skb, cofs + ALIGN(clen, 4),
+						 sizeof(_sctpch), &_sctpch);
+			if (sch && sch->type == SCTP_CID_ABORT)
 				chunk_type = sch->type;
 		}
 	}
@@ -982,7 +975,7 @@ set_sctp_state(struct ip_vs_protocol *pp, struct ip_vs_conn *cp,
 
 		IP_VS_DBG_BUF(8, "%s %s  %s:%d->"
 				"%s:%d state: %s->%s conn->refcnt:%d\n",
-				pp->name,
+				pd->pp->name,
 				((direction == IP_VS_DIR_OUTPUT) ?
 				 "output " : "input "),
 				IP_VS_DBG_ADDR(cp->af, &cp->daddr),
@@ -1006,34 +999,20 @@ set_sctp_state(struct ip_vs_protocol *pp, struct ip_vs_conn *cp,
 			}
 		}
 	}
-
-	 cp->timeout = pp->timeout_table[cp->state = next_state];
-
-	 return 1;
+	if (likely(pd))
+		cp->timeout = pd->timeout_table[cp->state = next_state];
+	else	/* What to do ? */
+		cp->timeout = sctp_timeouts[cp->state = next_state];
 }
 
-static int
+static void
 sctp_state_transition(struct ip_vs_conn *cp, int direction,
-		const struct sk_buff *skb, struct ip_vs_protocol *pp)
+		const struct sk_buff *skb, struct ip_vs_proto_data *pd)
 {
-	int ret = 0;
-
-	spin_lock(&cp->lock);
-	ret = set_sctp_state(pp, cp, direction, skb);
-	spin_unlock(&cp->lock);
-
-	return ret;
+	spin_lock_bh(&cp->lock);
+	set_sctp_state(pd, cp, direction, skb);
+	spin_unlock_bh(&cp->lock);
 }
-
-/*
- *      Hash table for SCTP application incarnations
- */
-#define SCTP_APP_TAB_BITS        4
-#define SCTP_APP_TAB_SIZE        (1 << SCTP_APP_TAB_BITS)
-#define SCTP_APP_TAB_MASK        (SCTP_APP_TAB_SIZE - 1)
-
-static struct list_head sctp_apps[SCTP_APP_TAB_SIZE];
-static DEFINE_SPINLOCK(sctp_app_lock);
 
 static inline __u16 sctp_app_hashkey(__be16 port)
 {
@@ -1041,40 +1020,41 @@ static inline __u16 sctp_app_hashkey(__be16 port)
 		& SCTP_APP_TAB_MASK;
 }
 
-static int sctp_register_app(struct ip_vs_app *inc)
+static int sctp_register_app(struct net *net, struct ip_vs_app *inc)
 {
 	struct ip_vs_app *i;
 	__u16 hash;
 	__be16 port = inc->port;
 	int ret = 0;
+	struct netns_ipvs *ipvs = net_ipvs(net);
+	struct ip_vs_proto_data *pd = ip_vs_proto_data_get(net, IPPROTO_SCTP);
 
 	hash = sctp_app_hashkey(port);
 
-	spin_lock_bh(&sctp_app_lock);
-	list_for_each_entry(i, &sctp_apps[hash], p_list) {
+	list_for_each_entry(i, &ipvs->sctp_apps[hash], p_list) {
 		if (i->port == port) {
 			ret = -EEXIST;
 			goto out;
 		}
 	}
-	list_add(&inc->p_list, &sctp_apps[hash]);
-	atomic_inc(&ip_vs_protocol_sctp.appcnt);
+	list_add_rcu(&inc->p_list, &ipvs->sctp_apps[hash]);
+	atomic_inc(&pd->appcnt);
 out:
-	spin_unlock_bh(&sctp_app_lock);
 
 	return ret;
 }
 
-static void sctp_unregister_app(struct ip_vs_app *inc)
+static void sctp_unregister_app(struct net *net, struct ip_vs_app *inc)
 {
-	spin_lock_bh(&sctp_app_lock);
-	atomic_dec(&ip_vs_protocol_sctp.appcnt);
-	list_del(&inc->p_list);
-	spin_unlock_bh(&sctp_app_lock);
+	struct ip_vs_proto_data *pd = ip_vs_proto_data_get(net, IPPROTO_SCTP);
+
+	atomic_dec(&pd->appcnt);
+	list_del_rcu(&inc->p_list);
 }
 
 static int sctp_app_conn_bind(struct ip_vs_conn *cp)
 {
+	struct netns_ipvs *ipvs = net_ipvs(ip_vs_conn_net(cp));
 	int hash;
 	struct ip_vs_app *inc;
 	int result = 0;
@@ -1085,12 +1065,12 @@ static int sctp_app_conn_bind(struct ip_vs_conn *cp)
 	/* Lookup application incarnations and bind the right one */
 	hash = sctp_app_hashkey(cp->vport);
 
-	spin_lock(&sctp_app_lock);
-	list_for_each_entry(inc, &sctp_apps[hash], p_list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(inc, &ipvs->sctp_apps[hash], p_list) {
 		if (inc->port == cp->vport) {
 			if (unlikely(!ip_vs_app_inc_get(inc)))
 				break;
-			spin_unlock(&sctp_app_lock);
+			rcu_read_unlock();
 
 			IP_VS_DBG_BUF(9, "%s: Binding conn %s:%u->"
 					"%s:%u to app %s on port %u\n",
@@ -1106,43 +1086,52 @@ static int sctp_app_conn_bind(struct ip_vs_conn *cp)
 			goto out;
 		}
 	}
-	spin_unlock(&sctp_app_lock);
+	rcu_read_unlock();
 out:
 	return result;
 }
 
-static void ip_vs_sctp_init(struct ip_vs_protocol *pp)
+/* ---------------------------------------------
+ *   timeouts is netns related now.
+ * ---------------------------------------------
+ */
+static int __ip_vs_sctp_init(struct net *net, struct ip_vs_proto_data *pd)
 {
-	IP_VS_INIT_HASH_TABLE(sctp_apps);
-	pp->timeout_table = sctp_timeouts;
+	struct netns_ipvs *ipvs = net_ipvs(net);
+
+	ip_vs_init_hash_table(ipvs->sctp_apps, SCTP_APP_TAB_SIZE);
+	pd->timeout_table = ip_vs_create_timeout_table((int *)sctp_timeouts,
+							sizeof(sctp_timeouts));
+	if (!pd->timeout_table)
+		return -ENOMEM;
+	return 0;
 }
 
-
-static void ip_vs_sctp_exit(struct ip_vs_protocol *pp)
+static void __ip_vs_sctp_exit(struct net *net, struct ip_vs_proto_data *pd)
 {
-
+	kfree(pd->timeout_table);
 }
 
 struct ip_vs_protocol ip_vs_protocol_sctp = {
-	.name = "SCTP",
-	.protocol = IPPROTO_SCTP,
-	.num_states = IP_VS_SCTP_S_LAST,
-	.dont_defrag = 0,
-	.appcnt = ATOMIC_INIT(0),
-	.init = ip_vs_sctp_init,
-	.exit = ip_vs_sctp_exit,
-	.register_app = sctp_register_app,
+	.name		= "SCTP",
+	.protocol	= IPPROTO_SCTP,
+	.num_states	= IP_VS_SCTP_S_LAST,
+	.dont_defrag	= 0,
+	.init		= NULL,
+	.exit		= NULL,
+	.init_netns	= __ip_vs_sctp_init,
+	.exit_netns	= __ip_vs_sctp_exit,
+	.register_app	= sctp_register_app,
 	.unregister_app = sctp_unregister_app,
-	.conn_schedule = sctp_conn_schedule,
-	.conn_in_get = ip_vs_conn_in_get_proto,
-	.conn_out_get = ip_vs_conn_out_get_proto,
-	.snat_handler = sctp_snat_handler,
-	.dnat_handler = sctp_dnat_handler,
-	.csum_check = sctp_csum_check,
-	.state_name = sctp_state_name,
+	.conn_schedule	= sctp_conn_schedule,
+	.conn_in_get	= ip_vs_conn_in_get_proto,
+	.conn_out_get	= ip_vs_conn_out_get_proto,
+	.snat_handler	= sctp_snat_handler,
+	.dnat_handler	= sctp_dnat_handler,
+	.csum_check	= sctp_csum_check,
+	.state_name	= sctp_state_name,
 	.state_transition = sctp_state_transition,
-	.app_conn_bind = sctp_app_conn_bind,
-	.debug_packet = ip_vs_tcpudp_debug_packet,
-	.timeout_change = sctp_timeout_change,
-	.set_state_timeout = sctp_set_state_timeout,
+	.app_conn_bind	= sctp_app_conn_bind,
+	.debug_packet	= ip_vs_tcpudp_debug_packet,
+	.timeout_change	= NULL,
 };

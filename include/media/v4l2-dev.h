@@ -16,12 +16,21 @@
 #include <linux/mutex.h>
 #include <linux/videodev2.h>
 
+#include <media/media-entity.h>
+
 #define VIDEO_MAJOR	81
 
 #define VFL_TYPE_GRABBER	0
 #define VFL_TYPE_VBI		1
 #define VFL_TYPE_RADIO		2
-#define VFL_TYPE_MAX		3
+#define VFL_TYPE_SUBDEV		3
+#define VFL_TYPE_MAX		4
+
+/* Is this a receiver, transmitter or mem-to-mem? */
+/* Ignored for VFL_TYPE_SUBDEV. */
+#define VFL_DIR_RX		0
+#define VFL_DIR_TX		1
+#define VFL_DIR_M2M		2
 
 struct v4l2_ioctl_callbacks;
 struct video_device;
@@ -32,7 +41,25 @@ struct v4l2_ctrl_handler;
    Drivers can clear this flag if they want to block all future
    device access. It is cleared by video_unregister_device. */
 #define V4L2_FL_REGISTERED	(0)
+/* file->private_data points to struct v4l2_fh */
 #define V4L2_FL_USES_V4L2_FH	(1)
+/* Use the prio field of v4l2_fh for core priority checking */
+#define V4L2_FL_USE_FH_PRIO	(2)
+
+/* Priority helper functions */
+
+struct v4l2_prio_state {
+	atomic_t prios[4];
+};
+
+void v4l2_prio_init(struct v4l2_prio_state *global);
+int v4l2_prio_change(struct v4l2_prio_state *global, enum v4l2_priority *local,
+		     enum v4l2_priority new);
+void v4l2_prio_open(struct v4l2_prio_state *global, enum v4l2_priority *local);
+void v4l2_prio_close(struct v4l2_prio_state *global, enum v4l2_priority local);
+enum v4l2_priority v4l2_prio_max(struct v4l2_prio_state *global);
+int v4l2_prio_check(struct v4l2_prio_state *global, enum v4l2_priority local);
+
 
 struct v4l2_file_operations {
 	struct module *owner;
@@ -41,6 +68,9 @@ struct v4l2_file_operations {
 	unsigned int (*poll) (struct file *, struct poll_table_struct *);
 	long (*ioctl) (struct file *, unsigned int, unsigned long);
 	long (*unlocked_ioctl) (struct file *, unsigned int, unsigned long);
+#ifdef CONFIG_COMPAT
+	long (*compat_ioctl32) (struct file *, unsigned int, unsigned long);
+#endif
 	unsigned long (*get_unmapped_area) (struct file *, unsigned long,
 				unsigned long, unsigned long, unsigned long);
 	int (*mmap) (struct file *, struct vm_area_struct *);
@@ -56,6 +86,9 @@ struct v4l2_file_operations {
 
 struct video_device
 {
+#if defined(CONFIG_MEDIA_CONTROLLER)
+	struct media_entity entity;
+#endif
 	/* device ops */
 	const struct v4l2_file_operations *fops;
 
@@ -67,9 +100,19 @@ struct video_device
 	struct device *parent;		/* device parent */
 	struct v4l2_device *v4l2_dev;	/* v4l2_device parent */
 
+	/* Control handler associated with this device node. May be NULL. */
+	struct v4l2_ctrl_handler *ctrl_handler;
+
+	/* vb2_queue associated with this device node. May be NULL. */
+	struct vb2_queue *queue;
+
+	/* Priority state. If NULL, then v4l2_dev->prio will be used. */
+	struct v4l2_prio_state *prio;
+
 	/* device info */
 	char name[32];
-	int vfl_type;
+	int vfl_type;	/* device type */
+	int vfl_dir;	/* receiver, transmitter or m2m */
 	/* 'minor' is set to -1 if the registration failed */
 	int minor;
 	u16 num;
@@ -77,6 +120,10 @@ struct video_device
 	unsigned long flags;
 	/* attribute to differentiate multiple indices on one physical device */
 	int index;
+
+	/* V4L2 file handles */
+	spinlock_t		fh_lock; /* Lock for all v4l2_fhs */
+	struct list_head	fh_list; /* List of struct v4l2_fh */
 
 	int debug;			/* Activates debug level*/
 
@@ -89,41 +136,38 @@ struct video_device
 
 	/* ioctl callbacks */
 	const struct v4l2_ioctl_ops *ioctl_ops;
-
-};
-
-struct video_device_shadow {
-#ifndef __GENKSYMS__
-	struct video_device *vdev;
-	struct list_head shadow_node;
-
-	/* Control handler associated with this device node. May be NULL. */
-	struct v4l2_ctrl_handler *ctrl_handler;
-
-	/* V4L2 file handles */
-	spinlock_t		fh_lock; /* Lock for all v4l2_fhs */
-	struct list_head	fh_list; /* List of struct v4l2_fh */
+	DECLARE_BITMAP(valid_ioctls, BASE_VIDIOC_PRIVATE);
 
 	/* serialization lock */
+	DECLARE_BITMAP(disable_locking, BASE_VIDIOC_PRIVATE);
 	struct mutex *lock;
-#endif
 };
 
+#define media_entity_to_video_device(__e) \
+	container_of(__e, struct video_device, entity)
 /* dev to video-device */
 #define to_video_device(cd) container_of(cd, struct video_device, dev)
 
-struct video_device_shadow *video_device_shadow_get(struct video_device *vdev);
-void video_device_shadow_release(struct video_device *vdev);
+int __must_check __video_register_device(struct video_device *vdev, int type,
+		int nr, int warn_if_nr_in_use, struct module *owner);
 
 /* Register video devices. Note that if video_register_device fails,
    the release() callback of the video_device structure is *not* called, so
    the caller is responsible for freeing any data. Usually that means that
    you call video_device_release() on failure. */
-int __must_check video_register_device(struct video_device *vdev, int type, int nr);
+static inline int __must_check video_register_device(struct video_device *vdev,
+		int type, int nr)
+{
+	return __video_register_device(vdev, type, nr, 1, vdev->fops->owner);
+}
 
 /* Same as video_register_device, but no warning is issued if the desired
    device node number was already in use. */
-int __must_check video_register_device_no_warn(struct video_device *vdev, int type, int nr);
+static inline int __must_check video_register_device_no_warn(
+		struct video_device *vdev, int type, int nr)
+{
+	return __video_register_device(vdev, type, nr, 0, vdev->fops->owner);
+}
 
 /* Unregister video devices. Will do nothing if vdev == NULL or
    video_is_registered() returns false. */
@@ -140,6 +184,26 @@ void video_device_release(struct video_device *vdev);
    static global struct. Note that having a static video_device is
    a dubious construction at best. */
 void video_device_release_empty(struct video_device *vdev);
+
+/* returns true if cmd is a known V4L2 ioctl */
+bool v4l2_is_known_ioctl(unsigned int cmd);
+
+/* mark that this command shouldn't use core locking */
+static inline void v4l2_disable_ioctl_locking(struct video_device *vdev, unsigned int cmd)
+{
+	if (_IOC_NR(cmd) < BASE_VIDIOC_PRIVATE)
+		set_bit(_IOC_NR(cmd), vdev->disable_locking);
+}
+
+/* Mark that this command isn't implemented. This must be called before
+   video_device_register. See also the comments in determine_valid_ioctls().
+   This function allows drivers to provide just one v4l2_ioctl_ops struct, but
+   disable ioctls based on the specific card that is actually found. */
+static inline void v4l2_disable_ioctl(struct video_device *vdev, unsigned int cmd)
+{
+	if (_IOC_NR(cmd) < BASE_VIDIOC_PRIVATE)
+		set_bit(_IOC_NR(cmd), vdev->valid_ioctls);
+}
 
 /* helper functions to access driver private data. */
 static inline void *video_get_drvdata(struct video_device *vdev)

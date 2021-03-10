@@ -10,12 +10,14 @@ struct scsi_transport_template;
 struct sas_rphy;
 struct request;
 
-enum sas_device_type {
-	SAS_PHY_UNUSED = 0,
-	SAS_END_DEVICE = 1,
-	SAS_EDGE_EXPANDER_DEVICE = 2,
-	SAS_FANOUT_EXPANDER_DEVICE = 3,
-};
+#if !IS_ENABLED(CONFIG_SCSI_SAS_ATTRS)
+static inline int scsi_is_sas_rphy(const struct device *sdev)
+{
+	return 0;
+}
+#else
+extern int scsi_is_sas_rphy(const struct device *);
+#endif
 
 static inline int sas_protocol_ata(enum sas_protocol proto)
 {
@@ -152,6 +154,7 @@ struct sas_port {
 
 	struct mutex		phy_list_mutex;
 	struct list_head	phy_list;
+	struct list_head	del_list; /* libsas only */
 };
 
 #define dev_to_sas_port(d) \
@@ -187,6 +190,7 @@ extern int sas_phy_add(struct sas_phy *);
 extern void sas_phy_delete(struct sas_phy *);
 extern int scsi_is_sas_phy(const struct device *);
 
+u64 sas_get_address(struct scsi_device *);
 unsigned int sas_tlr_supported(struct scsi_device *);
 unsigned int sas_is_tlr_enabled(struct scsi_device *);
 void sas_disable_tlr(struct scsi_device *);
@@ -199,7 +203,6 @@ extern int sas_rphy_add(struct sas_rphy *);
 extern void sas_rphy_remove(struct sas_rphy *);
 extern void sas_rphy_delete(struct sas_rphy *);
 extern void sas_rphy_unlink(struct sas_rphy *);
-extern int scsi_is_sas_rphy(const struct device *);
 
 struct sas_port *sas_port_alloc(struct device *, int);
 struct sas_port *sas_port_alloc_num(struct device *);

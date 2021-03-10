@@ -84,7 +84,6 @@ extern unsigned int vdso_enabled;
 	(((x)->e_machine == EM_386) || ((x)->e_machine == EM_486))
 
 #include <asm/processor.h>
-#include <asm/system.h>
 
 #ifdef CONFIG_X86_32
 #include <asm/desc.h>
@@ -156,20 +155,12 @@ do {						\
 #define elf_check_arch(x)			\
 	((x)->e_machine == EM_X86_64)
 
-#define compat_elf_check_arch(x)	elf_check_arch_ia32(x)
+#define compat_elf_check_arch(x)		\
+	(elf_check_arch_ia32(x) || (x)->e_machine == EM_X86_64)
 
-static inline void start_ia32_thread(struct pt_regs *regs, u32 ip, u32 sp)
-{
-	loadsegment(fs, 0);
-	loadsegment(ds, __USER32_DS);
-	loadsegment(es, __USER32_DS);
-	load_gs_index(0);
-	regs->ip = ip;
-	regs->sp = sp;
-	regs->flags = X86_EFLAGS_IF;
-	regs->cs = __USER32_CS;
-	regs->ss = __USER32_DS;
-}
+#if __USER32_DS != __USER_DS
+# error "The following code assumes __USER32_DS == __USER_DS"
+#endif
 
 static inline void elf_common_init(struct thread_struct *t,
 				   struct pt_regs *regs, const u16 ds)
@@ -184,22 +175,17 @@ static inline void elf_common_init(struct thread_struct *t,
 }
 
 #define ELF_PLAT_INIT(_r, load_addr)			\
-do {							\
-	elf_common_init(&current->thread, _r, 0);	\
-	clear_thread_flag(TIF_IA32);			\
-} while (0)
+	elf_common_init(&current->thread, _r, 0)
 
 #define	COMPAT_ELF_PLAT_INIT(regs, load_addr)		\
 	elf_common_init(&current->thread, regs, __USER_DS)
 
-#define	compat_start_thread(regs, ip, sp)		\
-do {							\
-	start_ia32_thread(regs, ip, sp);		\
-	set_fs(USER_DS);				\
-} while (0)
+void start_thread_ia32(struct pt_regs *regs, u32 new_ip, u32 new_sp);
+#define compat_start_thread start_thread_ia32
 
-void set_personality_ia32(void);
-#define COMPAT_SET_PERSONALITY(ex) set_personality_ia32()
+void set_personality_ia32(bool);
+#define COMPAT_SET_PERSONALITY(ex)			\
+	set_personality_ia32((ex).e_machine == EM_X86_64)
 
 #define COMPAT_ELF_PLATFORM			("i686")
 
@@ -250,7 +236,6 @@ extern int force_personality32;
 #endif /* !CONFIG_X86_32 */
 
 #define CORE_DUMP_USE_REGSET
-#define USE_ELF_CORE_DUMP
 #define ELF_EXEC_PAGESIZE	4096
 
 /*
@@ -266,6 +251,15 @@ extern int force_personality32;
    but it's not easy, and we've already done it here.  */
 
 #define ELF_HWCAP		(boot_cpu_data.x86_capability[0])
+
+extern u32 elf_hwcap2;
+
+/*
+ * HWCAP2 supplies mask with kernel enabled CPU features, so that
+ * the application can discover that it can safely use them.
+ * The bits are defined in uapi/asm/hwcap2.h.
+ */
+#define ELF_HWCAP2		(elf_hwcap2)
 
 /* This yields a string that ld.so will use to load implementation
    specific libraries for optimization.  This is more specific in
@@ -308,7 +302,7 @@ do {									\
 #define VDSO_HIGH_BASE		0xffffe000U /* CONFIG_COMPAT_VDSO address */
 
 /* 1GB for 64bit, 8MB for 32bit */
-#define STACK_RND_MASK (test_thread_flag(TIF_IA32) ? 0x7ff : 0x3fffff)
+#define STACK_RND_MASK (test_thread_flag(TIF_ADDR32) ? 0x7ff : 0x3fffff)
 
 #define ARCH_DLINFO							\
 do {									\
@@ -317,9 +311,20 @@ do {									\
 			    (unsigned long)current->mm->context.vdso);	\
 } while (0)
 
+#define ARCH_DLINFO_X32							\
+do {									\
+	if (vdso_enabled)						\
+		NEW_AUX_ENT(AT_SYSINFO_EHDR,				\
+			    (unsigned long)current->mm->context.vdso);	\
+} while (0)
+
 #define AT_SYSINFO		32
 
-#define COMPAT_ARCH_DLINFO	ARCH_DLINFO_IA32(sysctl_vsyscall32)
+#define COMPAT_ARCH_DLINFO						\
+if (test_thread_flag(TIF_X32))						\
+	ARCH_DLINFO_X32;						\
+else									\
+	ARCH_DLINFO_IA32(sysctl_vsyscall32)
 
 #define COMPAT_ELF_ET_DYN_BASE	(TASK_UNMAPPED_BASE + 0x1000000)
 
@@ -335,6 +340,8 @@ struct linux_binprm;
 #define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
 extern int arch_setup_additional_pages(struct linux_binprm *bprm,
 				       int uses_interp);
+extern int x32_setup_additional_pages(struct linux_binprm *bprm,
+				      int uses_interp);
 
 extern int syscall32_setup_pages(struct linux_binprm *, int exstack);
 #define compat_arch_setup_additional_pages	syscall32_setup_pages
@@ -348,18 +355,16 @@ static inline int mmap_is_ia32(void)
 	return 1;
 #endif
 #ifdef CONFIG_IA32_EMULATION
-	if (test_thread_flag(TIF_IA32))
+	if (test_thread_flag(TIF_ADDR32))
 		return 1;
 #endif
 	return 0;
 }
 
-/* The first two values are special, do not change. See align_addr() */
+/* Do not change the values. See get_align_mask() */
 enum align_flags {
 	ALIGN_VA_32	= BIT(0),
 	ALIGN_VA_64	= BIT(1),
-	ALIGN_VDSO	= BIT(2),
-	ALIGN_TOPDOWN	= BIT(3),
 };
 
 struct va_alignment {
@@ -369,5 +374,5 @@ struct va_alignment {
 } ____cacheline_aligned;
 
 extern struct va_alignment va_align;
-extern unsigned long align_addr(unsigned long, struct file *, enum align_flags);
+extern unsigned long align_vdso_addr(unsigned long);
 #endif /* _ASM_X86_ELF_H */

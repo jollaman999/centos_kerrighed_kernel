@@ -21,7 +21,6 @@
 #include <linux/mmzone.h>
 #include <linux/pagemap.h>
 #include <linux/swap.h>
-#include <linux/slab.h>
 #include <linux/smp.h>
 #include <linux/seq_file.h>
 #include <linux/hugetlb.h>
@@ -46,7 +45,7 @@ static int nommu_region_show(struct seq_file *m, struct vm_region *region)
 	file = region->vm_file;
 
 	if (file) {
-		struct inode *inode = region->vm_file->f_path.dentry->d_inode;
+		struct inode *inode = file_inode(region->vm_file);
 		dev = inode->i_sb->s_dev;
 		ino = inode->i_ino;
 	}

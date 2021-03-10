@@ -16,6 +16,7 @@
  * published by the Free Software Foundation.
  */
 
+#include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/firmware.h>
 #include <linux/etherdevice.h>
@@ -668,7 +669,7 @@ int p54_upload_key(struct p54_common *priv, u8 algo, int slot, u8 idx, u8 len,
 	if (addr)
 		memcpy(rxkey->mac, addr, ETH_ALEN);
 	else
-		eth_broadcast_addr(rxkey->mac);
+		memset(rxkey->mac, ~0, ETH_ALEN);
 
 	switch (algo) {
 	case P54_CRYPTO_WEP:

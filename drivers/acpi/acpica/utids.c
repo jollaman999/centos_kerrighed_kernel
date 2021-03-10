@@ -1,11 +1,11 @@
 /******************************************************************************
  *
- * Module Name: utids - support for device IDs - HID, UID, CID
+ * Module Name: utids - support for device Ids - HID, UID, CID
  *
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2009, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -48,42 +48,6 @@
 #define _COMPONENT          ACPI_UTILITIES
 ACPI_MODULE_NAME("utids")
 
-/* Local prototypes */
-static void acpi_ut_copy_id_string(char *destination, char *source);
-
-/*******************************************************************************
- *
- * FUNCTION:    acpi_ut_copy_id_string
- *
- * PARAMETERS:  Destination         - Where to copy the string
- *              Source              - Source string
- *
- * RETURN:      None
- *
- * DESCRIPTION: Copies an ID string for the _HID, _CID, and _UID methods.
- *              Performs removal of a leading asterisk if present -- workaround
- *              for a known issue on a bunch of machines.
- *
- ******************************************************************************/
-
-static void acpi_ut_copy_id_string(char *destination, char *source)
-{
-
-	/*
-	 * Workaround for ID strings that have a leading asterisk. This construct
-	 * is not allowed by the ACPI specification  (ID strings must be
-	 * alphanumeric), but enough existing machines have this embedded in their
-	 * ID strings that the following code is useful.
-	 */
-	if (*source == '*') {
-		source++;
-	}
-
-	/* Do the actual copy */
-
-	ACPI_STRCPY(destination, source);
-}
-
 /*******************************************************************************
  *
  * FUNCTION:    acpi_ut_execute_HID
@@ -101,13 +65,12 @@ static void acpi_ut_copy_id_string(char *destination, char *source)
  *              NOTE: Internal function, no parameter validation
  *
  ******************************************************************************/
-
 acpi_status
 acpi_ut_execute_HID(struct acpi_namespace_node *device_node,
-		    struct acpica_device_id **return_id)
+		    struct acpi_pnp_device_id **return_id)
 {
 	union acpi_operand_object *obj_desc;
-	struct acpica_device_id *hid;
+	struct acpi_pnp_device_id *hid;
 	u32 length;
 	acpi_status status;
 
@@ -131,29 +94,97 @@ acpi_ut_execute_HID(struct acpi_namespace_node *device_node,
 	/* Allocate a buffer for the HID */
 
 	hid =
-	    ACPI_ALLOCATE_ZEROED(sizeof(struct acpica_device_id) +
+	    ACPI_ALLOCATE_ZEROED(sizeof(struct acpi_pnp_device_id) +
 				 (acpi_size) length);
 	if (!hid) {
 		status = AE_NO_MEMORY;
 		goto cleanup;
 	}
 
-	/* Area for the string starts after DEVICE_ID struct */
+	/* Area for the string starts after PNP_DEVICE_ID struct */
 
-	hid->string = ACPI_ADD_PTR(char, hid, sizeof(struct acpica_device_id));
+	hid->string =
+	    ACPI_ADD_PTR(char, hid, sizeof(struct acpi_pnp_device_id));
 
 	/* Convert EISAID to a string or simply copy existing string */
 
 	if (obj_desc->common.type == ACPI_TYPE_INTEGER) {
 		acpi_ex_eisa_id_to_string(hid->string, obj_desc->integer.value);
 	} else {
-		acpi_ut_copy_id_string(hid->string, obj_desc->string.pointer);
+		strcpy(hid->string, obj_desc->string.pointer);
 	}
 
 	hid->length = length;
 	*return_id = hid;
 
 cleanup:
+
+	/* On exit, we must delete the return object */
+
+	acpi_ut_remove_reference(obj_desc);
+	return_ACPI_STATUS(status);
+}
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_ut_execute_SUB
+ *
+ * PARAMETERS:  device_node         - Node for the device
+ *              return_id           - Where the _SUB is returned
+ *
+ * RETURN:      Status
+ *
+ * DESCRIPTION: Executes the _SUB control method that returns the subsystem
+ *              ID of the device. The _SUB value is always a string containing
+ *              either a valid PNP or ACPI ID.
+ *
+ *              NOTE: Internal function, no parameter validation
+ *
+ ******************************************************************************/
+
+acpi_status
+acpi_ut_execute_SUB(struct acpi_namespace_node *device_node,
+		    struct acpi_pnp_device_id **return_id)
+{
+	union acpi_operand_object *obj_desc;
+	struct acpi_pnp_device_id *sub;
+	u32 length;
+	acpi_status status;
+
+	ACPI_FUNCTION_TRACE(ut_execute_SUB);
+
+	status = acpi_ut_evaluate_object(device_node, METHOD_NAME__SUB,
+					 ACPI_BTYPE_STRING, &obj_desc);
+	if (ACPI_FAILURE(status)) {
+		return_ACPI_STATUS(status);
+	}
+
+	/* Get the size of the String to be returned, includes null terminator */
+
+	length = obj_desc->string.length + 1;
+
+	/* Allocate a buffer for the SUB */
+
+	sub =
+	    ACPI_ALLOCATE_ZEROED(sizeof(struct acpi_pnp_device_id) +
+				 (acpi_size) length);
+	if (!sub) {
+		status = AE_NO_MEMORY;
+		goto cleanup;
+	}
+
+	/* Area for the string starts after PNP_DEVICE_ID struct */
+
+	sub->string =
+	    ACPI_ADD_PTR(char, sub, sizeof(struct acpi_pnp_device_id));
+
+	/* Simply copy existing string */
+
+	strcpy(sub->string, obj_desc->string.pointer);
+	sub->length = length;
+	*return_id = sub;
+
+      cleanup:
 
 	/* On exit, we must delete the return object */
 
@@ -181,10 +212,10 @@ cleanup:
 
 acpi_status
 acpi_ut_execute_UID(struct acpi_namespace_node *device_node,
-		    struct acpica_device_id **return_id)
+		    struct acpi_pnp_device_id **return_id)
 {
 	union acpi_operand_object *obj_desc;
-	struct acpica_device_id *uid;
+	struct acpi_pnp_device_id *uid;
 	u32 length;
 	acpi_status status;
 
@@ -208,23 +239,24 @@ acpi_ut_execute_UID(struct acpi_namespace_node *device_node,
 	/* Allocate a buffer for the UID */
 
 	uid =
-	    ACPI_ALLOCATE_ZEROED(sizeof(struct acpica_device_id) +
+	    ACPI_ALLOCATE_ZEROED(sizeof(struct acpi_pnp_device_id) +
 				 (acpi_size) length);
 	if (!uid) {
 		status = AE_NO_MEMORY;
 		goto cleanup;
 	}
 
-	/* Area for the string starts after DEVICE_ID struct */
+	/* Area for the string starts after PNP_DEVICE_ID struct */
 
-	uid->string = ACPI_ADD_PTR(char, uid, sizeof(struct acpica_device_id));
+	uid->string =
+	    ACPI_ADD_PTR(char, uid, sizeof(struct acpi_pnp_device_id));
 
 	/* Convert an Integer to string, or just copy an existing string */
 
 	if (obj_desc->common.type == ACPI_TYPE_INTEGER) {
 		acpi_ex_integer_to_string(uid->string, obj_desc->integer.value);
 	} else {
-		acpi_ut_copy_id_string(uid->string, obj_desc->string.pointer);
+		strcpy(uid->string, obj_desc->string.pointer);
 	}
 
 	uid->length = length;
@@ -263,11 +295,11 @@ cleanup:
 
 acpi_status
 acpi_ut_execute_CID(struct acpi_namespace_node *device_node,
-		    struct acpica_device_id_list **return_cid_list)
+		    struct acpi_pnp_device_id_list **return_cid_list)
 {
 	union acpi_operand_object **cid_objects;
 	union acpi_operand_object *obj_desc;
-	struct acpica_device_id_list *cid_list;
+	struct acpi_pnp_device_id_list *cid_list;
 	char *next_id_string;
 	u32 string_area_size;
 	u32 length;
@@ -309,14 +341,17 @@ acpi_ut_execute_CID(struct acpi_namespace_node *device_node,
 
 		switch (cid_objects[i]->common.type) {
 		case ACPI_TYPE_INTEGER:
+
 			string_area_size += ACPI_EISAID_STRING_SIZE;
 			break;
 
 		case ACPI_TYPE_STRING:
+
 			string_area_size += cid_objects[i]->string.length + 1;
 			break;
 
 		default:
+
 			status = AE_TYPE;
 			goto cleanup;
 		}
@@ -325,11 +360,12 @@ acpi_ut_execute_CID(struct acpi_namespace_node *device_node,
 	/*
 	 * Now that we know the length of the CIDs, allocate return buffer:
 	 * 1) Size of the base structure +
-	 * 2) Size of the CID DEVICE_ID array +
+	 * 2) Size of the CID PNP_DEVICE_ID array +
 	 * 3) Size of the actual CID strings
 	 */
-	cid_list_size = sizeof(struct acpica_device_id_list) +
-	    ((count - 1) * sizeof(struct acpica_device_id)) + string_area_size;
+	cid_list_size = sizeof(struct acpi_pnp_device_id_list) +
+	    ((count - 1) * sizeof(struct acpi_pnp_device_id)) +
+	    string_area_size;
 
 	cid_list = ACPI_ALLOCATE_ZEROED(cid_list_size);
 	if (!cid_list) {
@@ -337,10 +373,10 @@ acpi_ut_execute_CID(struct acpi_namespace_node *device_node,
 		goto cleanup;
 	}
 
-	/* Area for CID strings starts after the CID DEVICE_ID array */
+	/* Area for CID strings starts after the CID PNP_DEVICE_ID array */
 
 	next_id_string = ACPI_CAST_PTR(char, cid_list->ids) +
-	    ((acpi_size) count * sizeof(struct acpica_device_id));
+	    ((acpi_size) count * sizeof(struct acpi_pnp_device_id));
 
 	/* Copy/convert the CIDs to the return buffer */
 
@@ -357,8 +393,7 @@ acpi_ut_execute_CID(struct acpi_namespace_node *device_node,
 
 			/* Copy the String CID from the returned object */
 
-			acpi_ut_copy_id_string(next_id_string,
-					       cid_objects[i]->string.pointer);
+			strcpy(next_id_string, cid_objects[i]->string.pointer);
 			length = cid_objects[i]->string.length + 1;
 		}
 

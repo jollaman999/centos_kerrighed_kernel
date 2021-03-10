@@ -15,12 +15,8 @@ struct kstatfs {
 	__kernel_fsid_t f_fsid;
 	long f_namelen;
 	long f_frsize;
-#ifndef __GENKSYMS__
 	long f_flags;
 	long f_spare[4];
-#else
-	long f_spare[5];
-#endif
 };
 
 /*

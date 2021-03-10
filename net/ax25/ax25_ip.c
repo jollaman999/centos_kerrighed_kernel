@@ -16,6 +16,7 @@
 #include <linux/string.h>
 #include <linux/sockios.h>
 #include <linux/net.h>
+#include <linux/slab.h>
 #include <net/ax25.h>
 #include <linux/inet.h>
 #include <linux/netdevice.h>
@@ -23,7 +24,6 @@
 #include <linux/skbuff.h>
 #include <net/sock.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/termios.h>	/* For TIOCINQ/OUTQ */
 #include <linux/mm.h>
@@ -48,7 +48,7 @@
 
 int ax25_hard_header(struct sk_buff *skb, struct net_device *dev,
 		     unsigned short type, const void *daddr,
-		     const void *saddr, unsigned len)
+		     const void *saddr, unsigned int len)
 {
 	unsigned char *buff;
 
@@ -219,7 +219,7 @@ put:
 
 int ax25_hard_header(struct sk_buff *skb, struct net_device *dev,
 		     unsigned short type, const void *daddr,
-		     const void *saddr, unsigned len)
+		     const void *saddr, unsigned int len)
 {
 	return -AX25_HEADER_LEN;
 }

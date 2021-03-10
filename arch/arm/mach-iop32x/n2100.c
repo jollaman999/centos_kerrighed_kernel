@@ -23,7 +23,6 @@
 #include <linux/pci.h>
 #include <linux/pm.h>
 #include <linux/string.h>
-#include <linux/slab.h>
 #include <linux/serial_core.h>
 #include <linux/serial_8250.h>
 #include <linux/mtd/physmap.h>
@@ -51,11 +50,6 @@ static void __init n2100_timer_init(void)
 	iop_init_time(198000000);
 }
 
-static struct sys_timer n2100_timer = {
-	.init		= n2100_timer_init,
-	.offset		= iop_gettimeoffset,
-};
-
 
 /*
  * N2100 I/O.
@@ -80,7 +74,7 @@ void __init n2100_map_io(void)
  * N2100 PCI.
  */
 static int __init
-n2100_pci_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
+n2100_pci_map_irq(const struct pci_dev *dev, u8 slot, u8 pin)
 {
 	int irq;
 
@@ -116,11 +110,10 @@ n2100_pci_map_irq(struct pci_dev *dev, u8 slot, u8 pin)
 }
 
 static struct hw_pci n2100_pci __initdata = {
-	.swizzle	= pci_std_swizzle,
 	.nr_controllers = 1,
+	.ops		= &iop3xx_ops,
 	.setup		= iop3xx_pci_setup,
 	.preinit	= iop3xx_pci_preinit,
-	.scan		= iop3xx_pci_scan_bus,
 	.map_irq	= n2100_pci_map_irq,
 };
 
@@ -178,7 +171,7 @@ static struct plat_serial8250_port n2100_serial_port[] = {
 		.mapbase	= N2100_UART,
 		.membase	= (char *)N2100_UART,
 		.irq		= 0,
-		.flags		= UPF_SKIP_TEST,
+		.flags		= UPF_SKIP_TEST | UPF_AUTO_IRQ | UPF_SHARE_IRQ,
 		.iotype		= UPIO_MEM,
 		.regshift	= 0,
 		.uartclk	= 1843200,
@@ -293,6 +286,14 @@ static void n2100_power_off(void)
 		;
 }
 
+static void n2100_restart(char mode, const char *cmd)
+{
+	gpio_line_set(N2100_HARDWARE_RESET, GPIO_LOW);
+	gpio_line_config(N2100_HARDWARE_RESET, GPIO_OUT);
+	while (1)
+		;
+}
+
 
 static struct timer_list power_button_poll_timer;
 
@@ -329,11 +330,10 @@ static void __init n2100_init_machine(void)
 
 MACHINE_START(N2100, "Thecus N2100")
 	/* Maintainer: Lennert Buytenhek <buytenh@wantstofly.org> */
-	.phys_io	= N2100_UART,
-	.io_pg_offst	= ((N2100_UART) >> 18) & 0xfffc,
-	.boot_params	= 0xa0000100,
+	.atag_offset	= 0x100,
 	.map_io		= n2100_map_io,
 	.init_irq	= iop32x_init_irq,
-	.timer		= &n2100_timer,
+	.init_time	= n2100_timer_init,
 	.init_machine	= n2100_init_machine,
+	.restart	= n2100_restart,
 MACHINE_END

@@ -2,6 +2,8 @@
 #define _ASM_X86_PAGE_DEFS_H
 
 #include <linux/const.h>
+#include <linux/types.h>
+#include <linux/mem_encrypt.h>
 
 /* PAGE_SHIFT determines the page size */
 #define PAGE_SHIFT	12
@@ -14,7 +16,7 @@
 #define PUD_PAGE_SIZE		(_AC(1, UL) << PUD_SHIFT)
 #define PUD_PAGE_MASK		(~(PUD_PAGE_SIZE-1))
 
-#define __PHYSICAL_MASK		((phys_addr_t)(1ULL << __PHYSICAL_MASK_SHIFT) - 1)
+#define __PHYSICAL_MASK		((phys_addr_t)(__sme_clr((1ULL << __PHYSICAL_MASK_SHIFT) - 1)))
 #define __VIRTUAL_MASK		((1UL << __VIRTUAL_MASK_SHIFT) - 1)
 
 /* Cast *PAGE_MASK to a signed type so that it is sign-extended if
@@ -37,10 +39,17 @@
 	(((current->personality & READ_IMPLIES_EXEC) ? VM_EXEC : 0 ) | \
 	 VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE | VM_MAYEXEC)
 
+#define __PHYSICAL_START	ALIGN(CONFIG_PHYSICAL_START, \
+				      CONFIG_PHYSICAL_ALIGN)
+
+#define __START_KERNEL		(__START_KERNEL_map + __PHYSICAL_START)
+
 #ifdef CONFIG_X86_64
 #include <asm/page_64_types.h>
+#define IOREMAP_MAX_ORDER       (PUD_SHIFT)
 #else
 #include <asm/page_32_types.h>
+#define IOREMAP_MAX_ORDER       (PMD_SHIFT)
 #endif	/* CONFIG_X86_64 */
 
 #ifndef __ASSEMBLY__
@@ -50,11 +59,17 @@ extern int devmem_is_allowed(unsigned long pagenr);
 extern unsigned long max_low_pfn_mapped;
 extern unsigned long max_pfn_mapped;
 
+static inline phys_addr_t get_max_mapped(void)
+{
+	return (phys_addr_t)max_pfn_mapped << PAGE_SHIFT;
+}
+
+bool pfn_range_is_mapped(unsigned long start_pfn, unsigned long end_pfn);
+
 extern unsigned long init_memory_mapping(unsigned long start,
 					 unsigned long end);
 
-extern void initmem_init(unsigned long start_pfn, unsigned long end_pfn);
-extern void free_initmem(void);
+extern void initmem_init(void);
 
 #endif	/* !__ASSEMBLY__ */
 

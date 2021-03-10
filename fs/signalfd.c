@@ -22,12 +22,15 @@
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/signal.h>
 #include <linux/list.h>
 #include <linux/anon_inodes.h>
 #include <linux/signalfd.h>
 #include <linux/syscalls.h>
+#include <linux/proc_fs.h>
+#include <linux/compat.h>
 
 void signalfd_cleanup(struct sighand_struct *sighand)
 {
@@ -102,6 +105,7 @@ static int signalfd_copyinfo(struct signalfd_siginfo __user *uinfo,
 		 err |= __put_user(kinfo->si_tid, &uinfo->ssi_tid);
 		 err |= __put_user(kinfo->si_overrun, &uinfo->ssi_overrun);
 		 err |= __put_user((long) kinfo->si_ptr, &uinfo->ssi_ptr);
+		 err |= __put_user(kinfo->si_int, &uinfo->ssi_int);
 		break;
 	case __SI_POLL:
 		err |= __put_user(kinfo->si_band, &uinfo->ssi_band);
@@ -135,6 +139,7 @@ static int signalfd_copyinfo(struct signalfd_siginfo __user *uinfo,
 		err |= __put_user(kinfo->si_pid, &uinfo->ssi_pid);
 		err |= __put_user(kinfo->si_uid, &uinfo->ssi_uid);
 		err |= __put_user((long) kinfo->si_ptr, &uinfo->ssi_ptr);
+		err |= __put_user(kinfo->si_int, &uinfo->ssi_int);
 		break;
 	default:
 		/*
@@ -224,10 +229,28 @@ static ssize_t signalfd_read(struct file *file, char __user *buf, size_t count,
 	return total ? total: ret;
 }
 
+#ifdef CONFIG_PROC_FS
+static int signalfd_show_fdinfo(struct seq_file *m, struct file *f)
+{
+	struct signalfd_ctx *ctx = f->private_data;
+	sigset_t sigmask;
+
+	sigmask = ctx->sigmask;
+	signotset(&sigmask);
+	render_sigset_t(m, "sigmask:\t", &sigmask);
+
+	return 0;
+}
+#endif
+
 static const struct file_operations signalfd_fops = {
+#ifdef CONFIG_PROC_FS
+	.show_fdinfo	= signalfd_show_fdinfo,
+#endif
 	.release	= signalfd_release,
 	.poll		= signalfd_poll,
 	.read		= signalfd_read,
+	.llseek		= noop_llseek,
 };
 
 SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
@@ -261,16 +284,16 @@ SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 		 * anon_inode_getfd() will install the fd.
 		 */
 		ufd = anon_inode_getfd("[signalfd]", &signalfd_fops, ctx,
-				       flags & (O_CLOEXEC | O_NONBLOCK));
+				       O_RDWR | (flags & (O_CLOEXEC | O_NONBLOCK)));
 		if (ufd < 0)
 			kfree(ctx);
 	} else {
-		struct file *file = fget(ufd);
-		if (!file)
+		struct fd f = fdget(ufd);
+		if (!f.file)
 			return -EBADF;
-		ctx = file->private_data;
-		if (file->f_op != &signalfd_fops) {
-			fput(file);
+		ctx = f.file->private_data;
+		if (f.file->f_op != &signalfd_fops) {
+			fdput(f);
 			return -EINVAL;
 		}
 		spin_lock_irq(&current->sighand->siglock);
@@ -278,7 +301,7 @@ SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 		spin_unlock_irq(&current->sighand->siglock);
 
 		wake_up(&current->sighand->signalfd_wqh);
-		fput(file);
+		fdput(f);
 	}
 
 	return ufd;
@@ -289,3 +312,33 @@ SYSCALL_DEFINE3(signalfd, int, ufd, sigset_t __user *, user_mask,
 {
 	return sys_signalfd4(ufd, user_mask, sizemask, 0);
 }
+
+#ifdef CONFIG_COMPAT
+COMPAT_SYSCALL_DEFINE4(signalfd4, int, ufd,
+		     const compat_sigset_t __user *,sigmask,
+		     compat_size_t, sigsetsize,
+		     int, flags)
+{
+	compat_sigset_t ss32;
+	sigset_t tmp;
+	sigset_t __user *ksigmask;
+
+	if (sigsetsize != sizeof(compat_sigset_t))
+		return -EINVAL;
+	if (copy_from_user(&ss32, sigmask, sizeof(ss32)))
+		return -EFAULT;
+	sigset_from_compat(&tmp, &ss32);
+	ksigmask = compat_alloc_user_space(sizeof(sigset_t));
+	if (copy_to_user(ksigmask, &tmp, sizeof(sigset_t)))
+		return -EFAULT;
+
+	return sys_signalfd4(ufd, ksigmask, sizeof(sigset_t), flags);
+}
+
+COMPAT_SYSCALL_DEFINE3(signalfd, int, ufd,
+		     const compat_sigset_t __user *,sigmask,
+		     compat_size_t, sigsetsize)
+{
+	return compat_sys_signalfd4(ufd, sigmask, sigsetsize, 0);
+}
+#endif

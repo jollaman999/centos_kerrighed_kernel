@@ -12,7 +12,7 @@
 #include <linux/linkage.h>
 #include <linux/pagemap.h>
 #include <linux/wait.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 
 #ifdef CONFIG_BLOCK
 
@@ -32,14 +32,16 @@ enum bh_state_bits {
 	BH_Delay,	/* Buffer is not yet allocated on disk */
 	BH_Boundary,	/* Block is followed by a discontiguity */
 	BH_Write_EIO,	/* I/O error on write */
-	BH_Ordered,	/* DEPRECATED: ordered write */
-	BH_Eopnotsupp,	/* DEPRECATED: operation not supported (barrier) */
 	BH_Unwritten,	/* Buffer is allocated on disk but not written */
 	BH_Quiet,	/* Buffer Error Prinks to be quiet */
+	BH_Meta,	/* Buffer contains metadata */
+	BH_Prio,	/* Buffer should be submitted with REQ_PRIO */
 
 	BH_PrivateStart,/* not a state bit, but the first bit available
 			 * for private allocation by other entities
 			 */
+	BH_Defer_Completion = BITS_PER_LONG-1,/* Defer AIO completion to
+					       * workqueue */
 };
 
 #define MAX_BUF_PER_PAGE (PAGE_CACHE_SIZE / 512)
@@ -125,12 +127,12 @@ BUFFER_FNS(Async_Write, async_write)
 BUFFER_FNS(Delay, delay)
 BUFFER_FNS(Boundary, boundary)
 BUFFER_FNS(Write_EIO, write_io_error)
-BUFFER_FNS(Ordered, ordered)
-BUFFER_FNS(Eopnotsupp, eopnotsupp)
 BUFFER_FNS(Unwritten, unwritten)
+BUFFER_FNS(Meta, meta)
+BUFFER_FNS(Prio, prio)
+BUFFER_FNS(Defer_Completion, defer_completion)
 
 #define bh_offset(bh)		((unsigned long)(bh)->b_data & ~PAGE_MASK)
-#define touch_buffer(bh)	mark_page_accessed(bh->b_page)
 
 /* If we *know* page->private refers to buffer_heads */
 #define page_buffers(page)					\
@@ -140,12 +142,17 @@ BUFFER_FNS(Unwritten, unwritten)
 	})
 #define page_has_buffers(page)	PagePrivate(page)
 
+void buffer_check_dirty_writeback(struct page *page,
+				     bool *dirty, bool *writeback);
+
 /*
  * Declarations
  */
 
 void mark_buffer_dirty(struct buffer_head *bh);
+void mark_buffer_write_io_error(struct buffer_head *bh);
 void init_buffer(struct buffer_head *, bh_end_io_t *, void *);
+void touch_buffer(struct buffer_head *bh);
 void set_bh_page(struct buffer_head *bh,
 		struct page *page, unsigned long offset);
 int try_to_free_buffers(struct page *);
@@ -185,11 +192,14 @@ void ll_rw_block(int, int, struct buffer_head * bh[]);
 int sync_dirty_buffer(struct buffer_head *bh);
 int __sync_dirty_buffer(struct buffer_head *bh, int rw);
 void write_dirty_buffer(struct buffer_head *bh, int rw);
+int _submit_bh(int rw, struct buffer_head *bh, unsigned long bio_flags);
 int submit_bh(int, struct buffer_head *);
 void write_boundary_block(struct block_device *bdev,
 			sector_t bblock, unsigned blocksize);
 int bh_uptodate_or_lock(struct buffer_head *bh);
 int bh_submit_read(struct buffer_head *bh);
+loff_t page_cache_seek_hole_data(struct inode *inode, loff_t offset,
+				 loff_t length, int whence);
 
 extern int buffer_heads_over_limit;
 
@@ -198,22 +208,20 @@ extern int buffer_heads_over_limit;
  * address_spaces.
  */
 void block_invalidatepage(struct page *page, unsigned long offset);
+void block_invalidatepage_range(struct page *page, unsigned int offset,
+				unsigned int length);
 int block_write_full_page(struct page *page, get_block_t *get_block,
 				struct writeback_control *wbc);
 int __block_write_full_page(struct inode *inode, struct page *page,
 			get_block_t *get_block, struct writeback_control *wbc,
-			    bh_end_io_t *handler);
-int block_write_full_page_endio(struct page *page, get_block_t *get_block,
-			struct writeback_control *wbc, bh_end_io_t *handler);
+			bh_end_io_t *handler);
 int block_read_full_page(struct page*, get_block_t*);
 int block_is_partially_uptodate(struct page *page, read_descriptor_t *desc,
 				unsigned long from);
-int block_write_begin_newtrunc(struct file *, struct address_space *,
-				loff_t, unsigned, unsigned,
-				struct page **, void **, get_block_t*);
-int block_write_begin(struct file *, struct address_space *,
-				loff_t, unsigned, unsigned,
-				struct page **, void **, get_block_t*);
+int block_write_begin(struct address_space *mapping, loff_t pos, unsigned len,
+		unsigned flags, struct page **pagep, get_block_t *get_block);
+int __block_write_begin(struct page *page, loff_t pos, unsigned len,
+		get_block_t *get_block);
 int block_write_end(struct file *, struct address_space *,
 				loff_t, unsigned, unsigned,
 				struct page *, void *);
@@ -221,10 +229,7 @@ int generic_write_end(struct file *, struct address_space *,
 				loff_t, unsigned, unsigned,
 				struct page *, void *);
 void page_zero_new_buffers(struct page *page, unsigned from, unsigned to);
-int block_prepare_write(struct page*, unsigned, unsigned, get_block_t*);
-int cont_write_begin_newtrunc(struct file *, struct address_space *, loff_t,
-			unsigned, unsigned, struct page **, void **,
-			get_block_t *, loff_t *);
+void clean_page_buffers(struct page *page);
 int cont_write_begin(struct file *, struct address_space *, loff_t,
 			unsigned, unsigned, struct page **, void **,
 			get_block_t *, loff_t *);
@@ -234,9 +239,6 @@ int __block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
 				get_block_t get_block);
 int block_page_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf,
 				get_block_t get_block);
-int __block_prepare_write(struct inode *inode, struct page *page,
-			unsigned from, unsigned to, get_block_t *get_block);
-
 /* Convert errno to return value from ->page_mkwrite() call */
 static inline int block_page_mkwrite_return(int err)
 {
@@ -251,15 +253,9 @@ static inline int block_page_mkwrite_return(int err)
 	/* -ENOSPC, -EDQUOT, -EIO ... */
 	return VM_FAULT_SIGBUS;
 }
-void block_sync_page(struct page *);
 sector_t generic_block_bmap(struct address_space *, sector_t, get_block_t *);
 int block_truncate_page(struct address_space *, loff_t, get_block_t *);
-int file_fsync(struct file *, struct dentry *, int);
-int nobh_write_begin(struct file *, struct address_space *,
-				loff_t, unsigned, unsigned,
-				struct page **, void **, get_block_t*);
-int nobh_write_begin_newtrunc(struct file *, struct address_space *,
-				loff_t, unsigned, unsigned,
+int nobh_write_begin(struct address_space *, loff_t, unsigned, unsigned,
 				struct page **, void **, get_block_t*);
 int nobh_write_end(struct file *, struct address_space *,
 				loff_t, unsigned, unsigned,
@@ -338,15 +334,10 @@ map_bh(struct buffer_head *bh, struct super_block *sb, sector_t block)
 	bh->b_size = sb->s_blocksize;
 }
 
-/*
- * Calling wait_on_buffer() for a zero-ref buffer is illegal, so we call into
- * __wait_on_buffer() just to trip a debug check.  Because debug code in inline
- * functions is bloaty.
- */
 static inline void wait_on_buffer(struct buffer_head *bh)
 {
 	might_sleep();
-	if (buffer_locked(bh) || atomic_read(&bh->b_count) == 0)
+	if (buffer_locked(bh))
 		__wait_on_buffer(bh);
 }
 

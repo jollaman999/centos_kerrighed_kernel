@@ -41,7 +41,7 @@ probe_monitoring_device(struct nvkm_i2c_bus *bus,
 		return false;
 
 	if (!client->dev.driver ||
-	    to_i2c_driver(client->dev.driver)->detect(client, -1, info)) {
+	    to_i2c_driver(client->dev.driver)->detect(client, info)) {
 		i2c_unregister_device(client);
 		return false;
 	}

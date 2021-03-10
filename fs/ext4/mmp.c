@@ -6,23 +6,52 @@
 
 #include "ext4.h"
 
+/* Checksumming functions */
+static __le32 ext4_mmp_csum(struct super_block *sb, struct mmp_struct *mmp)
+{
+	struct ext4_sb_info *sbi = EXT4_SB(sb);
+	int offset = offsetof(struct mmp_struct, mmp_checksum);
+	__u32 csum;
+
+	csum = ext4_chksum(sbi, sbi->s_csum_seed, (char *)mmp, offset);
+
+	return cpu_to_le32(csum);
+}
+
+static int ext4_mmp_csum_verify(struct super_block *sb, struct mmp_struct *mmp)
+{
+	if (!ext4_has_metadata_csum(sb))
+		return 1;
+
+	return mmp->mmp_checksum == ext4_mmp_csum(sb, mmp);
+}
+
+static void ext4_mmp_csum_set(struct super_block *sb, struct mmp_struct *mmp)
+{
+	if (!ext4_has_metadata_csum(sb))
+		return;
+
+	mmp->mmp_checksum = ext4_mmp_csum(sb, mmp);
+}
+
 /*
  * Write the MMP block using WRITE_SYNC to try to get the block on-disk
  * faster.
  */
 static int write_mmp_block(struct super_block *sb, struct buffer_head *bh)
 {
+	struct mmp_struct *mmp = (struct mmp_struct *)(bh->b_data);
 
 	/*
 	 * We protect against freezing so that we don't create dirty buffers
 	 * on frozen filesystem.
 	 */
 	sb_start_write(sb);
-	mark_buffer_dirty(bh);
+	ext4_mmp_csum_set(sb, mmp);
 	lock_buffer(bh);
 	bh->b_end_io = end_buffer_write_sync;
 	get_bh(bh);
-	submit_bh(WRITE_SYNC, bh);
+	submit_bh(WRITE_SYNC | REQ_META | REQ_PRIO, bh);
 	wait_on_buffer(bh);
 	sb_end_write(sb);
 	if (unlikely(!buffer_uptodate(bh)))
@@ -48,25 +77,28 @@ static int read_mmp_block(struct super_block *sb, struct buffer_head **bh,
 	 * is not blocked in the elevator. */
 	if (!*bh)
 		*bh = sb_getblk(sb, mmp_block);
+	if (!*bh)
+		return -ENOMEM;
 	if (*bh) {
 		get_bh(*bh);
 		lock_buffer(*bh);
 		(*bh)->b_end_io = end_buffer_read_sync;
-		submit_bh(READ_SYNC, *bh);
+		submit_bh(READ_SYNC | REQ_META | REQ_PRIO, *bh);
 		wait_on_buffer(*bh);
 		if (!buffer_uptodate(*bh)) {
 			brelse(*bh);
 			*bh = NULL;
 		}
 	}
-	if (!*bh) {
+	if (unlikely(!*bh)) {
 		ext4_warning(sb, "Error while reading MMP block %llu",
 			     mmp_block);
 		return -EIO;
 	}
 
 	mmp = (struct mmp_struct *)((*bh)->b_data);
-	if (le32_to_cpu(mmp->mmp_magic) != EXT4_MMP_MAGIC)
+	if (le32_to_cpu(mmp->mmp_magic) != EXT4_MMP_MAGIC ||
+	    !ext4_mmp_csum_verify(sb, mmp))
 		return -EINVAL;
 
 	return 0;
@@ -76,10 +108,10 @@ static int read_mmp_block(struct super_block *sb, struct buffer_head **bh,
  * Dump as much information as possible to help the admin.
  */
 void __dump_mmp_msg(struct super_block *sb, struct mmp_struct *mmp,
-		    const char *function, const char *msg)
+		    const char *function, unsigned int line, const char *msg)
 {
-	__ext4_warning(sb, function, msg);
-	__ext4_warning(sb, function,
+	__ext4_warning(sb, function, line, msg);
+	__ext4_warning(sb, function, line,
 		       "MMP failure info: last update time: %llu, last update "
 		       "node: %s, last update device: %s\n",
 		       (long long unsigned int) le64_to_cpu(mmp->mmp_time),
@@ -224,7 +256,7 @@ static unsigned int mmp_new_seq(void)
 	u32 new_seq;
 
 	do {
-		get_random_bytes(&new_seq, sizeof(u32));
+		new_seq = prandom_u32();
 	} while (new_seq > EXT4_MMP_SEQ_MAX);
 
 	return new_seq;

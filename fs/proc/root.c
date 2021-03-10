@@ -16,25 +16,12 @@
 #include <linux/sched.h>
 #include <linux/module.h>
 #include <linux/bitops.h>
+#include <linux/user_namespace.h>
 #include <linux/mount.h>
 #include <linux/pid_namespace.h>
 #include <linux/parser.h>
 
 #include "internal.h"
-
-static int proc_test_super(struct super_block *sb, void *data)
-{
-	return sb->s_fs_info == data;
-}
-
-static int proc_set_super(struct super_block *sb, void *data)
-{
-	struct pid_namespace *ns;
-
-	ns = (struct pid_namespace *)data;
-	sb->s_fs_info = get_pid_ns(ns);
-	return set_anon_super(sb, NULL);
-}
 
 enum {
 	Opt_gid, Opt_hidepid, Opt_err,
@@ -46,7 +33,7 @@ static const match_table_t tokens = {
 	{Opt_err, NULL},
 };
 
-static int proc_parse_options(char *options, struct pid_namespace *pid)
+int proc_parse_options(char *options, struct pid_namespace *pid)
 {
 	char *p;
 	substring_t args[MAX_OPT_ARGS];
@@ -60,13 +47,13 @@ static int proc_parse_options(char *options, struct pid_namespace *pid)
 		if (!*p)
 			continue;
 
-		args[0].to = args[0].from = 0;
+		args[0].to = args[0].from = NULL;
 		token = match_token(p, tokens, args);
 		switch (token) {
 		case Opt_gid:
 			if (match_int(&args[0], &option))
 				return 0;
-			pid->pid_gid = option;
+			pid->pid_gid = make_kgid(current_user_ns(), option);
 			break;
 		case Opt_hidepid:
 			if (match_int(&args[0], &option))
@@ -93,50 +80,19 @@ int proc_remount(struct super_block *sb, int *flags, char *data)
 	return !proc_parse_options(data, pid);
 }
 
-static int proc_get_sb(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
+static struct dentry *proc_mount(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data)
 {
-	int err;
-	struct super_block *sb;
 	struct pid_namespace *ns;
-	struct proc_inode *ei;
-	char *options;
 
 	if (flags & MS_KERNMOUNT) {
-		ns = (struct pid_namespace *)data;
-		options = NULL;
+		ns = data;
+		data = NULL;
 	} else {
 		ns = task_active_pid_ns(current);
-		options = data;
 	}
 
-	sb = sget(fs_type, proc_test_super, proc_set_super, ns);
-	if (IS_ERR(sb))
-		return PTR_ERR(sb);
-
-	if (!sb->s_root) {
-		sb->s_flags = flags;
-		if (!proc_parse_options(options, ns)) {
-			deactivate_locked_super(sb);
-			return -EINVAL;
-		}
-		err = proc_fill_super(sb);
-		if (err) {
-			deactivate_locked_super(sb);
-			return err;
-		}
-
-		sb->s_flags |= MS_ACTIVE;
-	}
-	ei = PROC_I(sb->s_root->d_inode);
-	if (!ei->pid) {
-		rcu_read_lock();
-		ei->pid = get_pid(find_pid_ns(1, ns));
-		rcu_read_unlock();
-	}
-
-	simple_set_mnt(mnt, sb);
-	return 0;
+	return mount_ns(fs_type, flags, data, ns, ns->user_ns, proc_fill_super);
 }
 
 static void proc_kill_sb(struct super_block *sb)
@@ -144,14 +100,17 @@ static void proc_kill_sb(struct super_block *sb)
 	struct pid_namespace *ns;
 
 	ns = (struct pid_namespace *)sb->s_fs_info;
+	if (ns->proc_self)
+		dput(ns->proc_self);
 	kill_anon_super(sb);
 	put_pid_ns(ns);
 }
 
 static struct file_system_type proc_fs_type = {
 	.name		= "proc",
-	.get_sb		= proc_get_sb,
+	.mount		= proc_mount,
 	.kill_sb	= proc_kill_sb,
+	.fs_flags	= FS_USERNS_MOUNT,
 };
 
 void __init proc_root_init(void)
@@ -163,6 +122,7 @@ void __init proc_root_init(void)
 	if (err)
 		return;
 
+	proc_self_init();
 	proc_symlink("mounts", NULL, "self/mounts");
 
 	proc_net_init();
@@ -172,10 +132,10 @@ void __init proc_root_init(void)
 #endif
 	proc_mkdir("fs", NULL);
 	proc_mkdir("driver", NULL);
-	proc_mkdir("fs/nfsd", NULL); /* somewhere for the nfsd filesystem to be mounted */
+	proc_create_mount_point("fs/nfsd"); /* somewhere for the nfsd filesystem to be mounted */
 #if defined(CONFIG_SUN_OPENPROMFS) || defined(CONFIG_SUN_OPENPROMFS_MODULE)
 	/* just give it a mountpoint */
-	proc_mkdir("openprom", NULL);
+	proc_create_mount_point("openprom");
 #endif
 	proc_tty_init();
 #ifdef CONFIG_PROC_DEVICETREE
@@ -193,13 +153,12 @@ static int proc_root_getattr(struct vfsmount *mnt, struct dentry *dentry, struct
 	return 0;
 }
 
-static struct dentry *proc_root_lookup(struct inode * dir, struct dentry * dentry, struct nameidata *nd)
+static struct dentry *proc_root_lookup(struct inode * dir, struct dentry * dentry, unsigned int flags)
 {
-	if (!proc_lookup(dir, dentry, nd)) {
+	if (!proc_lookup(dir, dentry, flags))
 		return NULL;
-	}
 	
-	return proc_pid_lookup(dir, dentry, nd);
+	return proc_pid_lookup(dir, dentry, flags);
 }
 
 static int proc_root_readdir(struct file * filp,
@@ -227,6 +186,7 @@ static int proc_root_readdir(struct file * filp,
 static const struct file_operations proc_root_operations = {
 	.read		 = generic_read_dir,
 	.readdir	 = proc_root_readdir,
+	.llseek		= default_llseek,
 };
 
 /*
@@ -243,13 +203,14 @@ static const struct inode_operations proc_root_inode_operations = {
 struct proc_dir_entry proc_root = {
 	.low_ino	= PROC_ROOT_INO, 
 	.namelen	= 5, 
-	.name		= "/proc",
 	.mode		= S_IFDIR | S_IRUGO | S_IXUGO, 
 	.nlink		= 2, 
 	.count		= ATOMIC_INIT(1),
 	.proc_iops	= &proc_root_inode_operations, 
 	.proc_fops	= &proc_root_operations,
 	.parent		= &proc_root,
+	.subdir		= RB_ROOT,
+	.name		= "/proc",
 };
 
 int pid_ns_prepare_proc(struct pid_namespace *ns)
@@ -266,11 +227,5 @@ int pid_ns_prepare_proc(struct pid_namespace *ns)
 
 void pid_ns_release_proc(struct pid_namespace *ns)
 {
-	mntput(ns->proc_mnt);
+	kern_unmount(ns->proc_mnt);
 }
-
-EXPORT_SYMBOL(proc_symlink);
-EXPORT_SYMBOL(proc_mkdir);
-EXPORT_SYMBOL(create_proc_entry);
-EXPORT_SYMBOL(proc_create_data);
-EXPORT_SYMBOL(remove_proc_entry);

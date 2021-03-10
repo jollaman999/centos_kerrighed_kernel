@@ -13,10 +13,10 @@
 #include <linux/sched.h>
 #include <linux/tty.h>
 #include <linux/delay.h>
-#include <linux/smp_lock.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/kallsyms.h>
+#include <linux/ratelimit.h>
 
 #include <asm/gentrap.h>
 #include <asm/uaccess.h>
@@ -24,6 +24,7 @@
 #include <asm/sysinfo.h>
 #include <asm/hwrpb.h>
 #include <asm/mmu_context.h>
+#include <asm/special_insns.h>
 
 #include "proto.h"
 
@@ -168,13 +169,6 @@ void show_stack(struct task_struct *task, unsigned long *sp)
 	dik_show_trace(sp);
 }
 
-void dump_stack(void)
-{
-	show_stack(NULL, NULL);
-}
-
-EXPORT_SYMBOL(dump_stack);
-
 void
 die_if_kernel(char * str, struct pt_regs *regs, long err, unsigned long *r9_15)
 {
@@ -185,7 +179,7 @@ die_if_kernel(char * str, struct pt_regs *regs, long err, unsigned long *r9_15)
 #endif
 	printk("%s(%d): %s %ld\n", current->comm, task_pid_nr(current), str, err);
 	dik_show_regs(regs, r9_15);
-	add_taint(TAINT_DIE);
+	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
 	dik_show_trace((unsigned long *)(regs+1));
 	dik_show_code((unsigned int *)regs->pc);
 
@@ -622,7 +616,6 @@ do_entUna(void * va, unsigned long opcode, unsigned long reg,
 		return;
 	}
 
-	lock_kernel();
 	printk("Bad unaligned kernel access at %016lx: %p %lx %lu\n",
 		pc, va, opcode, reg);
 	do_exit(SIGSEGV);
@@ -645,7 +638,6 @@ got_exception:
 	 * Yikes!  No one to forward the exception to.
 	 * Since the registers are in a weird format, dump them ourselves.
  	 */
-	lock_kernel();
 
 	printk("%s(%d): unhandled unaligned exception\n",
 	       current->comm, task_pid_nr(current));
@@ -771,8 +763,7 @@ asmlinkage void
 do_entUnaUser(void __user * va, unsigned long opcode,
 	      unsigned long reg, struct pt_regs *regs)
 {
-	static int cnt = 0;
-	static unsigned long last_time;
+	static DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);
 
 	unsigned long tmp1, tmp2, tmp3, tmp4;
 	unsigned long fake_reg, *reg_addr = &fake_reg;
@@ -782,21 +773,17 @@ do_entUnaUser(void __user * va, unsigned long opcode,
 	/* Check the UAC bits to decide what the user wants us to do
 	   with the unaliged access.  */
 
-	if (!test_thread_flag (TIF_UAC_NOPRINT)) {
-		if (cnt >= 5 && time_after(jiffies, last_time + 5 * HZ)) {
-			cnt = 0;
-		}
-		if (++cnt < 5) {
+	if (!(current_thread_info()->status & TS_UAC_NOPRINT)) {
+		if (__ratelimit(&ratelimit)) {
 			printk("%s(%d): unaligned trap at %016lx: %p %lx %ld\n",
 			       current->comm, task_pid_nr(current),
 			       regs->pc - 4, va, opcode, reg);
 		}
-		last_time = jiffies;
 	}
-	if (test_thread_flag (TIF_UAC_SIGBUS))
+	if ((current_thread_info()->status & TS_UAC_SIGBUS))
 		goto give_sigbus;
 	/* Not sure why you'd want to use this, but... */
-	if (test_thread_flag (TIF_UAC_NOFIX))
+	if ((current_thread_info()->status & TS_UAC_NOFIX))
 		return;
 
 	/* Don't bother reading ds in the access check since we already

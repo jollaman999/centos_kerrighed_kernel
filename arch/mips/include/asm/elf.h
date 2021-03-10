@@ -11,13 +11,13 @@
 
 /* ELF header e_flags defines. */
 /* MIPS architecture level. */
-#define EF_MIPS_ARCH_1		0x00000000	/* -mips1 code.  */
-#define EF_MIPS_ARCH_2		0x10000000	/* -mips2 code.  */
-#define EF_MIPS_ARCH_3		0x20000000	/* -mips3 code.  */
-#define EF_MIPS_ARCH_4		0x30000000	/* -mips4 code.  */
-#define EF_MIPS_ARCH_5		0x40000000	/* -mips5 code.  */
-#define EF_MIPS_ARCH_32		0x50000000	/* MIPS32 code.  */
-#define EF_MIPS_ARCH_64		0x60000000	/* MIPS64 code.  */
+#define EF_MIPS_ARCH_1		0x00000000	/* -mips1 code.	 */
+#define EF_MIPS_ARCH_2		0x10000000	/* -mips2 code.	 */
+#define EF_MIPS_ARCH_3		0x20000000	/* -mips3 code.	 */
+#define EF_MIPS_ARCH_4		0x30000000	/* -mips4 code.	 */
+#define EF_MIPS_ARCH_5		0x40000000	/* -mips5 code.	 */
+#define EF_MIPS_ARCH_32		0x50000000	/* MIPS32 code.	 */
+#define EF_MIPS_ARCH_64		0x60000000	/* MIPS64 code.	 */
 #define EF_MIPS_ARCH_32R2	0x70000000	/* MIPS32 R2 code.  */
 #define EF_MIPS_ARCH_64R2	0x80000000	/* MIPS64 R2 code.  */
 
@@ -74,7 +74,7 @@
 #define R_MIPS_CALL16		11
 #define R_MIPS_GPREL32		12
 /* The remaining relocs are defined on Irix, although they are not
-   in the MIPS ELF ABI.  */
+   in the MIPS ELF ABI.	 */
 #define R_MIPS_UNUSED1		13
 #define R_MIPS_UNUSED2		14
 #define R_MIPS_UNUSED3		15
@@ -214,7 +214,7 @@ typedef elf_fpreg_t elf_fpregset_t[ELF_NFPREG];
 									\
 	if (__h->e_machine != EM_MIPS)					\
 		__res = 0;						\
-	if (__h->e_ident[EI_CLASS] != ELFCLASS64) 			\
+	if (__h->e_ident[EI_CLASS] != ELFCLASS64)			\
 		__res = 0;						\
 									\
 	__res;								\
@@ -249,7 +249,8 @@ extern struct mips_abi mips_abi_n32;
 
 #define SET_PERSONALITY(ex)						\
 do {									\
-	set_personality(PER_LINUX);					\
+	if (personality(current->personality) != PER_LINUX)		\
+		set_personality(PER_LINUX);				\
 									\
 	current->thread.abi = &mips_abi;				\
 } while (0)
@@ -291,11 +292,13 @@ do {									\
 		__SET_PERSONALITY32_O32();				\
 } while (0)
 #else
-#define __SET_PERSONALITY32(ex)	do { } while (0)
+#define __SET_PERSONALITY32(ex) do { } while (0)
 #endif
 
 #define SET_PERSONALITY(ex)						\
 do {									\
+	unsigned int p;							\
+									\
 	clear_thread_flag(TIF_32BIT_REGS);				\
 	clear_thread_flag(TIF_32BIT_ADDR);				\
 									\
@@ -304,12 +307,14 @@ do {									\
 	else								\
 		current->thread.abi = &mips_abi;			\
 									\
-	if (current->personality != PER_LINUX32)			\
+	p = personality(current->personality);				\
+	if (p != PER_LINUX32 && p != PER_LINUX)				\
 		set_personality(PER_LINUX);				\
 } while (0)
 
 #endif /* CONFIG_64BIT */
 
+struct pt_regs;
 struct task_struct;
 
 extern void elf_dump_regs(elf_greg_t *, struct pt_regs *regs);
@@ -326,23 +331,22 @@ extern int dump_task_fpu(struct task_struct *, elf_fpregset_t *);
 #define ELF_CORE_COPY_FPREGS(tsk, elf_fpregs)			\
 	dump_task_fpu(tsk, elf_fpregs)
 
-#define USE_ELF_CORE_DUMP
 #define ELF_EXEC_PAGESIZE	PAGE_SIZE
 
 /* This yields a mask that user programs can use to figure out what
    instruction set this cpu supports.  This could be done in userspace,
    but it's not easy, and we've already done it here.  */
 
-#define ELF_HWCAP       (0)
+#define ELF_HWCAP	(0)
 
-/* This yields a string that ld.so will use to load implementation
-   specific libraries for optimization.  This is more specific in
-   intent than poking at uname or /proc/cpuinfo.
+/*
+ * This yields a string that ld.so will use to load implementation
+ * specific libraries for optimization.	 This is more specific in
+ * intent than poking at uname or /proc/cpuinfo.
+ */
 
-   For the moment, we have only optimizations for the Intel generations,
-   but that could change... */
-
-#define ELF_PLATFORM  (NULL)
+#define ELF_PLATFORM  __elf_platform
+extern const char *__elf_platform;
 
 /*
  * See comments in asm-alpha/elf.h, this is the same thing
@@ -361,11 +365,20 @@ extern int dump_task_fpu(struct task_struct *, elf_fpregset_t *);
 
 /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
    use of this is to invoke "./ld.so someprog" to test out a new version of
-   the loader.  We need to make sure that it is out of the way of the program
-   that it will "exec", and that there is sufficient room for the brk.  */
+   the loader.	We need to make sure that it is out of the way of the program
+   that it will "exec", and that there is sufficient room for the brk.	*/
 
 #ifndef ELF_ET_DYN_BASE
-#define ELF_ET_DYN_BASE         (TASK_SIZE / 3 * 2)
+#define ELF_ET_DYN_BASE		(TASK_SIZE / 3 * 2)
 #endif
+
+#define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
+struct linux_binprm;
+extern int arch_setup_additional_pages(struct linux_binprm *bprm,
+				       int uses_interp);
+
+struct mm_struct;
+extern unsigned long arch_randomize_brk(struct mm_struct *mm);
+#define arch_randomize_brk arch_randomize_brk
 
 #endif /* _ASM_ELF_H */

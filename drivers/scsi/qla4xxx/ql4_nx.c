@@ -12,6 +12,8 @@
 #include "ql4_glbl.h"
 #include "ql4_inline.h"
 
+#include <asm-generic/io-64-nonatomic-lo-hi.h>
+
 #define TIMEOUT_100_MS	100
 #define MASK(n)		DMA_BIT_MASK(n)
 #define MN_WIN(addr)	(((addr & 0x1fc0000) >> 1) | ((addr >> 25) & 0x3ff))
@@ -2491,7 +2493,7 @@ static int __qla4_8xxx_minidump_process_rdmem(struct scsi_qla_host *ha,
 
 	if (r_addr & 0xf) {
 		DEBUG2(ql4_printk(KERN_INFO, ha,
-				  "[%s]: Read addr 0x%x not 16 bytes alligned\n",
+				  "[%s]: Read addr 0x%x not 16 bytes aligned\n",
 				  __func__, r_addr));
 		return QLA_ERROR;
 	}

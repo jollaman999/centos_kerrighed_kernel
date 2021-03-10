@@ -3,8 +3,7 @@
 #include <linux/stringify.h>
 #include <linux/linkage.h>
 #include <asm/dwarf2.h>
-#include <asm/asm.h>
-#include <asm/cpufeature.h>
+#include <asm/cpufeatures.h>
 #include <asm/alternative-asm.h>
 #include <asm/nospec-branch.h>
 

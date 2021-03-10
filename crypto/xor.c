@@ -18,6 +18,7 @@
 
 #define BH_TRACE 0
 #include <linux/module.h>
+#include <linux/gfp.h>
 #include <linux/raid/xor.h>
 #include <linux/jiffies.h>
 #include <linux/preempt.h>
@@ -55,11 +56,11 @@ xor_blocks(unsigned int src_count, unsigned int bytes, void *dest, void **srcs)
 EXPORT_SYMBOL(xor_blocks);
 
 /* Set of all registered templates.  */
-static struct xor_block_template *template_list;
+static struct xor_block_template *__initdata template_list;
 
 #define BENCH_SIZE (PAGE_SIZE)
 
-static void
+static void __init
 do_xor_speed(struct xor_block_template *tmpl, void *b1, void *b2)
 {
 	int speed;
@@ -135,9 +136,9 @@ calibrate_xor_blocks(void)
 
 	if (fastest) {
 		printk(KERN_INFO "xor: automatically using best "
-			"checksumming function: %s\n",
-			fastest->name);
+				 "checksumming function:\n");
 		xor_speed(fastest);
+		goto out;
 	} else {
 		printk(KERN_INFO "xor: measuring software checksum speed\n");
 		XOR_TRY_TEMPLATES;
@@ -152,6 +153,7 @@ calibrate_xor_blocks(void)
 
 #undef xor_speed
 
+ out:
 	free_pages((unsigned long)b1, 2);
 
 	active_template = fastest;

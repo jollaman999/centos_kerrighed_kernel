@@ -10,7 +10,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -144,7 +143,7 @@ static int jmicron_init_one (struct pci_dev *pdev, const struct pci_device_id *i
 	};
 	const struct ata_port_info *ppi[] = { &info, NULL };
 
-	return ata_pci_sff_init_one(pdev, ppi, &jmicron_sht, NULL);
+	return ata_pci_bmdma_init_one(pdev, ppi, &jmicron_sht, NULL, 0);
 }
 
 static const struct pci_device_id jmicron_pci_tbl[] = {
@@ -164,18 +163,7 @@ static struct pci_driver jmicron_pci_driver = {
 #endif
 };
 
-static int __init jmicron_init(void)
-{
-	return pci_register_driver(&jmicron_pci_driver);
-}
-
-static void __exit jmicron_exit(void)
-{
-	pci_unregister_driver(&jmicron_pci_driver);
-}
-
-module_init(jmicron_init);
-module_exit(jmicron_exit);
+module_pci_driver(jmicron_pci_driver);
 
 MODULE_AUTHOR("Alan Cox");
 MODULE_DESCRIPTION("SCSI low-level driver for Jmicron PATA ports");

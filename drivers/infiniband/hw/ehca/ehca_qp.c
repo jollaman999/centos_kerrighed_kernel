@@ -43,6 +43,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <linux/slab.h>
+
 #include "ehca_classes.h"
 #include "ehca_tools.h"
 #include "ehca_qes.h"
@@ -319,7 +321,7 @@ static inline int init_qp_queue(struct ehca_shca *shca,
 			ret = -EINVAL;
 			goto init_qp_queue1;
 		}
-		rpage = virt_to_abs(vpage);
+		rpage = __pa(vpage);
 
 		h_ret = hipz_h_register_rpage_qp(ipz_hca_handle,
 						 my_qp->ipz_qp_handle,
@@ -634,28 +636,24 @@ static struct ehca_qp *internal_create_qp(
 		my_qp->send_cq =
 			container_of(init_attr->send_cq, struct ehca_cq, ib_cq);
 
-	do {
-		if (!idr_pre_get(&ehca_qp_idr, GFP_KERNEL)) {
+	idr_preload(GFP_KERNEL);
+	write_lock_irqsave(&ehca_qp_idr_lock, flags);
+
+	ret = idr_alloc(&ehca_qp_idr, my_qp, 0, 0x2000000, GFP_NOWAIT);
+	if (ret >= 0)
+		my_qp->token = ret;
+
+	write_unlock_irqrestore(&ehca_qp_idr_lock, flags);
+	idr_preload_end();
+	if (ret < 0) {
+		if (ret == -ENOSPC) {
+			ret = -EINVAL;
+			ehca_err(pd->device, "Invalid number of qp");
+		} else {
 			ret = -ENOMEM;
-			ehca_err(pd->device, "Can't reserve idr resources.");
-			goto create_qp_exit0;
+			ehca_err(pd->device, "Can't allocate new idr entry.");
 		}
-
-		write_lock_irqsave(&ehca_qp_idr_lock, flags);
-		ret = idr_get_new(&ehca_qp_idr, my_qp, &my_qp->token);
-		write_unlock_irqrestore(&ehca_qp_idr_lock, flags);
-	} while (ret == -EAGAIN);
-
-	if (ret) {
-		ret = -ENOMEM;
-		ehca_err(pd->device, "Can't allocate new idr entry.");
 		goto create_qp_exit0;
-	}
-
-	if (my_qp->token > 0x1FFFFFF) {
-		ret = -EINVAL;
-		ehca_err(pd->device, "Invalid number of qp");
-		goto create_qp_exit1;
 	}
 
 	if (has_srq)
@@ -1092,7 +1090,7 @@ static int prepare_sqe_rts(struct ehca_qp *my_qp, struct ehca_shca *shca,
 	ehca_dbg(&shca->ib_device, "qp_num=%x bad_send_wqe_p=%p",
 		 qp_num, bad_send_wqe_p);
 	/* convert wqe pointer to vadr */
-	bad_send_wqe_v = abs_to_virt((u64)bad_send_wqe_p);
+	bad_send_wqe_v = __va((u64)bad_send_wqe_p);
 	if (ehca_debug_level >= 2)
 		ehca_dmp(bad_send_wqe_v, 32, "qp_num=%x bad_wqe", qp_num);
 	squeue = &my_qp->ipz_squeue;
@@ -1136,7 +1134,7 @@ static int calc_left_cqes(u64 wqe_p, struct ipz_queue *ipz_queue,
 	/* convert real to abs address */
 	wqe_p = wqe_p & (~(1UL << 63));
 
-	wqe_v = abs_to_virt(wqe_p);
+	wqe_v = __va(wqe_p);
 
 	if (ipz_queue_abs_to_offset(ipz_queue, wqe_p, &q_ofs)) {
 		ehca_gen_err("Invalid offset for calculating left cqes "
@@ -1331,7 +1329,7 @@ static int internal_modify_qp(struct ib_qp *ibqp,
 	qp_new_state = attr_mask & IB_QP_STATE ? attr->qp_state : qp_cur_state;
 	if (!smi_reset2init &&
 	    !ib_modify_qp_is_ok(qp_cur_state, qp_new_state, ibqp->qp_type,
-				attr_mask, IB_LINK_LAYER_UNSPECIFIED)) {
+				attr_mask)) {
 		ret = -EINVAL;
 		ehca_err(ibqp->device,
 			 "Invalid qp transition new_state=%x cur_state=%x "
@@ -1486,9 +1484,9 @@ static int internal_modify_qp(struct ib_qp *ibqp,
 		update_mask |= EHCA_BMASK_SET(MQPCB_MASK_QKEY, 1);
 	}
 	if (attr_mask & IB_QP_AV) {
-		mqpcb->dlid = attr->ah_attr.dlid;
+		mqpcb->dlid = rdma_ah_get_dlid(&attr->ah_attr);
 		update_mask |= EHCA_BMASK_SET(MQPCB_MASK_DLID, 1);
-		mqpcb->source_path_bits = attr->ah_attr.src_path_bits;
+		mqpcb->source_path_bits = rdma_ah_get_path_bits(&attr->ah_attr);
 		update_mask |= EHCA_BMASK_SET(MQPCB_MASK_SOURCE_PATH_BITS, 1);
 		mqpcb->service_level = attr->ah_attr.sl;
 		update_mask |= EHCA_BMASK_SET(MQPCB_MASK_SERVICE_LEVEL, 1);
@@ -1590,8 +1588,8 @@ static int internal_modify_qp(struct ib_qp *ibqp,
 		mqpcb->alt_p_key_idx = attr->alt_pkey_index;
 
 		mqpcb->timeout_al = attr->alt_timeout;
-		mqpcb->dlid_al = attr->alt_ah_attr.dlid;
-		mqpcb->source_path_bits_al = attr->alt_ah_attr.src_path_bits;
+		mqpcb->dlid_al = rdma_ah_get_dlid(&attr->alt_ah_attr);
+		mqpcb->source_path_bits_al = rdma_ah_get_path_bits(&attr->alt_ah_attr);
 		mqpcb->service_level_al = attr->alt_ah_attr.sl;
 
 		if (ehca_calc_ipd(shca, mqpcb->alt_phys_port,
@@ -1984,8 +1982,8 @@ int ehca_query_qp(struct ib_qp *qp,
 	}
 
 	qp_attr->ah_attr.static_rate = qpcb->max_static_rate;
-	qp_attr->ah_attr.dlid = qpcb->dlid;
-	qp_attr->ah_attr.src_path_bits = qpcb->source_path_bits;
+	rdma_ah_set_dlid(&qp_attr->ah_attr, qpcb->dlid);
+	rdma_ah_set_path_bits(&qp_attr->ah_attr, qpcb->source_path_bits);
 	qp_attr->ah_attr.port_num = qp_attr->port_num;
 
 	/* primary GRH */
@@ -2005,8 +2003,8 @@ int ehca_query_qp(struct ib_qp *qp,
 	}
 
 	qp_attr->alt_ah_attr.static_rate = qpcb->max_static_rate_al;
-	qp_attr->alt_ah_attr.dlid = qpcb->dlid_al;
-	qp_attr->alt_ah_attr.src_path_bits = qpcb->source_path_bits_al;
+	rdma_ah_set_dlid(&qp_attr->alt_ah_attr, qpcb->dlid_al);
+	rdma_ah_set_path_bits(&qp_attr->alt_ah_attr, qpcb->source_path_bits_al);
 
 	/* alternate GRH */
 	qp_attr->alt_ah_attr.grh.traffic_class = qpcb->traffic_class_al;

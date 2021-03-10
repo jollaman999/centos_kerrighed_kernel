@@ -16,7 +16,8 @@
  * assembly versions such as arch/ppc/lib/div64.S and arch/sh/lib/div64.S.
  */
 
-#include <linux/module.h>
+#include <linux/export.h>
+#include <linux/kernel.h>
 #include <linux/math64.h>
 
 /* Not needed on 64bit architectures */
@@ -126,7 +127,7 @@ EXPORT_SYMBOL(div64_u64_rem);
  * by the book 'Hacker's Delight'.  The original source and full proof
  * can be found here and is available for use without restriction.
  *
- * 'http://www.hackersdelight.org/HDcode/newCode/divDouble.c'
+ * 'http://www.hackersdelight.org/HDcode/newCode/divDouble.c.txt'
  */
 #ifndef div64_u64
 u64 div64_u64(u64 dividend, u64 divisor)
@@ -180,3 +181,44 @@ u32 iter_div_u64_rem(u64 dividend, u32 divisor, u64 *remainder)
 	return __iter_div_u64_rem(dividend, divisor, remainder);
 }
 EXPORT_SYMBOL(iter_div_u64_rem);
+
+#ifndef mul_u64_u64_div_u64
+u64 mul_u64_u64_div_u64(u64 a, u64 b, u64 c)
+{
+	u64 res = 0, div, rem;
+	int shift;
+
+	/* can a * b overflow ? */
+	if (ilog2(a) + ilog2(b) > 62) {
+		/*
+		 * (b * a) / c is equal to
+		 *
+		 *      (b / c) * a +
+		 *      (b % c) * a / c
+		 *
+		 * if nothing overflows. Can the 1st multiplication
+		 * overflow? Yes, but we do not care: this can only
+		 * happen if the end result can't fit in u64 anyway.
+		 *
+		 * So the code below does
+		 *
+		 *      res = (b / c) * a;
+		 *      b = b % c;
+		 */
+		div = div64_u64_rem(b, c, &rem);
+		res = div * a;
+		b = rem;
+
+		shift = ilog2(a) + ilog2(b) - 62;
+		if (shift > 0) {
+			/* drop precision */
+			b >>= shift;
+			c >>= shift;
+			if (!c)
+				return res;
+		}
+	}
+
+	return res + div64_u64(a * b, c);
+}
+#endif

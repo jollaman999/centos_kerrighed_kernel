@@ -5,8 +5,8 @@
 # and for each file listed in this file with generic-y creates
 # a small wrapper file in $(obj) (arch/$(SRCARCH)/include/generated/asm)
 
-kbuild-file := $(srctree)/arch/$(SRCARCH)/include/asm/Kbuild
-include $(kbuild-file)
+kbuild-file := $(srctree)/arch/$(SRCARCH)/include/$(src)/Kbuild
+-include $(kbuild-file)
 
 include scripts/Kbuild.include
 
@@ -17,6 +17,7 @@ quiet_cmd_wrap = WRAP    $@
 cmd_wrap = echo "\#include <asm-generic/$*.h>" >$@
 
 all: $(patsubst %, $(obj)/%, $(generic-y))
+	@:
 
 $(obj)/%.h:
 	$(call cmd,wrap)

@@ -2866,7 +2866,7 @@ static void b43legacy_op_bss_info_changed(struct ieee80211_hw *hw,
 		if (conf->bssid)
 			memcpy(wl->bssid, conf->bssid, ETH_ALEN);
 		else
-			eth_zero_addr(wl->bssid);
+			memset(wl->bssid, 0, ETH_ALEN);
 	}
 
 	if (b43legacy_status(dev) >= B43legacy_STAT_INITIALIZED) {
@@ -3470,7 +3470,7 @@ static void b43legacy_op_remove_interface(struct ieee80211_hw *hw,
 
 	spin_lock_irqsave(&wl->irq_lock, flags);
 	b43legacy_adjust_opmode(dev);
-	eth_zero_addr(wl->mac_addr);
+	memset(wl->mac_addr, 0, ETH_ALEN);
 	b43legacy_upload_card_macaddress(dev);
 	spin_unlock_irqrestore(&wl->irq_lock, flags);
 
@@ -3487,8 +3487,8 @@ static int b43legacy_op_start(struct ieee80211_hw *hw)
 	/* Kill all old instance specific information to make sure
 	 * the card won't use it in the short timeframe between start
 	 * and mac80211 reconfiguring it. */
-	eth_zero_addr(wl->bssid);
-	eth_zero_addr(wl->mac_addr);
+	memset(wl->bssid, 0, ETH_ALEN);
+	memset(wl->mac_addr, 0, ETH_ALEN);
 	wl->filter_flags = 0;
 	wl->beacon0_uploaded = false;
 	wl->beacon1_uploaded = false;
@@ -3836,9 +3836,8 @@ static int b43legacy_wireless_init(struct ssb_device *dev)
 	}
 
 	/* fill hw info */
-	ieee80211_hw_set(hw, RX_INCLUDES_FCS);
-	ieee80211_hw_set(hw, SIGNAL_DBM);
-
+	hw->flags = IEEE80211_HW_RX_INCLUDES_FCS |
+		    IEEE80211_HW_SIGNAL_DBM;
 	hw->wiphy->interface_modes =
 		BIT(NL80211_IFTYPE_AP) |
 		BIT(NL80211_IFTYPE_STATION) |

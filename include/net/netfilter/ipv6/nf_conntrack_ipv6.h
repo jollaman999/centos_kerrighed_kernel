@@ -6,13 +6,15 @@ extern struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv6;
 extern struct nf_conntrack_l4proto nf_conntrack_l4proto_tcp6;
 extern struct nf_conntrack_l4proto nf_conntrack_l4proto_udp6;
 extern struct nf_conntrack_l4proto nf_conntrack_l4proto_icmpv6;
-
-extern int nf_ct_frag6_init(void);
-extern void nf_ct_frag6_cleanup(void);
-extern struct sk_buff *nf_ct_frag6_gather(struct sk_buff *skb, u32 user);
-extern void nf_ct_frag6_consume_orig(struct sk_buff *skb);
-
-struct inet_frags_ctl;
+#ifdef CONFIG_NF_CT_PROTO_DCCP
+extern struct nf_conntrack_l4proto nf_conntrack_l4proto_dccp6;
+#endif
+#ifdef CONFIG_NF_CT_PROTO_SCTP
+extern struct nf_conntrack_l4proto nf_conntrack_l4proto_sctp6;
+#endif
+#ifdef CONFIG_NF_CT_PROTO_UDPLITE
+extern struct nf_conntrack_l4proto nf_conntrack_l4proto_udplite6;
+#endif
 
 #include <linux/sysctl.h>
 extern struct ctl_table nf_ct_ipv6_sysctl_table[];

@@ -14,14 +14,15 @@
 
 #include <linux/init.h>
 #include <linux/input.h>
-#include <asm/io.h>
+#include <linux/io.h>
 #include "pcsp.h"
+#include "pcsp_input.h"
 
 static void pcspkr_do_sound(unsigned int count)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&i8253_lock, flags);
+	raw_spin_lock_irqsave(&i8253_lock, flags);
 
 	if (count) {
 		/* set command for counter 2, 2 byte write */
@@ -36,7 +37,7 @@ static void pcspkr_do_sound(unsigned int count)
 		outb(inb_p(0x61) & 0xFC, 0x61);
 	}
 
-	spin_unlock_irqrestore(&i8253_lock, flags);
+	raw_spin_unlock_irqrestore(&i8253_lock, flags);
 }
 
 void pcspkr_stop_sound(void)
@@ -77,7 +78,7 @@ static int pcspkr_input_event(struct input_dev *dev, unsigned int type,
 	return 0;
 }
 
-int __devinit pcspkr_input_init(struct input_dev **rdev, struct device *dev)
+int pcspkr_input_init(struct input_dev **rdev, struct device *dev)
 {
 	int err;
 

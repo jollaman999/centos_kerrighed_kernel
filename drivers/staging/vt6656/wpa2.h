@@ -31,48 +31,23 @@
 #ifndef __WPA2_H__
 #define __WPA2_H__
 
-#include "ttype.h"
 #include "80211mgr.h"
 #include "80211hdr.h"
 #include "bssdb.h"
 
-/*---------------------  Export Definitions -------------------------*/
 #define MAX_PMKID_CACHE         16
 
 typedef struct tagsPMKIDInfo {
-    BYTE    abyBSSID[6];
-    BYTE    abyPMKID[16];
+    u8    abyBSSID[6];
+    u8    abyPMKID[16];
 } PMKIDInfo, *PPMKIDInfo;
 
 typedef struct tagSPMKIDCache {
-    ULONG       BSSIDInfoCount;
-    PMKIDInfo   BSSIDInfo[MAX_PMKID_CACHE];
+	u32 BSSIDInfoCount;
+	PMKIDInfo BSSIDInfo[MAX_PMKID_CACHE];
 } SPMKIDCache, *PSPMKIDCache;
 
+void WPA2_ClearRSN(PKnownBSS pBSSNode);
+void WPA2vParseRSN(PKnownBSS pBSSNode, PWLAN_IE_RSN pRSN);
 
-/*---------------------  Export Classes  ----------------------------*/
-
-/*---------------------  Export Variables  --------------------------*/
-
-/*---------------------  Export Types  ------------------------------*/
-
-/*---------------------  Export Functions  --------------------------*/
-
-VOID
-WPA2_ClearRSN (
-    IN PKnownBSS        pBSSNode
-    );
-
-VOID
-WPA2vParseRSN (
-    IN PKnownBSS        pBSSNode,
-    IN PWLAN_IE_RSN     pRSN
-    );
-
-UINT
-WPA2uSetIEs(
-    IN PVOID pMgmtHandle,
-    OUT PWLAN_IE_RSN pRSNIEs
-    );
-
-#endif // __WPA2_H__
+#endif /* __WPA2_H__ */

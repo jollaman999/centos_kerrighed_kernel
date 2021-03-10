@@ -18,19 +18,22 @@
 #include <asm/uaccess.h>
 #include "internal.h"
 
+static int logon_vet_description(const char *desc);
+
 /*
  * user defined keys take an arbitrary string as the description and an
  * arbitrary blob of data as the payload
  */
 struct key_type key_type_user = {
-	.name		= "user",
-	.instantiate	= user_instantiate,
-	.update		= user_update,
-	.match		= user_match,
-	.revoke		= user_revoke,
-	.destroy	= user_destroy,
-	.describe	= user_describe,
-	.read		= user_read,
+	.name			= "user",
+	.def_lookup_type	= KEYRING_SEARCH_LOOKUP_DIRECT,
+	.instantiate		= user_instantiate,
+	.update			= user_update,
+	.match			= user_match,
+	.revoke			= user_revoke,
+	.destroy		= user_destroy,
+	.describe		= user_describe,
+	.read			= user_read,
 };
 
 EXPORT_SYMBOL_GPL(key_type_user);
@@ -43,25 +46,28 @@ EXPORT_SYMBOL_GPL(key_type_user);
  */
 struct key_type key_type_logon = {
 	.name			= "logon",
+	.def_lookup_type	= KEYRING_SEARCH_LOOKUP_DIRECT,
 	.instantiate		= user_instantiate,
 	.update			= user_update,
 	.match			= user_match,
 	.revoke			= user_revoke,
 	.destroy		= user_destroy,
 	.describe		= user_describe,
+	.vet_description	= logon_vet_description,
 };
 EXPORT_SYMBOL_GPL(key_type_logon);
 
 /*
  * instantiate a user defined key
  */
-int user_instantiate(struct key *key, const void *data, size_t datalen)
+int user_instantiate(struct key *key, struct key_preparsed_payload *prep)
 {
 	struct user_key_payload *upayload;
+	size_t datalen = prep->datalen;
 	int ret;
 
 	ret = -EINVAL;
-	if (datalen <= 0 || datalen > 32767 || !data)
+	if (datalen <= 0 || datalen > 32767 || !prep->data)
 		goto error;
 
 	ret = key_payload_reserve(key, datalen);
@@ -75,7 +81,7 @@ int user_instantiate(struct key *key, const void *data, size_t datalen)
 
 	/* attach the data */
 	upayload->datalen = datalen;
-	memcpy(upayload->data, data, datalen);
+	memcpy(upayload->data, prep->data, datalen);
 	rcu_assign_keypointer(key, upayload);
 	ret = 0;
 
@@ -85,29 +91,26 @@ error:
 
 EXPORT_SYMBOL_GPL(user_instantiate);
 
-/*
- * dispose of the old data from an updated user defined key
- */
-static void user_update_rcu_disposal(struct rcu_head *rcu)
+static void user_free_payload_rcu(struct rcu_head *head)
 {
-	struct user_key_payload *upayload;
+	struct user_key_payload *payload;
 
-	upayload = container_of(rcu, struct user_key_payload, rcu);
-
-	kfree(upayload);
+	payload = container_of(head, struct user_key_payload, rcu);
+	kzfree(payload);
 }
 
 /*
  * update a user defined key
  * - the key's semaphore is write-locked
  */
-int user_update(struct key *key, const void *data, size_t datalen)
+int user_update(struct key *key, struct key_preparsed_payload *prep)
 {
 	struct user_key_payload *upayload, *zap;
+	size_t datalen = prep->datalen;
 	int ret;
 
 	ret = -EINVAL;
-	if (datalen <= 0 || datalen > 32767 || !data)
+	if (datalen <= 0 || datalen > 32767 || !prep->data)
 		goto error;
 
 	/* construct a replacement payload */
@@ -117,7 +120,7 @@ int user_update(struct key *key, const void *data, size_t datalen)
 		goto error;
 
 	upayload->datalen = datalen;
-	memcpy(upayload->data, data, datalen);
+	memcpy(upayload->data, prep->data, datalen);
 
 	/* check the quota and attach the new data */
 	zap = upayload;
@@ -126,13 +129,16 @@ int user_update(struct key *key, const void *data, size_t datalen)
 
 	if (ret == 0) {
 		/* attach the new data, displacing the old */
-		zap = key->payload.data;
+		if (key_is_positive(key))
+			zap = dereference_key_locked(key);
+		else
+			zap = NULL;
 		rcu_assign_keypointer(key, upayload);
 		key->expiry = 0;
 	}
 
 	if (zap)
-		call_rcu(&zap->rcu, user_update_rcu_disposal);
+		call_rcu(&zap->rcu, user_free_payload_rcu);
 
 error:
 	return ret;
@@ -156,14 +162,14 @@ EXPORT_SYMBOL_GPL(user_match);
  */
 void user_revoke(struct key *key)
 {
-	struct user_key_payload *upayload = key->payload.data;
+	struct user_key_payload *upayload = user_key_payload_locked(key);
 
 	/* clear the quota */
 	key_payload_reserve(key, 0);
 
 	if (upayload) {
 		rcu_assign_keypointer(key, NULL);
-		call_rcu(&upayload->rcu, user_update_rcu_disposal);
+		call_rcu(&upayload->rcu, user_free_payload_rcu);
 	}
 }
 
@@ -176,7 +182,7 @@ void user_destroy(struct key *key)
 {
 	struct user_key_payload *upayload = key->payload.data;
 
-	kfree(upayload);
+	kzfree(upayload);
 }
 
 EXPORT_SYMBOL_GPL(user_destroy);
@@ -187,7 +193,7 @@ EXPORT_SYMBOL_GPL(user_destroy);
 void user_describe(const struct key *key, struct seq_file *m)
 {
 	seq_puts(m, key->description);
-	if (key_is_instantiated(key))
+	if (key_is_positive(key))
 		seq_printf(m, ": %u", key->datalen);
 }
 
@@ -202,7 +208,7 @@ long user_read(const struct key *key, char __user *buffer, size_t buflen)
 	struct user_key_payload *upayload;
 	long ret;
 
-	upayload = rcu_dereference_key(key);
+	upayload = user_key_payload_locked(key);
 	ret = upayload->datalen;
 
 	/* we can return the data as is */
@@ -218,3 +224,20 @@ long user_read(const struct key *key, char __user *buffer, size_t buflen)
 }
 
 EXPORT_SYMBOL_GPL(user_read);
+
+/* Vet the description for a "logon" key */
+static int logon_vet_description(const char *desc)
+{
+	char *p;
+
+	/* require a "qualified" description string */
+	p = strchr(desc, ':');
+	if (!p)
+		return -EINVAL;
+
+	/* also reject description with ':' as first char */
+	if (p == desc)
+		return -EINVAL;
+
+	return 0;
+}

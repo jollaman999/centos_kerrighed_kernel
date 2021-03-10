@@ -22,7 +22,6 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/socket.h>
-#include <linux/nospec.h>
 
 /*
  * ABI Version 32 bit
@@ -38,7 +37,7 @@
  */
 #define	MISDN_MAJOR_VERSION	1
 #define	MISDN_MINOR_VERSION	1
-#define MISDN_RELEASE		21
+#define MISDN_RELEASE		29
 
 /* primitives for information exchange
  * generell format
@@ -115,6 +114,11 @@
 #define MDL_STATUS_UI_IND	0x1E04
 #define MDL_ERROR_IND		0x1F04
 #define MDL_ERROR_RSP		0x5F04
+
+/* intern layer 2 */
+#define DL_TIMER200_IND		0x7004
+#define DL_TIMER203_IND		0x7304
+#define DL_INTERN_MSG		0x7804
 
 /* DL_INFORMATION_IND types */
 #define DL_INFO_L2_CONNECT	0x0001
@@ -252,7 +256,7 @@
 struct mISDNhead {
 	unsigned int	prim;
 	unsigned int	id;
-}  __attribute__((packed));
+}  __packed;
 
 #define MISDN_HEADER_LEN	sizeof(struct mISDNhead)
 #define MAX_DATA_SIZE		2048
@@ -338,11 +342,8 @@ struct ph_info {
 static inline int
 test_channelmap(u_int nr, u_char *map)
 {
-	if (nr <= MISDN_MAX_CHANNEL) {
-		int idx = array_index_nospec(nr >> 3, MISDN_CHMAP_SIZE);
-
-		return map[idx] & (1 << (nr & 7));
-	}
+	if (nr <= MISDN_MAX_CHANNEL)
+		return map[nr >> 3] & (1 << (nr & 7));
 	else
 		return 0;
 }
@@ -364,6 +365,7 @@ clear_channelmap(u_int nr, u_char *map)
 #define MISDN_CTRL_LOOP			0x0001
 #define MISDN_CTRL_CONNECT		0x0002
 #define MISDN_CTRL_DISCONNECT		0x0004
+#define MISDN_CTRL_RX_BUFFER		0x0008
 #define MISDN_CTRL_PCMCONNECT		0x0010
 #define MISDN_CTRL_PCMDISCONNECT	0x0020
 #define MISDN_CTRL_SETPEER		0x0040
@@ -371,6 +373,7 @@ clear_channelmap(u_int nr, u_char *map)
 #define MISDN_CTRL_RX_OFF		0x0100
 #define MISDN_CTRL_FILL_EMPTY		0x0200
 #define MISDN_CTRL_GETPEER		0x0400
+#define MISDN_CTRL_L1_TIMER3		0x0800
 #define MISDN_CTRL_HW_FEATURES_OP	0x2000
 #define MISDN_CTRL_HW_FEATURES		0x2001
 #define MISDN_CTRL_HFC_OP		0x4000
@@ -384,6 +387,12 @@ clear_channelmap(u_int nr, u_char *map)
 #define MISDN_CTRL_HFC_ECHOCAN_OFF 	0x4008
 #define MISDN_CTRL_HFC_WD_INIT		0x4009
 #define MISDN_CTRL_HFC_WD_RESET		0x400A
+
+/* special RX buffer value for MISDN_CTRL_RX_BUFFER request.p1 is the minimum
+ * buffer size request.p2 the maximum. Using  MISDN_CTRL_RX_SIZE_IGNORE will
+ * not change the value, but still read back the actual stetting.
+ */
+#define MISDN_CTRL_RX_SIZE_IGNORE	-1
 
 /* socket options */
 #define MISDN_TIME_STAMP		0x0001
@@ -589,6 +598,7 @@ static inline struct mISDNdevice *dev_to_mISDN(struct device *dev)
 extern void	set_channel_address(struct mISDNchannel *, u_int, u_int);
 extern void	mISDN_clock_update(struct mISDNclock *, int, struct timeval *);
 extern unsigned short mISDN_clock_get(void);
+extern const char *mISDNDevName4ch(struct mISDNchannel *);
 
 #endif /* __KERNEL__ */
 #endif /* mISDNIF_H */

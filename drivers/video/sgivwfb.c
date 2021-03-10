@@ -47,7 +47,7 @@ static int ywrap = 0;
 
 static int flatpanel_id = -1;
 
-static struct fb_fix_screeninfo sgivwfb_fix __initdata = {
+static struct fb_fix_screeninfo sgivwfb_fix = {
 	.id		= "SGI Vis WS FB",
 	.type		= FB_TYPE_PACKED_PIXELS,
         .visual		= FB_VISUAL_PSEUDOCOLOR,
@@ -57,7 +57,7 @@ static struct fb_fix_screeninfo sgivwfb_fix __initdata = {
 	.line_length	= 640,
 };
 
-static struct fb_var_screeninfo sgivwfb_var __initdata = {
+static struct fb_var_screeninfo sgivwfb_var = {
 	/* 640x480, 8 bpp */
 	.xres		= 640,
 	.yres		= 480,
@@ -79,7 +79,7 @@ static struct fb_var_screeninfo sgivwfb_var __initdata = {
 	.vmode		= FB_VMODE_NONINTERLACED
 };
 
-static struct fb_var_screeninfo sgivwfb_var1600sw __initdata = {
+static struct fb_var_screeninfo sgivwfb_var1600sw = {
 	/* 1600x1024, 8 bpp */
 	.xres		= 1600,
 	.yres		= 1024,
@@ -260,13 +260,13 @@ static int sgivwfb_check_var(struct fb_var_screeninfo *var,
 	var->grayscale = 0;	/* No grayscale for now */
 
 	/* determine valid resolution and timing */
-	for (min_mode = 0; min_mode < DBE_VT_SIZE; min_mode++) {
+	for (min_mode = 0; min_mode < ARRAY_SIZE(dbeVTimings); min_mode++) {
 		if (dbeVTimings[min_mode].width >= var->xres &&
 		    dbeVTimings[min_mode].height >= var->yres)
 			break;
 	}
 
-	if (min_mode == DBE_VT_SIZE)
+	if (min_mode == ARRAY_SIZE(dbeVTimings))
 		return -EINVAL;	/* Resolution to high */
 
 	/* XXX FIXME - should try to pick best refresh rate */
@@ -705,23 +705,17 @@ static int sgivwfb_setcolreg(u_int regno, u_int red, u_int green,
 static int sgivwfb_mmap(struct fb_info *info,
 			struct vm_area_struct *vma)
 {
-	unsigned long size = vma->vm_end - vma->vm_start;
-	unsigned long offset = vma->vm_pgoff << PAGE_SHIFT;
+	int r;
 
-	if (vma->vm_pgoff > (~0UL >> PAGE_SHIFT))
-		return -EINVAL;
-	if (offset + size > sgivwfb_mem_size)
-		return -EINVAL;
-	offset += sgivwfb_mem_phys;
 	pgprot_val(vma->vm_page_prot) =
-	    pgprot_val(vma->vm_page_prot) | _PAGE_PCD;
-	vma->vm_flags |= VM_IO;
-	if (remap_pfn_range(vma, vma->vm_start, offset >> PAGE_SHIFT,
-						size, vma->vm_page_prot))
-		return -EAGAIN;
+		pgprot_val(vma->vm_page_prot) | _PAGE_PCD;
+
+	r = vm_iomap_memory(vma, sgivwfb_mem_phys, sgivwfb_mem_size);
+
 	printk(KERN_DEBUG "sgivwfb: mmap framebuffer P(%lx)->V(%lx)\n",
 	       offset, vma->vm_start);
-	return 0;
+
+	return r;
 }
 
 int __init sgivwfb_setup(char *options)
@@ -745,7 +739,7 @@ int __init sgivwfb_setup(char *options)
 /*
  *  Initialisation
  */
-static int __init sgivwfb_probe(struct platform_device *dev)
+static int sgivwfb_probe(struct platform_device *dev)
 {
 	struct sgivw_par *par;
 	struct fb_info *info;

@@ -18,8 +18,10 @@
  * Authors: Hollis Blanchard <hollisb@us.ibm.com>
  */
 
-#include <linux/gfp.h>
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/mm.h>
+#include <linux/slab.h>
 #include <asm/page.h>
 #include <xen/xencomm.h>
 #include <xen/interface/xen.h>

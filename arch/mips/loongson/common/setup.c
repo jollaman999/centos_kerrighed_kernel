@@ -2,9 +2,9 @@
  * Copyright (C) 2007 Lemote Inc. & Insititute of Computing Technology
  * Author: Fuxin Zhang, zhangfx@lemote.com
  *
- *  This program is free software; you can redistribute  it and/or modify it
- *  under  the terms of  the GNU General  Public License as published by the
- *  Free Software Foundation;  either version 2 of the  License, or (at your
+ *  This program is free software; you can redistribute	 it and/or modify it
+ *  under  the terms of	 the GNU General  Public License as published by the
+ *  Free Software Foundation;  either version 2 of the	License, or (at your
  *  option) any later version.
  */
 #include <linux/module.h>
@@ -41,15 +41,12 @@ void __init plat_mem_setup(void)
 	conswitchp = &vga_con;
 
 	screen_info = (struct screen_info) {
-		0, 25,		/* orig-x, orig-y */
-		    0,		/* unused */
-		    0,		/* orig-video-page */
-		    0,		/* orig-video-mode */
-		    80,		/* orig-video-cols */
-		    0, 0, 0,	/* ega_ax, ega_bx, ega_cx */
-		    25,		/* orig-video-lines */
-		    VIDEO_TYPE_VGAC,	/* orig-video-isVGA */
-		    16		/* orig-video-points */
+		.orig_x			= 0,
+		.orig_y			= 25,
+		.orig_video_cols	= 80,
+		.orig_video_lines	= 25,
+		.orig_video_isVGA	= VIDEO_TYPE_VGAC,
+		.orig_video_points	= 16,
 	};
 #elif defined(CONFIG_DUMMY_CONSOLE)
 	conswitchp = &dummy_con;

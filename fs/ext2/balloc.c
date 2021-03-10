@@ -13,6 +13,7 @@
 
 #include "ext2.h"
 #include <linux/quotaops.h>
+#include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/buffer_head.h>
 #include <linux/capability.h>
@@ -158,16 +159,6 @@ read_block_bitmap(struct super_block *sb, unsigned int block_group)
 	return bh;
 }
 
-static void release_blocks(struct super_block *sb, int count)
-{
-	if (count) {
-		struct ext2_sb_info *sbi = EXT2_SB(sb);
-
-		percpu_counter_add(&sbi->s_freeblocks_counter, count);
-		sb->s_dirt = 1;
-	}
-}
-
 static void group_adjust_blocks(struct super_block *sb, int group_no,
 	struct ext2_group_desc *desc, struct buffer_head *bh, int count)
 {
@@ -179,7 +170,6 @@ static void group_adjust_blocks(struct super_block *sb, int group_no,
 		free_blocks = le16_to_cpu(desc->bg_free_blocks_count);
 		desc->bg_free_blocks_count = cpu_to_le16(free_blocks + count);
 		spin_unlock(sb_bgl_lock(sbi, group_no));
-		sb->s_dirt = 1;
 		mark_buffer_dirty(bh);
 	}
 }
@@ -420,7 +410,7 @@ static inline int rsv_is_empty(struct ext2_reserve_window *rsv)
 void ext2_init_block_alloc_info(struct inode *inode)
 {
 	struct ext2_inode_info *ei = EXT2_I(inode);
-	struct ext2_block_alloc_info *block_i = ei->i_block_alloc_info;
+	struct ext2_block_alloc_info *block_i;
 	struct super_block *sb = inode->i_sb;
 
 	block_i = kmalloc(sizeof(*block_i), GFP_NOFS);
@@ -478,9 +468,9 @@ void ext2_discard_reservation(struct inode *inode)
 }
 
 /**
- * ext2_free_blocks_sb() -- Free given blocks and update quota and i_blocks
+ * ext2_free_blocks() -- Free given blocks and update quota and i_blocks
  * @inode:		inode
- * @block:		start physcial block to free
+ * @block:		start physical block to free
  * @count:		number of blocks to free
  */
 void ext2_free_blocks (struct inode * inode, unsigned long block,
@@ -569,8 +559,11 @@ do_more:
 	}
 error_return:
 	brelse(bitmap_bh);
-	release_blocks(sb, freed);
-	vfs_dq_free_block(inode, freed);
+	if (freed) {
+		percpu_counter_add(&sbi->s_freeblocks_counter, freed);
+		dquot_free_block_nodirty(inode, freed);
+		mark_inode_dirty(inode);
+	}
 }
 
 /**
@@ -645,10 +638,9 @@ find_next_usable_block(int start, struct buffer_head *bh, int maxblocks)
 	return here;
 }
 
-/*
+/**
  * ext2_try_to_allocate()
  * @sb:			superblock
- * @handle:		handle to this transaction
  * @group:		given allocation block group
  * @bitmap_bh:		bufferhead holds the block bitmap
  * @grp_goal:		given target block within the group
@@ -850,7 +842,7 @@ static int find_next_reservable_window(
 		rsv_window_remove(sb, my_rsv);
 
 	/*
-	 * Let's book the whole avaliable window for now.  We will check the
+	 * Let's book the whole available window for now.  We will check the
 	 * disk bitmap later and then, if there are free blocks then we adjust
 	 * the window size if it's larger than requested.
 	 * Otherwise, we will remove this node from the tree next time
@@ -1193,31 +1185,11 @@ static int ext2_has_free_blocks(struct ext2_sb_info *sbi)
 	free_blocks = percpu_counter_read_positive(&sbi->s_freeblocks_counter);
 	root_blocks = le32_to_cpu(sbi->s_es->s_r_blocks_count);
 	if (free_blocks < root_blocks + 1 && !capable(CAP_SYS_RESOURCE) &&
-		sbi->s_resuid != current_fsuid() &&
-		(sbi->s_resgid == 0 || !in_group_p (sbi->s_resgid))) {
+		!uid_eq(sbi->s_resuid, current_fsuid()) &&
+		(gid_eq(sbi->s_resgid, GLOBAL_ROOT_GID) ||
+		 !in_group_p (sbi->s_resgid))) {
 		return 0;
 	}
-	return 1;
-}
-
-/*
- * Returns 1 if the passed-in block region is valid; 0 if some part overlaps
- * with filesystem metadata blocksi.
- */
-int ext2_data_block_valid(struct ext2_sb_info *sbi, ext2_fsblk_t start_blk,
-			  unsigned int count)
-{
-	if ((start_blk <= le32_to_cpu(sbi->s_es->s_first_data_block)) ||
-	    (start_blk + count < start_blk) ||
-	    (start_blk > le32_to_cpu(sbi->s_es->s_blocks_count)))
-		return 0;
-
-	/* Ensure we do not step over superblock */
-	if ((start_blk <= sbi->s_sb_block) &&
-	    (start_blk + count >= sbi->s_sb_block))
-		return 0;
-
-
 	return 1;
 }
 
@@ -1257,19 +1229,17 @@ ext2_fsblk_t ext2_new_blocks(struct inode *inode, ext2_fsblk_t goal,
 	unsigned short windowsz = 0;
 	unsigned long ngroups;
 	unsigned long num = *count;
+	int ret;
 
 	*errp = -ENOSPC;
 	sb = inode->i_sb;
-	if (!sb) {
-		printk("ext2_new_blocks: nonexistent device");
-		return 0;
-	}
 
 	/*
 	 * Check quota for allocation of this block.
 	 */
-	if (vfs_dq_alloc_block(inode, num)) {
-		*errp = -EDQUOT;
+	ret = dquot_alloc_block(inode, num);
+	if (ret) {
+		*errp = ret;
 		return 0;
 	}
 
@@ -1350,6 +1320,12 @@ retry_alloc:
 
 		free_blocks = le16_to_cpu(gdp->bg_free_blocks_count);
 		/*
+		 * skip this group (and avoid loading bitmap) if there
+		 * are no free blocks
+		 */
+		if (!free_blocks)
+			continue;
+		/*
 		 * skip this group if the number of
 		 * free blocks is less than half of the reservation
 		 * window size.
@@ -1370,9 +1346,9 @@ retry_alloc:
 			goto allocated;
 	}
 	/*
-	 * We may end up a bogus ealier ENOSPC error due to
+	 * We may end up a bogus earlier ENOSPC error due to
 	 * filesystem is "full" of reservations, but
-	 * there maybe indeed free blocks avaliable on disk
+	 * there maybe indeed free blocks available on disk
 	 * In this case, we just forget about the reservations
 	 * just do block allocation as without reservations.
 	 */
@@ -1430,8 +1406,11 @@ allocated:
 
 	*errp = 0;
 	brelse(bitmap_bh);
-	vfs_dq_free_block(inode, *count-num);
-	*count = num;
+	if (num < *count) {
+		dquot_free_block_nodirty(inode, *count-num);
+		mark_inode_dirty(inode);
+		*count = num;
+	}
 	return ret_block;
 
 io_error:
@@ -1440,8 +1419,10 @@ out:
 	/*
 	 * Undo the block allocation
 	 */
-	if (!performed_allocation)
-		vfs_dq_free_block(inode, *count);
+	if (!performed_allocation) {
+		dquot_free_block_nodirty(inode, *count);
+		mark_inode_dirty(inode);
+	}
 	brelse(bitmap_bh);
 	return 0;
 }
@@ -1455,19 +1436,9 @@ ext2_fsblk_t ext2_new_block(struct inode *inode, unsigned long goal, int *errp)
 
 #ifdef EXT2FS_DEBUG
 
-static const int nibblemap[] = {4, 3, 3, 2, 3, 2, 2, 1, 3, 2, 2, 1, 2, 1, 1, 0};
-
-unsigned long ext2_count_free (struct buffer_head * map, unsigned int numchars)
+unsigned long ext2_count_free(struct buffer_head *map, unsigned int numchars)
 {
-	unsigned int i;
-	unsigned long sum = 0;
-
-	if (!map)
-		return (0);
-	for (i = 0; i < numchars; i++)
-		sum += nibblemap[map->b_data[i] & 0xf] +
-			nibblemap[(map->b_data[i] >> 4) & 0xf];
-	return (sum);
+	return numchars * BITS_PER_BYTE - memweight(map->b_data, numchars);
 }
 
 #endif  /*  EXT2FS_DEBUG  */

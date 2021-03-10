@@ -307,6 +307,7 @@ static int init_tfm(struct crypto_tfm *tfm)
 
 	if (crypto_cipher_blocksize(cipher) != LRW_BLOCK_SIZE) {
 		*flags |= CRYPTO_TFM_RES_BAD_BLOCK_LEN;
+		crypto_free_cipher(cipher);
 		return -EINVAL;
 	}
 
@@ -399,3 +400,4 @@ module_exit(crypto_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("LRW block cipher mode");
+MODULE_ALIAS_CRYPTO("lrw");

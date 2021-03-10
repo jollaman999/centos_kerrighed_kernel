@@ -7,10 +7,10 @@
  */
 
 #include <linux/module.h>
-#include <linux/smp_lock.h>
 #include <linux/unistd.h>
 #include <linux/user.h>
 #include <linux/uaccess.h>
+#include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/tick.h>
 #include <linux/fs.h>
@@ -19,6 +19,7 @@
 #include <asm/blackfin.h>
 #include <asm/fixed_code.h>
 #include <asm/mem_map.h>
+#include <asm/irq.h>
 
 asmlinkage void ret_from_fork(void);
 
@@ -38,12 +39,6 @@ int nr_l1stack_tasks;
 void *l1_stack_base;
 unsigned long l1_stack_len;
 
-/*
- * Powermanagement idle function, if any..
- */
-void (*pm_idle)(void) = NULL;
-EXPORT_SYMBOL(pm_idle);
-
 void (*pm_power_off)(void) = NULL;
 EXPORT_SYMBOL(pm_power_off);
 
@@ -51,93 +46,31 @@ EXPORT_SYMBOL(pm_power_off);
  * The idle loop on BFIN
  */
 #ifdef CONFIG_IDLE_L1
-static void default_idle(void)__attribute__((l1_text));
-void cpu_idle(void)__attribute__((l1_text));
+void arch_cpu_idle(void)__attribute__((l1_text));
 #endif
 
 /*
  * This is our default idle handler.  We need to disable
  * interrupts here to ensure we don't miss a wakeup call.
  */
-static void default_idle(void)
+void arch_cpu_idle(void)
 {
 #ifdef CONFIG_IPIPE
 	ipipe_suspend_domain();
 #endif
-	local_irq_disable_hw();
+	hard_local_irq_disable();
 	if (!need_resched())
 		idle_with_irq_disabled();
 
-	local_irq_enable_hw();
+	hard_local_irq_enable();
 }
-
-/*
- * The idle thread.  We try to conserve power, while trying to keep
- * overall latency low.  The architecture specific idle is passed
- * a value to indicate the level of "idleness" of the system.
- */
-void cpu_idle(void)
-{
-	/* endless idle loop with no priority at all */
-	while (1) {
-		void (*idle)(void) = pm_idle;
 
 #ifdef CONFIG_HOTPLUG_CPU
-		if (cpu_is_offline(smp_processor_id()))
-			cpu_die();
+void arch_cpu_idle_dead(void)
+{
+	cpu_die();
+}
 #endif
-		if (!idle)
-			idle = default_idle;
-		tick_nohz_stop_sched_tick(1);
-		while (!need_resched())
-			idle();
-		tick_nohz_restart_sched_tick();
-		preempt_enable_no_resched();
-		schedule();
-		preempt_disable();
-	}
-}
-
-/* Fill in the fpu structure for a core dump.  */
-
-int dump_fpu(struct pt_regs *regs, elf_fpregset_t * fpregs)
-{
-	return 1;
-}
-
-/*
- * This gets run with P1 containing the
- * function to call, and R1 containing
- * the "args".  Note P0 is clobbered on the way here.
- */
-void kernel_thread_helper(void);
-__asm__(".section .text\n"
-	".align 4\n"
-	"_kernel_thread_helper:\n\t"
-	"\tsp += -12;\n\t"
-	"\tr0 = r1;\n\t" "\tcall (p1);\n\t" "\tcall _do_exit;\n" ".previous");
-
-/*
- * Create a kernel thread.
- */
-pid_t kernel_thread(int (*fn) (void *), void *arg, unsigned long flags)
-{
-	struct pt_regs regs;
-
-	memset(&regs, 0, sizeof(regs));
-
-	regs.r1 = (unsigned long)arg;
-	regs.p1 = (unsigned long)fn;
-	regs.pc = (unsigned long)kernel_thread_helper;
-	regs.orig_p0 = -1;
-	/* Set bit 2 to tell ret_from_fork we should be returning to kernel
-	   mode.  */
-	regs.ipend = 0x8002;
-	__asm__ __volatile__("%0 = syscfg;":"=da"(regs.syscfg):);
-	return do_fork(flags | CLONE_VM | CLONE_UNTRACED, 0, &regs, 0, NULL,
-		       NULL);
-}
-EXPORT_SYMBOL(kernel_thread);
 
 /*
  * Do necessary setup to start up a newly executed thread.
@@ -147,7 +80,6 @@ EXPORT_SYMBOL(kernel_thread);
  */
 void start_thread(struct pt_regs *regs, unsigned long new_ip, unsigned long new_sp)
 {
-	set_fs(USER_DS);
 	regs->pc = new_ip;
 	if (current->mm)
 		regs->p5 = current->mm->start_data;
@@ -166,72 +98,46 @@ void flush_thread(void)
 {
 }
 
-asmlinkage int bfin_vfork(struct pt_regs *regs)
+asmlinkage int bfin_clone(unsigned long clone_flags, unsigned long newsp)
 {
-	return do_fork(CLONE_VFORK | CLONE_VM | SIGCHLD, rdusp(), regs, 0, NULL,
-		       NULL);
-}
-
-asmlinkage int bfin_clone(struct pt_regs *regs)
-{
-	unsigned long clone_flags;
-	unsigned long newsp;
-
 #ifdef __ARCH_SYNC_CORE_DCACHE
-	if (current->rt.nr_cpus_allowed == num_possible_cpus()) {
-		current->cpus_allowed = cpumask_of_cpu(smp_processor_id());
-		current->rt.nr_cpus_allowed = 1;
-	}
+	if (current->nr_cpus_allowed == num_possible_cpus())
+		set_cpus_allowed_ptr(current, cpumask_of(smp_processor_id()));
 #endif
-
-	/* syscall2 puts clone_flags in r0 and usp in r1 */
-	clone_flags = regs->r0;
-	newsp = regs->r1;
-	if (!newsp)
-		newsp = rdusp();
-	else
+	if (newsp)
 		newsp -= 12;
-	return do_fork(clone_flags, newsp, regs, 0, NULL, NULL);
+	return do_fork(clone_flags, newsp, 0, NULL, NULL);
 }
 
 int
 copy_thread(unsigned long clone_flags,
 	    unsigned long usp, unsigned long topstk,
-	    struct task_struct *p, struct pt_regs *regs)
+	    struct task_struct *p)
 {
 	struct pt_regs *childregs;
+	unsigned long *v;
 
 	childregs = (struct pt_regs *) (task_stack_page(p) + THREAD_SIZE) - 1;
-	*childregs = *regs;
-	childregs->r0 = 0;
+	v = ((unsigned long *)childregs) - 2;
+	if (unlikely(p->flags & PF_KTHREAD)) {
+		memset(childregs, 0, sizeof(struct pt_regs));
+		v[0] = usp;
+		v[1] = topstk;
+		childregs->orig_p0 = -1;
+		childregs->ipend = 0x8000;
+		__asm__ __volatile__("%0 = syscfg;":"=da"(childregs->syscfg):);
+		p->thread.usp = 0;
+	} else {
+		*childregs = *current_pt_regs();
+		childregs->r0 = 0;
+		p->thread.usp = usp ? : rdusp();
+		v[0] = v[1] = 0;
+	}
 
-	p->thread.usp = usp;
-	p->thread.ksp = (unsigned long)childregs;
+	p->thread.ksp = (unsigned long)v;
 	p->thread.pc = (unsigned long)ret_from_fork;
 
 	return 0;
-}
-
-/*
- * sys_execve() executes a new program.
- */
-
-asmlinkage int sys_execve(char __user *name, char __user * __user *argv, char __user * __user *envp)
-{
-	int error;
-	char *filename;
-	struct pt_regs *regs = (struct pt_regs *)((&name) + 6);
-
-	lock_kernel();
-	filename = getname(name);
-	error = PTR_ERR(filename);
-	if (IS_ERR(filename))
-		goto out;
-	error = do_execve(filename, argv, envp, regs);
-	putname(filename);
- out:
-	unlock_kernel();
-	return error;
 }
 
 unsigned long get_wchan(struct task_struct *p)
@@ -262,9 +168,12 @@ void finish_atomic_sections (struct pt_regs *regs)
 	int __user *up0 = (int __user *)regs->p0;
 
 	switch (regs->pc) {
+	default:
+		/* not in middle of an atomic step, so resume like normal */
+		return;
+
 	case ATOMIC_XCHG32 + 2:
 		put_user(regs->r1, up0);
-		regs->pc = ATOMIC_XCHG32 + 4;
 		break;
 
 	case ATOMIC_CAS32 + 2:
@@ -272,7 +181,6 @@ void finish_atomic_sections (struct pt_regs *regs)
 		if (regs->r0 == regs->r1)
 	case ATOMIC_CAS32 + 6:
 			put_user(regs->r2, up0);
-		regs->pc = ATOMIC_CAS32 + 8;
 		break;
 
 	case ATOMIC_ADD32 + 2:
@@ -280,7 +188,6 @@ void finish_atomic_sections (struct pt_regs *regs)
 		/* fall through */
 	case ATOMIC_ADD32 + 4:
 		put_user(regs->r0, up0);
-		regs->pc = ATOMIC_ADD32 + 6;
 		break;
 
 	case ATOMIC_SUB32 + 2:
@@ -288,7 +195,6 @@ void finish_atomic_sections (struct pt_regs *regs)
 		/* fall through */
 	case ATOMIC_SUB32 + 4:
 		put_user(regs->r0, up0);
-		regs->pc = ATOMIC_SUB32 + 6;
 		break;
 
 	case ATOMIC_IOR32 + 2:
@@ -296,7 +202,6 @@ void finish_atomic_sections (struct pt_regs *regs)
 		/* fall through */
 	case ATOMIC_IOR32 + 4:
 		put_user(regs->r0, up0);
-		regs->pc = ATOMIC_IOR32 + 6;
 		break;
 
 	case ATOMIC_AND32 + 2:
@@ -304,7 +209,6 @@ void finish_atomic_sections (struct pt_regs *regs)
 		/* fall through */
 	case ATOMIC_AND32 + 4:
 		put_user(regs->r0, up0);
-		regs->pc = ATOMIC_AND32 + 6;
 		break;
 
 	case ATOMIC_XOR32 + 2:
@@ -312,9 +216,15 @@ void finish_atomic_sections (struct pt_regs *regs)
 		/* fall through */
 	case ATOMIC_XOR32 + 4:
 		put_user(regs->r0, up0);
-		regs->pc = ATOMIC_XOR32 + 6;
 		break;
 	}
+
+	/*
+	 * We've finished the atomic section, and the only thing left for
+	 * userspace is to do a RTS, so we might as well handle that too
+	 * since we need to update the PC anyways.
+	 */
+	regs->pc = regs->rets;
 }
 
 static inline
@@ -336,12 +246,62 @@ int in_mem_const(unsigned long addr, unsigned long size,
 {
 	return in_mem_const_off(addr, size, 0, const_addr, const_size);
 }
-#define IN_ASYNC(bnum, bctlnum) \
+#ifdef CONFIG_BF60x
+#define ASYNC_ENABLED(bnum, bctlnum)	1
+#else
+#define ASYNC_ENABLED(bnum, bctlnum) \
 ({ \
-	(bfin_read_EBIU_AMGCTL() & 0xe) < ((bnum + 1) << 1) ? -EFAULT : \
-	bfin_read_EBIU_AMBCTL##bctlnum() & B##bnum##RDYEN ? -EFAULT : \
-	BFIN_MEM_ACCESS_CORE; \
+	(bfin_read_EBIU_AMGCTL() & 0xe) < ((bnum + 1) << 1) ? 0 : \
+	bfin_read_EBIU_AMBCTL##bctlnum() & B##bnum##RDYEN ? 0 : \
+	1; \
 })
+#endif
+/*
+ * We can't read EBIU banks that aren't enabled or we end up hanging
+ * on the access to the async space.  Make sure we validate accesses
+ * that cross async banks too.
+ *	0 - found, but unusable
+ *	1 - found & usable
+ *	2 - not found
+ */
+static
+int in_async(unsigned long addr, unsigned long size)
+{
+	if (addr >= ASYNC_BANK0_BASE && addr < ASYNC_BANK0_BASE + ASYNC_BANK0_SIZE) {
+		if (!ASYNC_ENABLED(0, 0))
+			return 0;
+		if (addr + size <= ASYNC_BANK0_BASE + ASYNC_BANK0_SIZE)
+			return 1;
+		size -= ASYNC_BANK0_BASE + ASYNC_BANK0_SIZE - addr;
+		addr = ASYNC_BANK0_BASE + ASYNC_BANK0_SIZE;
+	}
+	if (addr >= ASYNC_BANK1_BASE && addr < ASYNC_BANK1_BASE + ASYNC_BANK1_SIZE) {
+		if (!ASYNC_ENABLED(1, 0))
+			return 0;
+		if (addr + size <= ASYNC_BANK1_BASE + ASYNC_BANK1_SIZE)
+			return 1;
+		size -= ASYNC_BANK1_BASE + ASYNC_BANK1_SIZE - addr;
+		addr = ASYNC_BANK1_BASE + ASYNC_BANK1_SIZE;
+	}
+	if (addr >= ASYNC_BANK2_BASE && addr < ASYNC_BANK2_BASE + ASYNC_BANK2_SIZE) {
+		if (!ASYNC_ENABLED(2, 1))
+			return 0;
+		if (addr + size <= ASYNC_BANK2_BASE + ASYNC_BANK2_SIZE)
+			return 1;
+		size -= ASYNC_BANK2_BASE + ASYNC_BANK2_SIZE - addr;
+		addr = ASYNC_BANK2_BASE + ASYNC_BANK2_SIZE;
+	}
+	if (addr >= ASYNC_BANK3_BASE && addr < ASYNC_BANK3_BASE + ASYNC_BANK3_SIZE) {
+		if (ASYNC_ENABLED(3, 1))
+			return 0;
+		if (addr + size <= ASYNC_BANK3_BASE + ASYNC_BANK3_SIZE)
+			return 1;
+		return 0;
+	}
+
+	/* not within async bounds */
+	return 2;
+}
 
 int bfin_mem_access_type(unsigned long addr, unsigned long size)
 {
@@ -378,17 +338,11 @@ int bfin_mem_access_type(unsigned long addr, unsigned long size)
 	if (addr >= SYSMMR_BASE)
 		return BFIN_MEM_ACCESS_CORE_ONLY;
 
-	/* We can't read EBIU banks that aren't enabled or we end up hanging
-	 * on the access to the async space.
-	 */
-	if (in_mem_const(addr, size, ASYNC_BANK0_BASE, ASYNC_BANK0_SIZE))
-		return IN_ASYNC(0, 0);
-	if (in_mem_const(addr, size, ASYNC_BANK1_BASE, ASYNC_BANK1_SIZE))
-		return IN_ASYNC(1, 0);
-	if (in_mem_const(addr, size, ASYNC_BANK2_BASE, ASYNC_BANK2_SIZE))
-		return IN_ASYNC(2, 1);
-	if (in_mem_const(addr, size, ASYNC_BANK3_BASE, ASYNC_BANK3_SIZE))
-		return IN_ASYNC(3, 1);
+	switch (in_async(addr, size)) {
+	case 0: return -EFAULT;
+	case 1: return BFIN_MEM_ACCESS_CORE;
+	case 2: /* fall through */;
+	}
 
 	if (in_mem_const(addr, size, BOOT_ROM_START, BOOT_ROM_LENGTH))
 		return BFIN_MEM_ACCESS_CORE;
@@ -405,6 +359,8 @@ __attribute__((l1_text))
 /* Return 1 if access to memory range is OK, 0 otherwise */
 int _access_ok(unsigned long addr, unsigned long size)
 {
+	int aret;
+
 	if (size == 0)
 		return 1;
 	/* Check that things do not wrap around */
@@ -454,6 +410,16 @@ int _access_ok(unsigned long addr, unsigned long size)
 	if (in_mem_const(addr, size, COREB_L1_DATA_B_START, COREB_L1_DATA_B_LENGTH))
 		return 1;
 #endif
+
+#ifndef CONFIG_EXCEPTION_L1_SCRATCH
+	if (in_mem_const(addr, size, (unsigned long)l1_stack_base, l1_stack_len))
+		return 1;
+#endif
+
+	aret = in_async(addr, size);
+	if (aret < 2)
+		return aret;
+
 	if (in_mem_const_off(addr, size, _ebss_l2 - _stext_l2, L2_START, L2_LENGTH))
 		return 1;
 

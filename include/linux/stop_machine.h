@@ -3,8 +3,8 @@
 
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
+#include <linux/smp.h>
 #include <linux/list.h>
-#include <asm/system.h>
 
 /*
  * stop_cpu[s]() is simplistic per-cpu maximum priority cpu
@@ -28,10 +28,12 @@ struct cpu_stop_work {
 };
 
 int stop_one_cpu(unsigned int cpu, cpu_stop_fn_t fn, void *arg);
-void stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
+int stop_two_cpus(unsigned int cpu1, unsigned int cpu2, cpu_stop_fn_t fn, void *arg);
+bool stop_one_cpu_nowait(unsigned int cpu, cpu_stop_fn_t fn, void *arg,
 			 struct cpu_stop_work *work_buf);
 int stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg);
 int try_stop_cpus(const struct cpumask *cpumask, cpu_stop_fn_t fn, void *arg);
+void stop_machine_park(int cpu);
 
 #else	/* CONFIG_SMP */
 
@@ -62,7 +64,7 @@ static void stop_one_cpu_nowait_workfn(struct work_struct *work)
 	preempt_enable();
 }
 
-static inline void stop_one_cpu_nowait(unsigned int cpu,
+static inline bool stop_one_cpu_nowait(unsigned int cpu,
 				       cpu_stop_fn_t fn, void *arg,
 				       struct cpu_stop_work *work_buf)
 {
@@ -71,7 +73,10 @@ static inline void stop_one_cpu_nowait(unsigned int cpu,
 		work_buf->fn = fn;
 		work_buf->arg = arg;
 		schedule_work(&work_buf->work);
+		return true;
 	}
+
+	return false;
 }
 
 static inline int stop_cpus(const struct cpumask *cpumask,
@@ -94,7 +99,7 @@ static inline int try_stop_cpus(const struct cpumask *cpumask,
  * stop_machine "Bogolock": stop the entire machine, disable
  * interrupts.  This is a very heavy lock, which is equivalent to
  * grabbing every spinlock (and more).  So the "read" side to such a
- * lock is anything which disables preeempt.
+ * lock is anything which disables preemption.
  */
 #if defined(CONFIG_STOP_MACHINE) && defined(CONFIG_SMP)
 
@@ -105,7 +110,7 @@ static inline int try_stop_cpus(const struct cpumask *cpumask,
  * @cpus: the cpus to run the @fn() on (NULL = any online cpu)
  *
  * Description: This causes a thread to be scheduled on every cpu,
- * each of which disables interrupts.  The result is that noone is
+ * each of which disables interrupts.  The result is that no one is
  * holding a spinlock or inside any other preempt-disabled region when
  * @fn() runs.
  *
@@ -129,8 +134,8 @@ int stop_machine_from_inactive_cpu(int (*fn)(void *), void *data,
 
 #else	 /* CONFIG_STOP_MACHINE && CONFIG_SMP */
 
-static inline int stop_machine(int (*fn)(void *), void *data,
-			       const struct cpumask *cpus)
+static inline int __stop_machine(int (*fn)(void *), void *data,
+				 const struct cpumask *cpus)
 {
 	unsigned long flags;
 	int ret;
@@ -138,6 +143,12 @@ static inline int stop_machine(int (*fn)(void *), void *data,
 	ret = fn(data);
 	local_irq_restore(flags);
 	return ret;
+}
+
+static inline int stop_machine(int (*fn)(void *), void *data,
+			       const struct cpumask *cpus)
+{
+	return __stop_machine(fn, data, cpus);
 }
 
 static inline int stop_machine_from_inactive_cpu(int (*fn)(void *), void *data,

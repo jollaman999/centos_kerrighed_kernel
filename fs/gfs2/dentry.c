@@ -7,11 +7,11 @@
  * of the GNU General Public License version 2.
  */
 
-#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
 #include <linux/buffer_head.h>
 #include <linux/gfs2_ondisk.h>
+#include <linux/namei.h>
 #include <linux/crc32.h>
 
 #include "gfs2.h"
@@ -25,7 +25,7 @@
 /**
  * gfs2_drevalidate - Check directory lookup consistency
  * @dentry: the mapping to check
- * @nd:
+ * @flags: lookup flags
  *
  * Check to make sure the lookup necessary to arrive at this inode from its
  * parent is still good.
@@ -33,16 +33,24 @@
  * Returns: 1 if the dentry is ok, 0 if it isn't
  */
 
-static int gfs2_drevalidate(struct dentry *dentry, struct nameidata *nd)
+static int gfs2_drevalidate(struct dentry *dentry, unsigned int flags)
 {
-	struct dentry *parent = dget_parent(dentry);
-	struct gfs2_sbd *sdp = GFS2_SB(parent->d_inode);
-	struct gfs2_inode *dip = GFS2_I(parent->d_inode);
-	struct inode *inode = dentry->d_inode;
+	struct dentry *parent;
+	struct gfs2_sbd *sdp;
+	struct gfs2_inode *dip;
+	struct inode *inode;
 	struct gfs2_holder d_gh;
 	struct gfs2_inode *ip = NULL;
 	int error;
 	int had_lock = 0;
+
+	if (flags & LOOKUP_RCU)
+		return -ECHILD;
+
+	parent = dget_parent(dentry);
+	sdp = GFS2_SB(parent->d_inode);
+	dip = GFS2_I(parent->d_inode);
+	inode = dentry->d_inode;
 
 	if (inode) {
 		if (is_bad_inode(inode))
@@ -50,7 +58,7 @@ static int gfs2_drevalidate(struct dentry *dentry, struct nameidata *nd)
 		ip = GFS2_I(inode);
 	}
 
-	if (sdp->sd_args.ar_localcaching)
+	if (sdp->sd_lockstruct.ls_ops->lm_mount == NULL)
 		goto valid;
 
 	had_lock = (gfs2_glock_is_locked_by_me(dip->i_gl) != NULL);
@@ -85,12 +93,6 @@ invalid_gunlock:
 	if (!had_lock)
 		gfs2_glock_dq_uninit(&d_gh);
 invalid:
-	if (inode && S_ISDIR(inode->i_mode)) {
-		if (have_submounts(dentry))
-			goto valid;
-		shrink_dcache_parent(dentry);
-	}
-	d_drop(dentry);
 	dput(parent);
 	return 0;
 
@@ -101,13 +103,13 @@ fail:
 	return 0;
 }
 
-static int gfs2_dhash(struct dentry *dentry, struct qstr *str)
+static int gfs2_dhash(const struct dentry *dentry, struct qstr *str)
 {
 	str->hash = gfs2_disk_hash(str->name, str->len);
 	return 0;
 }
 
-static int gfs2_dentry_delete(struct dentry *dentry)
+static int gfs2_dentry_delete(const struct dentry *dentry)
 {
 	struct gfs2_inode *ginode;
 

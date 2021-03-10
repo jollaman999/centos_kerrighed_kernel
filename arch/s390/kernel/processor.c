@@ -1,6 +1,4 @@
 /*
- *  arch/s390/kernel/processor.c
- *
  *  Copyright IBM Corp. 2008
  *  Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com)
  */
@@ -8,101 +6,110 @@
 #define KMSG_COMPONENT "cpu"
 #define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
+#include <linux/bitops.h>
 #include <linux/kernel.h>
-#include <linux/module.h>
 #include <linux/init.h>
-#include <linux/smp.h>
 #include <linux/seq_file.h>
 #include <linux/delay.h>
-
+#include <linux/cpu.h>
+#include <asm/diag.h>
 #include <asm/elf.h>
+#include <asm/facility.h>
 #include <asm/lowcore.h>
 #include <asm/param.h>
-#include <asm/system.h>
+#include <asm/smp.h>
 
-void __cpuinit print_cpu_info(void)
+static DEFINE_PER_CPU(struct cpuid, cpu_id);
+
+void notrace cpu_relax(void)
 {
-	pr_info("Processor %d started, address %d, identification %06X\n",
-		S390_lowcore.cpu_nr, S390_lowcore.cpu_addr,
-		S390_lowcore.cpu_id.ident);
+	if (!smp_cpu_mtid && MACHINE_HAS_DIAG44) {
+		diag_stat_inc(DIAG_STAT_X044);
+		asm volatile("diag 0,0,0x44");
+	}
+	barrier();
+}
+EXPORT_SYMBOL(cpu_relax);
+
+/*
+ * cpu_init - initializes state that is per-CPU.
+ */
+void cpu_init(void)
+{
+	struct s390_idle_data *idle = &__get_cpu_var(s390_idle);
+	struct cpuid *id = &__get_cpu_var(cpu_id);
+
+	get_cpu_id(id);
+	atomic_inc(&init_mm.mm_count);
+	current->active_mm = &init_mm;
+	BUG_ON(current->mm);
+	enter_lazy_tlb(&init_mm, current);
+	memset(idle, 0, sizeof(*idle));
 }
 
 static void show_facilities(struct seq_file *m)
 {
-	unsigned long long *facility_bits;
-	int dwords, bit, i;
+	unsigned int bit;
+	long *facilities;
 
-	facility_bits = kzalloc(32 * BITS_PER_LONG, GFP_KERNEL);
-	if (!facility_bits)
-		return;
-
-	dwords = stfle(facility_bits, 32);
-	if (dwords < 0)
-		goto out;
-
+	facilities = (long *)&S390_lowcore.stfle_fac_list;
 	seq_puts(m, "facilities      :");
-	for (i = 0; i < min(dwords, 32); i++)
-		for (bit = 0; bit < BITS_PER_LONG; bit++)
-			if (facility_bits[i] &
-			    (1ULL << (BITS_PER_LONG - 1 - bit)))
-				seq_printf(m, " %d", BITS_PER_LONG * i + bit);
+	for_each_set_bit_inv(bit, facilities, MAX_FACILITY_BIT)
+		seq_printf(m, " %d", bit);
 	seq_putc(m, '\n');
-out:
-	kfree(facility_bits);
 }
 
 /*
  * show_cpuinfo - Get information on one CPU for use by procfs.
  */
-
 static int show_cpuinfo(struct seq_file *m, void *v)
 {
-	static const char *hwcap_str[11] = {
+	static const char *hwcap_str[] = {
 		"esan3", "zarch", "stfle", "msa", "ldisp", "eimm", "dfp",
-		"edat", "etf3eh", "highgprs", "te"
+		"edat", "etf3eh", "highgprs", "te", "vx", "vxd", "vxe", "gs",
+		"vxe2", "vxp", "sort", "dflt"
 	};
-	struct _lowcore *lc;
+	static const char * const int_hwcap_str[] = {
+		"sie"
+	};
 	unsigned long n = (unsigned long) v - 1;
 	int i;
 
-	s390_adjust_jiffies();
-	preempt_disable();
 	if (!n) {
+		s390_adjust_jiffies();
 		seq_printf(m, "vendor_id       : IBM/S390\n"
 			   "# processors    : %i\n"
 			   "bogomips per cpu: %lu.%02lu\n",
 			   num_online_cpus(), loops_per_jiffy/(500000/HZ),
 			   (loops_per_jiffy/(5000/HZ))%100);
+		seq_printf(m, "max thread id   : %d\n", smp_cpu_mtid);
 		seq_puts(m, "features\t: ");
-		for (i = 0; i < 11; i++)
+		for (i = 0; i < ARRAY_SIZE(hwcap_str); i++)
 			if (hwcap_str[i] && (elf_hwcap & (1UL << i)))
 				seq_printf(m, "%s ", hwcap_str[i]);
+		for (i = 0; i < ARRAY_SIZE(int_hwcap_str); i++)
+			if (int_hwcap_str[i] && (int_hwcap & (1UL << i)))
+				seq_printf(m, "%s ", int_hwcap_str[i]);
 		seq_puts(m, "\n");
 		show_facilities(m);
+		show_cacheinfo(m);
 	}
-
+	get_online_cpus();
 	if (cpu_online(n)) {
-#ifdef CONFIG_SMP
-		lc = (smp_processor_id() == n) ?
-			&S390_lowcore : lowcore_ptr[n];
-#else
-		lc = &S390_lowcore;
-#endif
+		struct cpuid *id = &per_cpu(cpu_id, n);
 		seq_printf(m, "processor %li: "
 			   "version = %02X,  "
 			   "identification = %06X,  "
 			   "machine = %04X\n",
-			   n, lc->cpu_id.version,
-			   lc->cpu_id.ident,
-			   lc->cpu_id.machine);
+			   n, id->version, id->ident, id->machine);
 	}
-	preempt_enable();
+	put_online_cpus();
 	return 0;
 }
 
 static void *c_start(struct seq_file *m, loff_t *pos)
 {
-	return *pos < NR_CPUS ? (void *)((unsigned long) *pos + 1) : NULL;
+	return *pos < nr_cpu_ids ? (void *)((unsigned long) *pos + 1) : NULL;
 }
 
 static void *c_next(struct seq_file *m, void *v, loff_t *pos)
@@ -124,12 +131,7 @@ const struct seq_operations cpuinfo_op = {
 
 int s390_isolate_bp(void)
 {
-	unsigned long long facility_bits[2];
-	int nr_facilities;
-
-	nr_facilities = min(stfle(facility_bits, 2), 2) * BITS_PER_LONG;
-	facility_bits[1] &= ~(1ULL << 46);
-	if (nr_facilities < 2 || !(facility_bits[1] & (1ULL << 45)))
+	if (!test_facility(82))
 		return -EOPNOTSUPP;
 	set_thread_flag(TIF_ISOLATE_BP);
 	return 0;
@@ -138,12 +140,7 @@ EXPORT_SYMBOL(s390_isolate_bp);
 
 int s390_isolate_bp_guest(void)
 {
-	unsigned long long facility_bits[2];
-	int nr_facilities;
-
-	nr_facilities = min(stfle(facility_bits, 2), 2) * BITS_PER_LONG;
-	facility_bits[1] &= ~(1ULL << 46);
-	if (nr_facilities < 2 || !(facility_bits[1] & (1ULL << 45)))
+	if (!test_facility(82))
 		return -EOPNOTSUPP;
 	set_thread_flag(TIF_ISOLATE_BP_GUEST);
 	return 0;

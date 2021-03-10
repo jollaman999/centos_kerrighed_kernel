@@ -14,7 +14,6 @@
 #include <linux/kernel.h>
 #include <linux/kmemcheck.h>
 #include <linux/mm.h>
-#include <linux/module.h>
 #include <linux/page-flags.h>
 #include <linux/percpu.h>
 #include <linux/ptrace.h>
@@ -337,7 +336,7 @@ bool kmemcheck_is_obj_initialized(unsigned long addr, size_t size)
 	if (!shadow)
 		return true;
 
-	status = kmemcheck_shadow_test(shadow, size);
+	status = kmemcheck_shadow_test_all(shadow, size);
 
 	return status == KMEMCHECK_SHADOW_INITIALIZED;
 }
@@ -630,6 +629,8 @@ bool kmemcheck_fault(struct pt_regs *regs, unsigned long address,
 	pte = kmemcheck_pte_lookup(address);
 	if (!pte)
 		return false;
+
+	WARN_ON_ONCE(in_nmi());
 
 	if (error_code & 2)
 		kmemcheck_access(regs, address, KMEMCHECK_WRITE);

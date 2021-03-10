@@ -28,7 +28,6 @@
  *    Gareth Hughes <gareth@valinux.com>
  */
 
-#include <linux/nospec.h>
 #include <drm/drmP.h>
 #include <drm/r128_drm.h>
 #include "r128_drv.h"
@@ -983,25 +982,14 @@ static int r128_cce_dispatch_write_pixels(struct drm_device *dev,
 
 	xbuf_size = count * sizeof(*x);
 	ybuf_size = count * sizeof(*y);
-	x = kmalloc(xbuf_size, GFP_KERNEL);
-	if (x == NULL)
-		return -ENOMEM;
-	y = kmalloc(ybuf_size, GFP_KERNEL);
-	if (y == NULL) {
+	x = memdup_user(depth->x, xbuf_size);
+	if (IS_ERR(x))
+		return PTR_ERR(x);
+	y = memdup_user(depth->y, ybuf_size);
+	if (IS_ERR(y)) {
 		kfree(x);
-		return -ENOMEM;
+		return PTR_ERR(y);
 	}
-	if (copy_from_user(x, depth->x, xbuf_size)) {
-		kfree(x);
-		kfree(y);
-		return -EFAULT;
-	}
-	if (copy_from_user(y, depth->y, xbuf_size)) {
-		kfree(x);
-		kfree(y);
-		return -EFAULT;
-	}
-
 	buffer_size = depth->n * sizeof(u32);
 	buffer = memdup_user(depth->buffer, buffer_size);
 	if (IS_ERR(buffer)) {
@@ -1323,7 +1311,6 @@ static int r128_cce_vertex(struct drm_device *dev, void *data, struct drm_file *
 	struct drm_buf *buf;
 	drm_r128_buf_priv_t *buf_priv;
 	drm_r128_vertex_t *vertex = data;
-	int idx;
 
 	LOCK_TEST_WITH_RETURN(dev, file_priv);
 
@@ -1337,8 +1324,6 @@ static int r128_cce_vertex(struct drm_device *dev, void *data, struct drm_file *
 			  vertex->idx, dma->buf_count - 1);
 		return -EINVAL;
 	}
-	idx = array_index_nospec(vertex->idx, dma->buf_count);
-
 	if (vertex->prim < 0 ||
 	    vertex->prim > R128_CCE_VC_CNTL_PRIM_TYPE_TRI_TYPE2) {
 		DRM_ERROR("buffer prim %d\n", vertex->prim);
@@ -1348,7 +1333,7 @@ static int r128_cce_vertex(struct drm_device *dev, void *data, struct drm_file *
 	RING_SPACE_TEST_WITH_RETURN(dev_priv);
 	VB_AGE_TEST_WITH_RETURN(dev_priv);
 
-	buf = dma->buflist[idx];
+	buf = dma->buflist[vertex->idx];
 	buf_priv = buf->dev_private;
 
 	if (buf->file_priv != file_priv) {
@@ -1378,7 +1363,7 @@ static int r128_cce_indices(struct drm_device *dev, void *data, struct drm_file 
 	struct drm_buf *buf;
 	drm_r128_buf_priv_t *buf_priv;
 	drm_r128_indices_t *elts = data;
-	int count, idx;
+	int count;
 
 	LOCK_TEST_WITH_RETURN(dev, file_priv);
 
@@ -1392,8 +1377,6 @@ static int r128_cce_indices(struct drm_device *dev, void *data, struct drm_file 
 			  elts->idx, dma->buf_count - 1);
 		return -EINVAL;
 	}
-	idx = array_index_nospec(elts->idx, dma->buf_count);
-
 	if (elts->prim < 0 ||
 	    elts->prim > R128_CCE_VC_CNTL_PRIM_TYPE_TRI_TYPE2) {
 		DRM_ERROR("buffer prim %d\n", elts->prim);
@@ -1403,7 +1386,7 @@ static int r128_cce_indices(struct drm_device *dev, void *data, struct drm_file 
 	RING_SPACE_TEST_WITH_RETURN(dev_priv);
 	VB_AGE_TEST_WITH_RETURN(dev_priv);
 
-	buf = dma->buflist[idx];
+	buf = dma->buflist[elts->idx];
 	buf_priv = buf->dev_private;
 
 	if (buf->file_priv != file_priv) {
@@ -1456,7 +1439,6 @@ static int r128_cce_blit(struct drm_device *dev, void *data, struct drm_file *fi
 			  blit->idx, dma->buf_count - 1);
 		return -EINVAL;
 	}
-	blit->idx = array_index_nospec(blit->idx, dma->buf_count);
 
 	RING_SPACE_TEST_WITH_RETURN(dev_priv);
 	VB_AGE_TEST_WITH_RETURN(dev_priv);
@@ -1467,7 +1449,7 @@ static int r128_cce_blit(struct drm_device *dev, void *data, struct drm_file *fi
 	return ret;
 }
 
-static int r128_cce_depth(struct drm_device *dev, void *data, struct drm_file *file_priv)
+int r128_cce_depth(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	drm_r128_private_t *dev_priv = dev->dev_private;
 	drm_r128_depth_t *depth = data;
@@ -1499,7 +1481,7 @@ static int r128_cce_depth(struct drm_device *dev, void *data, struct drm_file *f
 	return ret;
 }
 
-static int r128_cce_stipple(struct drm_device *dev, void *data, struct drm_file *file_priv)
+int r128_cce_stipple(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	drm_r128_private_t *dev_priv = dev->dev_private;
 	drm_r128_stipple_t *stipple = data;
@@ -1527,7 +1509,6 @@ static int r128_cce_indirect(struct drm_device *dev, void *data, struct drm_file
 	struct drm_buf *buf;
 	drm_r128_buf_priv_t *buf_priv;
 	drm_r128_indirect_t *indirect = data;
-	int idx;
 #if 0
 	RING_LOCALS;
 #endif
@@ -1545,9 +1526,8 @@ static int r128_cce_indirect(struct drm_device *dev, void *data, struct drm_file
 			  indirect->idx, dma->buf_count - 1);
 		return -EINVAL;
 	}
-	idx = array_index_nospec(indirect->idx, dma->buf_count);
 
-	buf = dma->buflist[idx];
+	buf = dma->buflist[indirect->idx];
 	buf_priv = buf->dev_private;
 
 	if (buf->file_priv != file_priv) {
@@ -1591,7 +1571,7 @@ static int r128_cce_indirect(struct drm_device *dev, void *data, struct drm_file
 	return 0;
 }
 
-static int r128_getparam(struct drm_device *dev, void *data, struct drm_file *file_priv)
+int r128_getparam(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	drm_r128_private_t *dev_priv = dev->dev_private;
 	drm_r128_getparam_t *param = data;

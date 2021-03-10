@@ -50,6 +50,7 @@
 #include <linux/tick.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/sched/rt.h>
 
 #include <asm/nmi.h>
 #include <asm/msr.h>
@@ -96,7 +97,7 @@ static unsigned int duration;
 static unsigned int pkg_cstate_ratio_cur;
 static unsigned int window_size;
 
-static int duration_set(const char *arg, struct kernel_param *kp)
+static int duration_set(const char *arg, const struct kernel_param *kp)
 {
 	int ret = 0;
 	unsigned long new_duration;
@@ -118,9 +119,13 @@ exit:
 	return ret;
 }
 
+static struct kernel_param_ops duration_ops = {
+	.set = duration_set,
+	.get = param_get_int,
+};
 
 
-module_param_call(duration, duration_set, param_get_int, &duration, 0644);
+module_param_cb(duration, &duration_ops, &duration, 0644);
 MODULE_PARM_DESC(duration, "forced idle time for each attempt in msec.");
 
 struct powerclamp_calibration_data {
@@ -140,7 +145,7 @@ struct powerclamp_calibration_data {
 
 static struct powerclamp_calibration_data cal_data[MAX_TARGET_RATIO];
 
-static int window_size_set(const char *arg, struct kernel_param *kp)
+static int window_size_set(const char *arg, const struct kernel_param *kp)
 {
 	int ret = 0;
 	unsigned long new_window_size;
@@ -162,8 +167,12 @@ exit_win:
 	return ret;
 }
 
+static struct kernel_param_ops window_size_ops = {
+	.set = window_size_set,
+	.get = param_get_int,
+};
 
-module_param_call(window_size, window_size_set, param_get_int, &window_size, 0644);
+module_param_cb(window_size, &window_size_ops, &window_size, 0644);
 MODULE_PARM_DESC(window_size, "sliding window in number of clamping cycles\n"
 	"\tpowerclamp controls idle ratio within this window. larger\n"
 	"\twindow size results in slower response time but more smooth\n"
@@ -331,7 +340,7 @@ static bool powerclamp_adjust_controls(unsigned int target_ratio,
 
 	/* check result for the last window */
 	msr_now = pkg_state_counter();
-	rdtscll(tsc_now);
+	tsc_now = rdtsc();
 
 	/* calculate pkg cstate vs tsc ratio */
 	if (!msr_last || !tsc_last)
@@ -363,7 +372,7 @@ static int clamp_thread(void *arg)
 {
 	int cpunr = (unsigned long)arg;
 	DEFINE_TIMER(wakeup_timer, noop_timer, 0, 0);
-	struct sched_param param = {
+	static const struct sched_param param = {
 		.sched_priority = MAX_USER_RT_PRIO/2,
 	};
 	unsigned int count = 0;
@@ -379,7 +388,7 @@ static int clamp_thread(void *arg)
 		int sleeptime;
 		unsigned long target_jiffies;
 		unsigned int guard;
-		unsigned int compensation = 0;
+		unsigned int compensated_ratio;
 		int interval; /* jiffies to sleep for each attempt */
 		unsigned int duration_jiffies = msecs_to_jiffies(duration);
 		unsigned int window_size_now;
@@ -400,8 +409,11 @@ static int clamp_thread(void *arg)
 		 * c-states, thus we need to compensate the injected idle ratio
 		 * to achieve the actual target reported by the HW.
 		 */
-		compensation = get_compensation(target_ratio);
-		interval = duration_jiffies*100/(target_ratio+compensation);
+		compensated_ratio = target_ratio +
+			get_compensation(target_ratio);
+		if (compensated_ratio <= 0)
+			compensated_ratio = 1;
+		interval = duration_jiffies * 100 / compensated_ratio;
 
 		/* align idle time */
 		target_jiffies = roundup(jiffies, interval);
@@ -432,7 +444,6 @@ static int clamp_thread(void *arg)
 		 * allowed. thus jiffies are updated properly.
 		 */
 		preempt_disable();
-		tick_nohz_stop_sched_tick(1);
 		/* mwait until target jiffies is reached */
 		while (time_before(jiffies, target_jiffies)) {
 			unsigned long ecx = 1;
@@ -442,15 +453,13 @@ static int clamp_thread(void *arg)
 			 * REVISIT: may call enter_idle() to notify drivers who
 			 * can save power during cpu idle. same for exit_idle()
 			 */
+			local_touch_nmi();
 			stop_critical_timings();
-			__monitor((void *)&current_thread_info()->flags, 0, 0);
-			cpu_relax(); /* allow HT sibling to run */
-			__mwait(eax, ecx);
+			mwait_idle_with_hints(eax, ecx);
 			start_critical_timings();
 			atomic_inc(&idle_wakeup_counter);
 		}
-		tick_nohz_restart_sched_tick();
-		preempt_enable_no_resched();
+		preempt_enable();
 	}
 	del_timer_sync(&wakeup_timer);
 	clear_bit(cpunr, cpu_clamping_mask);
@@ -476,7 +485,7 @@ static void poll_pkg_cstate(struct work_struct *dummy)
 	u64 val64;
 
 	msr_now = pkg_state_counter();
-	rdtscll(tsc_now);
+	tsc_now = rdtsc();
 	jiffies_now = jiffies;
 
 	/* calculate pkg cstate vs tsc ratio */
@@ -504,12 +513,6 @@ static int start_power_clamp(void)
 	unsigned long cpu;
 	struct task_struct *thread;
 
-	/* check if pkg cstate counter is completely 0, abort in this case */
-	if (!has_pkg_state_counter()) {
-		pr_err("pkg cstate counter not functional, abort\n");
-		return -EINVAL;
-	}
-
 	set_target_ratio = clamp(set_target_ratio, 0U, MAX_TARGET_RATIO - 1);
 	/* prevent cpu hotplug */
 	get_online_cpus();
@@ -527,9 +530,10 @@ static int start_power_clamp(void)
 		struct task_struct **p =
 			per_cpu_ptr(powerclamp_thread, cpu);
 
-		thread = kthread_create(clamp_thread,
+		thread = kthread_create_on_node(clamp_thread,
 						(void *) cpu,
-						"kidle_inject/%ld", cpu);
+						cpu_to_node(cpu),
+						"kidle_inj/%ld", cpu);
 		/* bind to cpu here */
 		if (likely(!IS_ERR(thread))) {
 			kthread_bind(thread, cpu);
@@ -577,9 +581,10 @@ static int powerclamp_cpu_callback(struct notifier_block *nfb,
 
 	switch (action) {
 	case CPU_ONLINE:
-		thread = kthread_create(clamp_thread,
+		thread = kthread_create_on_node(clamp_thread,
 						(void *) cpu,
-						"kidle_inject/%lu", cpu);
+						cpu_to_node(cpu),
+						"kidle_inj/%lu", cpu);
 		if (likely(!IS_ERR(thread))) {
 			kthread_bind(thread, cpu);
 			wake_up_process(thread);
@@ -645,8 +650,8 @@ static int powerclamp_set_cur_state(struct thermal_cooling_device *cdev,
 		goto exit_set;
 	} else	if (set_target_ratio > 0 && new_target_ratio == 0) {
 		pr_info("Stop forced idle injection\n");
-		set_target_ratio = 0;
 		end_power_clamp();
+		set_target_ratio = 0;
 	} else	/* adjust currently running */ {
 		set_target_ratio = new_target_ratio;
 		/* make new set_target_ratio visible to other cpus */
@@ -664,49 +669,25 @@ static struct thermal_cooling_device_ops powerclamp_cooling_ops = {
 	.set_cur_state = powerclamp_set_cur_state,
 };
 
-/* runs on Nehalem and later */
-static const struct x86_cpu_id intel_powerclamp_ids[] = {
-	{ X86_VENDOR_INTEL, 6, 0x1a},
-	{ X86_VENDOR_INTEL, 6, 0x1c},
-	{ X86_VENDOR_INTEL, 6, 0x1e},
-	{ X86_VENDOR_INTEL, 6, 0x1f},
-	{ X86_VENDOR_INTEL, 6, 0x25},
-	{ X86_VENDOR_INTEL, 6, 0x26},
-	{ X86_VENDOR_INTEL, 6, 0x2a},
-	{ X86_VENDOR_INTEL, 6, 0x2c},
-	{ X86_VENDOR_INTEL, 6, 0x2d},
-	{ X86_VENDOR_INTEL, 6, 0x2e},
-	{ X86_VENDOR_INTEL, 6, 0x2f},
-	{ X86_VENDOR_INTEL, 6, 0x37},
-	{ X86_VENDOR_INTEL, 6, 0x3a},
-	{ X86_VENDOR_INTEL, 6, 0x3c},
-	{ X86_VENDOR_INTEL, 6, 0x3d},
-	{ X86_VENDOR_INTEL, 6, 0x3e},
-	{ X86_VENDOR_INTEL, 6, 0x3f},
-	{ X86_VENDOR_INTEL, 6, 0x45},
-	{ X86_VENDOR_INTEL, 6, 0x46},
-	{ X86_VENDOR_INTEL, 6, 0x47},
-	{ X86_VENDOR_INTEL, 6, 0x4d},
-	{ X86_VENDOR_INTEL, 6, 0x4e},
-	{ X86_VENDOR_INTEL, 6, 0x4f},
-	{ X86_VENDOR_INTEL, 6, 0x56},
-	{ X86_VENDOR_INTEL, 6, 0x5e},
+static const struct x86_cpu_id __initconst intel_powerclamp_ids[] = {
+	{ X86_VENDOR_INTEL, X86_FAMILY_ANY, X86_MODEL_ANY, X86_FEATURE_MWAIT },
 	{}
 };
 MODULE_DEVICE_TABLE(x86cpu, intel_powerclamp_ids);
 
-static int powerclamp_probe(void)
+static int __init powerclamp_probe(void)
 {
+
 	if (!x86_match_cpu(intel_powerclamp_ids)) {
-		pr_err("Intel powerclamp does not run on family %d model %d\n",
-				boot_cpu_data.x86, boot_cpu_data.x86_model);
+		pr_err("CPU does not support MWAIT");
 		return -ENODEV;
 	}
-	if (!boot_cpu_has(X86_FEATURE_NONSTOP_TSC) ||
-		!boot_cpu_has(X86_FEATURE_CONSTANT_TSC) ||
-		!boot_cpu_has(X86_FEATURE_MWAIT) ||
-		!boot_cpu_has(X86_FEATURE_ARAT))
+
+	/* The goal for idle time alignment is to achieve package cstate. */
+	if (!has_pkg_state_counter()) {
+		pr_info("No package C-state available");
 		return -ENODEV;
+	}
 
 	/* find the deepest mwait value */
 	find_target_mwait();
@@ -761,7 +742,7 @@ file_error:
 	debugfs_remove_recursive(debug_dir);
 }
 
-static int powerclamp_init(void)
+static int __init powerclamp_init(void)
 {
 	int retval;
 	int bitmap_size;
@@ -810,7 +791,7 @@ exit_free:
 }
 module_init(powerclamp_init);
 
-static void powerclamp_exit(void)
+static void __exit powerclamp_exit(void)
 {
 	unregister_hotcpu_notifier(&powerclamp_cpu_notifier);
 	end_power_clamp();

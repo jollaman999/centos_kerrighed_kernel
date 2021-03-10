@@ -1,12 +1,13 @@
 /*
- *  drivers/s390/net/qeth_core_sys.c
- *
  *    Copyright IBM Corp. 2007
  *    Author(s): Utz Bacher <utz.bacher@de.ibm.com>,
  *		 Frank Pavlic <fpavlic@de.ibm.com>,
  *		 Thomas Spatzier <tspat@de.ibm.com>,
  *		 Frank Blaschka <frank.blaschka@de.ibm.com>
  */
+
+#define KMSG_COMPONENT "qeth"
+#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
 
 #include <linux/list.h>
 #include <linux/rwsem.h>
@@ -216,6 +217,10 @@ static ssize_t qeth_dev_prioqing_show(struct device *dev,
 		return sprintf(buf, "%s\n", "by precedence");
 	case QETH_PRIO_Q_ING_TOS:
 		return sprintf(buf, "%s\n", "by type of service");
+	case QETH_PRIO_Q_ING_SKB:
+		return sprintf(buf, "%s\n", "by skb-priority");
+	case QETH_PRIO_Q_ING_VLAN:
+		return sprintf(buf, "%s\n", "by VLAN headers");
 	default:
 		return sprintf(buf, "always queue %i\n",
 			       card->qdio.default_out_queue);
@@ -249,11 +254,23 @@ static ssize_t qeth_dev_prioqing_store(struct device *dev,
 	}
 
 	tmp = strsep((char **) &buf, "\n");
-	if (!strcmp(tmp, "prio_queueing_prec"))
+	if (!strcmp(tmp, "prio_queueing_prec")) {
 		card->qdio.do_prio_queueing = QETH_PRIO_Q_ING_PREC;
-	else if (!strcmp(tmp, "prio_queueing_tos"))
+		card->qdio.default_out_queue = QETH_DEFAULT_QUEUE;
+	} else if (!strcmp(tmp, "prio_queueing_skb")) {
+		card->qdio.do_prio_queueing = QETH_PRIO_Q_ING_SKB;
+		card->qdio.default_out_queue = QETH_DEFAULT_QUEUE;
+	} else if (!strcmp(tmp, "prio_queueing_tos")) {
 		card->qdio.do_prio_queueing = QETH_PRIO_Q_ING_TOS;
-	else if (!strcmp(tmp, "no_prio_queueing:0")) {
+		card->qdio.default_out_queue = QETH_DEFAULT_QUEUE;
+	} else if (!strcmp(tmp, "prio_queueing_vlan")) {
+		if (!card->options.layer2) {
+			rc = -ENOTSUPP;
+			goto out;
+		}
+		card->qdio.do_prio_queueing = QETH_PRIO_Q_ING_VLAN;
+		card->qdio.default_out_queue = QETH_DEFAULT_QUEUE;
+	} else if (!strcmp(tmp, "no_prio_queueing:0")) {
 		card->qdio.do_prio_queueing = QETH_NO_PRIO_QUEUEING;
 		card->qdio.default_out_queue = 0;
 	} else if (!strcmp(tmp, "no_prio_queueing:1")) {
@@ -263,6 +280,10 @@ static ssize_t qeth_dev_prioqing_store(struct device *dev,
 		card->qdio.do_prio_queueing = QETH_NO_PRIO_QUEUEING;
 		card->qdio.default_out_queue = 2;
 	} else if (!strcmp(tmp, "no_prio_queueing:3")) {
+		if (card->info.type == QETH_CARD_TYPE_IQD) {
+			rc = -EPERM;
+			goto out;
+		}
 		card->qdio.do_prio_queueing = QETH_NO_PRIO_QUEUEING;
 		card->qdio.default_out_queue = 3;
 	} else if (!strcmp(tmp, "no_prio_queueing")) {
@@ -369,7 +390,7 @@ static ssize_t qeth_dev_performance_stats_store(struct device *dev,
 	i = simple_strtoul(buf, &tmp, 16);
 	if ((i == 0) || (i == 1)) {
 		if (i == card->options.performance_stats)
-			goto out;;
+			goto out;
 		card->options.performance_stats = i;
 		if (i == 0)
 			memset(&card->perf_stats, 0,
@@ -429,19 +450,25 @@ static ssize_t qeth_dev_layer2_store(struct device *dev,
 
 	if (card->options.layer2 == newdis)
 		goto out;
-	else {
-		card->info.mac_bits  = 0;
-		if (card->discipline.ccwgdriver) {
-			card->discipline.ccwgdriver->remove(card->gdev);
-			qeth_core_free_discipline(card);
-		}
+	if (card->info.type == QETH_CARD_TYPE_OSM) {
+		/* fixed layer, can't switch */
+		rc = -EOPNOTSUPP;
+		goto out;
+	}
+
+	card->info.mac_bits = 0;
+	if (card->discipline) {
+		card->discipline->remove(card->gdev);
+		qeth_core_free_discipline(card);
 	}
 
 	rc = qeth_core_load_discipline(card, newdis);
 	if (rc)
 		goto out;
 
-	rc = card->discipline.ccwgdriver->probe(card->gdev);
+	rc = card->discipline->setup(card->gdev);
+	if (rc)
+		qeth_core_free_discipline(card);
 out:
 	mutex_unlock(&card->discipline_mutex);
 	return rc ? rc : count;
@@ -726,11 +753,11 @@ static struct attribute *qeth_blkt_device_attrs[] = {
 	&dev_attr_inter_jumbo.attr,
 	NULL,
 };
-
-static struct attribute_group qeth_device_blkt_group = {
+const struct attribute_group qeth_device_blkt_group = {
 	.name = "blkt",
 	.attrs = qeth_blkt_device_attrs,
 };
+EXPORT_SYMBOL_GPL(qeth_device_blkt_group);
 
 static struct attribute *qeth_device_attrs[] = {
 	&dev_attr_state.attr,
@@ -750,9 +777,15 @@ static struct attribute *qeth_device_attrs[] = {
 	&dev_attr_switch_attrs.attr,
 	NULL,
 };
-
-static struct attribute_group qeth_device_attr_group = {
+const struct attribute_group qeth_device_attr_group = {
 	.attrs = qeth_device_attrs,
+};
+EXPORT_SYMBOL_GPL(qeth_device_attr_group);
+
+const struct attribute_group *qeth_generic_attr_groups[] = {
+	&qeth_device_attr_group,
+	&qeth_device_blkt_group,
+	NULL,
 };
 
 static struct attribute *qeth_osn_device_attrs[] = {
@@ -764,37 +797,10 @@ static struct attribute *qeth_osn_device_attrs[] = {
 	&dev_attr_recover.attr,
 	NULL,
 };
-
 static struct attribute_group qeth_osn_device_attr_group = {
 	.attrs = qeth_osn_device_attrs,
 };
-
-int qeth_core_create_device_attributes(struct device *dev)
-{
-	int ret;
-	ret = sysfs_create_group(&dev->kobj, &qeth_device_attr_group);
-	if (ret)
-		return ret;
-	ret = sysfs_create_group(&dev->kobj, &qeth_device_blkt_group);
-	if (ret)
-		sysfs_remove_group(&dev->kobj, &qeth_device_attr_group);
-
-	return 0;
-}
-
-void qeth_core_remove_device_attributes(struct device *dev)
-{
-	sysfs_remove_group(&dev->kobj, &qeth_device_attr_group);
-	sysfs_remove_group(&dev->kobj, &qeth_device_blkt_group);
-}
-
-int qeth_core_create_osn_attributes(struct device *dev)
-{
-	return sysfs_create_group(&dev->kobj, &qeth_osn_device_attr_group);
-}
-
-void qeth_core_remove_osn_attributes(struct device *dev)
-{
-	sysfs_remove_group(&dev->kobj, &qeth_osn_device_attr_group);
-	return;
-}
+const struct attribute_group *qeth_osn_attr_groups[] = {
+	&qeth_osn_device_attr_group,
+	NULL,
+};

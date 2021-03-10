@@ -108,6 +108,7 @@ struct isci_remote_device {
 
 #define ISCI_REMOTE_DEVICE_START_TIMEOUT 5000
 
+/* device reference routines must be called under sci_lock */
 static inline struct isci_remote_device *isci_get_device(
 	struct isci_remote_device *idev)
 {
@@ -116,7 +117,6 @@ static inline struct isci_remote_device *isci_get_device(
 	return idev;
 }
 
-/* device reference routines must be called under sci_lock */
 static inline struct isci_remote_device *isci_lookup_device(struct domain_device *dev)
 {
 	struct isci_remote_device *idev = dev->lldd_dev;
@@ -297,7 +297,7 @@ static inline struct isci_remote_device *rnc_to_dev(struct sci_remote_node_conte
 
 static inline bool dev_is_expander(struct domain_device *dev)
 {
-	return dev->dev_type == EDGE_DEV || dev->dev_type == FANOUT_DEV;
+	return dev->dev_type == SAS_EDGE_EXPANDER_DEVICE || dev->dev_type == SAS_FANOUT_EXPANDER_DEVICE;
 }
 
 static inline void sci_remote_device_decrement_request_count(struct isci_remote_device *idev)
@@ -348,6 +348,10 @@ enum sci_status sci_remote_device_terminate_requests(
 int isci_remote_device_is_safe_to_abort(
 	struct isci_remote_device *idev);
 
+enum sci_status
+sci_remote_device_abort_requests_pending_abort(
+	struct isci_remote_device *idev);
+
 enum sci_status isci_remote_device_suspend(
 	struct isci_host *ihost,
 	struct isci_remote_device *idev);
@@ -367,10 +371,6 @@ enum sci_status isci_remote_device_reset(
 
 enum sci_status isci_remote_device_reset_complete(
 	struct isci_host *ihost,
-	struct isci_remote_device *idev);
-
-enum sci_status
-sci_remote_device_abort_requests_pending_abort(
 	struct isci_remote_device *idev);
 
 enum sci_status isci_remote_device_suspend_terminate(

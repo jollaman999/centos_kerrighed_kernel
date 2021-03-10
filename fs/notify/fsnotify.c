@@ -18,8 +18,10 @@
 
 #include <linux/dcache.h>
 #include <linux/fs.h>
+#include <linux/gfp.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/mount.h>
 #include <linux/srcu.h>
 
 #include <linux/fsnotify_backend.h>
@@ -33,6 +35,75 @@ void __fsnotify_inode_delete(struct inode *inode)
 	fsnotify_clear_marks_by_inode(inode);
 }
 EXPORT_SYMBOL_GPL(__fsnotify_inode_delete);
+
+void __fsnotify_vfsmount_delete(struct vfsmount *mnt)
+{
+	fsnotify_clear_marks_by_mount(mnt);
+}
+
+/**
+ * fsnotify_unmount_inodes - an sb is unmounting.  handle any watched inodes.
+ * @sb: superblock being unmounted.
+ *
+ * Called during unmount with no locks held, so needs to be safe against
+ * concurrent modifiers. We temporarily drop sb->s_inode_list_lock and CAN block.
+ */
+void fsnotify_unmount_inodes(struct super_block *sb)
+{
+	struct inode *inode, *iput_inode = NULL;
+
+	spin_lock(&sb->s_inode_list_lock);
+	list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+		/*
+		 * We cannot __iget() an inode in state I_FREEING,
+		 * I_WILL_FREE, or I_NEW which is fine because by that point
+		 * the inode cannot have any associated watches.
+		 */
+		spin_lock(&inode->i_lock);
+		if (inode->i_state & (I_FREEING|I_WILL_FREE|I_NEW)) {
+			spin_unlock(&inode->i_lock);
+			continue;
+		}
+
+		/*
+		 * If i_count is zero, the inode cannot have any watches and
+		 * doing an __iget/iput with MS_ACTIVE clear would actually
+		 * evict all inodes with zero i_count from icache which is
+		 * unnecessarily violent and may in fact be illegal to do.
+		 * However, we should have been called /after/ evict_inodes
+		 * removed all zero refcount inodes, in any case.  Test to
+		 * be sure.
+		 */
+		if (!atomic_read(&inode->i_count)) {
+			spin_unlock(&inode->i_lock);
+			continue;
+		}
+
+		__iget(inode);
+		spin_unlock(&inode->i_lock);
+		spin_unlock(&sb->s_inode_list_lock);
+
+		if (iput_inode)
+			iput(iput_inode);
+
+		/* for each watch, send FS_UNMOUNT and then remove it */
+		fsnotify(inode, FS_UNMOUNT, inode, FSNOTIFY_EVENT_INODE, NULL, 0);
+
+		fsnotify_inode_delete(inode);
+
+		iput_inode = inode;
+
+		cond_resched();
+		spin_lock(&sb->s_inode_list_lock);
+	}
+	spin_unlock(&sb->s_inode_list_lock);
+
+	if (iput_inode)
+		iput(iput_inode);
+	/* Wait for outstanding inode references from connectors */
+	wait_event(sb->s_writers.wait_unfrozen,
+		       !atomic_long_read(&sb->s_fsnotify_inode_refs));
+}
 
 /*
  * Given an inode, first check if we care what happens to our children.  Inotify
@@ -52,79 +123,198 @@ void __fsnotify_update_child_dentry_flags(struct inode *inode)
 	/* determine if the children should tell inode about their events */
 	watched = fsnotify_inode_watches_children(inode);
 
-	spin_lock(&dcache_lock);
+	spin_lock(&inode->i_lock);
 	/* run all of the dentries associated with this inode.  Since this is a
 	 * directory, there damn well better only be one item on this list */
-	list_for_each_entry(alias, &inode->i_dentry, d_alias) {
+	hlist_for_each_entry(alias, &inode->i_dentry, d_alias) {
 		struct dentry *child;
 
 		/* run all of the children of the original inode and fix their
 		 * d_flags to indicate parental interest (their parent is the
 		 * original inode) */
+		spin_lock(&alias->d_lock);
 		list_for_each_entry(child, &alias->d_subdirs, d_u.d_child) {
 			if (!child->d_inode)
 				continue;
 
-			spin_lock(&child->d_lock);
+			spin_lock_nested(&child->d_lock, DENTRY_D_LOCK_NESTED);
 			if (watched)
 				child->d_flags |= DCACHE_FSNOTIFY_PARENT_WATCHED;
 			else
 				child->d_flags &= ~DCACHE_FSNOTIFY_PARENT_WATCHED;
 			spin_unlock(&child->d_lock);
 		}
+		spin_unlock(&alias->d_lock);
 	}
-	spin_unlock(&dcache_lock);
+	spin_unlock(&inode->i_lock);
 }
 
 /* Notify this dentry's parent about a child's events. */
-void __fsnotify_parent(struct dentry *dentry, __u32 mask)
+int __fsnotify_parent(const struct path *path, struct dentry *dentry, __u32 mask)
 {
 	struct dentry *parent;
 	struct inode *p_inode;
-	bool send = false;
-	bool should_update_children = false;
+	int ret = 0;
+
+	if (!dentry)
+		dentry = path->dentry;
 
 	if (!(dentry->d_flags & DCACHE_FSNOTIFY_PARENT_WATCHED))
-		return;
+		return 0;
 
-	spin_lock(&dentry->d_lock);
-	parent = dentry->d_parent;
+	parent = dget_parent(dentry);
 	p_inode = parent->d_inode;
 
-	if (fsnotify_inode_watches_children(p_inode)) {
-		if (p_inode->i_fsnotify_mask & mask) {
-			dget(parent);
-			send = true;
-		}
-	} else {
-		/*
-		 * The parent doesn't care about events on it's children but
-		 * at least one child thought it did.  We need to run all the
-		 * children and update their d_flags to let them know p_inode
-		 * doesn't care about them any more.
-		 */
-		dget(parent);
-		should_update_children = true;
-	}
+	if (unlikely(!fsnotify_inode_watches_children(p_inode))) {
+		__fsnotify_update_child_dentry_flags(p_inode);
+	} else if (p_inode->i_fsnotify_mask & mask & ALL_FSNOTIFY_EVENTS) {
+		struct name_snapshot name;
 
-	spin_unlock(&dentry->d_lock);
-
-	if (send) {
 		/* we are notifying a parent so come up with the new mask which
 		 * specifies these are events which came from a child. */
 		mask |= FS_EVENT_ON_CHILD;
 
-		fsnotify(p_inode, mask, dentry->d_inode, FSNOTIFY_EVENT_INODE,
-			 dentry->d_name.name, 0);
-		dput(parent);
+		take_dentry_name_snapshot(&name, dentry);
+		if (path)
+			ret = fsnotify(p_inode, mask, path, FSNOTIFY_EVENT_PATH,
+				       name.name, 0);
+		else
+			ret = fsnotify(p_inode, mask, dentry->d_inode, FSNOTIFY_EVENT_INODE,
+				       name.name, 0);
+		release_dentry_name_snapshot(&name);
 	}
 
-	if (unlikely(should_update_children)) {
-		__fsnotify_update_child_dentry_flags(p_inode);
-		dput(parent);
-	}
+	dput(parent);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(__fsnotify_parent);
+
+static int send_to_group(struct inode *to_tell,
+			 __u32 mask, const void *data,
+			 int data_is, u32 cookie,
+			 const unsigned char *file_name,
+			 struct fsnotify_iter_info *iter_info)
+{
+	struct fsnotify_group *group = NULL;
+	__u32 test_mask = (mask & ~FS_EVENT_ON_CHILD);
+	__u32 marks_mask = 0;
+	__u32 marks_ignored_mask = 0;
+	struct fsnotify_mark *mark;
+	int type;
+
+	if (WARN_ON(!iter_info->report_mask))
+		return 0;
+
+	/* clear ignored on inode modification */
+	if (mask & FS_MODIFY) {
+		fsnotify_foreach_obj_type(type) {
+			if (!fsnotify_iter_should_report_type(iter_info, type))
+				continue;
+			mark = iter_info->marks[type];
+			if (mark &&
+			    !(mark->flags & FSNOTIFY_MARK_FLAG_IGNORED_SURV_MODIFY))
+				mark->ignored_mask = 0;
+		}
+	}
+
+	fsnotify_foreach_obj_type(type) {
+		if (!fsnotify_iter_should_report_type(iter_info, type))
+			continue;
+		mark = iter_info->marks[type];
+		/* does the object mark tell us to do something? */
+		if (mark) {
+			group = mark->group;
+			marks_mask |= mark->mask;
+			marks_ignored_mask |= mark->ignored_mask;
+		}
+	}
+
+	pr_debug("%s: group=%p to_tell=%p mask=%x marks_mask=%x marks_ignored_mask=%x"
+		 " data=%p data_is=%d cookie=%d\n",
+		 __func__, group, to_tell, mask, marks_mask, marks_ignored_mask,
+		 data, data_is, cookie);
+
+	if (!(test_mask & marks_mask & ~marks_ignored_mask))
+		return 0;
+
+	return group->ops->handle_event(group, to_tell, mask, data, data_is,
+					file_name, cookie, iter_info);
+}
+
+static struct fsnotify_mark *fsnotify_first_mark(struct fsnotify_mark_connector **connp)
+{
+	struct fsnotify_mark_connector *conn;
+	struct hlist_node *node = NULL;
+
+	conn = srcu_dereference(*connp, &fsnotify_mark_srcu);
+	if (conn)
+		node = srcu_dereference(conn->list.first, &fsnotify_mark_srcu);
+
+	return hlist_entry_safe(node, struct fsnotify_mark, obj_list);
+}
+
+static struct fsnotify_mark *fsnotify_next_mark(struct fsnotify_mark *mark)
+{
+	struct hlist_node *node = NULL;
+
+	if (mark)
+		node = srcu_dereference(mark->obj_list.next,
+					&fsnotify_mark_srcu);
+
+	return hlist_entry_safe(node, struct fsnotify_mark, obj_list);
+}
+
+/*
+ * iter_info is a multi head priority queue of marks.
+ * Pick a subset of marks from queue heads, all with the
+ * same group and set the report_mask for selected subset.
+ * Returns the report_mask of the selected subset.
+ */
+static unsigned int fsnotify_iter_select_report_types(
+		struct fsnotify_iter_info *iter_info)
+{
+	struct fsnotify_group *max_prio_group = NULL;
+	struct fsnotify_mark *mark;
+	int type;
+
+	/* Choose max prio group among groups of all queue heads */
+	fsnotify_foreach_obj_type(type) {
+		mark = iter_info->marks[type];
+		if (mark &&
+		    fsnotify_compare_groups(max_prio_group, mark->group) > 0)
+			max_prio_group = mark->group;
+	}
+
+	if (!max_prio_group)
+		return 0;
+
+	/* Set the report mask for marks from same group as max prio group */
+	iter_info->report_mask = 0;
+	fsnotify_foreach_obj_type(type) {
+		mark = iter_info->marks[type];
+		if (mark &&
+		    fsnotify_compare_groups(max_prio_group, mark->group) == 0)
+			fsnotify_iter_set_report_type(iter_info, type);
+	}
+
+	return iter_info->report_mask;
+}
+
+/*
+ * Pop from iter_info multi head queue, the marks that were iterated in the
+ * current iteration step.
+ */
+static void fsnotify_iter_next(struct fsnotify_iter_info *iter_info)
+{
+	int type;
+
+	fsnotify_foreach_obj_type(type) {
+		if (fsnotify_iter_should_report_type(iter_info, type))
+			iter_info->marks[type] =
+				fsnotify_next_mark(iter_info->marks[type]);
+	}
+}
 
 /*
  * This is the main call to fsnotify.  The VFS calls into hook specific functions
@@ -132,57 +322,90 @@ EXPORT_SYMBOL_GPL(__fsnotify_parent);
  * out to all of the registered fsnotify_group.  Those groups can then use the
  * notification event in whatever means they feel necessary.
  */
-void fsnotify(struct inode *to_tell, __u32 mask, void *data, int data_is, const char *file_name, u32 cookie)
+int fsnotify(struct inode *to_tell, __u32 mask, const void *data, int data_is,
+	     const unsigned char *file_name, u32 cookie)
 {
-	struct fsnotify_group *group;
-	struct fsnotify_event *event = NULL;
-	int idx;
+	struct fsnotify_iter_info iter_info = {};
+	struct mount *mnt;
+	int ret = 0;
 	/* global tests shouldn't care about events on child only the specific event */
 	__u32 test_mask = (mask & ~FS_EVENT_ON_CHILD);
 
-	if (list_empty(&fsnotify_groups))
-		return;
+	if (data_is == FSNOTIFY_EVENT_PATH)
+		mnt = real_mount(((const struct path *)data)->mnt);
+	else
+		mnt = NULL;
 
-	if (!(test_mask & fsnotify_mask))
-		return;
+	/* An event "on child" is not intended for a mount mark */
+	if (mask & FS_EVENT_ON_CHILD)
+		mnt = NULL;
 
-	if (!(test_mask & to_tell->i_fsnotify_mask))
-		return;
 	/*
-	 * SRCU!!  the groups list is very very much read only and the path is
-	 * very hot.  The VAST majority of events are not going to need to do
-	 * anything other than walk the list so it's crazy to pre-allocate.
+	 * Optimization: srcu_read_lock() has a memory barrier which can
+	 * be expensive.  It protects walking the *_fsnotify_marks lists.
+	 * However, if we do not walk the lists, we do not have to do
+	 * SRCU because we have no references to any objects and do not
+	 * need SRCU to keep them "alive".
 	 */
-	idx = srcu_read_lock(&fsnotify_grp_srcu);
-	list_for_each_entry_rcu(group, &fsnotify_groups, group_list) {
-		if (test_mask & group->mask) {
-			if (!group->ops->should_send_event(group, to_tell, mask))
-				continue;
-			if (!event) {
-				event = fsnotify_create_event(to_tell, mask, data,
-							      data_is, file_name, cookie,
-							      GFP_NOFS);
-				/* shit, we OOM'd and now we can't tell, maybe
-				 * someday someone else will want to do something
-				 * here */
-				if (!event)
-					break;
-			}
-			group->ops->handle_event(group, event);
-		}
+	if (!to_tell->i_fsnotify_marks &&
+	    (!mnt || !mnt->mnt_fsnotify_marks))
+		return 0;
+	/*
+	 * if this is a modify event we may need to clear the ignored masks
+	 * otherwise return if neither the inode nor the vfsmount care about
+	 * this type of event.
+	 */
+	if (!(mask & FS_MODIFY) &&
+	    !(test_mask & to_tell->i_fsnotify_mask) &&
+	    !(mnt && test_mask & mnt->mnt_fsnotify_mask))
+		return 0;
+
+	iter_info.srcu_idx = srcu_read_lock(&fsnotify_mark_srcu);
+
+	iter_info.marks[FSNOTIFY_OBJ_TYPE_INODE] =
+		fsnotify_first_mark(&to_tell->i_fsnotify_marks);
+	if (mnt) {
+		iter_info.marks[FSNOTIFY_OBJ_TYPE_VFSMOUNT] =
+			fsnotify_first_mark(&mnt->mnt_fsnotify_marks);
 	}
-	srcu_read_unlock(&fsnotify_grp_srcu, idx);
+
 	/*
-	 * fsnotify_create_event() took a reference so the event can't be cleaned
-	 * up while we are still trying to add it to lists, drop that one.
+	 * We need to merge inode & vfsmount mark lists so that inode mark
+	 * ignore masks are properly reflected for mount mark notifications.
+	 * That's why this traversal is so complicated...
 	 */
-	if (event)
-		fsnotify_put_event(event);
+	while (fsnotify_iter_select_report_types(&iter_info)) {
+		ret = send_to_group(to_tell, mask, data, data_is, cookie,
+				    file_name, &iter_info);
+
+		if (ret && (mask & ALL_FSNOTIFY_PERM_EVENTS))
+			goto out;
+
+		fsnotify_iter_next(&iter_info);
+	}
+	ret = 0;
+out:
+	srcu_read_unlock(&fsnotify_mark_srcu, iter_info.srcu_idx);
+
+	return ret;
 }
 EXPORT_SYMBOL_GPL(fsnotify);
 
+extern struct kmem_cache *fsnotify_mark_connector_cachep;
+
 static __init int fsnotify_init(void)
 {
-	return init_srcu_struct(&fsnotify_grp_srcu);
+	int ret;
+
+	BUG_ON(hweight32(ALL_FSNOTIFY_EVENTS) != 23);
+
+	ret = init_srcu_struct(&fsnotify_mark_srcu);
+	if (ret)
+		panic("initializing fsnotify_mark_srcu");
+
+	fsnotify_mark_connector_cachep = KMEM_CACHE(fsnotify_mark_connector,
+						    SLAB_PANIC);
+
+	return 0;
 }
-subsys_initcall(fsnotify_init);
+core_initcall(fsnotify_init);

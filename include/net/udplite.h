@@ -26,6 +26,7 @@ static __inline__ int udplite_getfrag(void *from, char *to, int  offset,
 static inline int udplite_sk_init(struct sock *sk)
 {
 	udp_sk(sk)->pcflag = UDPLITE_BIT;
+	sk->sk_destruct = udp_destruct_sock;
 	return 0;
 }
 
@@ -40,7 +41,7 @@ static inline int udplite_checksum_init(struct sk_buff *skb, struct udphdr *uh)
          * checksum. UDP-Lite (like IPv6) mandates checksums, hence packets
          * with a zero checksum field are illegal.                            */
 	if (uh->check == 0) {
-		LIMIT_NETDEBUG(KERN_DEBUG "UDPLITE: zeroed checksum field\n");
+		LIMIT_NETDEBUG(KERN_DEBUG "UDPLite: zeroed checksum field\n");
 		return 1;
 	}
 
@@ -52,7 +53,7 @@ static inline int udplite_checksum_init(struct sk_buff *skb, struct udphdr *uh)
 		/*
 		 * Coverage length violates RFC 3828: log and discard silently.
 		 */
-		LIMIT_NETDEBUG(KERN_DEBUG "UDPLITE: bad csum coverage %d/%d\n",
+		LIMIT_NETDEBUG(KERN_DEBUG "UDPLite: bad csum coverage %d/%d\n",
 			       cscov, skb->len);
 		return 1;
 
@@ -61,6 +62,7 @@ static inline int udplite_checksum_init(struct sk_buff *skb, struct udphdr *uh)
 		UDP_SKB_CB(skb)->cscov = cscov;
 		if (skb->ip_summed == CHECKSUM_COMPLETE)
 			skb->ip_summed = CHECKSUM_NONE;
+		skb->csum_valid = 0;
         }
 
 	return 0;
@@ -79,7 +81,6 @@ static inline __wsum udplite_csum_outgoing(struct sock *sk, struct sk_buff *skb)
 		 * The special case "up->pcslen == 0" signifies full coverage.
 		 */
 		if (up->pcslen < up->len) {
-			gmb();
 			if (0 < up->pcslen)
 				cscov = up->pcslen;
 			udp_hdr(skb)->len = htons(up->pcslen);

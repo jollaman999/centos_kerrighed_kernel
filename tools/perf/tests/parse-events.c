@@ -1,15 +1,18 @@
-
 #include "parse-events.h"
 #include "evsel.h"
 #include "evlist.h"
-/* XXX There's no support for HW_BREAKPOINT in RHEL6 yet.
-#include "../../../include/linux/hw_breakpoint.h"
-*/
 #include <api/fs/fs.h>
-#include <api/fs/tracefs.h>
-#include <api/fs/debugfs.h>
 #include "tests.h"
 #include "debug.h"
+#include "util.h"
+#include <dirent.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <linux/kernel.h>
+#include <linux/hw_breakpoint.h>
+#include <api/fs/tracing_path.h>
 
 #define PERF_TP_SAMPLE_TYPE (PERF_SAMPLE_RAW | PERF_SAMPLE_TIME | \
 			     PERF_SAMPLE_CPU | PERF_SAMPLE_PERIOD)
@@ -34,7 +37,7 @@ static int test__checkevent_tracepoint_multi(struct perf_evlist *evlist)
 	TEST_ASSERT_VAL("wrong number of entries", evlist->nr_entries > 1);
 	TEST_ASSERT_VAL("wrong number of groups", 0 == evlist->nr_groups);
 
-	evlist__for_each(evlist, evsel) {
+	evlist__for_each_entry(evlist, evsel) {
 		TEST_ASSERT_VAL("wrong type",
 			PERF_TYPE_TRACEPOINT == evsel->attr.type);
 		TEST_ASSERT_VAL("wrong sample_type",
@@ -84,8 +87,12 @@ static int test__checkevent_symbolic_name_config(struct perf_evlist *evlist)
 	TEST_ASSERT_VAL("wrong type", PERF_TYPE_HARDWARE == evsel->attr.type);
 	TEST_ASSERT_VAL("wrong config",
 			PERF_COUNT_HW_CPU_CYCLES == evsel->attr.config);
+	/*
+	 * The period value gets configured within perf_evlist__config,
+	 * while this test executes only parse events method.
+	 */
 	TEST_ASSERT_VAL("wrong period",
-			100000 == evsel->attr.sample_period);
+			0 == evsel->attr.sample_period);
 	TEST_ASSERT_VAL("wrong config1",
 			0 == evsel->attr.config1);
 	TEST_ASSERT_VAL("wrong config2",
@@ -114,7 +121,6 @@ static int test__checkevent_genhw(struct perf_evlist *evlist)
 	return 0;
 }
 
-/* XXX There's no support for HW_BREAKPOINT in RHEL6 yet.
 static int test__checkevent_breakpoint(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel = perf_evlist__first(evlist);
@@ -187,8 +193,6 @@ static int test__checkevent_breakpoint_rw(struct perf_evlist *evlist)
 	return 0;
 }
 
-*/
-
 static int test__checkevent_tracepoint_modifier(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel = perf_evlist__first(evlist);
@@ -208,7 +212,7 @@ test__checkevent_tracepoint_multi_modifier(struct perf_evlist *evlist)
 
 	TEST_ASSERT_VAL("wrong number of entries", evlist->nr_entries > 1);
 
-	evlist__for_each(evlist, evsel) {
+	evlist__for_each_entry(evlist, evsel) {
 		TEST_ASSERT_VAL("wrong exclude_user",
 				!evsel->attr.exclude_user);
 		TEST_ASSERT_VAL("wrong exclude_kernel",
@@ -330,7 +334,6 @@ static int test__checkevent_exclude_idle_modifier_1(struct perf_evlist *evlist)
 	return test__checkevent_symbolic_name(evlist);
 }
 
-/* XXX There's no support for HW_BREAKPOINT in RHEL6 yet.
 static int test__checkevent_breakpoint_modifier(struct perf_evlist *evlist)
 {
 	struct perf_evsel *evsel = perf_evlist__first(evlist);
@@ -401,7 +404,6 @@ static int test__checkevent_breakpoint_rw_modifier(struct perf_evlist *evlist)
 
 	return test__checkevent_breakpoint_rw(evlist);
 }
-*/
 
 static int test__checkevent_pmu(struct perf_evlist *evlist)
 {
@@ -413,7 +415,11 @@ static int test__checkevent_pmu(struct perf_evlist *evlist)
 	TEST_ASSERT_VAL("wrong config",    10 == evsel->attr.config);
 	TEST_ASSERT_VAL("wrong config1",    1 == evsel->attr.config1);
 	TEST_ASSERT_VAL("wrong config2",    3 == evsel->attr.config2);
-	TEST_ASSERT_VAL("wrong period",  1000 == evsel->attr.sample_period);
+	/*
+	 * The period value gets configured within perf_evlist__config,
+	 * while this test executes only parse events method.
+	 */
+	TEST_ASSERT_VAL("wrong period",     0 == evsel->attr.sample_period);
 
 	return 0;
 }
@@ -434,7 +440,7 @@ static int test__checkevent_list(struct perf_evlist *evlist)
 	TEST_ASSERT_VAL("wrong exclude_hv", !evsel->attr.exclude_hv);
 	TEST_ASSERT_VAL("wrong precise_ip", !evsel->attr.precise_ip);
 
-	/* syscalls:sys_enter_open:k */
+	/* syscalls:sys_enter_openat:k */
 	evsel = perf_evsel__next(evsel);
 	TEST_ASSERT_VAL("wrong type", PERF_TYPE_TRACEPOINT == evsel->attr.type);
 	TEST_ASSERT_VAL("wrong sample_type",
@@ -474,6 +480,39 @@ static int test__checkevent_pmu_name(struct perf_evlist *evlist)
 	TEST_ASSERT_VAL("wrong config",  2 == evsel->attr.config);
 	TEST_ASSERT_VAL("wrong name",
 			!strcmp(perf_evsel__name(evsel), "cpu/config=2/u"));
+
+	return 0;
+}
+
+static int test__checkevent_pmu_partial_time_callgraph(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	/* cpu/config=1,call-graph=fp,time,period=100000/ */
+	TEST_ASSERT_VAL("wrong number of entries", 2 == evlist->nr_entries);
+	TEST_ASSERT_VAL("wrong type", PERF_TYPE_RAW == evsel->attr.type);
+	TEST_ASSERT_VAL("wrong config",  1 == evsel->attr.config);
+	/*
+	 * The period, time and callgraph value gets configured
+	 * within perf_evlist__config,
+	 * while this test executes only parse events method.
+	 */
+	TEST_ASSERT_VAL("wrong period",     0 == evsel->attr.sample_period);
+	TEST_ASSERT_VAL("wrong callgraph",  !evsel__has_callchain(evsel));
+	TEST_ASSERT_VAL("wrong time",  !(PERF_SAMPLE_TIME & evsel->attr.sample_type));
+
+	/* cpu/config=2,call-graph=no,time=0,period=2000/ */
+	evsel = perf_evsel__next(evsel);
+	TEST_ASSERT_VAL("wrong type", PERF_TYPE_RAW == evsel->attr.type);
+	TEST_ASSERT_VAL("wrong config",  2 == evsel->attr.config);
+	/*
+	 * The period, time and callgraph value gets configured
+	 * within perf_evlist__config,
+	 * while this test executes only parse events method.
+	 */
+	TEST_ASSERT_VAL("wrong period",     0 == evsel->attr.sample_period);
+	TEST_ASSERT_VAL("wrong callgraph",  !evsel__has_callchain(evsel));
+	TEST_ASSERT_VAL("wrong time",  !(PERF_SAMPLE_TIME & evsel->attr.sample_type));
 
 	return 0;
 }
@@ -672,7 +711,7 @@ static int test__group3(struct perf_evlist *evlist __maybe_unused)
 	TEST_ASSERT_VAL("wrong number of entries", 5 == evlist->nr_entries);
 	TEST_ASSERT_VAL("wrong number of groups", 2 == evlist->nr_groups);
 
-	/* group1 syscalls:sys_enter_open:H */
+	/* group1 syscalls:sys_enter_openat:H */
 	evsel = leader = perf_evlist__first(evlist);
 	TEST_ASSERT_VAL("wrong type", PERF_TYPE_TRACEPOINT == evsel->attr.type);
 	TEST_ASSERT_VAL("wrong sample_type",
@@ -1183,30 +1222,125 @@ static int test__pinned_group(struct perf_evlist *evlist)
 	return 0;
 }
 
+static int test__checkevent_breakpoint_len(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong number of entries", 1 == evlist->nr_entries);
+	TEST_ASSERT_VAL("wrong type", PERF_TYPE_BREAKPOINT == evsel->attr.type);
+	TEST_ASSERT_VAL("wrong config", 0 == evsel->attr.config);
+	TEST_ASSERT_VAL("wrong bp_type", (HW_BREAKPOINT_R | HW_BREAKPOINT_W) ==
+					 evsel->attr.bp_type);
+	TEST_ASSERT_VAL("wrong bp_len", HW_BREAKPOINT_LEN_1 ==
+					evsel->attr.bp_len);
+
+	return 0;
+}
+
+static int test__checkevent_breakpoint_len_w(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong number of entries", 1 == evlist->nr_entries);
+	TEST_ASSERT_VAL("wrong type", PERF_TYPE_BREAKPOINT == evsel->attr.type);
+	TEST_ASSERT_VAL("wrong config", 0 == evsel->attr.config);
+	TEST_ASSERT_VAL("wrong bp_type", HW_BREAKPOINT_W ==
+					 evsel->attr.bp_type);
+	TEST_ASSERT_VAL("wrong bp_len", HW_BREAKPOINT_LEN_2 ==
+					evsel->attr.bp_len);
+
+	return 0;
+}
+
+static int
+test__checkevent_breakpoint_len_rw_modifier(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong exclude_user", !evsel->attr.exclude_user);
+	TEST_ASSERT_VAL("wrong exclude_kernel", evsel->attr.exclude_kernel);
+	TEST_ASSERT_VAL("wrong exclude_hv", evsel->attr.exclude_hv);
+	TEST_ASSERT_VAL("wrong precise_ip", !evsel->attr.precise_ip);
+
+	return test__checkevent_breakpoint_rw(evlist);
+}
+
+static int test__checkevent_precise_max_modifier(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong number of entries", 2 == evlist->nr_entries);
+	TEST_ASSERT_VAL("wrong type", PERF_TYPE_SOFTWARE == evsel->attr.type);
+	TEST_ASSERT_VAL("wrong config",
+			PERF_COUNT_SW_TASK_CLOCK == evsel->attr.config);
+	return 0;
+}
+
+static int test__checkevent_config_symbol(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "insn") == 0);
+	return 0;
+}
+
+static int test__checkevent_config_raw(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "rawpmu") == 0);
+	return 0;
+}
+
+static int test__checkevent_config_num(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "numpmu") == 0);
+	return 0;
+}
+
+static int test__checkevent_config_cache(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "cachepmu") == 0);
+	return 0;
+}
+
+static bool test__intel_pt_valid(void)
+{
+	return !!perf_pmu__find("intel_pt");
+}
+
+static int test__intel_pt(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong name setting", strcmp(evsel->name, "intel_pt//u") == 0);
+	return 0;
+}
+
+static int test__checkevent_complex_name(struct perf_evlist *evlist)
+{
+	struct perf_evsel *evsel = perf_evlist__first(evlist);
+
+	TEST_ASSERT_VAL("wrong complex name parsing", strcmp(evsel->name, "COMPLEX_CYCLES_NAME:orig=cycles,desc=chip-clock-ticks") == 0);
+	return 0;
+}
+
 static int count_tracepoints(void)
 {
-	char events_path[PATH_MAX];
 	struct dirent *events_ent;
-	const char *mountpoint;
 	DIR *events_dir;
 	int cnt = 0;
 
-	mountpoint = tracefs_find_mountpoint();
-	if (mountpoint) {
-		scnprintf(events_path, PATH_MAX, "%s/events",
-			  mountpoint);
-	} else {
-		mountpoint = debugfs_find_mountpoint();
-		scnprintf(events_path, PATH_MAX, "%s/tracing/events",
-			  mountpoint);
-	}
-
-	events_dir = opendir(events_path);
+	events_dir = tracing_events__opendir();
 
 	TEST_ASSERT_VAL("Can't open events dir", events_dir);
 
 	while ((events_ent = readdir(events_dir))) {
-		char sys_path[PATH_MAX];
+		char *sys_path;
 		struct dirent *sys_ent;
 		DIR *sys_dir;
 
@@ -1217,8 +1351,8 @@ static int count_tracepoints(void)
 		    || !strcmp(events_ent->d_name, "header_page"))
 			continue;
 
-		scnprintf(sys_path, PATH_MAX, "%s/%s",
-			  events_path, events_ent->d_name);
+		sys_path = get_events_file(events_ent->d_name);
+		TEST_ASSERT_VAL("Can't get sys path", sys_path);
 
 		sys_dir = opendir(sys_path);
 		TEST_ASSERT_VAL("Can't open sys dir", sys_dir);
@@ -1234,6 +1368,7 @@ static int count_tracepoints(void)
 		}
 
 		closedir(sys_dir);
+		put_events_file(sys_path);
 	}
 
 	closedir(events_dir);
@@ -1252,12 +1387,13 @@ struct evlist_test {
 	const char *name;
 	__u32 type;
 	const int id;
+	bool (*valid)(void);
 	int (*check)(struct perf_evlist *evlist);
 };
 
 static struct evlist_test test__events[] = {
 	{
-		.name  = "syscalls:sys_enter_open",
+		.name  = "syscalls:sys_enter_openat",
 		.check = test__checkevent_tracepoint,
 		.id    = 0,
 	},
@@ -1296,7 +1432,6 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_genhw,
 		.id    = 7,
 	},
-/* XXX There's no support for HW_BREAKPOINT in RHEL6 yet.
 	{
 		.name  = "mem:0",
 		.check = test__checkevent_breakpoint,
@@ -1317,9 +1452,8 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_breakpoint_w,
 		.id    = 11,
 	},
-*/
 	{
-		.name  = "syscalls:sys_enter_open:k",
+		.name  = "syscalls:sys_enter_openat:k",
 		.check = test__checkevent_tracepoint_modifier,
 		.id    = 12,
 	},
@@ -1353,7 +1487,6 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_genhw_modifier,
 		.id    = 18,
 	},
-/* XXX There's no support for HW_BREAKPOINT in RHEL6 yet.
 	{
 		.name  = "mem:0:u",
 		.check = test__checkevent_breakpoint_modifier,
@@ -1374,9 +1507,8 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_breakpoint_w_modifier,
 		.id    = 22,
 	},
-*/
 	{
-		.name  = "r1,syscalls:sys_enter_open:k,1:1:hp",
+		.name  = "r1,syscalls:sys_enter_openat:k,1:1:hp",
 		.check = test__checkevent_list,
 		.id    = 23,
 	},
@@ -1390,7 +1522,6 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_exclude_guest_modifier,
 		.id    = 25,
 	},
-/* XXX There's no support for HW_BREAKPOINT in RHEL6 yet.
 	{
 		.name  = "mem:0:rw",
 		.check = test__checkevent_breakpoint_rw,
@@ -1401,7 +1532,6 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_breakpoint_rw_modifier,
 		.id    = 27,
 	},
-*/
 	{
 		.name  = "{instructions:k,cycles:upp}",
 		.check = test__group1,
@@ -1413,7 +1543,7 @@ static struct evlist_test test__events[] = {
 		.id    = 29,
 	},
 	{
-		.name  = "group1{syscalls:sys_enter_open:H,cycles:kppp},group2{cycles,1:3}:G,instructions:u",
+		.name  = "group1{syscalls:sys_enter_openat:H,cycles:kppp},group2{cycles,1:3}:G,instructions:u",
 		.check = test__group3,
 		.id    = 30,
 	},
@@ -1472,6 +1602,21 @@ static struct evlist_test test__events[] = {
 		.check = test__pinned_group,
 		.id    = 41,
 	},
+	{
+		.name  = "mem:0/1",
+		.check = test__checkevent_breakpoint_len,
+		.id    = 42,
+	},
+	{
+		.name  = "mem:0/2:w",
+		.check = test__checkevent_breakpoint_len_w,
+		.id    = 43,
+	},
+	{
+		.name  = "mem:0/4:rw:u",
+		.check = test__checkevent_breakpoint_len_rw_modifier,
+		.id    = 44
+	},
 #if defined(__s390x__)
 	{
 		.name  = "kvm-s390:kvm_s390_create_vm",
@@ -1489,6 +1634,42 @@ static struct evlist_test test__events[] = {
 		.check = test__checkevent_exclude_idle_modifier_1,
 		.id    = 46,
 	},
+	{
+		.name  = "task-clock:P,cycles",
+		.check = test__checkevent_precise_max_modifier,
+		.id    = 47,
+	},
+	{
+		.name  = "instructions/name=insn/",
+		.check = test__checkevent_config_symbol,
+		.id    = 48,
+	},
+	{
+		.name  = "r1234/name=rawpmu/",
+		.check = test__checkevent_config_raw,
+		.id    = 49,
+	},
+	{
+		.name  = "4:0x6530160/name=numpmu/",
+		.check = test__checkevent_config_num,
+		.id    = 50,
+	},
+	{
+		.name  = "L1-dcache-misses/name=cachepmu/",
+		.check = test__checkevent_config_cache,
+		.id    = 51,
+	},
+	{
+		.name  = "intel_pt//u",
+		.valid = test__intel_pt_valid,
+		.check = test__intel_pt,
+		.id    = 52,
+	},
+	{
+		.name  = "cycles/name='COMPLEX_CYCLES_NAME:orig=cycles,desc=chip-clock-ticks'/Duk",
+		.check = test__checkevent_complex_name,
+		.id    = 53
+	}
 };
 
 static struct evlist_test test__events_pmu[] = {
@@ -1502,6 +1683,16 @@ static struct evlist_test test__events_pmu[] = {
 		.check = test__checkevent_pmu_name,
 		.id    = 1,
 	},
+	{
+		.name  = "cpu/config=1,call-graph=fp,time,period=100000/,cpu/config=2,call-graph=no,time=0,period=2000/",
+		.check = test__checkevent_pmu_partial_time_callgraph,
+		.id    = 2,
+	},
+	{
+		.name  = "cpu/name='COMPLEX_CYCLES_NAME:orig=cycles,desc=chip-clock-ticks',period=0x1,event=0x2/ukp",
+		.check = test__checkevent_complex_name,
+		.id    = 3,
+	}
 };
 
 struct terms_test {
@@ -1519,17 +1710,24 @@ static struct terms_test test__terms[] = {
 
 static int test_event(struct evlist_test *e)
 {
+	struct parse_events_error err = { .idx = 0, };
 	struct perf_evlist *evlist;
 	int ret;
+
+	if (e->valid && !e->valid()) {
+		pr_debug("... SKIP");
+		return 0;
+	}
 
 	evlist = perf_evlist__new();
 	if (evlist == NULL)
 		return -ENOMEM;
 
-	ret = parse_events(evlist, e->name);
+	ret = parse_events(evlist, e->name, &err);
 	if (ret) {
-		pr_debug("failed to parse event '%s', err %d\n",
-			 e->name, ret);
+		pr_debug("failed to parse event '%s', err %d, str '%s'\n",
+			 e->name, ret, err.str);
+		parse_events_print_error(&err, e->name);
 	} else {
 		ret = e->check(evlist);
 	}
@@ -1547,10 +1745,11 @@ static int test_events(struct evlist_test *events, unsigned cnt)
 	for (i = 0; i < cnt; i++) {
 		struct evlist_test *e = &events[i];
 
-		pr_debug("running test %d '%s'\n", e->id, e->name);
+		pr_debug("running test %d '%s'", e->id, e->name);
 		ret1 = test_event(e);
 		if (ret1)
 			ret2 = ret1;
+		pr_debug("\n");
 	}
 
 	return ret2;
@@ -1571,7 +1770,7 @@ static int test_term(struct terms_test *t)
 	}
 
 	ret = t->check(&terms);
-	parse_events__free_terms(&terms);
+	parse_events_terms__purge(&terms);
 
 	return ret;
 }
@@ -1632,15 +1831,14 @@ static int test_pmu_events(void)
 	}
 
 	while (!ret && (ent = readdir(dir))) {
-#define MAX_NAME 100
-		struct evlist_test e;
-		char name[MAX_NAME];
+		struct evlist_test e = { .id = 0, };
+		char name[2 * NAME_MAX + 1 + 12 + 3];
 
-		if (!strcmp(ent->d_name, ".") ||
-		    !strcmp(ent->d_name, ".."))
+		/* Names containing . are special and cannot be used directly */
+		if (strchr(ent->d_name, '.'))
 			continue;
 
-		snprintf(name, MAX_NAME, "cpu/event=%s/u", ent->d_name);
+		snprintf(name, sizeof(name), "cpu/event=%s/u", ent->d_name);
 
 		e.name  = name;
 		e.check = test__checkevent_pmu_events;
@@ -1648,18 +1846,17 @@ static int test_pmu_events(void)
 		ret = test_event(&e);
 		if (ret)
 			break;
-		snprintf(name, MAX_NAME, "%s:u,cpu/event=%s/u", ent->d_name, ent->d_name);
+		snprintf(name, sizeof(name), "%s:u,cpu/event=%s/u", ent->d_name, ent->d_name);
 		e.name  = name;
 		e.check = test__checkevent_pmu_events_mix;
 		ret = test_event(&e);
-#undef MAX_NAME
 	}
 
 	closedir(dir);
 	return ret;
 }
 
-int test__parse_events(void)
+int test__parse_events(struct test *test __maybe_unused, int subtest __maybe_unused)
 {
 	int ret1, ret2 = 0;
 

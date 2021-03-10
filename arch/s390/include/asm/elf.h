@@ -1,6 +1,4 @@
 /*
- *  include/asm-s390/elf.h
- *
  *  S390 version
  *
  *  Derived from "include/asm-i386/elf.h"
@@ -104,15 +102,26 @@
 #define HWCAP_S390_ETF3EH	256
 #define HWCAP_S390_HIGH_GPRS	512
 #define HWCAP_S390_TE		1024
+#define HWCAP_S390_VXRS		2048
+#define HWCAP_S390_VXRS_BCD	4096
+#define HWCAP_S390_VXRS_EXT	8192
+#define HWCAP_S390_GS		16384
+#define HWCAP_S390_VXRS_EXT2	32768
+#define HWCAP_S390_VXRS_PDE	65536
+#define HWCAP_S390_SORT		131072
+#define HWCAP_S390_DFLT		262144
+
+/* Internal bits, not exposed via elf */
+#define HWCAP_INT_SIE		1UL
 
 /*
  * These are used to set parameters in the core dumps.
  */
-#ifndef __s390x__
+#ifndef CONFIG_64BIT
 #define ELF_CLASS	ELFCLASS32
-#else /* __s390x__ */
+#else /* CONFIG_64BIT */
 #define ELF_CLASS	ELFCLASS64
-#endif /* __s390x__ */
+#endif /* CONFIG_64BIT */
 #define ELF_DATA	ELFDATA2MSB
 #define ELF_ARCH	EM_S390
 
@@ -121,6 +130,8 @@
  */
 
 #include <asm/ptrace.h>
+#include <asm/compat.h>
+#include <asm/syscall.h>
 #include <asm/user.h>
 
 typedef s390_fp_regs elf_fpregset_t;
@@ -130,7 +141,6 @@ typedef s390_fp_regs compat_elf_fpregset_t;
 typedef s390_compat_regs compat_elf_gregset_t;
 
 #include <linux/sched.h>	/* for task_struct */
-#include <asm/system.h>		/* for save_access_regs */
 #include <asm/mmu_context.h>
 
 #include <asm/vdso.h>
@@ -156,7 +166,6 @@ extern unsigned int vdso_enabled;
 	} while (0)
 
 #define CORE_DUMP_USE_REGSET
-#define USE_ELF_CORE_DUMP
 #define ELF_EXEC_PAGESIZE	4096
 
 /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical
@@ -174,6 +183,10 @@ extern unsigned int vdso_enabled;
 extern unsigned long elf_hwcap;
 #define ELF_HWCAP (elf_hwcap)
 
+/* Internal hardware capabilities, not exposed via elf */
+
+extern unsigned long int_hwcap;
+
 /* This yields a string that ld.so will use to load implementation
    specific libraries for optimization.  This is more specific in
    intent than poking at uname or /proc/cpuinfo.
@@ -185,31 +198,31 @@ extern unsigned long elf_hwcap;
 extern char elf_platform[];
 #define ELF_PLATFORM (elf_platform)
 
-#ifndef __s390x__
-#define SET_PERSONALITY(ex) set_personality(PER_LINUX)
-#else /* __s390x__ */
+#ifndef CONFIG_COMPAT
+#define SET_PERSONALITY(ex) \
+do {								\
+	set_personality(PER_LINUX |				\
+		(current->personality & (~PER_MASK)));		\
+	current_thread_info()->sys_call_table = 		\
+		(unsigned long) &sys_call_table;		\
+} while (0)
+#else /* CONFIG_COMPAT */
 #define SET_PERSONALITY(ex)					\
 do {								\
 	if (personality(current->personality) != PER_LINUX32)	\
-		set_personality(PER_LINUX);			\
-	if ((ex).e_ident[EI_CLASS] == ELFCLASS32)		\
+		set_personality(PER_LINUX |			\
+			(current->personality & ~PER_MASK));	\
+	if ((ex).e_ident[EI_CLASS] == ELFCLASS32) {		\
 		set_thread_flag(TIF_31BIT);			\
-	else							\
+		current_thread_info()->sys_call_table =		\
+			(unsigned long)	&sys_call_table_emu;	\
+	} else {						\
 		clear_thread_flag(TIF_31BIT);			\
+		current_thread_info()->sys_call_table =		\
+			(unsigned long) &sys_call_table;	\
+	}							\
 } while (0)
-#endif /* __s390x__ */
-
-/*
- * An executable for which elf_read_implies_exec() returns TRUE will
- * have the READ_IMPLIES_EXEC personality flag set automatically.
- */
-#define elf_read_implies_exec(ex, executable_stack)	\
-({							\
-	if (current->mm->context.noexec &&		\
-	    executable_stack != EXSTACK_DISABLE_X)	\
-		disable_noexec(current->mm, current);	\
-	current->mm->context.noexec == 0;		\
-})
+#endif /* CONFIG_COMPAT */
 
 extern unsigned long mmap_rnd_mask;
 
@@ -226,5 +239,7 @@ struct linux_binprm;
 
 #define ARCH_HAS_SETUP_ADDITIONAL_PAGES 1
 int arch_setup_additional_pages(struct linux_binprm *, int);
+
+void *fill_cpu_elf_notes(void *ptr, struct save_area *sa, __vector128 *vxrs);
 
 #endif

@@ -1,7 +1,7 @@
 /*
- * Sclp "store data in absolut storage"
+ * SCLP "store data in absolute storage"
  *
- * Copyright IBM Corp. 2003,2007
+ * Copyright IBM Corp. 2003, 2013
  * Author(s): Michael Holzheu
  */
 
@@ -178,7 +178,7 @@ int sclp_sdias_copy(void *dest, int start_blk, int nr_blks)
 	sccb.evbuf.event_qual = SDIAS_EQ_STORE_DATA;
 	sccb.evbuf.data_id = SDIAS_DI_FCP_DUMP;
 	sccb.evbuf.event_id = 4712;
-#ifdef __s390x__
+#ifdef CONFIG_64BIT
 	sccb.evbuf.asa_size = SDIAS_ASA_SIZE_64;
 #else
 	sccb.evbuf.asa_size = SDIAS_ASA_SIZE_32;

@@ -33,31 +33,28 @@
 #ifndef _ASM_X86_XEN_HYPERVISOR_H
 #define _ASM_X86_XEN_HYPERVISOR_H
 
-#include <xen/xen.h>
-
-/* arch/i386/kernel/setup.c */
 extern struct shared_info *HYPERVISOR_shared_info;
 extern struct start_info *xen_start_info;
 
+#include <asm/processor.h>
+
+static inline uint32_t xen_cpuid_base(void)
+{
+	return hypervisor_cpuid_base("XenVMMXenVMM", 2);
+}
+
 #ifdef CONFIG_XEN
-extern enum xen_domain_type xen_domain_type;
+extern bool xen_hvm_need_lapic(void);
+
+static inline bool xen_x2apic_para_available(void)
+{
+	return xen_hvm_need_lapic();
+}
 #else
-#define xen_domain_type		XEN_NATIVE
+static inline bool xen_x2apic_para_available(void)
+{
+	return (xen_cpuid_base() != 0);
+}
 #endif
-
-#define xen_domain()		(xen_domain_type != XEN_NATIVE)
-#define xen_pv_domain()		(xen_domain() &&			\
-				 xen_domain_type == XEN_PV_DOMAIN)
-#define xen_hvm_domain()	(xen_domain() &&			\
-				 xen_domain_type == XEN_HVM_DOMAIN)
-
-#ifdef CONFIG_XEN_DOM0
-#include <xen/interface/xen.h>
-
-#define xen_initial_domain()	(xen_pv_domain() && \
-				 xen_start_info->flags & SIF_INITDOMAIN)
-#else  /* !CONFIG_XEN_DOM0 */
-#define xen_initial_domain()	(0)
-#endif	/* CONFIG_XEN_DOM0 */
 
 #endif /* _ASM_X86_XEN_HYPERVISOR_H */

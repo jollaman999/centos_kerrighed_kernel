@@ -21,7 +21,7 @@ enum pid_type
  * quickly from the numeric pid value.  The attached processes may be
  * quickly accessed by following pointers from struct pid.
  *
- * Storing pid_t values in the kernel and refering to them later has a
+ * Storing pid_t values in the kernel and referring to them later has a
  * problem.  The process originally with that pid may have exited and the
  * pid allocator wrapped, and another process could have come along
  * and been assigned that pid.
@@ -86,11 +86,9 @@ extern struct task_struct *get_pid_task(struct pid *pid, enum pid_type);
 extern struct pid *get_task_pid(struct task_struct *task, enum pid_type type);
 
 /*
- * attach_pid() and detach_pid() must be called with the tasklist_lock
- * write-held.
+ * these helpers must be called with the tasklist_lock write-held.
  */
-extern void attach_pid(struct task_struct *task, enum pid_type type,
-			struct pid *pid);
+extern void attach_pid(struct task_struct *task, enum pid_type);
 extern void detach_pid(struct task_struct *task, enum pid_type);
 extern void change_pid(struct task_struct *task, enum pid_type,
 			struct pid *pid);
@@ -105,7 +103,7 @@ extern struct pid_namespace init_pid_ns;
  * or rcu_read_lock() held.
  *
  * find_pid_ns() finds the pid in the namespace specified
- * find_vpid() finr the pid by its virtual id, i.e. in the current namespace
+ * find_vpid() finds the pid by its virtual id, i.e. in the current namespace
  *
  * see also find_task_by_vpid() set in include/linux/sched.h
  */
@@ -176,9 +174,8 @@ pid_t pid_vnr(struct pid *pid);
 
 #define do_each_pid_task(pid, type, task)				\
 	do {								\
-		struct hlist_node *pos___;				\
 		if ((pid) != NULL)					\
-			hlist_for_each_entry_rcu((task), pos___,	\
+			hlist_for_each_entry_rcu((task),		\
 				&(pid)->tasks[type], pids[type].node) {
 
 			/*

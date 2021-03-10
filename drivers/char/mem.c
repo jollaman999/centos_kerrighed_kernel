@@ -3,9 +3,9 @@
  *
  *  Copyright (C) 1991, 1992  Linus Torvalds
  *
- *  Added devfs support. 
+ *  Added devfs support.
  *    Jan-11-1998, C. Scott Ananian <cananian@alumni.princeton.edu>
- *  Shared /dev/zero mmaping support, Feb 2000, Kanoj Sarcar <kanoj@sgi.com>
+ *  Shared /dev/zero mmapping support, Feb 2000, Kanoj Sarcar <kanoj@sgi.com>
  */
 
 #include <linux/mm.h>
@@ -26,9 +26,10 @@
 #include <linux/bootmem.h>
 #include <linux/splice.h>
 #include <linux/pfn.h>
-#include <linux/smp_lock.h>
+#include <linux/export.h>
 #include <linux/io.h>
-#include <linux/nospec.h>
+#include <linux/aio.h>
+#include <linux/security.h>
 
 #include <asm/uaccess.h>
 
@@ -48,43 +49,10 @@ static inline unsigned long size_inside_page(unsigned long start,
 	return min(sz, size);
 }
 
-/*
- * Architectures vary in how they handle caching for addresses
- * outside of main memory.
- *
- */
-static inline int uncached_access(struct file *file, unsigned long addr)
-{
-#if defined(CONFIG_IA64)
-	/*
-	 * On ia64, we ignore O_SYNC because we cannot tolerate memory attribute aliases.
-	 */
-	return !(efi_mem_attributes(addr) & EFI_MEMORY_WB);
-#elif defined(CONFIG_MIPS)
-	{
-		extern int __uncached_access(struct file *file,
-					     unsigned long addr);
-
-		return __uncached_access(file, addr);
-	}
-#else
-	/*
-	 * Accessing memory above the top the kernel knows about or through a file pointer
-	 * that was marked O_SYNC will be done non-cached.
-	 */
-	if (file->f_flags & O_SYNC)
-		return 1;
-	return addr >= __pa(high_memory);
-#endif
-}
-
 #ifndef ARCH_HAS_VALID_PHYS_ADDR_RANGE
-static inline int valid_phys_addr_range(unsigned long addr, size_t count)
+static inline int valid_phys_addr_range(phys_addr_t addr, size_t count)
 {
-	if (addr + count > __pa(high_memory))
-		return 0;
-
-	return 1;
+	return addr + count <= __pa(high_memory);
 }
 
 static inline int valid_mmap_phys_addr_range(unsigned long pfn, size_t size)
@@ -127,20 +95,25 @@ static inline int range_is_allowed(unsigned long pfn, unsigned long size)
 }
 #endif
 
-void __attribute__((weak)) unxlate_dev_mem_ptr(unsigned long phys, void *addr)
+#ifndef unxlate_dev_mem_ptr
+#define unxlate_dev_mem_ptr unxlate_dev_mem_ptr
+void __weak unxlate_dev_mem_ptr(phys_addr_t phys, void *addr)
 {
 }
+#endif
 
 /*
- * This funcion reads the *physical* memory. The f_pos points directly to the 
- * memory location. 
+ * This funcion reads the *physical* memory. The f_pos points directly to the
+ * memory location.
  */
-static ssize_t read_mem(struct file * file, char __user * buf,
+static ssize_t read_mem(struct file *file, char __user *buf,
 			size_t count, loff_t *ppos)
 {
-	unsigned long p = *ppos;
+	phys_addr_t p = *ppos;
 	ssize_t read, sz;
-	char *ptr;
+	void *ptr;
+	char *bounce;
+	int err;
 
 	if (!valid_phys_addr_range(p, count))
 		return -EFAULT;
@@ -152,23 +125,30 @@ static ssize_t read_mem(struct file * file, char __user * buf,
 		if (sz > 0) {
 			if (clear_user(buf, sz))
 				return -EFAULT;
-			buf += sz; 
-			p += sz; 
-			count -= sz; 
-			read += sz; 
+			buf += sz;
+			p += sz;
+			count -= sz;
+			read += sz;
 		}
 	}
 #endif
 
+	bounce = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!bounce)
+		return -ENOMEM;
+
 	while (count > 0) {
 		unsigned long remaining;
-		int allowed;
+		int allowed, probe;
 
 		sz = size_inside_page(p, count);
 
+		err = -EPERM;
 		allowed = page_is_allowed(p >> PAGE_SHIFT);
 		if (!allowed)
-			return -EPERM;
+			goto failed;
+
+		err = -EFAULT;
 		if (allowed == 2) {
 			/* Show zeros for restricted memory. */
 			remaining = clear_user(buf, sz);
@@ -180,33 +160,44 @@ static ssize_t read_mem(struct file * file, char __user * buf,
 			 */
 			ptr = xlate_dev_mem_ptr(p);
 			if (!ptr)
-				return -EFAULT;
+				goto failed;
 
-			remaining = copy_to_user(buf, ptr, sz);
-
+			probe = probe_kernel_read(bounce, ptr, sz);
 			unxlate_dev_mem_ptr(p, ptr);
+			if (probe)
+				goto failed;
+
+			remaining = copy_to_user(buf, bounce, sz);
 		}
 
 		if (remaining)
-			return -EFAULT;
+			goto failed;
 
 		buf += sz;
 		p += sz;
 		count -= sz;
 		read += sz;
 	}
+	kfree(bounce);
 
 	*ppos += read;
 	return read;
+
+failed:
+	kfree(bounce);
+	return err;
 }
 
-static ssize_t write_mem(struct file * file, const char __user * buf, 
+static ssize_t write_mem(struct file *file, const char __user *buf,
 			 size_t count, loff_t *ppos)
 {
-	unsigned long p = *ppos;
+	phys_addr_t p = *ppos;
 	ssize_t written, sz;
 	unsigned long copied;
 	void *ptr;
+
+	if (get_securelevel() > 0)
+		return -EPERM;
 
 	if (!valid_phys_addr_range(p, count))
 		return -EFAULT;
@@ -268,18 +259,53 @@ static ssize_t write_mem(struct file * file, const char __user * buf,
 	return written;
 }
 
-int __attribute__((weak)) phys_mem_access_prot_allowed(struct file *file,
+int __weak phys_mem_access_prot_allowed(struct file *file,
 	unsigned long pfn, unsigned long size, pgprot_t *vma_prot)
 {
 	return 1;
 }
 
 #ifndef __HAVE_PHYS_MEM_ACCESS_PROT
+
+/*
+ * Architectures vary in how they handle caching for addresses
+ * outside of main memory.
+ *
+ */
+#ifdef pgprot_noncached
+static int uncached_access(struct file *file, phys_addr_t addr)
+{
+#if defined(CONFIG_IA64)
+	/*
+	 * On ia64, we ignore O_DSYNC because we cannot tolerate memory
+	 * attribute aliases.
+	 */
+	return !(efi_mem_attributes(addr) & EFI_MEMORY_WB);
+#elif defined(CONFIG_MIPS)
+	{
+		extern int __uncached_access(struct file *file,
+					     unsigned long addr);
+
+		return __uncached_access(file, addr);
+	}
+#else
+	/*
+	 * Accessing memory above the top the kernel knows about or through a
+	 * file pointer
+	 * that was marked O_DSYNC will be done non-cached.
+	 */
+	if (file->f_flags & O_DSYNC)
+		return 1;
+	return addr >= __pa(high_memory);
+#endif
+}
+#endif
+
 static pgprot_t phys_mem_access_prot(struct file *file, unsigned long pfn,
 				     unsigned long size, pgprot_t vma_prot)
 {
 #ifdef pgprot_noncached
-	unsigned long offset = pfn << PAGE_SHIFT;
+	phys_addr_t offset = pfn << PAGE_SHIFT;
 
 	if (uncached_access(file, offset))
 		return pgprot_noncached(vma_prot);
@@ -320,7 +346,7 @@ static const struct vm_operations_struct mmap_mem_ops = {
 #endif
 };
 
-static int mmap_mem(struct file * file, struct vm_area_struct * vma)
+static int mmap_mem(struct file *file, struct vm_area_struct *vma)
 {
 	size_t size = vma->vm_end - vma->vm_start;
 
@@ -343,7 +369,7 @@ static int mmap_mem(struct file * file, struct vm_area_struct * vma)
 
 	vma->vm_ops = &mmap_mem_ops;
 
-	/* Remap-pfn-range will mark the range VM_IO and VM_RESERVED */
+	/* Remap-pfn-range will mark the range VM_IO */
 	if (remap_pfn_range(vma,
 			    vma->vm_start,
 			    vma->vm_pgoff,
@@ -355,7 +381,7 @@ static int mmap_mem(struct file * file, struct vm_area_struct * vma)
 }
 
 #ifdef CONFIG_DEVKMEM
-static int mmap_kmem(struct file * file, struct vm_area_struct * vma)
+static int mmap_kmem(struct file *file, struct vm_area_struct *vma)
 {
 	unsigned long pfn;
 
@@ -363,9 +389,9 @@ static int mmap_kmem(struct file * file, struct vm_area_struct * vma)
 	pfn = __pa((u64)vma->vm_pgoff << PAGE_SHIFT) >> PAGE_SHIFT;
 
 	/*
-	 * RED-PEN: on some architectures there is more mapped memory
-	 * than available in mem_map which pfn_valid checks
-	 * for. Perhaps should add a new macro here.
+	 * RED-PEN: on some architectures there is more mapped memory than
+	 * available in mem_map which pfn_valid checks for. Perhaps should add a
+	 * new macro here.
 	 *
 	 * RED-PEN: vmalloc is not supported right now.
 	 */
@@ -415,18 +441,19 @@ static ssize_t read_oldmem(struct file *file, char __user *buf,
 /*
  * This function reads the *virtual* memory as seen by the kernel.
  */
-static ssize_t read_kmem(struct file *file, char __user *buf, 
+static ssize_t read_kmem(struct file *file, char __user *buf,
 			 size_t count, loff_t *ppos)
 {
 	unsigned long p = *ppos;
 	ssize_t low_count, read, sz;
-	char * kbuf; /* k-addr because vread() takes vmlist_lock rwlock */
+	char *kbuf; /* k-addr because vread() takes vmlist_lock rwlock */
+	int err = 0;
 
 	read = 0;
 	if (p < (unsigned long) high_memory) {
 		low_count = count;
-		if (count > (unsigned long) high_memory - p)
-			low_count = (unsigned long) high_memory - p;
+		if (count > (unsigned long)high_memory - p)
+			low_count = (unsigned long)high_memory - p;
 
 #ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
 		/* we don't have page 0 mapped on sparc and m68k.. */
@@ -449,7 +476,7 @@ static ssize_t read_kmem(struct file *file, char __user *buf,
 			 * uncached, then it must also be accessed uncached
 			 * by the kernel or data corruption may occur
 			 */
-			kbuf = xlate_dev_kmem_ptr((char *)p);
+			kbuf = xlate_dev_kmem_ptr((void *)p);
 
 			if (copy_to_user(buf, kbuf, sz))
 				return -EFAULT;
@@ -466,30 +493,32 @@ static ssize_t read_kmem(struct file *file, char __user *buf,
 		if (!kbuf)
 			return -ENOMEM;
 		while (count > 0) {
-			int len = size_inside_page(p, count);
-
-			len = vread(kbuf, (char *)p, len);
-			if (!len)
+			sz = size_inside_page(p, count);
+			if (!is_vmalloc_or_module_addr((void *)p)) {
+				err = -ENXIO;
 				break;
-			if (copy_to_user(buf, kbuf, len)) {
-				free_page((unsigned long)kbuf);
-				return -EFAULT;
 			}
-			count -= len;
-			buf += len;
-			read += len;
-			p += len;
+			sz = vread(kbuf, (char *)p, sz);
+			if (!sz)
+				break;
+			if (copy_to_user(buf, kbuf, sz)) {
+				err = -EFAULT;
+				break;
+			}
+			count -= sz;
+			buf += sz;
+			read += sz;
+			p += sz;
 		}
 		free_page((unsigned long)kbuf);
 	}
- 	*ppos = p;
- 	return read;
+	*ppos = p;
+	return read ? read : err;
 }
 
 
-static inline ssize_t
-do_write_kmem(void *p, unsigned long realp, const char __user * buf,
-	      size_t count, loff_t *ppos)
+static ssize_t do_write_kmem(unsigned long p, const char __user *buf,
+				size_t count, loff_t *ppos)
 {
 	ssize_t written, sz;
 	unsigned long copied;
@@ -497,28 +526,27 @@ do_write_kmem(void *p, unsigned long realp, const char __user * buf,
 	written = 0;
 #ifdef __ARCH_HAS_NO_PAGE_ZERO_MAPPED
 	/* we don't have page 0 mapped on sparc and m68k.. */
-	if (realp < PAGE_SIZE) {
-		sz = size_inside_page(realp, count);
+	if (p < PAGE_SIZE) {
+		sz = size_inside_page(p, count);
 		/* Hmm. Do something? */
 		buf += sz;
 		p += sz;
-		realp += sz;
 		count -= sz;
 		written += sz;
 	}
 #endif
 
 	while (count > 0) {
-		char *ptr;
+		void *ptr;
 
-		sz = size_inside_page(realp, count);
+		sz = size_inside_page(p, count);
 
 		/*
-		 * On ia64 if a page has been mapped somewhere as
-		 * uncached, then it must also be accessed uncached
-		 * by the kernel or data corruption may occur
+		 * On ia64 if a page has been mapped somewhere as uncached, then
+		 * it must also be accessed uncached by the kernel or data
+		 * corruption may occur.
 		 */
-		ptr = xlate_dev_kmem_ptr(p);
+		ptr = xlate_dev_kmem_ptr((void *)p);
 
 		copied = copy_from_user(ptr, buf, sz);
 		if (copied) {
@@ -529,7 +557,6 @@ do_write_kmem(void *p, unsigned long realp, const char __user * buf,
 		}
 		buf += sz;
 		p += sz;
-		realp += sz;
 		count -= sz;
 		written += sz;
 	}
@@ -538,29 +565,27 @@ do_write_kmem(void *p, unsigned long realp, const char __user * buf,
 	return written;
 }
 
-
 /*
  * This function writes to the *virtual* memory as seen by the kernel.
  */
-static ssize_t write_kmem(struct file * file, const char __user * buf, 
+static ssize_t write_kmem(struct file *file, const char __user *buf,
 			  size_t count, loff_t *ppos)
 {
 	unsigned long p = *ppos;
 	ssize_t wrote = 0;
 	ssize_t virtr = 0;
-	ssize_t written;
-	char * kbuf; /* k-addr because vwrite() takes vmlist_lock rwlock */
+	char *kbuf; /* k-addr because vwrite() takes vmlist_lock rwlock */
+	int err = 0;
+
+	if (get_securelevel() > 0)
+		return -EPERM;
 
 	if (p < (unsigned long) high_memory) {
-
-		wrote = count;
-		if (count > (unsigned long) high_memory - p)
-			wrote = (unsigned long) high_memory - p;
-
-		written = do_write_kmem((void*)p, p, buf, wrote, ppos);
-		if (written != wrote)
-			return written;
-		wrote = written;
+		unsigned long to_write = min_t(unsigned long, count,
+					       (unsigned long)high_memory - p);
+		wrote = do_write_kmem(p, buf, to_write, ppos);
+		if (wrote != to_write)
+			return wrote;
 		p += wrote;
 		buf += wrote;
 		count -= wrote;
@@ -571,41 +596,47 @@ static ssize_t write_kmem(struct file * file, const char __user * buf,
 		if (!kbuf)
 			return wrote ? wrote : -ENOMEM;
 		while (count > 0) {
-			int len = size_inside_page(p, count);
+			unsigned long sz = size_inside_page(p, count);
+			unsigned long n;
 
-			written = copy_from_user(kbuf, buf, len);
-			if (written) {
-				if (wrote + virtr)
-					break;
-				free_page((unsigned long)kbuf);
-				return -EFAULT;
+			if (!is_vmalloc_or_module_addr((void *)p)) {
+				err = -ENXIO;
+				break;
 			}
-			len = vwrite(kbuf, (char *)p, len);
-			count -= len;
-			buf += len;
-			virtr += len;
-			p += len;
+			n = copy_from_user(kbuf, buf, sz);
+			if (n) {
+				err = -EFAULT;
+				break;
+			}
+			vwrite(kbuf, (char *)p, sz);
+			count -= sz;
+			buf += sz;
+			virtr += sz;
+			p += sz;
 		}
 		free_page((unsigned long)kbuf);
 	}
 
- 	*ppos = p;
- 	return virtr + wrote;
+	*ppos = p;
+	return virtr + wrote ? : err;
 }
 #endif
 
 #ifdef CONFIG_DEVPORT
-static ssize_t read_port(struct file * file, char __user * buf,
+static ssize_t read_port(struct file *file, char __user *buf,
 			 size_t count, loff_t *ppos)
 {
 	unsigned long i = *ppos;
 	char __user *tmp = buf;
 
+	if (get_securelevel() > 0)
+		return -EPERM;
+
 	if (!access_ok(VERIFY_WRITE, buf, count))
-		return -EFAULT; 
+		return -EFAULT;
 	while (count-- > 0 && i < 65536) {
-		if (__put_user(inb(i),tmp) < 0) 
-			return -EFAULT;  
+		if (__put_user(inb(i), tmp) < 0)
+			return -EFAULT;
 		i++;
 		tmp++;
 	}
@@ -613,22 +644,25 @@ static ssize_t read_port(struct file * file, char __user * buf,
 	return tmp-buf;
 }
 
-static ssize_t write_port(struct file * file, const char __user * buf,
+static ssize_t write_port(struct file *file, const char __user *buf,
 			  size_t count, loff_t *ppos)
 {
 	unsigned long i = *ppos;
-	const char __user * tmp = buf;
+	const char __user *tmp = buf;
 
-	if (!access_ok(VERIFY_READ,buf,count))
+	if (get_securelevel() > 0)
+		return -EPERM;
+
+	if (!access_ok(VERIFY_READ, buf, count))
 		return -EFAULT;
 	while (count-- > 0 && i < 65536) {
 		char c;
 		if (__get_user(c, tmp)) {
 			if (tmp > buf)
 				break;
-			return -EFAULT; 
+			return -EFAULT;
 		}
-		outb(c,i);
+		outb(c, i);
 		i++;
 		tmp++;
 	}
@@ -637,16 +671,28 @@ static ssize_t write_port(struct file * file, const char __user * buf,
 }
 #endif
 
-static ssize_t read_null(struct file * file, char __user * buf,
+static ssize_t read_null(struct file *file, char __user *buf,
 			 size_t count, loff_t *ppos)
 {
 	return 0;
 }
 
-static ssize_t write_null(struct file * file, const char __user * buf,
+static ssize_t write_null(struct file *file, const char __user *buf,
 			  size_t count, loff_t *ppos)
 {
 	return count;
+}
+
+static ssize_t aio_read_null(struct kiocb *iocb, const struct iovec *iov,
+			     unsigned long nr_segs, loff_t pos)
+{
+	return 0;
+}
+
+static ssize_t aio_write_null(struct kiocb *iocb, const struct iovec *iov,
+			      unsigned long nr_segs, loff_t pos)
+{
+	return iov_length(iov, nr_segs);
 }
 
 static int pipe_to_null(struct pipe_inode_info *info, struct pipe_buffer *buf,
@@ -655,13 +701,13 @@ static int pipe_to_null(struct pipe_inode_info *info, struct pipe_buffer *buf,
 	return sd->len;
 }
 
-static ssize_t splice_write_null(struct pipe_inode_info *pipe,struct file *out,
+static ssize_t splice_write_null(struct pipe_inode_info *pipe, struct file *out,
 				 loff_t *ppos, size_t len, unsigned int flags)
 {
 	return splice_from_pipe(pipe, out, ppos, len, flags, pipe_to_null);
 }
 
-static ssize_t read_zero(struct file * file, char __user * buf, 
+static ssize_t read_zero(struct file *file, char __user *buf,
 			 size_t count, loff_t *ppos)
 {
 	size_t written;
@@ -692,7 +738,25 @@ static ssize_t read_zero(struct file * file, char __user * buf,
 	return written ? written : -EFAULT;
 }
 
-static int mmap_zero(struct file * file, struct vm_area_struct * vma)
+static ssize_t aio_read_zero(struct kiocb *iocb, const struct iovec *iov,
+			     unsigned long nr_segs, loff_t pos)
+{
+	size_t written = 0;
+	unsigned long i;
+	ssize_t ret;
+
+	for (i = 0; i < nr_segs; i++) {
+		ret = read_zero(iocb->ki_filp, iov[i].iov_base, iov[i].iov_len,
+				&pos);
+		if (ret < 0)
+			break;
+		written += ret;
+	}
+
+	return written ? written : -EFAULT;
+}
+
+static int mmap_zero(struct file *file, struct vm_area_struct *vma)
 {
 #ifndef CONFIG_MMU
 	return -ENOSYS;
@@ -702,7 +766,7 @@ static int mmap_zero(struct file * file, struct vm_area_struct * vma)
 	return 0;
 }
 
-static ssize_t write_full(struct file * file, const char __user * buf,
+static ssize_t write_full(struct file *file, const char __user *buf,
 			  size_t count, loff_t *ppos)
 {
 	return -ENOSPC;
@@ -713,8 +777,7 @@ static ssize_t write_full(struct file * file, const char __user * buf,
  * can fopen() both devices with "a" now.  This was previously impossible.
  * -- SRB.
  */
-
-static loff_t null_lseek(struct file * file, loff_t offset, int orig)
+static loff_t null_lseek(struct file *file, loff_t offset, int orig)
 {
 	return file->f_pos = 0;
 }
@@ -727,30 +790,32 @@ static loff_t null_lseek(struct file * file, loff_t offset, int orig)
  * also note that seeking relative to the "end of file" isn't supported:
  * it has no meaning, so it returns -EINVAL.
  */
-static loff_t memory_lseek(struct file * file, loff_t offset, int orig)
+static loff_t memory_lseek(struct file *file, loff_t offset, int orig)
 {
 	loff_t ret;
 
-	mutex_lock(&file->f_path.dentry->d_inode->i_mutex);
+	mutex_lock(&file_inode(file)->i_mutex);
 	switch (orig) {
-		case 0:
-			file->f_pos = offset;
-			ret = file->f_pos;
-			force_successful_syscall_return();
+	case SEEK_CUR:
+		offset += file->f_pos;
+	case SEEK_SET:
+		/* to avoid userland mistaking f_pos=-9 as -EBADF=-9 */
+		if ((unsigned long long)offset >= ~0xFFFULL) {
+			ret = -EOVERFLOW;
 			break;
-		case 1:
-			file->f_pos += offset;
-			ret = file->f_pos;
-			force_successful_syscall_return();
-			break;
-		default:
-			ret = -EINVAL;
+		}
+		file->f_pos = offset;
+		ret = file->f_pos;
+		force_successful_syscall_return();
+		break;
+	default:
+		ret = -EINVAL;
 	}
-	mutex_unlock(&file->f_path.dentry->d_inode->i_mutex);
+	mutex_unlock(&file_inode(file)->i_mutex);
 	return ret;
 }
 
-static int open_port(struct inode * inode, struct file * filp)
+static int open_port(struct inode *inode, struct file *filp)
 {
 	return capable(CAP_SYS_RAWIO) ? 0 : -EPERM;
 }
@@ -759,6 +824,7 @@ static int open_port(struct inode * inode, struct file * filp)
 #define full_lseek      null_lseek
 #define write_zero	write_null
 #define read_full       read_zero
+#define aio_write_zero	aio_write_null
 #define open_mem	open_port
 #define open_kmem	open_mem
 #define open_oldmem	open_mem
@@ -787,6 +853,8 @@ static const struct file_operations null_fops = {
 	.llseek		= null_lseek,
 	.read		= read_null,
 	.write		= write_null,
+	.aio_read	= aio_read_null,
+	.aio_write	= aio_write_null,
 	.splice_write	= splice_write_null,
 };
 
@@ -803,16 +871,19 @@ static const struct file_operations zero_fops = {
 	.llseek		= zero_lseek,
 	.read		= read_zero,
 	.write		= write_zero,
+	.aio_read	= aio_read_zero,
+	.aio_write	= aio_write_zero,
 	.mmap		= mmap_zero,
 };
 
 /*
  * capabilities for /dev/zero
  * - permits private mappings, "copies" are taken of the source of zeros
+ * - no writeback happens
  */
 static struct backing_dev_info zero_bdi = {
 	.name		= "char/mem",
-	.capabilities	= BDI_CAP_MAP_COPY,
+	.capabilities	= BDI_CAP_MAP_COPY | BDI_CAP_NO_ACCT_AND_WRITEBACK,
 };
 
 static const struct file_operations full_fops = {
@@ -825,37 +896,13 @@ static const struct file_operations full_fops = {
 static const struct file_operations oldmem_fops = {
 	.read	= read_oldmem,
 	.open	= open_oldmem,
+	.llseek = default_llseek,
 };
 #endif
 
-static ssize_t kmsg_write(struct file * file, const char __user * buf,
-			  size_t count, loff_t *ppos)
-{
-	char *tmp;
-	ssize_t ret;
-
-	tmp = kmalloc(count + 1, GFP_KERNEL);
-	if (tmp == NULL)
-		return -ENOMEM;
-	ret = -EFAULT;
-	if (!copy_from_user(tmp, buf, count)) {
-		tmp[count] = 0;
-		ret = printk("%s", tmp);
-		if (ret > count)
-			/* printk can add a prefix */
-			ret = count;
-	}
-	kfree(tmp);
-	return ret;
-}
-
-static const struct file_operations kmsg_fops = {
-	.write =	kmsg_write,
-};
-
 static const struct memdev {
 	const char *name;
-	mode_t mode;
+	umode_t mode;
 	const struct file_operations *fops;
 	struct backing_dev_info *dev_info;
 } devlist[] = {
@@ -871,7 +918,9 @@ static const struct memdev {
 	 [7] = { "full", 0666, &full_fops, NULL },
 	 [8] = { "random", 0666, &random_fops, NULL },
 	 [9] = { "urandom", 0666, &urandom_fops, NULL },
-	[11] = { "kmsg", 0, &kmsg_fops, NULL },
+#ifdef CONFIG_PRINTK
+	[11] = { "kmsg", 0644, &kmsg_fops, NULL },
+#endif
 #ifdef CONFIG_CRASH_DUMP
 	[12] = { "oldmem", 0, &oldmem_fops, NULL },
 #endif
@@ -881,43 +930,38 @@ static int memory_open(struct inode *inode, struct file *filp)
 {
 	int minor;
 	const struct memdev *dev;
-	int ret = -ENXIO;
-
-	lock_kernel();
 
 	minor = iminor(inode);
 	if (minor >= ARRAY_SIZE(devlist))
-		goto out;
-	minor = array_index_nospec(minor, ARRAY_SIZE(devlist));
+		return -ENXIO;
 
 	dev = &devlist[minor];
 	if (!dev->fops)
-		goto out;
+		return -ENXIO;
 
 	filp->f_op = dev->fops;
 	if (dev->dev_info)
 		filp->f_mapping->backing_dev_info = dev->dev_info;
 
+	/* Is /dev/mem or /dev/kmem ? */
+	if (dev->dev_info == &directly_mappable_cdev_bdi)
+		filp->f_mode |= FMODE_UNSIGNED_OFFSET;
+
 	if (dev->fops->open)
-		ret = dev->fops->open(inode, filp);
-	else
-		ret = 0;
-out:
-	unlock_kernel();
-	return ret;
+		return dev->fops->open(inode, filp);
+
+	return 0;
 }
 
 static const struct file_operations memory_fops = {
-	.open		= memory_open,
+	.open = memory_open,
+	.llseek = noop_llseek,
 };
 
-static char *mem_devnode(struct device *dev, mode_t *mode)
+static char *mem_devnode(struct device *dev, umode_t *mode)
 {
-	unsigned int minor = array_index_nospec(MINOR(dev->devt),
-						ARRAY_SIZE(devlist));
-
-	if (mode && devlist[minor].mode)
-		*mode = devlist[minor].mode;
+	if (mode && devlist[MINOR(dev->devt)].mode)
+		*mode = devlist[MINOR(dev->devt)].mode;
 	return NULL;
 }
 
@@ -932,17 +976,20 @@ static int __init chr_dev_init(void)
 	if (err)
 		return err;
 
-	if (register_chrdev(MEM_MAJOR,"mem",&memory_fops))
+	if (register_chrdev(MEM_MAJOR, "mem", &memory_fops))
 		printk("unable to get major %d for memory devs\n", MEM_MAJOR);
 
 	mem_class = class_create(THIS_MODULE, "mem");
+	if (IS_ERR(mem_class))
+		return PTR_ERR(mem_class);
+
 	mem_class->devnode = mem_devnode;
 	for (minor = 1; minor < ARRAY_SIZE(devlist); minor++) {
 		if (!devlist[minor].name)
 			continue;
 
 		/*
-		 * Create /dev/port? 
+		 * Create /dev/port?
 		 */
 		if ((minor == DEVPORT_MINOR) && !arch_has_dev_port())
 			continue;
@@ -951,7 +998,7 @@ static int __init chr_dev_init(void)
 			      NULL, devlist[minor].name);
 	}
 
-	return 0;
+	return tty_init();
 }
 
 fs_initcall(chr_dev_init);

@@ -324,7 +324,7 @@ static void sd_send_cmd_get_rsp(struct rtsx_usb_sdmmc *host,
 	case MMC_RSP_R1:
 		rsp_type = SD_RSP_TYPE_R1;
 		break;
-	case MMC_RSP_R1 & ~MMC_RSP_CRC:
+	case MMC_RSP_R1_NO_CRC:
 		rsp_type = SD_RSP_TYPE_R1 | SD_NO_CHECK_CRC7;
 		break;
 	case MMC_RSP_R1B:
@@ -682,7 +682,7 @@ static int sd_tuning_rx_cmd(struct rtsx_usb_sdmmc *host,
 		u8 opcode, u8 sample_point)
 {
 	int err;
-	struct mmc_command cmd = {0};
+	struct mmc_command cmd = {};
 
 	err = sd_change_phase(host, sample_point, 0);
 	if (err)
@@ -1138,11 +1138,6 @@ static void sdmmc_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	dev_dbg(sdmmc_dev(host), "%s\n", __func__);
 	mutex_lock(&ucr->dev_mutex);
 
-	if (rtsx_usb_card_exclusive_check(ucr, RTSX_USB_SD_CARD)) {
-		mutex_unlock(&ucr->dev_mutex);
-		return;
-	}
-
 	sd_set_power_mode(host, ios->power_mode);
 	sd_set_bus_width(host, ios->bus_width);
 	sd_set_timing(host, ios->timing, &host->ddr_mode);
@@ -1188,10 +1183,8 @@ static int sdmmc_switch_voltage(struct mmc_host *mmc, struct mmc_ios *ios)
 	if (host->host_removal)
 		return -ENOMEDIUM;
 
-#if 0 /* 1.2V is not supported */
 	if (ios->signal_voltage == MMC_SIGNAL_VOLTAGE_120)
 		return -EPERM;
-#endif
 
 	mutex_lock(&ucr->dev_mutex);
 
@@ -1227,7 +1220,6 @@ static int sdmmc_switch_voltage(struct mmc_host *mmc, struct mmc_ios *ios)
 	return err;
 }
 
-#if 0
 static int sdmmc_card_busy(struct mmc_host *mmc)
 {
 	struct rtsx_usb_sdmmc *host = mmc_priv(mmc);
@@ -1267,9 +1259,8 @@ out:
 	else
 		return 0;
 }
-#endif
 
-static int sdmmc_execute_tuning(struct mmc_host *mmc)
+static int sdmmc_execute_tuning(struct mmc_host *mmc, u32 opcode)
 {
 	struct rtsx_usb_sdmmc *host = mmc_priv(mmc);
 	struct rtsx_ucr *ucr = host->ucr;
@@ -1294,6 +1285,7 @@ static const struct mmc_host_ops rtsx_usb_sdmmc_ops = {
 	.get_ro = sdmmc_get_ro,
 	.get_cd = sdmmc_get_cd,
 	.start_signal_voltage_switch = sdmmc_switch_voltage,
+	.card_busy = sdmmc_card_busy,
 	.execute_tuning = sdmmc_execute_tuning,
 };
 
@@ -1317,6 +1309,7 @@ static void rtsx_usb_update_led(struct work_struct *work)
 		container_of(work, struct rtsx_usb_sdmmc, led_work);
 	struct rtsx_ucr *ucr = host->ucr;
 
+	pm_runtime_get_sync(sdmmc_dev(host));
 	mutex_lock(&ucr->dev_mutex);
 
 	if (host->led.brightness == LED_OFF)
@@ -1325,6 +1318,7 @@ static void rtsx_usb_update_led(struct work_struct *work)
 		rtsx_usb_turn_on_led(ucr);
 
 	mutex_unlock(&ucr->dev_mutex);
+	pm_runtime_put(sdmmc_dev(host));
 }
 #endif
 
@@ -1339,14 +1333,12 @@ static void rtsx_usb_init_host(struct rtsx_usb_sdmmc *host)
 		MMC_CAP_MMC_HIGHSPEED | MMC_CAP_BUS_WIDTH_TEST |
 		MMC_CAP_UHS_SDR12 | MMC_CAP_UHS_SDR25 | MMC_CAP_UHS_SDR50 |
 		MMC_CAP_NEEDS_POLL;
+	mmc->caps2 = MMC_CAP2_NO_PRESCAN_POWERUP | MMC_CAP2_FULL_PWR_CYCLE;
 
-#if 0  /* No RHEL-6 support */
 	mmc->max_current_330 = 400;
 	mmc->max_current_180 = 800;
-#endif
 	mmc->ops = &rtsx_usb_sdmmc_ops;
-	mmc->max_phys_segs = 256;
-	mmc->max_hw_segs = 256;
+	mmc->max_segs = 256;
 	mmc->max_seg_size = 65536;
 	mmc->max_blk_size = 512;
 	mmc->max_blk_count = 65535;
@@ -1382,6 +1374,8 @@ static int rtsx_usb_sdmmc_drv_probe(struct platform_device *pdev)
 
 	mutex_init(&host->host_mutex);
 	rtsx_usb_init_host(host);
+	pm_runtime_use_autosuspend(&pdev->dev);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, 50);
 	pm_runtime_enable(&pdev->dev);
 
 #ifdef RTSX_USB_USE_LEDS_CLASS
@@ -1436,6 +1430,7 @@ static int rtsx_usb_sdmmc_drv_remove(struct platform_device *pdev)
 
 	mmc_free_host(mmc);
 	pm_runtime_disable(&pdev->dev);
+	pm_runtime_dont_use_autosuspend(&pdev->dev);
 	platform_set_drvdata(pdev, NULL);
 
 	dev_dbg(&(pdev->dev),
@@ -1444,7 +1439,7 @@ static int rtsx_usb_sdmmc_drv_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static struct platform_device_id rtsx_usb_sdmmc_ids[] = {
+static const struct platform_device_id rtsx_usb_sdmmc_ids[] = {
 	{
 		.name = "rtsx_usb_sdmmc",
 	}, {
@@ -1458,7 +1453,6 @@ static struct platform_driver rtsx_usb_sdmmc_driver = {
 	.remove		= rtsx_usb_sdmmc_drv_remove,
 	.id_table       = rtsx_usb_sdmmc_ids,
 	.driver		= {
-		.owner	= THIS_MODULE,
 		.name	= "rtsx_usb_sdmmc",
 	},
 };

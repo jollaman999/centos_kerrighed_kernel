@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 static struct rc_map_table cinergy[] = {
 	{ 0x00, KEY_0 },
@@ -25,7 +26,7 @@ static struct rc_map_table cinergy[] = {
 	{ 0x09, KEY_9 },
 
 	{ 0x0a, KEY_POWER },
-	{ 0x0b, KEY_PROG1 },		/* app */
+	{ 0x0b, KEY_MEDIA },		/* app */
 	{ 0x0c, KEY_ZOOM },		/* zoom/fullscreen */
 	{ 0x0d, KEY_CHANNELUP },	/* channel */
 	{ 0x0e, KEY_CHANNELDOWN },	/* channel- */

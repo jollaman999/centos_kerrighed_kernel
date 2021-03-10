@@ -22,7 +22,6 @@
  * CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
  * WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
-#include <linux/nospec.h>
 #include <drm/drmP.h>
 #include <drm/savage_drm.h>
 #include "savage_drv.h"
@@ -504,9 +503,7 @@ static int savage_dispatch_vb_prim(drm_savage_private_t * dev_priv,
 
 			for (i = start; i < start + count; ++i) {
 				unsigned int j = i + reorder[i % 3];
-				unsigned int idx = array_index_nospec(vb_stride * j,
-								      vb_size / sizeof(int));
-				DMA_COPY(&vtxbuf[idx], vtx_size);
+				DMA_COPY(&vtxbuf[vb_stride * j], vtx_size);
 			}
 
 			DMA_COMMIT();
@@ -515,15 +512,12 @@ static int savage_dispatch_vb_prim(drm_savage_private_t * dev_priv,
 			DMA_DRAW_PRIMITIVE(count, prim, skip);
 
 			if (vb_stride == vtx_size) {
-				unsigned int idx = array_index_nospec(vb_stride * start,
-								      vb_size / sizeof(int));
-				DMA_COPY(&vtxbuf[idx],
+				DMA_COPY(&vtxbuf[vb_stride * start],
 					 vtx_size * count);
 			} else {
 				for (i = start; i < start + count; ++i) {
-					unsigned int idx = array_index_nospec(vb_stride * i,
-									      vb_size / sizeof(int));
-					DMA_COPY(&vtxbuf[idx], vtx_size);
+					DMA_COPY(&vtxbuf [vb_stride * i],
+						 vtx_size);
 				}
 			}
 
@@ -769,9 +763,7 @@ static int savage_dispatch_vb_idx(drm_savage_private_t * dev_priv,
 
 			for (i = 0; i < count; ++i) {
 				unsigned int j = idx[i + reorder[i % 3]];
-				unsigned int index = array_index_nospec(vb_stride * j,
-									vb_size / sizeof(int));
-				DMA_COPY(&vtxbuf[index], vtx_size);
+				DMA_COPY(&vtxbuf[vb_stride * j], vtx_size);
 			}
 
 			DMA_COMMIT();
@@ -781,9 +773,7 @@ static int savage_dispatch_vb_idx(drm_savage_private_t * dev_priv,
 
 			for (i = 0; i < count; ++i) {
 				unsigned int j = idx[i];
-				unsigned int index = array_index_nospec(vb_stride * j,
-									vb_size / sizeof(int));
-				DMA_COPY(&vtxbuf[index], vtx_size);
+				DMA_COPY(&vtxbuf[vb_stride * j], vtx_size);
 			}
 
 			DMA_COMMIT();
@@ -973,7 +963,7 @@ int savage_bci_cmdbuf(struct drm_device *dev, void *data, struct drm_file *file_
 	drm_savage_cmd_header_t *first_draw_cmd;
 	unsigned int *kvb_addr = NULL;
 	struct drm_clip_rect *kbox_addr = NULL;
-	unsigned int i, j, dma_idx;
+	unsigned int i, j;
 	int ret = 0;
 
 	DRM_DEBUG("\n");
@@ -987,9 +977,7 @@ int savage_bci_cmdbuf(struct drm_device *dev, void *data, struct drm_file *file_
 			     cmdbuf->dma_idx, dma->buf_count - 1);
 			return -EINVAL;
 		}
-		dma_idx = array_index_nospec(cmdbuf->dma_idx, dma->buf_count);
-
-		dmabuf = dma->buflist[dma_idx];
+		dmabuf = dma->buflist[cmdbuf->dma_idx];
 	} else {
 		dmabuf = NULL;
 	}
@@ -1013,15 +1001,10 @@ int savage_bci_cmdbuf(struct drm_device *dev, void *data, struct drm_file *file_
 		cmdbuf->cmd_addr = kcmd_addr;
 	}
 	if (cmdbuf->vb_size) {
-		kvb_addr = kmalloc(cmdbuf->vb_size, GFP_KERNEL);
-		if (kvb_addr == NULL) {
-			ret = -ENOMEM;
-			goto done;
-		}
-
-		if (copy_from_user(kvb_addr, cmdbuf->vb_addr,
-				       cmdbuf->vb_size)) {
-			ret = -EFAULT;
+		kvb_addr = memdup_user(cmdbuf->vb_addr, cmdbuf->vb_size);
+		if (IS_ERR(kvb_addr)) {
+			ret = PTR_ERR(kvb_addr);
+			kvb_addr = NULL;
 			goto done;
 		}
 		cmdbuf->vb_addr = kvb_addr;

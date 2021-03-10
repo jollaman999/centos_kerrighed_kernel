@@ -64,6 +64,7 @@ static const char * scsi_debug_version_date = "20100324";
 /* Additional Sense Code (ASC) */
 #define NO_ADDITIONAL_SENSE 0x0
 #define LOGICAL_UNIT_NOT_READY 0x4
+#define LOGICAL_UNIT_COMMUNICATION_FAILURE 0x8
 #define UNRECOVERED_READ_ERR 0x11
 #define PARAMETER_LIST_LENGTH_ERR 0x1a
 #define INVALID_OPCODE 0x20
@@ -101,6 +102,7 @@ static const char * scsi_debug_version_date = "20100324";
 #define DEF_LBPU 0
 #define DEF_LBPWS 0
 #define DEF_LBPWS10 0
+#define DEF_LBPRZ 1
 #define DEF_LOWEST_ALIGNED 0
 #define DEF_NO_LUN_0   0
 #define DEF_NUM_PARTS   0
@@ -108,6 +110,7 @@ static const char * scsi_debug_version_date = "20100324";
 #define DEF_OPT_BLKS 64
 #define DEF_PHYSBLK_EXP 0
 #define DEF_PTYPE   0
+#define DEF_REMOVABLE false
 #define DEF_SCSI_LEVEL   5    /* INQUIRY, byte2 [5->SPC-3] */
 #define DEF_SECTOR_SIZE 512
 #define DEF_UNMAP_ALIGNMENT 0
@@ -127,6 +130,7 @@ static const char * scsi_debug_version_date = "20100324";
 #define SCSI_DEBUG_OPT_DIF_ERR   32
 #define SCSI_DEBUG_OPT_DIX_ERR   64
 #define SCSI_DEBUG_OPT_MAC_TIMEOUT  128
+#define SCSI_DEBUG_OPT_SHORT_TRANSFER	256
 /* When "every_nth" > 0 then modulo "every_nth" commands:
  *   - a no response is simulated if SCSI_DEBUG_OPT_TIMEOUT is set
  *   - a RECOVERED_ERROR is simulated on successful read and write
@@ -147,6 +151,7 @@ static const char * scsi_debug_version_date = "20100324";
 /* when 1==SCSI_DEBUG_OPT_MEDIUM_ERR, a medium error is simulated at this
  * sector on read commands: */
 #define OPT_MEDIUM_ERR_ADDR   0x1234 /* that's sector 4660 in decimal */
+#define OPT_MEDIUM_ERR_NUM    10     /* number of consecutive medium errs */
 
 /* If REPORT LUNS has luns >= 256 it can choose "flat space" (value 1)
  * or "peripheral device" addressing (value 0) */
@@ -166,7 +171,7 @@ static int scsi_debug_dix = DEF_DIX;
 static int scsi_debug_dsense = DEF_D_SENSE;
 static int scsi_debug_every_nth = DEF_EVERY_NTH;
 static int scsi_debug_fake_rw = DEF_FAKE_RW;
-static int scsi_debug_guard = DEF_GUARD;
+static unsigned int scsi_debug_guard = DEF_GUARD;
 static int scsi_debug_lowest_aligned = DEF_LOWEST_ALIGNED;
 static int scsi_debug_max_luns = DEF_MAX_LUNS;
 static int scsi_debug_max_queue = SCSI_DEBUG_CANQUEUE;
@@ -185,16 +190,18 @@ static int scsi_debug_vpd_use_hostno = DEF_VPD_USE_HOSTNO;
 static unsigned int scsi_debug_lbpu = DEF_LBPU;
 static unsigned int scsi_debug_lbpws = DEF_LBPWS;
 static unsigned int scsi_debug_lbpws10 = DEF_LBPWS10;
+static unsigned int scsi_debug_lbprz = DEF_LBPRZ;
 static unsigned int scsi_debug_unmap_alignment = DEF_UNMAP_ALIGNMENT;
 static unsigned int scsi_debug_unmap_granularity = DEF_UNMAP_GRANULARITY;
 static unsigned int scsi_debug_unmap_max_blocks = DEF_UNMAP_MAX_BLOCKS;
 static unsigned int scsi_debug_unmap_max_desc = DEF_UNMAP_MAX_DESC;
 static unsigned int scsi_debug_write_same_length = DEF_WRITESAME_LENGTH;
+static bool scsi_debug_removable = DEF_REMOVABLE;
+static bool scsi_debug_clustering;
 
 static int scsi_debug_cmnd_count = 0;
 
 #define DEV_READONLY(TGT)      (0)
-#define DEV_REMOVEABLE(TGT)    (0)
 
 static unsigned int sdebug_store_sectors;
 static sector_t sdebug_capacity;	/* in sectors */
@@ -254,7 +261,7 @@ struct sdebug_queued_cmd {
 static struct sdebug_queued_cmd queued_arr[SCSI_DEBUG_CANQUEUE];
 
 static unsigned char * fake_storep;	/* ramdisk storage */
-static unsigned char *dif_storep;	/* protection info */
+static struct sd_dif_tuple *dif_storep;	/* protection info */
 static void *map_storep;		/* provisioning map */
 
 static unsigned long map_size;
@@ -273,11 +280,6 @@ static char sdebug_proc_name[] = "scsi_debug";
 
 static struct bus_type pseudo_lld_bus;
 
-static inline sector_t dif_offset(sector_t sector)
-{
-	return sector << 3;
-}
-
 static struct device_driver sdebug_driverfs_driver = {
 	.name 		= sdebug_proc_name,
 	.bus		= &pseudo_lld_bus,
@@ -293,6 +295,20 @@ static unsigned char ctrl_m_pg[] = {0xa, 10, 2, 0, 0, 0, 0, 0,
 				    0, 0, 0x2, 0x4b};
 static unsigned char iec_m_pg[] = {0x1c, 0xa, 0x08, 0, 0, 0, 0, 0,
 			           0, 0, 0x0, 0x0};
+
+static void *fake_store(unsigned long long lba)
+{
+	lba = do_div(lba, sdebug_store_sectors);
+
+	return fake_storep + lba * scsi_debug_sector_size;
+}
+
+static struct sd_dif_tuple *dif_store(sector_t sector)
+{
+	sector = do_div(sector, sdebug_store_sectors);
+
+	return dif_storep + sector;
+}
 
 static int sdebug_add_adapter(void);
 static void sdebug_remove_adapter(void);
@@ -435,10 +451,7 @@ static int fill_from_dev_buffer(struct scsi_cmnd *scp, unsigned char *arr,
 
 	act_len = sg_copy_from_buffer(sdb->table.sgl, sdb->table.nents,
 				      arr, arr_len);
-	if (sdb->resid)
-		sdb->resid -= act_len;
-	else
-		sdb->resid = scsi_bufflen(scp) - act_len;
+	sdb->resid = scsi_bufflen(scp) - act_len;
 
 	return 0;
 }
@@ -774,10 +787,10 @@ static int inquiry_evpd_b1(unsigned char *arr)
 	return 0x3c;
 }
 
-/* Thin provisioning VPD page (SBC-3) */
+/* Logical block provisioning VPD page (SBC-3) */
 static int inquiry_evpd_b2(unsigned char *arr)
 {
-	memset(arr, 0, 0x8);
+	memset(arr, 0, 0x4);
 	arr[0] = 0;			/* threshold exponent */
 
 	if (scsi_debug_lbpu)
@@ -789,7 +802,10 @@ static int inquiry_evpd_b2(unsigned char *arr)
 	if (scsi_debug_lbpws10)
 		arr[1] |= 1 << 5;
 
-	return 0x8;
+	if (scsi_debug_lbprz)
+		arr[1] |= 1 << 2;
+
+	return 0x4;
 }
 
 #define SDEBUG_LONG_INQ_SZ 96
@@ -913,13 +929,13 @@ static int resp_inquiry(struct scsi_cmnd * scp, int target,
 		return ret;
 	}
 	/* drops through here for a standard inquiry */
-	arr[1] = DEV_REMOVEABLE(target) ? 0x80 : 0;	/* Removable disk */
+	arr[1] = scsi_debug_removable ? 0x80 : 0;	/* Removable disk */
 	arr[2] = scsi_debug_scsi_level;
 	arr[3] = 2;    /* response_data_format==2 */
 	arr[4] = SDEBUG_LONG_INQ_SZ - 5;
 	arr[5] = scsi_debug_dif ? 1 : 0; /* PROTECT bit */
 	if (0 == scsi_debug_vpd_use_hostno)
-		arr[5] = 0x10; /* claim: implicit TGPS */
+		arr[5] |= 0x10; /* claim: implicit TPGS */
 	arr[6] = 0x10; /* claim: MultiP */
 	/* arr[6] |= 0x40; ... claim: EncServ (enclosure services) */
 	arr[7] = 0xa; /* claim: LINKED + CMDQUE */
@@ -1070,8 +1086,11 @@ static int resp_readcap16(struct scsi_cmnd * scp,
 	arr[13] = scsi_debug_physblk_exp & 0xf;
 	arr[14] = (scsi_debug_lowest_aligned >> 8) & 0x3f;
 
-	if (scsi_debug_lbp())
+	if (scsi_debug_lbp()) {
 		arr[14] |= 0x80; /* LBPME */
+		if (scsi_debug_lbprz)
+			arr[14] |= 0x40; /* LBPRZ */
+	}
 
 	arr[15] = scsi_debug_lowest_aligned & 0xff;
 
@@ -1202,7 +1221,7 @@ static int resp_format_pg(unsigned char * p, int pcontrol, int target)
 	p[11] = sdebug_sectors_per & 0xff;
 	p[12] = (scsi_debug_sector_size >> 8) & 0xff;
 	p[13] = scsi_debug_sector_size & 0xff;
-	if (DEV_REMOVEABLE(target))
+	if (scsi_debug_removable)
 		p[20] |= 0x20; /* should agree with INQUIRY */
 	if (1 == pcontrol)
 		memset(p + 2, 0, sizeof(format_pg) - 2);
@@ -1683,114 +1702,155 @@ static int check_device_access_params(struct sdebug_dev_info *devi,
 	return 0;
 }
 
+/* Returns number of bytes copied or -1 if error. */
 static int do_device_access(struct scsi_cmnd *scmd,
 			    struct sdebug_dev_info *devi,
 			    unsigned long long lba, unsigned int num, int write)
 {
 	int ret;
-	unsigned int block, rest = 0;
-	int (*func)(struct scsi_cmnd *, unsigned char *, int);
+	unsigned long long block, rest = 0;
+	struct scsi_data_buffer *sdb;
+	enum dma_data_direction dir;
 
-	func = write ? fetch_to_dev_buffer : fill_from_dev_buffer;
+	if (write) {
+		sdb = scsi_out(scmd);
+		dir = DMA_TO_DEVICE;
+	} else {
+		sdb = scsi_in(scmd);
+		dir = DMA_FROM_DEVICE;
+	}
+
+	if (!sdb->length)
+		return 0;
+	if (!(scsi_bidi_cmnd(scmd) || scmd->sc_data_direction == dir))
+		return -1;
 
 	block = do_div(lba, sdebug_store_sectors);
 	if (block + num > sdebug_store_sectors)
 		rest = block + num - sdebug_store_sectors;
 
-	ret = func(scmd, fake_storep + (block * scsi_debug_sector_size),
-		   (num - rest) * scsi_debug_sector_size);
-	if (!ret && rest)
-		ret = func(scmd, fake_storep, rest * scsi_debug_sector_size);
+	ret = sg_copy_buffer(sdb->table.sgl, sdb->table.nents,
+		   fake_storep + (block * scsi_debug_sector_size),
+		   (num - rest) * scsi_debug_sector_size, 0, write);
+	if (ret != (num - rest) * scsi_debug_sector_size)
+		return ret;
+
+	if (rest) {
+		ret += sg_copy_buffer(sdb->table.sgl, sdb->table.nents,
+			    fake_storep, rest * scsi_debug_sector_size,
+			    (num - rest) * scsi_debug_sector_size, write);
+	}
 
 	return ret;
+}
+
+static __be16 dif_compute_csum(const void *buf, int len)
+{
+	__be16 csum;
+
+	if (scsi_debug_guard)
+		csum = (__force __be16)ip_compute_csum(buf, len);
+	else
+		csum = cpu_to_be16(crc_t10dif(buf, len));
+
+	return csum;
+}
+
+static int dif_verify(struct sd_dif_tuple *sdt, const void *data,
+		      sector_t sector, u32 ei_lba)
+{
+	__be16 csum = dif_compute_csum(data, scsi_debug_sector_size);
+
+	if (sdt->guard_tag != csum) {
+		pr_err("%s: GUARD check failed on sector %lu rcvd 0x%04x, data 0x%04x\n",
+			__func__,
+			(unsigned long)sector,
+			be16_to_cpu(sdt->guard_tag),
+			be16_to_cpu(csum));
+		return 0x01;
+	}
+	if (scsi_debug_dif == SD_DIF_TYPE1_PROTECTION &&
+	    be32_to_cpu(sdt->ref_tag) != (sector & 0xffffffff)) {
+		pr_err("%s: REF check failed on sector %lu\n",
+			__func__, (unsigned long)sector);
+		return 0x03;
+	}
+	if (scsi_debug_dif == SD_DIF_TYPE2_PROTECTION &&
+	    be32_to_cpu(sdt->ref_tag) != ei_lba) {
+		pr_err("%s: REF check failed on sector %lu\n",
+			__func__, (unsigned long)sector);
+		return 0x03;
+	}
+	return 0;
+}
+
+static void dif_copy_prot(struct scsi_cmnd *SCpnt, sector_t sector,
+			  unsigned int sectors, bool read)
+{
+	size_t resid;
+	void *paddr;
+	const void *dif_store_end = dif_storep + sdebug_store_sectors;
+	struct sg_mapping_iter miter;
+
+	/* Bytes of protection data to copy into sgl */
+	resid = sectors * sizeof(*dif_storep);
+
+	sg_miter_start(&miter, scsi_prot_sglist(SCpnt),
+			scsi_prot_sg_count(SCpnt), SG_MITER_ATOMIC |
+			(read ? SG_MITER_TO_SG : SG_MITER_FROM_SG));
+
+	while (sg_miter_next(&miter) && resid > 0) {
+		size_t len = min(miter.length, resid);
+		void *start = dif_store(sector);
+		size_t rest = 0;
+
+		if (dif_store_end < start + len)
+			rest = start + len - dif_store_end;
+
+		paddr = miter.addr;
+
+		if (read)
+			memcpy(paddr, start, len - rest);
+		else
+			memcpy(start, paddr, len - rest);
+
+		if (rest) {
+			if (read)
+				memcpy(paddr + len - rest, dif_storep, rest);
+			else
+				memcpy(dif_storep, paddr + len - rest, rest);
+		}
+
+		sector += len / sizeof(*dif_storep);
+		resid -= len;
+	}
+	sg_miter_stop(&miter);
 }
 
 static int prot_verify_read(struct scsi_cmnd *SCpnt, sector_t start_sec,
 			    unsigned int sectors, u32 ei_lba)
 {
-	unsigned int i, resid;
-	struct scatterlist *psgl;
+	unsigned int i;
 	struct sd_dif_tuple *sdt;
 	sector_t sector;
-	sector_t tmp_sec = start_sec;
-	void *paddr;
 
-	start_sec = do_div(tmp_sec, sdebug_store_sectors);
-
-	sdt = (struct sd_dif_tuple *)(dif_storep + dif_offset(start_sec));
-
-	for (i = 0 ; i < sectors ; i++) {
-		u16 csum;
-
-		if (sdt[i].app_tag == 0xffff)
-			continue;
+	for (i = 0; i < sectors; i++, ei_lba++) {
+		int ret;
 
 		sector = start_sec + i;
+		sdt = dif_store(sector);
 
-		switch (scsi_debug_guard) {
-		case 1:
-			csum = ip_compute_csum(fake_storep +
-					       sector * scsi_debug_sector_size,
-					       scsi_debug_sector_size);
-			break;
-		case 0:
-			csum = crc_t10dif(fake_storep +
-					  sector * scsi_debug_sector_size,
-					  scsi_debug_sector_size);
-			csum = cpu_to_be16(csum);
-			break;
-		default:
-			BUG();
-		}
+		if (sdt->app_tag == cpu_to_be16(0xffff))
+			continue;
 
-		if (sdt[i].guard_tag != csum) {
-			printk(KERN_ERR "%s: GUARD check failed on sector %lu" \
-			       " rcvd 0x%04x, data 0x%04x\n", __func__,
-			       (unsigned long)sector,
-			       be16_to_cpu(sdt[i].guard_tag),
-			       be16_to_cpu(csum));
+		ret = dif_verify(sdt, fake_store(sector), sector, ei_lba);
+		if (ret) {
 			dif_errors++;
-			return 0x01;
+			return ret;
 		}
-
-		if (scsi_debug_dif == SD_DIF_TYPE1_PROTECTION &&
-		    be32_to_cpu(sdt[i].ref_tag) != (sector & 0xffffffff)) {
-			printk(KERN_ERR "%s: REF check failed on sector %lu\n",
-			       __func__, (unsigned long)sector);
-			dif_errors++;
-			return 0x03;
-		}
-
-		if (scsi_debug_dif == SD_DIF_TYPE2_PROTECTION &&
-		    be32_to_cpu(sdt[i].ref_tag) != ei_lba) {
-			printk(KERN_ERR "%s: REF check failed on sector %lu\n",
-			       __func__, (unsigned long)sector);
-			dif_errors++;
-			return 0x03;
-		}
-
-		ei_lba++;
 	}
 
-	resid = sectors * 8; /* Bytes of protection data to copy into sgl */
-	sector = start_sec;
-
-	scsi_for_each_prot_sg(SCpnt, psgl, scsi_prot_sg_count(SCpnt), i) {
-		int len = min(psgl->length, resid);
-
-		paddr = kmap_atomic(sg_page(psgl), KM_IRQ0) + psgl->offset;
-		memcpy(paddr, dif_storep + dif_offset(sector), len);
-
-		sector += len >> 3;
-		if (sector >= sdebug_store_sectors) {
-			/* Force wrap */
-			tmp_sec = sector;
-			sector = do_div(tmp_sec, sdebug_store_sectors);
-		}
-		resid -= len;
-		kunmap_atomic(paddr, KM_IRQ0);
-	}
-
+	dif_copy_prot(SCpnt, start_sec, sectors, true);
 	dix_reads++;
 
 	return 0;
@@ -1808,37 +1868,45 @@ static int resp_read(struct scsi_cmnd *SCpnt, unsigned long long lba,
 		return ret;
 
 	if ((SCSI_DEBUG_OPT_MEDIUM_ERR & scsi_debug_opts) &&
-	    (lba <= OPT_MEDIUM_ERR_ADDR) &&
+	    (lba <= (OPT_MEDIUM_ERR_ADDR + OPT_MEDIUM_ERR_NUM - 1)) &&
 	    ((lba + num) > OPT_MEDIUM_ERR_ADDR)) {
 		/* claim unrecoverable read error */
-		mk_sense_buffer(devip, MEDIUM_ERROR, UNRECOVERED_READ_ERR,
-				0);
+		mk_sense_buffer(devip, MEDIUM_ERROR, UNRECOVERED_READ_ERR, 0);
 		/* set info field and valid bit for fixed descriptor */
 		if (0x70 == (devip->sense_buff[0] & 0x7f)) {
 			devip->sense_buff[0] |= 0x80;	/* Valid bit */
-			ret = OPT_MEDIUM_ERR_ADDR;
+			ret = (lba < OPT_MEDIUM_ERR_ADDR)
+			      ? OPT_MEDIUM_ERR_ADDR : (int)lba;
 			devip->sense_buff[3] = (ret >> 24) & 0xff;
 			devip->sense_buff[4] = (ret >> 16) & 0xff;
 			devip->sense_buff[5] = (ret >> 8) & 0xff;
 			devip->sense_buff[6] = ret & 0xff;
 		}
+	        scsi_set_resid(SCpnt, scsi_bufflen(SCpnt));
 		return check_condition_result;
 	}
+
+	read_lock_irqsave(&atomic_rw, iflags);
 
 	/* DIX + T10 DIF */
 	if (scsi_debug_dix && scsi_prot_sg_count(SCpnt)) {
 		int prot_ret = prot_verify_read(SCpnt, lba, num, ei_lba);
 
 		if (prot_ret) {
+			read_unlock_irqrestore(&atomic_rw, iflags);
 			mk_sense_buffer(devip, ABORTED_COMMAND, 0x10, prot_ret);
 			return illegal_condition_result;
 		}
 	}
 
-	read_lock_irqsave(&atomic_rw, iflags);
 	ret = do_device_access(SCpnt, devip, lba, num, 0);
 	read_unlock_irqrestore(&atomic_rw, iflags);
-	return ret;
+	if (ret == -1)
+		return DID_ERROR << 16;
+
+	scsi_in(SCpnt)->resid = scsi_bufflen(SCpnt) - ret;
+
+	return 0;
 }
 
 void dump_sector(unsigned char *buf, int len)
@@ -1865,124 +1933,72 @@ void dump_sector(unsigned char *buf, int len)
 static int prot_verify_write(struct scsi_cmnd *SCpnt, sector_t start_sec,
 			     unsigned int sectors, u32 ei_lba)
 {
-	int i, j, ret;
+	int ret;
 	struct sd_dif_tuple *sdt;
-	struct scatterlist *dsgl = scsi_sglist(SCpnt);
-	struct scatterlist *psgl = scsi_prot_sglist(SCpnt);
-	void *daddr, *paddr;
-	sector_t tmp_sec = start_sec;
-	sector_t sector;
+	void *daddr;
+	sector_t sector = start_sec;
 	int ppage_offset;
-	unsigned short csum;
-
-	sector = do_div(tmp_sec, sdebug_store_sectors);
+	int dpage_offset;
+	struct sg_mapping_iter diter;
+	struct sg_mapping_iter piter;
 
 	BUG_ON(scsi_sg_count(SCpnt) == 0);
 	BUG_ON(scsi_prot_sg_count(SCpnt) == 0);
 
-	paddr = kmap_atomic(sg_page(psgl), KM_IRQ1) + psgl->offset;
-	ppage_offset = 0;
+	sg_miter_start(&piter, scsi_prot_sglist(SCpnt),
+			scsi_prot_sg_count(SCpnt),
+			SG_MITER_ATOMIC | SG_MITER_FROM_SG);
+	sg_miter_start(&diter, scsi_sglist(SCpnt), scsi_sg_count(SCpnt),
+			SG_MITER_ATOMIC | SG_MITER_FROM_SG);
 
-	/* For each data page */
-	scsi_for_each_sg(SCpnt, dsgl, scsi_sg_count(SCpnt), i) {
-		daddr = kmap_atomic(sg_page(dsgl), KM_IRQ0) + dsgl->offset;
-
-		/* For each sector-sized chunk in data page */
-		for (j = 0 ; j < dsgl->length ; j += scsi_debug_sector_size) {
-
-			/* If we're at the end of the current
-			 * protection page advance to the next one
-			 */
-			if (ppage_offset >= psgl->length) {
-				kunmap_atomic(paddr, KM_IRQ1);
-				psgl = sg_next(psgl);
-				BUG_ON(psgl == NULL);
-				paddr = kmap_atomic(sg_page(psgl), KM_IRQ1)
-					+ psgl->offset;
-				ppage_offset = 0;
-			}
-
-			sdt = paddr + ppage_offset;
-
-			switch (scsi_debug_guard) {
-			case 1:
-				csum = ip_compute_csum(daddr,
-						       scsi_debug_sector_size);
-				break;
-			case 0:
-				csum = cpu_to_be16(crc_t10dif(daddr,
-						      scsi_debug_sector_size));
-				break;
-			default:
-				BUG();
-				ret = 0;
-				goto out;
-			}
-
-			if (sdt->guard_tag != csum) {
-				printk(KERN_ERR
-				       "%s: GUARD check failed on sector %lu " \
-				       "rcvd 0x%04x, calculated 0x%04x\n",
-				       __func__, (unsigned long)sector,
-				       be16_to_cpu(sdt->guard_tag),
-				       be16_to_cpu(csum));
-				ret = 0x01;
-				dump_sector(daddr, scsi_debug_sector_size);
-				goto out;
-			}
-
-			if (scsi_debug_dif == SD_DIF_TYPE1_PROTECTION &&
-			    be32_to_cpu(sdt->ref_tag)
-			    != (start_sec & 0xffffffff)) {
-				printk(KERN_ERR
-				       "%s: REF check failed on sector %lu\n",
-				       __func__, (unsigned long)sector);
-				ret = 0x03;
-				dump_sector(daddr, scsi_debug_sector_size);
-				goto out;
-			}
-
-			if (scsi_debug_dif == SD_DIF_TYPE2_PROTECTION &&
-			    be32_to_cpu(sdt->ref_tag) != ei_lba) {
-				printk(KERN_ERR
-				       "%s: REF check failed on sector %lu\n",
-				       __func__, (unsigned long)sector);
-				ret = 0x03;
-				dump_sector(daddr, scsi_debug_sector_size);
-				goto out;
-			}
-
-			/* Would be great to copy this in bigger
-			 * chunks.  However, for the sake of
-			 * correctness we need to verify each sector
-			 * before writing it to "stable" storage
-			 */
-			memcpy(dif_storep + dif_offset(sector), sdt, 8);
-
-			sector++;
-
-			if (sector == sdebug_store_sectors)
-				sector = 0;	/* Force wrap */
-
-			start_sec++;
-			ei_lba++;
-			daddr += scsi_debug_sector_size;
-			ppage_offset += sizeof(struct sd_dif_tuple);
+	/* For each protection page */
+	while (sg_miter_next(&piter)) {
+		dpage_offset = 0;
+		if (WARN_ON(!sg_miter_next(&diter))) {
+			ret = 0x01;
+			goto out;
 		}
 
-		kunmap_atomic(daddr, KM_IRQ0);
+		for (ppage_offset = 0; ppage_offset < piter.length;
+		     ppage_offset += sizeof(struct sd_dif_tuple)) {
+			/* If we're at the end of the current
+			 * data page advance to the next one
+			 */
+			if (dpage_offset >= diter.length) {
+				if (WARN_ON(!sg_miter_next(&diter))) {
+					ret = 0x01;
+					goto out;
+				}
+				dpage_offset = 0;
+			}
+
+			sdt = piter.addr + ppage_offset;
+			daddr = diter.addr + dpage_offset;
+
+			ret = dif_verify(sdt, daddr, sector, ei_lba);
+			if (ret) {
+				dump_sector(daddr, scsi_debug_sector_size);
+				goto out;
+			}
+
+			sector++;
+			ei_lba++;
+			dpage_offset += scsi_debug_sector_size;
+		}
+		diter.consumed = dpage_offset;
+		sg_miter_stop(&diter);
 	}
+	sg_miter_stop(&piter);
 
-	kunmap_atomic(paddr, KM_IRQ1);
-
+	dif_copy_prot(SCpnt, start_sec, sectors, false);
 	dix_writes++;
 
 	return 0;
 
 out:
 	dif_errors++;
-	kunmap_atomic(daddr, KM_IRQ0);
-	kunmap_atomic(paddr, KM_IRQ1);
+	sg_miter_stop(&diter);
+	sg_miter_stop(&piter);
 	return ret;
 }
 
@@ -2053,9 +2069,20 @@ static void unmap_region(sector_t lba, unsigned int len)
 
 		if (lba == map_index_to_lba(index) &&
 		    lba + scsi_debug_unmap_granularity <= end &&
-		    index < map_size)
+		    index < map_size) {
 			clear_bit(index, map_storep);
-
+			if (scsi_debug_lbprz) {
+				memset(fake_storep +
+				       lba * scsi_debug_sector_size, 0,
+				       scsi_debug_sector_size *
+				       scsi_debug_unmap_granularity);
+			}
+			if (dif_storep) {
+				memset(dif_storep + lba, 0xff,
+				       sizeof(*dif_storep) *
+				       scsi_debug_unmap_granularity);
+			}
+		}
 		lba = map_index_to_lba(index + 1);
 	}
 }
@@ -2071,19 +2098,21 @@ static int resp_write(struct scsi_cmnd *SCpnt, unsigned long long lba,
 	if (ret)
 		return ret;
 
+	write_lock_irqsave(&atomic_rw, iflags);
+
 	/* DIX + T10 DIF */
 	if (scsi_debug_dix && scsi_prot_sg_count(SCpnt)) {
 		int prot_ret = prot_verify_write(SCpnt, lba, num, ei_lba);
 
 		if (prot_ret) {
+			write_unlock_irqrestore(&atomic_rw, iflags);
 			mk_sense_buffer(devip, ILLEGAL_REQUEST, 0x10, prot_ret);
 			return illegal_condition_result;
 		}
 	}
 
-	write_lock_irqsave(&atomic_rw, iflags);
 	ret = do_device_access(SCpnt, devip, lba, num, 1);
-	if (scsi_debug_unmap_granularity)
+	if (scsi_debug_lbp())
 		map_region(lba, num);
 	write_unlock_irqrestore(&atomic_rw, iflags);
 	if (-1 == ret)
@@ -2116,7 +2145,7 @@ static int resp_write_same(struct scsi_cmnd *scmd, unsigned long long lba,
 
 	write_lock_irqsave(&atomic_rw, iflags);
 
-	if (unmap && scsi_debug_unmap_granularity) {
+	if (unmap && scsi_debug_lbp()) {
 		unmap_region(lba, num);
 		goto out;
 	}
@@ -2140,7 +2169,7 @@ static int resp_write_same(struct scsi_cmnd *scmd, unsigned long long lba,
 		       fake_storep + (lba * scsi_debug_sector_size),
 		       scsi_debug_sector_size);
 
-	if (scsi_debug_unmap_granularity)
+	if (scsi_debug_lbp())
 		map_region(lba, num);
 out:
 	write_unlock_irqrestore(&atomic_rw, iflags);
@@ -2160,6 +2189,7 @@ static int resp_unmap(struct scsi_cmnd * scmd, struct sdebug_dev_info * devip)
 	struct unmap_block_desc *desc;
 	unsigned int i, payload_len, descriptors;
 	int ret;
+	unsigned long iflags;
 
 	ret = check_readiness(scmd, 1, devip);
 	if (ret)
@@ -2181,6 +2211,8 @@ static int resp_unmap(struct scsi_cmnd * scmd, struct sdebug_dev_info * devip)
 
 	desc = (void *)&buf[8];
 
+	write_lock_irqsave(&atomic_rw, iflags);
+
 	for (i = 0 ; i < descriptors ; i++) {
 		unsigned long long lba = get_unaligned_be64(&desc[i].lba);
 		unsigned int num = get_unaligned_be32(&desc[i].blocks);
@@ -2195,6 +2227,7 @@ static int resp_unmap(struct scsi_cmnd * scmd, struct sdebug_dev_info * devip)
 	ret = 0;
 
 out:
+	write_unlock_irqrestore(&atomic_rw, iflags);
 	kfree(buf);
 
 	return ret;
@@ -2227,7 +2260,7 @@ static int resp_get_lba_status(struct scsi_cmnd * scmd,
 	mapped = map_state(lba, &num);
 
 	memset(arr, 0, SDEBUG_GET_LBA_STATUS_LEN);
-	put_unaligned_be32(16, &arr[0]);	/* Parameter Data Length */
+	put_unaligned_be32(20, &arr[0]);	/* Parameter Data Length */
 	put_unaligned_be64(lba, &arr[8]);	/* LBA */
 	put_unaligned_be32(num, &arr[16]);	/* Number of blocks */
 	arr[20] = !mapped;			/* mapped = 0, unmapped = 1 */
@@ -2295,36 +2328,37 @@ static int resp_report_luns(struct scsi_cmnd * scp,
 static int resp_xdwriteread(struct scsi_cmnd *scp, unsigned long long lba,
 			    unsigned int num, struct sdebug_dev_info *devip)
 {
-	int i, j, ret = -1;
+	int j;
 	unsigned char *kaddr, *buf;
 	unsigned int offset;
-	struct scatterlist *sg;
 	struct scsi_data_buffer *sdb = scsi_in(scp);
+	struct sg_mapping_iter miter;
 
 	/* better not to use temporary buffer. */
 	buf = kmalloc(scsi_bufflen(scp), GFP_ATOMIC);
-	if (!buf)
-		return ret;
+	if (!buf) {
+		mk_sense_buffer(devip, NOT_READY,
+				LOGICAL_UNIT_COMMUNICATION_FAILURE, 0);
+		return check_condition_result;
+	}
 
 	scsi_sg_copy_to_buffer(scp, buf, scsi_bufflen(scp));
 
 	offset = 0;
-	for_each_sg(sdb->table.sgl, sg, sdb->table.nents, i) {
-		kaddr = (unsigned char *)kmap_atomic(sg_page(sg), KM_USER0);
-		if (!kaddr)
-			goto out;
+	sg_miter_start(&miter, sdb->table.sgl, sdb->table.nents,
+			SG_MITER_ATOMIC | SG_MITER_TO_SG);
 
-		for (j = 0; j < sg->length; j++)
-			*(kaddr + sg->offset + j) ^= *(buf + offset + j);
+	while (sg_miter_next(&miter)) {
+		kaddr = miter.addr;
+		for (j = 0; j < miter.length; j++)
+			*(kaddr + j) ^= *(buf + offset + j);
 
-		offset += sg->length;
-		kunmap_atomic(kaddr, KM_USER0);
+		offset += miter.length;
 	}
-	ret = 0;
-out:
+	sg_miter_stop(&miter);
 	kfree(buf);
 
-	return ret;
+	return 0;
 }
 
 /* When timer goes off this function is called. */
@@ -2461,7 +2495,7 @@ static void scsi_debug_slave_destroy(struct scsi_device *sdp)
 		printk(KERN_INFO "scsi_debug: slave_destroy <%u %u %u %u>\n",
 		       sdp->host->host_no, sdp->channel, sdp->id, sdp->lun);
 	if (devip) {
-		/* make this slot avaliable for re-use */
+		/* make this slot available for re-use */
 		devip->used = 0;
 		sdp->hostdata = NULL;
 	}
@@ -2478,9 +2512,7 @@ static int stop_queued_cmnd(struct scsi_cmnd *cmnd)
 	for (k = 0; k < scsi_debug_max_queue; ++k) {
 		sqcp = &queued_arr[k];
 		if (sqcp->in_use && (cmnd == sqcp->a_cmnd)) {
-			spin_unlock_irqrestore(&queued_arr_lock, iflags);
 			del_timer_sync(&sqcp->cmnd_timer);
-			spin_lock_irqsave(&queued_arr_lock, iflags);
 			sqcp->in_use = 0;
 			sqcp->a_cmnd = NULL;
 			break;
@@ -2501,9 +2533,7 @@ static void stop_all_queued(void)
 	for (k = 0; k < scsi_debug_max_queue; ++k) {
 		sqcp = &queued_arr[k];
 		if (sqcp->in_use && sqcp->a_cmnd) {
-			spin_unlock_irqrestore(&queued_arr_lock, iflags);
 			del_timer_sync(&sqcp->cmnd_timer);
-			spin_lock_irqsave(&queued_arr_lock, iflags);
 			sqcp->in_use = 0;
 			sqcp->a_cmnd = NULL;
 		}
@@ -2730,6 +2760,7 @@ static int schedule_resp(struct scsi_cmnd * cmnd,
  */
 module_param_named(add_host, scsi_debug_add_host, int, S_IRUGO | S_IWUSR);
 module_param_named(ato, scsi_debug_ato, int, S_IRUGO);
+module_param_named(clustering, scsi_debug_clustering, bool, S_IRUGO | S_IWUSR);
 module_param_named(delay, scsi_debug_delay, int, S_IRUGO | S_IWUSR);
 module_param_named(dev_size_mb, scsi_debug_dev_size_mb, int, S_IRUGO);
 module_param_named(dif, scsi_debug_dif, int, S_IRUGO);
@@ -2737,10 +2768,11 @@ module_param_named(dix, scsi_debug_dix, int, S_IRUGO);
 module_param_named(dsense, scsi_debug_dsense, int, S_IRUGO | S_IWUSR);
 module_param_named(every_nth, scsi_debug_every_nth, int, S_IRUGO | S_IWUSR);
 module_param_named(fake_rw, scsi_debug_fake_rw, int, S_IRUGO | S_IWUSR);
-module_param_named(guard, scsi_debug_guard, int, S_IRUGO);
+module_param_named(guard, scsi_debug_guard, uint, S_IRUGO);
 module_param_named(lbpu, scsi_debug_lbpu, int, S_IRUGO);
 module_param_named(lbpws, scsi_debug_lbpws, int, S_IRUGO);
 module_param_named(lbpws10, scsi_debug_lbpws10, int, S_IRUGO);
+module_param_named(lbprz, scsi_debug_lbprz, int, S_IRUGO);
 module_param_named(lowest_aligned, scsi_debug_lowest_aligned, int, S_IRUGO);
 module_param_named(max_luns, scsi_debug_max_luns, int, S_IRUGO | S_IWUSR);
 module_param_named(max_queue, scsi_debug_max_queue, int, S_IRUGO | S_IWUSR);
@@ -2752,6 +2784,7 @@ module_param_named(opt_blks, scsi_debug_opt_blks, int, S_IRUGO);
 module_param_named(opts, scsi_debug_opts, int, S_IRUGO | S_IWUSR);
 module_param_named(physblk_exp, scsi_debug_physblk_exp, int, S_IRUGO);
 module_param_named(ptype, scsi_debug_ptype, int, S_IRUGO | S_IWUSR);
+module_param_named(removable, scsi_debug_removable, bool, S_IRUGO | S_IWUSR);
 module_param_named(scsi_level, scsi_debug_scsi_level, int, S_IRUGO);
 module_param_named(sector_size, scsi_debug_sector_size, int, S_IRUGO);
 module_param_named(unmap_alignment, scsi_debug_unmap_alignment, int, S_IRUGO);
@@ -2771,6 +2804,7 @@ MODULE_VERSION(SCSI_DEBUG_VERSION);
 
 MODULE_PARM_DESC(add_host, "0..127 hosts allowed(def=1)");
 MODULE_PARM_DESC(ato, "application tag ownership: 0=disk 1=host (def=1)");
+MODULE_PARM_DESC(clustering, "when set enables larger transfers (def=0)");
 MODULE_PARM_DESC(delay, "# of jiffies to delay response(def=1)");
 MODULE_PARM_DESC(dev_size_mb, "size in MB of ram shared by devs(def=8)");
 MODULE_PARM_DESC(dif, "data integrity field type: 0-3 (def=0)");
@@ -2782,6 +2816,7 @@ MODULE_PARM_DESC(guard, "protection checksum: 0=crc, 1=ip (def=0)");
 MODULE_PARM_DESC(lbpu, "enable LBP, support UNMAP command (def=0)");
 MODULE_PARM_DESC(lbpws, "enable LBP, support WRITE SAME(16) with UNMAP bit (def=0)");
 MODULE_PARM_DESC(lbpws10, "enable LBP, support WRITE SAME(10) with UNMAP bit (def=0)");
+MODULE_PARM_DESC(lbprz, "unmapped blocks return 0 on read (def=1)");
 MODULE_PARM_DESC(lowest_aligned, "lowest aligned lba (def=0)");
 MODULE_PARM_DESC(max_luns, "number of LUNs per target to simulate(def=1)");
 MODULE_PARM_DESC(max_queue, "max number of queued commands (1 to 255(def))");
@@ -2793,6 +2828,7 @@ MODULE_PARM_DESC(opt_blks, "optimal transfer length in block (def=64)");
 MODULE_PARM_DESC(opts, "1->noise, 2->medium_err, 4->timeout, 8->recovered_err... (def=0)");
 MODULE_PARM_DESC(physblk_exp, "physical block exponent (def=0)");
 MODULE_PARM_DESC(ptype, "SCSI peripheral type(def=0[disk])");
+MODULE_PARM_DESC(removable, "claim to have removable media (def=0)");
 MODULE_PARM_DESC(scsi_level, "SCSI level to simulate(def=5[SPC-3])");
 MODULE_PARM_DESC(sector_size, "logical block size in bytes (def=512)");
 MODULE_PARM_DESC(unmap_alignment, "lowest aligned thin provisioning lba (def=0)");
@@ -2817,31 +2853,27 @@ static const char * scsi_debug_info(struct Scsi_Host * shp)
 /* scsi_debug_proc_info
  * Used if the driver currently has no own support for /proc/scsi
  */
-static int scsi_debug_proc_info(struct Scsi_Host *host, char *buffer, char **start, off_t offset,
-				int length, int inout)
+static int scsi_debug_write_info(struct Scsi_Host *host, char *buffer, int length)
 {
-	int len, pos, begin;
-	int orig_length;
+	char arr[16];
+	int opts;
+	int minLen = length > 15 ? 15 : length;
 
-	orig_length = length;
+	if (!capable(CAP_SYS_ADMIN) || !capable(CAP_SYS_RAWIO))
+		return -EACCES;
+	memcpy(arr, buffer, minLen);
+	arr[minLen] = '\0';
+	if (1 != sscanf(arr, "%d", &opts))
+		return -EINVAL;
+	scsi_debug_opts = opts;
+	if (scsi_debug_every_nth != 0)
+		scsi_debug_cmnd_count = 0;
+	return length;
+}
 
-	if (inout == 1) {
-		char arr[16];
-		int minLen = length > 15 ? 15 : length;
-
-		if (!capable(CAP_SYS_ADMIN) || !capable(CAP_SYS_RAWIO))
-			return -EACCES;
-		memcpy(arr, buffer, minLen);
-		arr[minLen] = '\0';
-		if (1 != sscanf(arr, "%d", &pos))
-			return -EINVAL;
-		scsi_debug_opts = pos;
-		if (scsi_debug_every_nth != 0)
-                        scsi_debug_cmnd_count = 0;
-		return length;
-	}
-	begin = 0;
-	pos = len = sprintf(buffer, "scsi_debug adapter driver, version "
+static int scsi_debug_show_info(struct seq_file *m, struct Scsi_Host *host)
+{
+	seq_printf(m, "scsi_debug adapter driver, version "
 	    "%s [%s]\n"
 	    "num_tgts=%d, shared (ram) size=%d MB, opts=0x%x, "
 	    "every_nth=%d(curr:%d)\n"
@@ -2856,24 +2888,16 @@ static int scsi_debug_proc_info(struct Scsi_Host *host, char *buffer, char **sta
 	    scsi_debug_sector_size, sdebug_cylinders_per, sdebug_heads,
 	    sdebug_sectors_per, num_aborts, num_dev_resets, num_bus_resets,
 	    num_host_resets, dix_reads, dix_writes, dif_errors);
-	if (pos < offset) {
-		len = 0;
-		begin = pos;
-	}
-	*start = buffer + (offset - begin);	/* Start of wanted data */
-	len -= (offset - begin);
-	if (len > length)
-		len = length;
-	return len;
+	return 0;
 }
 
-static ssize_t sdebug_delay_show(struct device_driver * ddp, char * buf)
+static ssize_t delay_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_delay);
 }
 
-static ssize_t sdebug_delay_store(struct device_driver * ddp,
-				  const char * buf, size_t count)
+static ssize_t delay_store(struct device_driver *ddp, const char *buf,
+			   size_t count)
 {
         int delay;
 	char work[20];
@@ -2886,16 +2910,15 @@ static ssize_t sdebug_delay_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(delay, S_IRUGO | S_IWUSR, sdebug_delay_show,
-	    sdebug_delay_store);
+static DRIVER_ATTR_RW(delay);
 
-static ssize_t sdebug_opts_show(struct device_driver * ddp, char * buf)
+static ssize_t opts_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "0x%x\n", scsi_debug_opts);
 }
 
-static ssize_t sdebug_opts_store(struct device_driver * ddp,
-				 const char * buf, size_t count)
+static ssize_t opts_store(struct device_driver *ddp, const char *buf,
+			  size_t count)
 {
         int opts;
 	char work[20];
@@ -2915,15 +2938,14 @@ opts_done:
 	scsi_debug_cmnd_count = 0;
 	return count;
 }
-DRIVER_ATTR(opts, S_IRUGO | S_IWUSR, sdebug_opts_show,
-	    sdebug_opts_store);
+static DRIVER_ATTR_RW(opts);
 
-static ssize_t sdebug_ptype_show(struct device_driver * ddp, char * buf)
+static ssize_t ptype_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_ptype);
 }
-static ssize_t sdebug_ptype_store(struct device_driver * ddp,
-				  const char * buf, size_t count)
+static ssize_t ptype_store(struct device_driver *ddp, const char *buf,
+			   size_t count)
 {
         int n;
 
@@ -2933,14 +2955,14 @@ static ssize_t sdebug_ptype_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(ptype, S_IRUGO | S_IWUSR, sdebug_ptype_show, sdebug_ptype_store);
+static DRIVER_ATTR_RW(ptype);
 
-static ssize_t sdebug_dsense_show(struct device_driver * ddp, char * buf)
+static ssize_t dsense_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_dsense);
 }
-static ssize_t sdebug_dsense_store(struct device_driver * ddp,
-				  const char * buf, size_t count)
+static ssize_t dsense_store(struct device_driver *ddp, const char *buf,
+			    size_t count)
 {
         int n;
 
@@ -2950,15 +2972,14 @@ static ssize_t sdebug_dsense_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(dsense, S_IRUGO | S_IWUSR, sdebug_dsense_show,
-	    sdebug_dsense_store);
+static DRIVER_ATTR_RW(dsense);
 
-static ssize_t sdebug_fake_rw_show(struct device_driver * ddp, char * buf)
+static ssize_t fake_rw_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_fake_rw);
 }
-static ssize_t sdebug_fake_rw_store(struct device_driver * ddp,
-				    const char * buf, size_t count)
+static ssize_t fake_rw_store(struct device_driver *ddp, const char *buf,
+			     size_t count)
 {
         int n;
 
@@ -2968,15 +2989,14 @@ static ssize_t sdebug_fake_rw_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(fake_rw, S_IRUGO | S_IWUSR, sdebug_fake_rw_show,
-	    sdebug_fake_rw_store);
+static DRIVER_ATTR_RW(fake_rw);
 
-static ssize_t sdebug_no_lun_0_show(struct device_driver * ddp, char * buf)
+static ssize_t no_lun_0_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_no_lun_0);
 }
-static ssize_t sdebug_no_lun_0_store(struct device_driver * ddp,
-				     const char * buf, size_t count)
+static ssize_t no_lun_0_store(struct device_driver *ddp, const char *buf,
+			      size_t count)
 {
         int n;
 
@@ -2986,15 +3006,14 @@ static ssize_t sdebug_no_lun_0_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(no_lun_0, S_IRUGO | S_IWUSR, sdebug_no_lun_0_show,
-	    sdebug_no_lun_0_store);
+static DRIVER_ATTR_RW(no_lun_0);
 
-static ssize_t sdebug_num_tgts_show(struct device_driver * ddp, char * buf)
+static ssize_t num_tgts_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_num_tgts);
 }
-static ssize_t sdebug_num_tgts_store(struct device_driver * ddp,
-				     const char * buf, size_t count)
+static ssize_t num_tgts_store(struct device_driver *ddp, const char *buf,
+			      size_t count)
 {
         int n;
 
@@ -3005,27 +3024,26 @@ static ssize_t sdebug_num_tgts_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(num_tgts, S_IRUGO | S_IWUSR, sdebug_num_tgts_show,
-	    sdebug_num_tgts_store);
+static DRIVER_ATTR_RW(num_tgts);
 
-static ssize_t sdebug_dev_size_mb_show(struct device_driver * ddp, char * buf)
+static ssize_t dev_size_mb_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_dev_size_mb);
 }
-DRIVER_ATTR(dev_size_mb, S_IRUGO, sdebug_dev_size_mb_show, NULL);
+static DRIVER_ATTR_RO(dev_size_mb);
 
-static ssize_t sdebug_num_parts_show(struct device_driver * ddp, char * buf)
+static ssize_t num_parts_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_num_parts);
 }
-DRIVER_ATTR(num_parts, S_IRUGO, sdebug_num_parts_show, NULL);
+static DRIVER_ATTR_RO(num_parts);
 
-static ssize_t sdebug_every_nth_show(struct device_driver * ddp, char * buf)
+static ssize_t every_nth_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_every_nth);
 }
-static ssize_t sdebug_every_nth_store(struct device_driver * ddp,
-				      const char * buf, size_t count)
+static ssize_t every_nth_store(struct device_driver *ddp, const char *buf,
+			       size_t count)
 {
         int nth;
 
@@ -3036,15 +3054,14 @@ static ssize_t sdebug_every_nth_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(every_nth, S_IRUGO | S_IWUSR, sdebug_every_nth_show,
-	    sdebug_every_nth_store);
+static DRIVER_ATTR_RW(every_nth);
 
-static ssize_t sdebug_max_luns_show(struct device_driver * ddp, char * buf)
+static ssize_t max_luns_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_max_luns);
 }
-static ssize_t sdebug_max_luns_store(struct device_driver * ddp,
-				     const char * buf, size_t count)
+static ssize_t max_luns_store(struct device_driver *ddp, const char *buf,
+			      size_t count)
 {
         int n;
 
@@ -3055,15 +3072,14 @@ static ssize_t sdebug_max_luns_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(max_luns, S_IRUGO | S_IWUSR, sdebug_max_luns_show,
-	    sdebug_max_luns_store);
+static DRIVER_ATTR_RW(max_luns);
 
-static ssize_t sdebug_max_queue_show(struct device_driver * ddp, char * buf)
+static ssize_t max_queue_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_max_queue);
 }
-static ssize_t sdebug_max_queue_store(struct device_driver * ddp,
-				      const char * buf, size_t count)
+static ssize_t max_queue_store(struct device_driver *ddp, const char *buf,
+			       size_t count)
 {
         int n;
 
@@ -3074,27 +3090,26 @@ static ssize_t sdebug_max_queue_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(max_queue, S_IRUGO | S_IWUSR, sdebug_max_queue_show,
-	    sdebug_max_queue_store);
+static DRIVER_ATTR_RW(max_queue);
 
-static ssize_t sdebug_no_uld_show(struct device_driver * ddp, char * buf)
+static ssize_t no_uld_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_no_uld);
 }
-DRIVER_ATTR(no_uld, S_IRUGO, sdebug_no_uld_show, NULL);
+static DRIVER_ATTR_RO(no_uld);
 
-static ssize_t sdebug_scsi_level_show(struct device_driver * ddp, char * buf)
+static ssize_t scsi_level_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_scsi_level);
 }
-DRIVER_ATTR(scsi_level, S_IRUGO, sdebug_scsi_level_show, NULL);
+static DRIVER_ATTR_RO(scsi_level);
 
-static ssize_t sdebug_virtual_gb_show(struct device_driver * ddp, char * buf)
+static ssize_t virtual_gb_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_virtual_gb);
 }
-static ssize_t sdebug_virtual_gb_store(struct device_driver * ddp,
-				       const char * buf, size_t count)
+static ssize_t virtual_gb_store(struct device_driver *ddp, const char *buf,
+				size_t count)
 {
         int n;
 
@@ -3107,16 +3122,15 @@ static ssize_t sdebug_virtual_gb_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(virtual_gb, S_IRUGO | S_IWUSR, sdebug_virtual_gb_show,
-	    sdebug_virtual_gb_store);
+static DRIVER_ATTR_RW(virtual_gb);
 
-static ssize_t sdebug_add_host_show(struct device_driver * ddp, char * buf)
+static ssize_t add_host_show(struct device_driver *ddp, char *buf)
 {
         return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_add_host);
 }
 
-static ssize_t sdebug_add_host_store(struct device_driver * ddp,
-				     const char * buf, size_t count)
+static ssize_t add_host_store(struct device_driver *ddp, const char *buf,
+			      size_t count)
 {
 	int delta_hosts;
 
@@ -3133,16 +3147,14 @@ static ssize_t sdebug_add_host_store(struct device_driver * ddp,
 	}
 	return count;
 }
-DRIVER_ATTR(add_host, S_IRUGO | S_IWUSR, sdebug_add_host_show,
-	    sdebug_add_host_store);
+static DRIVER_ATTR_RW(add_host);
 
-static ssize_t sdebug_vpd_use_hostno_show(struct device_driver * ddp,
-					  char * buf)
+static ssize_t vpd_use_hostno_show(struct device_driver *ddp, char *buf)
 {
 	return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_vpd_use_hostno);
 }
-static ssize_t sdebug_vpd_use_hostno_store(struct device_driver * ddp,
-					   const char * buf, size_t count)
+static ssize_t vpd_use_hostno_store(struct device_driver *ddp, const char *buf,
+				    size_t count)
 {
 	int n;
 
@@ -3152,40 +3164,39 @@ static ssize_t sdebug_vpd_use_hostno_store(struct device_driver * ddp,
 	}
 	return -EINVAL;
 }
-DRIVER_ATTR(vpd_use_hostno, S_IRUGO | S_IWUSR, sdebug_vpd_use_hostno_show,
-	    sdebug_vpd_use_hostno_store);
+static DRIVER_ATTR_RW(vpd_use_hostno);
 
-static ssize_t sdebug_sector_size_show(struct device_driver * ddp, char * buf)
+static ssize_t sector_size_show(struct device_driver *ddp, char *buf)
 {
 	return scnprintf(buf, PAGE_SIZE, "%u\n", scsi_debug_sector_size);
 }
-DRIVER_ATTR(sector_size, S_IRUGO, sdebug_sector_size_show, NULL);
+static DRIVER_ATTR_RO(sector_size);
 
-static ssize_t sdebug_dix_show(struct device_driver *ddp, char *buf)
+static ssize_t dix_show(struct device_driver *ddp, char *buf)
 {
 	return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_dix);
 }
-DRIVER_ATTR(dix, S_IRUGO, sdebug_dix_show, NULL);
+static DRIVER_ATTR_RO(dix);
 
-static ssize_t sdebug_dif_show(struct device_driver *ddp, char *buf)
+static ssize_t dif_show(struct device_driver *ddp, char *buf)
 {
 	return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_dif);
 }
-DRIVER_ATTR(dif, S_IRUGO, sdebug_dif_show, NULL);
+static DRIVER_ATTR_RO(dif);
 
-static ssize_t sdebug_guard_show(struct device_driver *ddp, char *buf)
+static ssize_t guard_show(struct device_driver *ddp, char *buf)
 {
-	return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_guard);
+	return scnprintf(buf, PAGE_SIZE, "%u\n", scsi_debug_guard);
 }
-DRIVER_ATTR(guard, S_IRUGO, sdebug_guard_show, NULL);
+static DRIVER_ATTR_RO(guard);
 
-static ssize_t sdebug_ato_show(struct device_driver *ddp, char *buf)
+static ssize_t ato_show(struct device_driver *ddp, char *buf)
 {
 	return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_ato);
 }
-DRIVER_ATTR(ato, S_IRUGO, sdebug_ato_show, NULL);
+static DRIVER_ATTR_RO(ato);
 
-static ssize_t sdebug_map_show(struct device_driver *ddp, char *buf)
+static ssize_t map_show(struct device_driver *ddp, char *buf)
 {
 	ssize_t count;
 
@@ -3200,82 +3211,62 @@ static ssize_t sdebug_map_show(struct device_driver *ddp, char *buf)
 
 	return count;
 }
-DRIVER_ATTR(map, S_IRUGO, sdebug_map_show, NULL);
+static DRIVER_ATTR_RO(map);
 
+static ssize_t removable_show(struct device_driver *ddp, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%d\n", scsi_debug_removable ? 1 : 0);
+}
+static ssize_t removable_store(struct device_driver *ddp, const char *buf,
+			       size_t count)
+{
+	int n;
 
-/* Note: The following function creates attribute files in the
+	if ((count > 0) && (1 == sscanf(buf, "%d", &n)) && (n >= 0)) {
+		scsi_debug_removable = (n > 0);
+		return count;
+	}
+	return -EINVAL;
+}
+static DRIVER_ATTR_RW(removable);
+
+/* Note: The following array creates attribute files in the
    /sys/bus/pseudo/drivers/scsi_debug directory. The advantage of these
    files (over those found in the /sys/module/scsi_debug/parameters
    directory) is that auxiliary actions can be triggered when an attribute
    is changed. For example see: sdebug_add_host_store() above.
  */
-static int do_create_driverfs_files(void)
-{
-	int ret;
 
-	ret = driver_create_file(&sdebug_driverfs_driver, &driver_attr_add_host);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_delay);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_dev_size_mb);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_dsense);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_every_nth);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_fake_rw);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_max_luns);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_max_queue);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_no_lun_0);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_no_uld);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_num_parts);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_num_tgts);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_ptype);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_opts);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_scsi_level);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_virtual_gb);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_vpd_use_hostno);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_sector_size);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_dix);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_dif);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_guard);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_ato);
-	ret |= driver_create_file(&sdebug_driverfs_driver, &driver_attr_map);
-	return ret;
-}
-
-static void do_remove_driverfs_files(void)
-{
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_map);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_ato);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_guard);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_dif);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_dix);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_sector_size);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_vpd_use_hostno);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_virtual_gb);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_scsi_level);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_opts);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_ptype);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_num_tgts);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_num_parts);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_no_uld);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_no_lun_0);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_max_queue);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_max_luns);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_fake_rw);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_every_nth);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_dsense);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_dev_size_mb);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_delay);
-	driver_remove_file(&sdebug_driverfs_driver, &driver_attr_add_host);
-}
-
-static void pseudo_0_release(struct device *dev)
-{
-	if (SCSI_DEBUG_OPT_NOISE & scsi_debug_opts)
-		printk(KERN_INFO "scsi_debug: pseudo_0_release() called\n");
-}
-
-static struct device pseudo_primary = {
-	.init_name	= "pseudo_0",
-	.release	= pseudo_0_release,
+static struct attribute *sdebug_drv_attrs[] = {
+	&driver_attr_delay.attr,
+	&driver_attr_opts.attr,
+	&driver_attr_ptype.attr,
+	&driver_attr_dsense.attr,
+	&driver_attr_fake_rw.attr,
+	&driver_attr_no_lun_0.attr,
+	&driver_attr_num_tgts.attr,
+	&driver_attr_dev_size_mb.attr,
+	&driver_attr_num_parts.attr,
+	&driver_attr_every_nth.attr,
+	&driver_attr_max_luns.attr,
+	&driver_attr_max_queue.attr,
+	&driver_attr_no_uld.attr,
+	&driver_attr_scsi_level.attr,
+	&driver_attr_virtual_gb.attr,
+	&driver_attr_add_host.attr,
+	&driver_attr_vpd_use_hostno.attr,
+	&driver_attr_sector_size.attr,
+	&driver_attr_dix.attr,
+	&driver_attr_dif.attr,
+	&driver_attr_guard.attr,
+	&driver_attr_ato.attr,
+	&driver_attr_map.attr,
+	&driver_attr_removable.attr,
+	NULL,
 };
+ATTRIBUTE_GROUPS(sdebug_drv);
+
+static struct device *pseudo_primary;
 
 static int __init scsi_debug_init(void)
 {
@@ -3306,6 +3297,11 @@ static int __init scsi_debug_init(void)
 
 	default:
 		printk(KERN_ERR "scsi_debug_init: dif must be 0, 1, 2 or 3\n");
+		return -EINVAL;
+	}
+
+	if (scsi_debug_num_tgts < 0) {
+		pr_err("num_tgts must be >= 0\n");
 		return -EINVAL;
 	}
 
@@ -3340,10 +3336,10 @@ static int __init scsi_debug_init(void)
 	/* play around with geometry, don't waste too much on track 0 */
 	sdebug_heads = 8;
 	sdebug_sectors_per = 32;
-	if (scsi_debug_dev_size_mb >= 16)
-		sdebug_heads = 32;
-	else if (scsi_debug_dev_size_mb >= 256)
+	if (scsi_debug_dev_size_mb >= 256)
 		sdebug_heads = 64;
+	else if (scsi_debug_dev_size_mb >= 16)
+		sdebug_heads = 32;
 	sdebug_cylinders_per = (unsigned long)sdebug_capacity /
 			       (sdebug_sectors_per * sdebug_heads);
 	if (sdebug_cylinders_per >= 1024) {
@@ -3363,7 +3359,7 @@ static int __init scsi_debug_init(void)
 	if (scsi_debug_num_parts > 0)
 		sdebug_build_parts(fake_storep, sz);
 
-	if (scsi_debug_dif) {
+	if (scsi_debug_dix) {
 		int dif_size;
 
 		dif_size = sdebug_store_sectors * sizeof(struct sd_dif_tuple);
@@ -3393,9 +3389,10 @@ static int __init scsi_debug_init(void)
 			clamp(scsi_debug_unmap_granularity, 1U, 0xffffffffU);
 
 		if (scsi_debug_unmap_alignment &&
-		    scsi_debug_unmap_granularity < scsi_debug_unmap_alignment) {
+		    scsi_debug_unmap_granularity <=
+		    scsi_debug_unmap_alignment) {
 			printk(KERN_ERR
-			       "%s: ERR: unmap_granularity < unmap_alignment\n",
+			       "%s: ERR: unmap_granularity <= unmap_alignment\n",
 			       __func__);
 			return -EINVAL;
 		}
@@ -3419,10 +3416,10 @@ static int __init scsi_debug_init(void)
 			map_region(0, 2);
 	}
 
-	ret = device_register(&pseudo_primary);
-	if (ret < 0) {
-		printk(KERN_WARNING "scsi_debug: device_register error: %d\n",
-			ret);
+	pseudo_primary = root_device_register("pseudo_0");
+	if (IS_ERR(pseudo_primary)) {
+		printk(KERN_WARNING "scsi_debug: root_device_register() error\n");
+		ret = PTR_ERR(pseudo_primary);
 		goto free_vm;
 	}
 	ret = bus_register(&pseudo_lld_bus);
@@ -3436,12 +3433,6 @@ static int __init scsi_debug_init(void)
 		printk(KERN_WARNING "scsi_debug: driver_register error: %d\n",
 			ret);
 		goto bus_unreg;
-	}
-	ret = do_create_driverfs_files();
-	if (ret < 0) {
-		printk(KERN_WARNING "scsi_debug: driver_create_file error: %d\n",
-			ret);
-		goto del_files;
 	}
 
 	init_all_queued();
@@ -3463,18 +3454,13 @@ static int __init scsi_debug_init(void)
 	}
 	return 0;
 
-del_files:
-	do_remove_driverfs_files();
-	driver_unregister(&sdebug_driverfs_driver);
 bus_unreg:
 	bus_unregister(&pseudo_lld_bus);
 dev_unreg:
-	device_unregister(&pseudo_primary);
+	root_device_unregister(pseudo_primary);
 free_vm:
-	if (map_storep)
-		vfree(map_storep);
-	if (dif_storep)
-		vfree(dif_storep);
+	vfree(map_storep);
+	vfree(dif_storep);
 	vfree(fake_storep);
 
 	return ret;
@@ -3487,14 +3473,12 @@ static void __exit scsi_debug_exit(void)
 	stop_all_queued();
 	for (; k; k--)
 		sdebug_remove_adapter();
-	do_remove_driverfs_files();
 	driver_unregister(&sdebug_driverfs_driver);
 	bus_unregister(&pseudo_lld_bus);
-	device_unregister(&pseudo_primary);
+	root_device_unregister(pseudo_primary);
 
-	if (dif_storep)
-		vfree(dif_storep);
-
+	vfree(map_storep);
+	vfree(dif_storep);
 	vfree(fake_storep);
 }
 
@@ -3541,7 +3525,7 @@ static int sdebug_add_adapter(void)
         spin_unlock(&sdebug_host_list_lock);
 
         sdbg_host->dev.bus = &pseudo_lld_bus;
-        sdbg_host->dev.parent = &pseudo_primary;
+        sdbg_host->dev.parent = pseudo_primary;
         sdbg_host->dev.release = &sdebug_release_adapter;
         dev_set_name(&sdbg_host->dev, "adapter%d", scsi_debug_add_host);
 
@@ -3584,7 +3568,7 @@ static void sdebug_remove_adapter(void)
 }
 
 static
-int scsi_debug_queuecommand(struct scsi_cmnd *SCpnt, done_funct_t done)
+int scsi_debug_queuecommand_lck(struct scsi_cmnd *SCpnt, done_funct_t done)
 {
 	unsigned char *cmd = (unsigned char *) SCpnt->cmnd;
 	int len, k;
@@ -3598,6 +3582,7 @@ int scsi_debug_queuecommand(struct scsi_cmnd *SCpnt, done_funct_t done)
 	int inj_transport = 0;
 	int inj_dif = 0;
 	int inj_dix = 0;
+	int inj_short = 0;
 	int delay_override = 0;
 	int unmap = 0;
 
@@ -3643,6 +3628,8 @@ int scsi_debug_queuecommand(struct scsi_cmnd *SCpnt, done_funct_t done)
 			inj_dif = 1; /* to reads and writes below */
 		else if (SCSI_DEBUG_OPT_DIX_ERR & scsi_debug_opts)
 			inj_dix = 1; /* to reads and writes below */
+		else if (SCSI_DEBUG_OPT_SHORT_TRANSFER & scsi_debug_opts)
+			inj_short = 1;
 	}
 
 	if (devip->wlun) {
@@ -3707,7 +3694,7 @@ int scsi_debug_queuecommand(struct scsi_cmnd *SCpnt, done_funct_t done)
 	case READ_CAPACITY:
 		errsts = resp_readcap(SCpnt, devip);
 		break;
-	case SERVICE_ACTION_IN:
+	case SERVICE_ACTION_IN_16:
 		if (cmd[1] == SAI_READ_CAPACITY_16)
 			errsts = resp_readcap16(SCpnt, devip);
 		else if (cmd[1] == SAI_GET_LBA_STATUS) {
@@ -3759,6 +3746,10 @@ read:
 		if (scsi_debug_fake_rw)
 			break;
 		get_data_transfer_info(cmd, &lba, &num, &ei_lba);
+
+		if (inj_short)
+			num /= 2;
+
 		errsts = resp_read(SCpnt, lba, num, devip, ei_lba);
 		if (inj_recovered && (0 == errsts)) {
 			mk_sense_buffer(devip, RECOVERED_ERROR,
@@ -3933,8 +3924,11 @@ write:
 			     (delay_override ? 0 : scsi_debug_delay));
 }
 
+static DEF_SCSI_QCMD(scsi_debug_queuecommand)
+
 static struct scsi_host_template sdebug_driver_template = {
-	.proc_info =		scsi_debug_proc_info,
+	.show_info =		scsi_debug_show_info,
+	.write_info =		scsi_debug_write_info,
 	.proc_name =		sdebug_proc_name,
 	.name =			"SCSI DEBUG",
 	.info =			scsi_debug_info,
@@ -3967,9 +3961,11 @@ static int sdebug_driver_probe(struct device * dev)
 	sdbg_host = to_sdebug_host(dev);
 
 	sdebug_driver_template.can_queue = scsi_debug_max_queue;
+	if (scsi_debug_clustering)
+		sdebug_driver_template.use_clustering = ENABLE_CLUSTERING;
 	hpnt = scsi_host_alloc(&sdebug_driver_template, sizeof(sdbg_host));
 	if (NULL == hpnt) {
-		printk(KERN_ERR "%s: scsi_register failed\n", __func__);
+		pr_err("%s: scsi_host_alloc failed\n", __func__);
 		error = -ENODEV;
 		return error;
 	}
@@ -4074,4 +4070,5 @@ static struct bus_type pseudo_lld_bus = {
 	.match = pseudo_lld_bus_match,
 	.probe = sdebug_driver_probe,
 	.remove = sdebug_driver_remove,
+	.drv_groups = sdebug_drv_groups,
 };

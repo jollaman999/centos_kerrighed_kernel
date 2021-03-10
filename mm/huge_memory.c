@@ -7,16 +7,27 @@
 
 #include <linux/mm.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/highmem.h>
 #include <linux/hugetlb.h>
 #include <linux/mmu_notifier.h>
 #include <linux/rmap.h>
 #include <linux/swap.h>
+#include <linux/shrinker.h>
 #include <linux/mm_inline.h>
+#include <linux/dax.h>
 #include <linux/kthread.h>
 #include <linux/khugepaged.h>
 #include <linux/freezer.h>
+#include <linux/pfn_t.h>
 #include <linux/mman.h>
+#include <linux/memremap.h>
+#include <linux/pagemap.h>
+#include <linux/migrate.h>
+#include <linux/hashtable.h>
+#include <linux/userfaultfd_k.h>
+#include <linux/page_idle.h>
+
 #include <asm/tlb.h>
 #include <asm/pgalloc.h>
 #include "internal.h"
@@ -29,9 +40,15 @@
  * allocations.
  */
 unsigned long transparent_hugepage_flags __read_mostly =
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE_ALWAYS
 	(1<<TRANSPARENT_HUGEPAGE_FLAG)|
+#endif
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE_MADVISE
+	(1<<TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG)|
+#endif
 	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_FLAG)|
-	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG);
+	(1<<TRANSPARENT_HUGEPAGE_DEFRAG_KHUGEPAGED_FLAG)|
+	(1<<TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
 
 /* default scan 8*512 pte (or vmas) every 30 second */
 static unsigned int khugepaged_pages_to_scan __read_mostly = HPAGE_PMD_NR*8;
@@ -52,12 +69,11 @@ static DECLARE_WAIT_QUEUE_HEAD(khugepaged_wait);
 static unsigned int khugepaged_max_ptes_none __read_mostly = HPAGE_PMD_NR-1;
 
 static int khugepaged(void *none);
-static int mm_slots_hash_init(void);
 static int khugepaged_slab_init(void);
-static void khugepaged_slab_free(void);
 
-#define MM_SLOTS_HASH_HEADS 1024
-static struct hlist_head *mm_slots_hash __read_mostly;
+#define MM_SLOTS_HASH_BITS 10
+static __read_mostly DEFINE_HASHTABLE(mm_slots_hash, MM_SLOTS_HASH_BITS);
+
 static struct kmem_cache *mm_slot_cache __read_mostly;
 
 /**
@@ -84,7 +100,8 @@ struct khugepaged_scan {
 	struct list_head mm_head;
 	struct mm_slot *mm_slot;
 	unsigned long address;
-} khugepaged_scan = {
+};
+static struct khugepaged_scan khugepaged_scan = {
 	.mm_head = LIST_HEAD_INIT(khugepaged_scan.mm_head),
 };
 
@@ -94,7 +111,6 @@ static int set_recommended_min_free_kbytes(void)
 	struct zone *zone;
 	int nr_zones = 0;
 	unsigned long recommended_min;
-	extern int min_free_kbytes;
 
 	if (!khugepaged_enabled())
 		return 0;
@@ -152,6 +168,66 @@ static int start_khugepaged(void)
 	return err;
 }
 
+static atomic_t huge_zero_refcount;
+struct page *huge_zero_page __read_mostly;
+
+struct page *get_huge_zero_page(void)
+{
+	struct page *zero_page;
+retry:
+	if (likely(atomic_inc_not_zero(&huge_zero_refcount)))
+		return ACCESS_ONCE(huge_zero_page);
+
+	zero_page = alloc_pages((GFP_TRANSHUGE | __GFP_ZERO) & ~__GFP_MOVABLE,
+			HPAGE_PMD_ORDER);
+	if (!zero_page) {
+		count_vm_event(THP_ZERO_PAGE_ALLOC_FAILED);
+		return NULL;
+	}
+	count_vm_event(THP_ZERO_PAGE_ALLOC);
+	preempt_disable();
+	if (cmpxchg(&huge_zero_page, NULL, zero_page)) {
+		preempt_enable();
+		__free_pages(zero_page, compound_order(zero_page));
+		goto retry;
+	}
+
+	/* We take additional reference here. It will be put back by shrinker */
+	atomic_set(&huge_zero_refcount, 2);
+	preempt_enable();
+	return ACCESS_ONCE(huge_zero_page);
+}
+
+void put_huge_zero_page(void)
+{
+	/*
+	 * Counter should never go to zero here. Only shrinker can put
+	 * last reference.
+	 */
+	BUG_ON(atomic_dec_and_test(&huge_zero_refcount));
+}
+
+static int shrink_huge_zero_page(struct shrinker *shrink,
+		struct shrink_control *sc)
+{
+	if (!sc->nr_to_scan)
+		/* we can free zero page only if last reference remains */
+		return atomic_read(&huge_zero_refcount) == 1 ? HPAGE_PMD_NR : 0;
+
+	if (atomic_cmpxchg(&huge_zero_refcount, 1, 0) == 1) {
+		struct page *zero_page = xchg(&huge_zero_page, NULL);
+		BUG_ON(zero_page == NULL);
+		__free_pages(zero_page, compound_order(zero_page));
+	}
+
+	return 0;
+}
+
+static struct shrinker huge_zero_page_shrinker = {
+	.shrink = shrink_huge_zero_page,
+	.seeks = DEFAULT_SEEKS,
+};
+
 #ifdef CONFIG_SYSFS
 
 static ssize_t double_flag_show(struct kobject *kobj,
@@ -178,7 +254,7 @@ static ssize_t double_flag_store(struct kobject *kobj,
 		set_bit(enabled, &transparent_hugepage_flags);
 		clear_bit(req_madv, &transparent_hugepage_flags);
 	} else if (!memcmp("madvise", buf,
-			min(sizeof("madvise")-1, count))) {
+			   min(sizeof("madvise")-1, count))) {
 		clear_bit(enabled, &transparent_hugepage_flags);
 		set_bit(req_madv, &transparent_hugepage_flags);
 	} else if (!memcmp("never", buf,
@@ -228,24 +304,28 @@ static ssize_t single_flag_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf,
 				enum transparent_hugepage_flag flag)
 {
-	if (test_bit(flag, &transparent_hugepage_flags))
-		return sprintf(buf, "[yes] no\n");
-	else
-		return sprintf(buf, "yes [no]\n");
+	return sprintf(buf, "%d\n",
+		       !!test_bit(flag, &transparent_hugepage_flags));
 }
+
 static ssize_t single_flag_store(struct kobject *kobj,
 				 struct kobj_attribute *attr,
 				 const char *buf, size_t count,
 				 enum transparent_hugepage_flag flag)
 {
-	if (!memcmp("yes", buf,
-		    min(sizeof("yes")-1, count))) {
-		set_bit(flag, &transparent_hugepage_flags);
-	} else if (!memcmp("no", buf,
-			   min(sizeof("no")-1, count))) {
-		clear_bit(flag, &transparent_hugepage_flags);
-	} else
+	unsigned long value;
+	int ret;
+
+	ret = kstrtoul(buf, 10, &value);
+	if (ret < 0)
+		return ret;
+	if (value > 1)
 		return -EINVAL;
+
+	if (value)
+		set_bit(flag, &transparent_hugepage_flags);
+	else
+		clear_bit(flag, &transparent_hugepage_flags);
 
 	return count;
 }
@@ -273,6 +353,20 @@ static ssize_t defrag_store(struct kobject *kobj,
 static struct kobj_attribute defrag_attr =
 	__ATTR(defrag, 0644, defrag_show, defrag_store);
 
+static ssize_t use_zero_page_show(struct kobject *kobj,
+		struct kobj_attribute *attr, char *buf)
+{
+	return single_flag_show(kobj, attr, buf,
+				TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
+}
+static ssize_t use_zero_page_store(struct kobject *kobj,
+		struct kobj_attribute *attr, const char *buf, size_t count)
+{
+	return single_flag_store(kobj, attr, buf, count,
+				 TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG);
+}
+static struct kobj_attribute use_zero_page_attr =
+	__ATTR(use_zero_page, 0644, use_zero_page_show, use_zero_page_store);
 #ifdef CONFIG_DEBUG_VM
 static ssize_t debug_cow_show(struct kobject *kobj,
 				struct kobj_attribute *attr, char *buf)
@@ -294,6 +388,7 @@ static struct kobj_attribute debug_cow_attr =
 static struct attribute *hugepage_attr[] = {
 	&enabled_attr.attr,
 	&defrag_attr.attr,
+	&use_zero_page_attr.attr,
 #ifdef CONFIG_DEBUG_VM
 	&debug_cow_attr.attr,
 #endif
@@ -466,58 +561,74 @@ static struct attribute_group khugepaged_attr_group = {
 	.attrs = khugepaged_attr,
 	.name = "khugepaged",
 };
+
+static int __init hugepage_init_sysfs(struct kobject **hugepage_kobj)
+{
+	int err;
+
+	*hugepage_kobj = kobject_create_and_add("transparent_hugepage", mm_kobj);
+	if (unlikely(!*hugepage_kobj)) {
+		printk(KERN_ERR "hugepage: failed to create transparent hugepage kobject\n");
+		return -ENOMEM;
+	}
+
+	err = sysfs_create_group(*hugepage_kobj, &hugepage_attr_group);
+	if (err) {
+		printk(KERN_ERR "hugepage: failed to register transparent hugepage group\n");
+		goto delete_obj;
+	}
+
+	err = sysfs_create_group(*hugepage_kobj, &khugepaged_attr_group);
+	if (err) {
+		printk(KERN_ERR "hugepage: failed to register transparent hugepage group\n");
+		goto remove_hp_group;
+	}
+
+	return 0;
+
+remove_hp_group:
+	sysfs_remove_group(*hugepage_kobj, &hugepage_attr_group);
+delete_obj:
+	kobject_put(*hugepage_kobj);
+	return err;
+}
+
+static void __init hugepage_exit_sysfs(struct kobject *hugepage_kobj)
+{
+	sysfs_remove_group(hugepage_kobj, &khugepaged_attr_group);
+	sysfs_remove_group(hugepage_kobj, &hugepage_attr_group);
+	kobject_put(hugepage_kobj);
+}
+#else
+static inline int hugepage_init_sysfs(struct kobject **hugepage_kobj)
+{
+	return 0;
+}
+
+static inline void hugepage_exit_sysfs(struct kobject *hugepage_kobj)
+{
+}
 #endif /* CONFIG_SYSFS */
 
 static int __init hugepage_init(void)
 {
 	int err;
-#ifdef CONFIG_SYSFS
 	struct kobject *hugepage_kobj;
-#endif
 
-	err = -EINVAL;
 	if (!has_transparent_hugepage()) {
 		transparent_hugepage_flags = 0;
-		goto out;
+		return -EINVAL;
 	}
 
-#ifdef CONFIG_SYSFS
-	err = -ENOMEM;
-	hugepage_kobj = kobject_create_and_add("redhat_transparent_hugepage",
-					       mm_kobj);
-	if (unlikely(!hugepage_kobj)) {
-		printk(KERN_ERR "hugepage: failed kobject create\n");
-		goto out;
-	}
-
-	err = sysfs_create_group(hugepage_kobj, &hugepage_attr_group);
-	if (err) {
-		printk(KERN_ERR "hugepage: failed register hugepage group\n");
-		goto out;
-	}
-
-	err = sysfs_create_group(hugepage_kobj, &khugepaged_attr_group);
-	if (err) {
-		printk(KERN_ERR "hugepage: failed register hugepage group\n");
-		goto out;
-	}
-
-	err = sysfs_create_link(mm_kobj, hugepage_kobj, "transparent_hugepage");
-	if (err) {
-		printk(KERN_ERR "hugepage: failed create symlink transparent_hugepage\n");
-		goto out;
-	}
-#endif
+	err = hugepage_init_sysfs(&hugepage_kobj);
+	if (err)
+		return err;
 
 	err = khugepaged_slab_init();
 	if (err)
 		goto out;
 
-	err = mm_slots_hash_init();
-	if (err) {
-		khugepaged_slab_free();
-		goto out;
-	}
+	register_shrinker(&huge_zero_page_shrinker);
 
 	/*
 	 * By default disable transparent hugepages on smaller systems,
@@ -529,7 +640,9 @@ static int __init hugepage_init(void)
 
 	start_khugepaged();
 
+	return 0;
 out:
+	hugepage_exit_sysfs(hugepage_kobj);
 	return err;
 }
 module_init(hugepage_init)
@@ -547,7 +660,7 @@ static int __init setup_transparent_hugepage(char *str)
 		ret = 1;
 	} else if (!strcmp(str, "madvise")) {
 		clear_bit(TRANSPARENT_HUGEPAGE_FLAG,
-			&transparent_hugepage_flags);
+			  &transparent_hugepage_flags);
 		set_bit(TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG,
 			&transparent_hugepage_flags);
 		ret = 1;
@@ -566,35 +679,83 @@ out:
 }
 __setup("transparent_hugepage=", setup_transparent_hugepage);
 
-static void prepare_pmd_huge_pte(pgtable_t pgtable,
-				 struct mm_struct *mm)
-{
-	VM_BUG_ON(spin_can_lock(&mm->page_table_lock));
-
-	/* FIFO */
-	if (!mm->pmd_huge_pte)
-		INIT_LIST_HEAD(&pgtable->lru);
-	else
-		list_add(&pgtable->lru, &mm->pmd_huge_pte->lru);
-	mm->pmd_huge_pte = pgtable;
-}
-
-static inline pmd_t maybe_pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)
+pmd_t maybe_pmd_mkwrite(pmd_t pmd, struct vm_area_struct *vma)
 {
 	if (likely(vma->vm_flags & VM_WRITE))
 		pmd = pmd_mkwrite(pmd);
 	return pmd;
 }
 
-static int __do_huge_pmd_anonymous_page(struct mm_struct *mm,
-					struct vm_area_struct *vma,
-					unsigned long haddr, pmd_t *pmd,
-					struct page *page)
+static inline pmd_t mk_huge_pmd(struct page *page, struct vm_area_struct *vma)
 {
-	int ret = 0;
-	pgtable_t pgtable;
+	pmd_t entry;
+	entry = mk_pmd(page, vma->vm_page_prot);
+	entry = pmd_mkhuge(entry);
+	entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+	return entry;
+}
 
-	VM_BUG_ON(!PageCompound(page));
+unsigned long __thp_get_unmapped_area(struct file *filp, unsigned long len,
+		loff_t off, unsigned long flags, unsigned long size)
+{
+	unsigned long addr;
+	loff_t off_end = off + len;
+	loff_t off_align = round_up(off, size);
+	unsigned long len_pad;
+
+	if (off_end <= off_align || (off_end - off_align) < size)
+		return 0;
+
+	len_pad = len + size;
+	if (len_pad < len || (off + len_pad) < off)
+		return 0;
+
+	addr = current->mm->get_unmapped_area(filp, 0, len_pad,
+					      off >> PAGE_SHIFT, flags);
+	if (IS_ERR_VALUE(addr))
+		return 0;
+
+	addr += (off - addr) & (size - 1);
+	return addr;
+}
+
+unsigned long thp_get_unmapped_area(struct file *filp, unsigned long addr,
+		unsigned long len, unsigned long pgoff, unsigned long flags)
+{
+	loff_t off = (loff_t)pgoff << PAGE_SHIFT;
+
+	if (addr)
+		goto out;
+	if (!IS_DAX(filp->f_mapping->host) || !IS_ENABLED(CONFIG_FS_DAX_PMD))
+		goto out;
+
+	addr = __thp_get_unmapped_area(filp, len, off, flags, PMD_SIZE);
+	if (addr)
+		return addr;
+
+ out:
+	return current->mm->get_unmapped_area(filp, addr, len, pgoff, flags);
+}
+EXPORT_SYMBOL_GPL(thp_get_unmapped_area);
+
+static int __do_huge_pmd_anonymous_page(struct vm_fault *vmf,
+		struct page *page)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = (unsigned long)vmf->virtual_address;
+	pgtable_t pgtable;
+	spinlock_t *ptl;
+	unsigned long haddr = address & HPAGE_PMD_MASK;
+
+	VM_BUG_ON_PAGE(!PageCompound(page), page);
+
+	if (unlikely(mem_cgroup_newpage_charge(page, mm, GFP_KERNEL))) {
+		put_page(page);
+		count_vm_event(THP_FAULT_FALLBACK);
+		return VM_FAULT_FALLBACK;
+	}
+
 	pgtable = pte_alloc_one(mm, haddr);
 	if (unlikely(!pgtable)) {
 		mem_cgroup_uncharge_page(page);
@@ -603,34 +764,47 @@ static int __do_huge_pmd_anonymous_page(struct mm_struct *mm,
 	}
 
 	clear_huge_page(page, haddr, HPAGE_PMD_NR);
+	/*
+	 * The memory barrier inside __SetPageUptodate makes sure that
+	 * clear_huge_page writes become visible before the set_pmd_at()
+	 * write.
+	 */
 	__SetPageUptodate(page);
 
-	spin_lock(&mm->page_table_lock);
-	if (unlikely(!pmd_none(*pmd))) {
-		spin_unlock(&mm->page_table_lock);
+	ptl = pmd_lock(mm, vmf->pmd);
+	if (unlikely(!pmd_none(*vmf->pmd))) {
+		spin_unlock(ptl);
 		mem_cgroup_uncharge_page(page);
 		put_page(page);
 		pte_free(mm, pgtable);
 	} else {
 		pmd_t entry;
-		entry = mk_pmd(page, vma->vm_page_prot);
-		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
-		entry = pmd_mkhuge(entry);
-		/*
-		 * The spinlocking to take the lru_lock inside
-		 * page_add_new_anon_rmap() acts as a full memory
-		 * barrier to be sure clear_huge_page writes become
-		 * visible after the set_pmd_at() write.
-		 */
+
+		/* Deliver the page fault to userland */
+		if (userfaultfd_missing(vma)) {
+			int ret;
+
+			spin_unlock(ptl);
+			mem_cgroup_uncharge_page(page);
+			put_page(page);
+			pte_free(mm, pgtable);
+			ret = handle_userfault(vmf, VM_UFFD_MISSING);
+			VM_BUG_ON(ret & VM_FAULT_FALLBACK);
+			return ret;
+		}
+
+		init_trans_huge_mmu_gather_count(page);
+		entry = mk_huge_pmd(page, vma);
 		page_add_new_anon_rmap(page, vma, haddr);
-		set_pmd_at(mm, haddr, pmd, entry);
-		prepare_pmd_huge_pte(pgtable, mm);
-		add_mm_counter(mm, anon_rss, HPAGE_PMD_NR);
-		mm->nr_ptes++;
-		spin_unlock(&mm->page_table_lock);
+		pgtable_trans_huge_deposit(mm, vmf->pmd, pgtable);
+		set_pmd_at(mm, haddr, vmf->pmd, entry);
+		add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR);
+		atomic_long_inc(&mm->nr_ptes);
+		spin_unlock(ptl);
+		count_vm_event(THP_FAULT_ALLOC);
 	}
 
-	return ret;
+	return 0;
 }
 
 static inline gfp_t alloc_hugepage_gfpmask(int defrag, gfp_t extra_gfp)
@@ -638,80 +812,279 @@ static inline gfp_t alloc_hugepage_gfpmask(int defrag, gfp_t extra_gfp)
 	return (GFP_TRANSHUGE & ~(defrag ? 0 : __GFP_WAIT)) | extra_gfp;
 }
 
-static inline struct page *alloc_hugepage_vma(int defrag,
-					      struct vm_area_struct *vma,
-					      unsigned long haddr, int nd,
-					      gfp_t extra_gfp)
+#ifndef CONFIG_NUMA
+static inline struct page *alloc_hugepage(int defrag)
 {
-	return alloc_pages_vma(alloc_hugepage_gfpmask(defrag, extra_gfp),
-			       HPAGE_PMD_ORDER, vma, haddr, nd);
+	return alloc_pages(alloc_hugepage_gfpmask(defrag, 0),
+			   HPAGE_PMD_ORDER);
+}
+#endif
+
+/* Caller must hold page table lock. */
+static bool set_huge_zero_page(pgtable_t pgtable, struct mm_struct *mm,
+		struct vm_area_struct *vma, unsigned long haddr, pmd_t *pmd,
+		struct page *zero_page)
+{
+	pmd_t entry;
+	if (!pmd_none(*pmd))
+		return false;
+	entry = mk_pmd(zero_page, vma->vm_page_prot);
+	entry = pmd_mkhuge(entry);
+	if (pgtable)
+		pgtable_trans_huge_deposit(mm, pmd, pgtable);
+	set_pmd_at(mm, haddr, pmd, entry);
+	atomic_long_inc(&mm->nr_ptes);
+	return true;
 }
 
-int do_huge_pmd_anonymous_page(struct mm_struct *mm, struct vm_area_struct *vma,
-			       unsigned long address, pmd_t *pmd,
-			       unsigned int flags)
+int do_huge_pmd_anonymous_page(struct vm_fault *vmf)
 {
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = (unsigned long)vmf->virtual_address;
+	gfp_t gfp;
 	struct page *page;
 	unsigned long haddr = address & HPAGE_PMD_MASK;
-	pte_t *pte;
 
-	if (haddr >= vma->vm_start && haddr + HPAGE_PMD_SIZE <= vma->vm_end) {
-		if (unlikely(anon_vma_prepare(vma)))
-			return VM_FAULT_OOM;
-		if (unlikely(khugepaged_enter(vma)))
-			return VM_FAULT_OOM;
-		page = alloc_hugepage_vma(transparent_hugepage_defrag(vma),
-					  vma, haddr, numa_node_id(), 0);
-		if (unlikely(!page)) {
-			count_vm_event(THP_FAULT_FALLBACK);
-			goto out;
-		}
-		count_vm_event(THP_FAULT_ALLOC);
-		if (unlikely(mem_cgroup_newpage_charge(page, mm, GFP_KERNEL))) {
-			put_page(page);
-			goto out;
-		}
-
-		return __do_huge_pmd_anonymous_page(mm, vma, haddr, pmd, page);
-	}
-out:
-	/*
-	 * Use __pte_alloc instead of pte_alloc_map, because we can't
-	 * run pte_offset_map on the pmd, if an huge pmd could
-	 * materialize from under us from a different thread.
-	 */
-	if (unlikely(pmd_none(*pmd)) &&
-	    unlikely(__pte_alloc(mm, vma, pmd, address)))
+	if (haddr < vma->vm_start || haddr + HPAGE_PMD_SIZE > vma->vm_end)
+		return VM_FAULT_FALLBACK;
+	if (unlikely(anon_vma_prepare(vma)))
 		return VM_FAULT_OOM;
-	/* if an huge pmd materialized from under us just retry later */
-	if (unlikely(pmd_trans_huge(*pmd)))
-		return 0;
+	if (unlikely(khugepaged_enter(vma, vma->vm_flags)))
+		return VM_FAULT_OOM;
+	if (!(vmf->flags & FAULT_FLAG_WRITE) &&
+			transparent_hugepage_use_zero_page()) {
+		spinlock_t *ptl;
+		pgtable_t pgtable;
+		struct page *zero_page;
+		bool set;
+		int ret;
+		pgtable = pte_alloc_one(mm, haddr);
+		if (unlikely(!pgtable))
+			return VM_FAULT_OOM;
+		zero_page = get_huge_zero_page();
+		if (unlikely(!zero_page)) {
+			pte_free(mm, pgtable);
+			count_vm_event(THP_FAULT_FALLBACK);
+			return VM_FAULT_FALLBACK;
+		}
+		ptl = pmd_lock(mm, vmf->pmd);
+		ret = 0;
+		set = false;
+		if (pmd_none(*vmf->pmd)) {
+			if (userfaultfd_missing(vma)) {
+				spin_unlock(ptl);
+				ret = handle_userfault(vmf, VM_UFFD_MISSING);
+				VM_BUG_ON(ret & VM_FAULT_FALLBACK);
+			} else {
+				set_huge_zero_page(pgtable, mm, vma,
+						   haddr, vmf->pmd,
+						   zero_page);
+				spin_unlock(ptl);
+				set = true;
+			}
+		} else
+			spin_unlock(ptl);
+		if (!set) {
+			pte_free(mm, pgtable);
+			put_huge_zero_page();
+		}
+		return ret;
+	}
+	gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
+	page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+	if (unlikely(!page)) {
+		count_vm_event(THP_FAULT_FALLBACK);
+		return VM_FAULT_FALLBACK;
+	}
+	return __do_huge_pmd_anonymous_page(vmf, page);
+}
+
+static int insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
+		pmd_t *pmd, pfn_t pfn, pgprot_t prot, bool write)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pmd_t entry;
+	spinlock_t *ptl;
+
+	ptl = pmd_lock(mm, pmd);
 	/*
-	 * A regular pmd is established and it can't morph into a huge pmd
-	 * from under us anymore at this point because we hold the mmap_sem
-	 * read mode and khugepaged takes it in write mode. So now it's
-	 * safe to run pte_offset_map().
+	 * RHEL-only: return VM_FAULT_FALLBACK if our hugepage PMD insertion
+	 * collided with a PMD that is a parent of PTEs.  This is a failure
+	 * case for filesystem DAX but should never happen for device DAX.
 	 */
-	pte = pte_offset_map(pmd, address);
-	return handle_pte_fault(mm, vma, address, pte, pmd, flags);
+	if (!pmd_none(*pmd) && !pmd_trans_huge(*pmd) && !pmd_devmap(*pmd)) {
+		spin_unlock(ptl);
+		return VM_FAULT_FALLBACK;
+	}
+	entry = pmd_mkhuge(pfn_t_pmd(pfn, prot));
+	if (pfn_t_devmap(pfn))
+		entry = pmd_mkdevmap(entry);
+	if (write) {
+		entry = pmd_mkyoung(pmd_mkdirty(entry));
+		entry = maybe_pmd_mkwrite(entry, vma);
+	}
+	set_pmd_at(mm, addr, pmd, entry);
+	update_mmu_cache_pmd(vma, addr, pmd);
+	spin_unlock(ptl);
+	return VM_FAULT_NOPAGE;
+}
+
+int vmf_insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
+			pmd_t *pmd, pfn_t pfn, bool write)
+{
+	pgprot_t pgprot = vma->vm_page_prot;
+	/*
+	 * If we had pmd_special, we could avoid all these restrictions,
+	 * but we need to be consistent with PTEs and architectures that
+	 * can't support a 'special' bit.
+	 */
+	BUG_ON(!(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) &&
+			!pfn_t_devmap(pfn));
+	BUG_ON((vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) ==
+						(VM_PFNMAP|VM_MIXEDMAP));
+	BUG_ON((vma->vm_flags & VM_PFNMAP) && is_cow_mapping(vma->vm_flags));
+
+	if (addr < vma->vm_start || addr >= vma->vm_end)
+		return VM_FAULT_SIGBUS;
+	if (track_pfn_insert(vma, &pgprot, pfn))
+		return VM_FAULT_SIGBUS;
+	return insert_pfn_pmd(vma, addr, pmd, pfn, pgprot, write);
+}
+EXPORT_SYMBOL_GPL(vmf_insert_pfn_pmd);
+
+#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+static pud_t maybe_pud_mkwrite(pud_t pud, struct vm_area_struct *vma)
+{
+	if (likely(vma->vm_flags & VM_WRITE))
+		pud = pud_mkwrite(pud);
+	return pud;
+}
+
+static void insert_pfn_pud(struct vm_area_struct *vma, unsigned long addr,
+		pud_t *pud, pfn_t pfn, pgprot_t prot, bool write)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pud_t entry;
+	spinlock_t *ptl;
+
+	ptl = pud_lock(mm, pud);
+	entry = pud_mkhuge(pfn_t_pud(pfn, prot));
+	if (pfn_t_devmap(pfn))
+		entry = pud_mkdevmap(entry);
+	if (write) {
+		entry = pud_mkyoung(pud_mkdirty(entry));
+		entry = maybe_pud_mkwrite(entry, vma);
+	}
+	set_pud_at(mm, addr, pud, entry);
+	update_mmu_cache_pud(vma, addr, pud);
+	spin_unlock(ptl);
+}
+
+int vmf_insert_pfn_pud(struct vm_area_struct *vma, unsigned long addr,
+			pud_t *pud, pfn_t pfn, bool write)
+{
+	pgprot_t pgprot = vma->vm_page_prot;
+	/*
+	 * If we had pud_special, we could avoid all these restrictions,
+	 * but we need to be consistent with PTEs and architectures that
+	 * can't support a 'special' bit.
+	 */
+	BUG_ON(!(vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) &&
+			!pfn_t_devmap(pfn));
+	BUG_ON((vma->vm_flags & (VM_PFNMAP|VM_MIXEDMAP)) ==
+						(VM_PFNMAP|VM_MIXEDMAP));
+	BUG_ON((vma->vm_flags & VM_PFNMAP) && is_cow_mapping(vma->vm_flags));
+
+	if (addr < vma->vm_start || addr >= vma->vm_end)
+		return VM_FAULT_SIGBUS;
+
+	track_pfn_insert(vma, &pgprot, pfn);
+
+	insert_pfn_pud(vma, addr, pud, pfn, pgprot, write);
+	return VM_FAULT_NOPAGE;
+}
+EXPORT_SYMBOL_GPL(vmf_insert_pfn_pud);
+#endif /* CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD */
+
+static void touch_pmd(struct vm_area_struct *vma, unsigned long addr,
+		pmd_t *pmd)
+{
+	pmd_t _pmd;
+
+	/*
+	 * We should set the dirty bit only for FOLL_WRITE but for now
+	 * the dirty bit in the pmd is meaningless.  And if the dirty
+	 * bit will become meaningful and we'll only set it with
+	 * FOLL_WRITE, an atomic set_bit will be required on the pmd to
+	 * set the young bit, instead of the current set_pmd_at.
+	 */
+	_pmd = pmd_mkyoung(pmd_mkdirty(*pmd));
+	if (pmdp_set_access_flags(vma, addr & HPAGE_PMD_MASK,
+				pmd, _pmd,  1))
+		update_mmu_cache_pmd(vma, addr, pmd);
+}
+
+struct page *follow_devmap_pmd(struct vm_area_struct *vma, unsigned long addr,
+		pmd_t *pmd, int flags)
+{
+	unsigned long pfn = pmd_pfn(*pmd);
+	struct mm_struct *mm = vma->vm_mm;
+	struct dev_pagemap *pgmap;
+	struct page *page;
+
+	assert_spin_locked(pmd_lockptr(mm, pmd));
+
+	if (flags & FOLL_WRITE && !pmd_write(*pmd))
+		return NULL;
+
+	if (pmd_present(*pmd) && pmd_devmap(*pmd))
+		/* pass */;
+	else
+		return NULL;
+
+	if (flags & FOLL_TOUCH)
+		touch_pmd(vma, addr, pmd);
+
+	/*
+	 * device mapped pages can only be returned if the
+	 * caller will manage the page reference count.
+	 */
+	if (!(flags & FOLL_GET))
+		return ERR_PTR(-EEXIST);
+
+	pfn += (addr & ~PMD_MASK) >> PAGE_SHIFT;
+	pgmap = get_dev_pagemap(pfn, NULL);
+	if (!pgmap)
+		return ERR_PTR(-EFAULT);
+	page = pfn_to_page(pfn);
+	get_page(page);
+	put_dev_pagemap(pgmap);
+
+	return page;
 }
 
 int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 		  pmd_t *dst_pmd, pmd_t *src_pmd, unsigned long addr,
 		  struct vm_area_struct *vma)
 {
+	spinlock_t *dst_ptl, *src_ptl;
 	struct page *src_page;
 	pmd_t pmd;
-	pgtable_t pgtable;
-	int ret;
+	pgtable_t pgtable = NULL;
+	int ret = -ENOMEM;
 
-	ret = -ENOMEM;
+	/* Skip if can be re-fill on fault */
+	if (!vma_is_anonymous(vma))
+		return 0;
+
 	pgtable = pte_alloc_one(dst_mm, addr);
 	if (unlikely(!pgtable))
 		goto out;
 
-	spin_lock(&dst_mm->page_table_lock);
-	spin_lock_nested(&src_mm->page_table_lock, SINGLE_DEPTH_NESTING);
+	dst_ptl = pmd_lock(dst_mm, dst_pmd);
+	src_ptl = pmd_lockptr(src_mm, src_pmd);
+	spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
 
 	ret = -EAGAIN;
 	pmd = *src_pmd;
@@ -719,65 +1092,289 @@ int copy_huge_pmd(struct mm_struct *dst_mm, struct mm_struct *src_mm,
 		pte_free(dst_mm, pgtable);
 		goto out_unlock;
 	}
+	/*
+	 * When page table lock is held, the huge zero pmd should not be
+	 * under splitting since we don't split the page itself, only pmd to
+	 * a page table.
+	 */
+	if (is_huge_zero_pmd(pmd)) {
+		struct page *zero_page;
+		/*
+		 * get_huge_zero_page() will never allocate a new page here,
+		 * since we already have a zero page to copy. It just takes a
+		 * reference.
+		 */
+		zero_page = get_huge_zero_page();
+		set_huge_zero_page(pgtable, dst_mm, vma, addr, dst_pmd,
+				zero_page);
+		ret = 0;
+		goto out_unlock;
+	}
+
 	if (unlikely(pmd_trans_splitting(pmd))) {
 		/* split huge page running from under us */
-		spin_unlock(&src_mm->page_table_lock);
-		spin_unlock(&dst_mm->page_table_lock);
+		spin_unlock(src_ptl);
+		spin_unlock(dst_ptl);
 		pte_free(dst_mm, pgtable);
 
 		wait_split_huge_page(vma->anon_vma, src_pmd); /* src_vma */
 		goto out;
 	}
+
 	src_page = pmd_page(pmd);
-	VM_BUG_ON(!PageHead(src_page));
+	VM_BUG_ON_PAGE(!PageHead(src_page), src_page);
 	get_page(src_page);
 	page_dup_rmap(src_page);
-	add_mm_counter(dst_mm, anon_rss, HPAGE_PMD_NR);
+	add_mm_counter(dst_mm, MM_ANONPAGES, HPAGE_PMD_NR);
+	atomic_long_inc(&dst_mm->nr_ptes);
+	pgtable_trans_huge_deposit(dst_mm, dst_pmd, pgtable);
 
 	pmdp_set_wrprotect(src_mm, addr, src_pmd);
 	pmd = pmd_mkold(pmd_wrprotect(pmd));
 	set_pmd_at(dst_mm, addr, dst_pmd, pmd);
-	prepare_pmd_huge_pte(pgtable, dst_mm);
-	dst_mm->nr_ptes++;
 
 	ret = 0;
 out_unlock:
-	spin_unlock(&src_mm->page_table_lock);
-	spin_unlock(&dst_mm->page_table_lock);
+	spin_unlock(src_ptl);
+	spin_unlock(dst_ptl);
 out:
 	return ret;
 }
 
-/* no "address" argument so destroys page coloring of some arch */
-pgtable_t get_pmd_huge_pte(struct mm_struct *mm)
+#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+static void touch_pud(struct vm_area_struct *vma, unsigned long addr,
+		pud_t *pud)
 {
-	pgtable_t pgtable;
+	pud_t _pud;
 
-	VM_BUG_ON(spin_can_lock(&mm->page_table_lock));
-
-	/* FIFO */
-	pgtable = mm->pmd_huge_pte;
-	if (list_empty(&pgtable->lru))
-		mm->pmd_huge_pte = NULL;
-	else {
-		mm->pmd_huge_pte = list_entry(pgtable->lru.next,
-					      struct page, lru);
-		list_del(&pgtable->lru);
-	}
-	return pgtable;
+	/*
+	 * We should set the dirty bit only for FOLL_WRITE but for now
+	 * the dirty bit in the pud is meaningless.  And if the dirty
+	 * bit will become meaningful and we'll only set it with
+	 * FOLL_WRITE, an atomic set_bit will be required on the pud to
+	 * set the young bit, instead of the current set_pud_at.
+	 */
+	_pud = pud_mkyoung(pud_mkdirty(*pud));
+	if (pudp_set_access_flags(vma, addr & HPAGE_PUD_MASK,
+				pud, _pud,  1))
+		update_mmu_cache_pud(vma, addr, pud);
 }
 
-static int do_huge_pmd_wp_page_fallback(struct mm_struct *mm,
-					struct vm_area_struct *vma,
-					unsigned long address,
-					pmd_t *pmd, pmd_t orig_pmd,
-					struct page *page,
-					unsigned long haddr)
+struct page *follow_devmap_pud(struct vm_area_struct *vma, unsigned long addr,
+		pud_t *pud, int flags)
 {
+	unsigned long pfn = pud_pfn(*pud);
+	struct mm_struct *mm = vma->vm_mm;
+	struct dev_pagemap *pgmap;
+	struct page *page;
+
+	assert_spin_locked(pud_lockptr(mm, pud));
+
+	if (flags & FOLL_WRITE && !pud_write(*pud))
+		return NULL;
+
+	if (pud_present(*pud) && pud_devmap(*pud))
+		/* pass */;
+	else
+		return NULL;
+
+	if (flags & FOLL_TOUCH)
+		touch_pud(vma, addr, pud);
+
+	/*
+	 * device mapped pages can only be returned if the
+	 * caller will manage the page reference count.
+	 */
+	if (!(flags & FOLL_GET))
+		return ERR_PTR(-EEXIST);
+
+	pfn += (addr & ~PUD_MASK) >> PAGE_SHIFT;
+	pgmap = get_dev_pagemap(pfn, NULL);
+	if (!pgmap)
+		return ERR_PTR(-EFAULT);
+	page = pfn_to_page(pfn);
+	get_page(page);
+	put_dev_pagemap(pgmap);
+
+	return page;
+}
+
+int copy_huge_pud(struct mm_struct *dst_mm, struct mm_struct *src_mm,
+		  pud_t *dst_pud, pud_t *src_pud, unsigned long addr,
+		  struct vm_area_struct *vma)
+{
+	spinlock_t *dst_ptl, *src_ptl;
+	pud_t pud;
+	int ret;
+
+	dst_ptl = pud_lock(dst_mm, dst_pud);
+	src_ptl = pud_lockptr(src_mm, src_pud);
+	spin_lock_nested(src_ptl, SINGLE_DEPTH_NESTING);
+
+	ret = -EAGAIN;
+	pud = *src_pud;
+	if (unlikely(!pud_trans_huge(pud) && !pud_devmap(pud)))
+		goto out_unlock;
+
+	/*
+	 * When page table lock is held, the huge zero pud should not be
+	 * under splitting since we don't split the page itself, only pud to
+	 * a page table.
+	 */
+	if (is_huge_zero_pud(pud)) {
+		/* No huge zero pud yet */
+	}
+
+	pudp_set_wrprotect(src_mm, addr, src_pud);
+	pud = pud_mkold(pud_wrprotect(pud));
+	set_pud_at(dst_mm, addr, dst_pud, pud);
+
+	ret = 0;
+out_unlock:
+	spin_unlock(src_ptl);
+	spin_unlock(dst_ptl);
+	return ret;
+}
+
+void huge_pud_set_accessed(struct vm_fault *vmf, pud_t orig_pud)
+{
+	pud_t entry;
+	unsigned long address = (unsigned long)vmf->virtual_address;
+	unsigned long haddr;
+	bool write = vmf->flags & FAULT_FLAG_WRITE;
+	spinlock_t *ptl;
+
+	ptl = pud_lock(vmf->vma->vm_mm, vmf->pud);
+	if (unlikely(!pud_same(*vmf->pud, orig_pud)))
+		goto unlock;
+
+	entry = pud_mkyoung(orig_pud);
+	if (write)
+		entry = pud_mkdirty(entry);
+	haddr = address & HPAGE_PUD_MASK;
+	if (pudp_set_access_flags(vmf->vma, haddr, vmf->pud, entry, write))
+		update_mmu_cache_pud(vmf->vma, address, vmf->pud);
+
+unlock:
+	spin_unlock(ptl);
+}
+#endif /* CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD */
+
+void huge_pmd_set_accessed(struct vm_fault *vmf, pmd_t orig_pmd)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	unsigned long address = (unsigned long)vmf->virtual_address;
+	spinlock_t *ptl;
+	pmd_t entry;
+	unsigned long haddr;
+
+	ptl = pmd_lock(vma->vm_mm, vmf->pmd);
+	if (unlikely(!pmd_same(*vmf->pmd, orig_pmd)))
+		goto unlock;
+
+	entry = pmd_mkyoung(orig_pmd);
+	haddr = address & HPAGE_PMD_MASK;
+	if (pmdp_set_access_flags(vmf->vma, haddr, vmf->pmd, entry,
+				vmf->flags & FAULT_FLAG_WRITE))
+		update_mmu_cache_pmd(vma, address, vmf->pmd);
+
+unlock:
+	spin_unlock(ptl);
+}
+
+static int do_huge_pmd_wp_zero_page_fallback(struct vm_fault *vmf,
+		pmd_t orig_pmd)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = (unsigned long)vmf->virtual_address;
+	unsigned long haddr = address & HPAGE_PMD_MASK;
+	spinlock_t *ptl;
+	pgtable_t pgtable;
+	pmd_t _pmd;
+	struct page *page;
+	int i, ret = 0;
+	unsigned long mmun_start;	/* For mmu_notifiers */
+	unsigned long mmun_end;		/* For mmu_notifiers */
+
+	page = alloc_page_vma(GFP_HIGHUSER_MOVABLE, vma, address);
+	if (!page) {
+		ret |= VM_FAULT_OOM;
+		goto out;
+	}
+
+	if (mem_cgroup_newpage_charge(page, mm, GFP_KERNEL)) {
+		put_page(page);
+		ret |= VM_FAULT_OOM;
+		goto out;
+	}
+
+	clear_user_highpage(page, address);
+	__SetPageUptodate(page);
+
+	mmun_start = haddr;
+	mmun_end   = haddr + HPAGE_PMD_SIZE;
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+
+	ptl = pmd_lock(mm, vmf->pmd);
+	if (unlikely(!pmd_same(*vmf->pmd, orig_pmd)))
+		goto out_free_page;
+
+	pmdp_clear_flush_notify(vma, haddr, vmf->pmd);
+	/* leave pmd empty until pte is filled */
+
+	pgtable = pgtable_trans_huge_withdraw(mm, vmf->pmd);
+	pmd_populate(mm, &_pmd, pgtable);
+
+	for (i = 0; i < HPAGE_PMD_NR; i++, haddr += PAGE_SIZE) {
+		pte_t *pte, entry;
+		if (haddr == (address & PAGE_MASK)) {
+			entry = mk_pte(page, vma->vm_page_prot);
+			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+			page_add_new_anon_rmap(page, vma, haddr);
+		} else {
+			entry = pfn_pte(my_zero_pfn(haddr), vma->vm_page_prot);
+			entry = pte_mkspecial(entry);
+		}
+		pte = pte_offset_map(&_pmd, haddr);
+		VM_BUG_ON(!pte_none(*pte));
+		set_pte_at(mm, haddr, pte, entry);
+		pte_unmap(pte);
+	}
+	smp_wmb(); /* make pte visible before pmd */
+	pmd_populate(mm, vmf->pmd, pgtable);
+	spin_unlock(ptl);
+	put_huge_zero_page();
+	inc_mm_counter(mm, MM_ANONPAGES);
+
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+
+	ret |= VM_FAULT_WRITE;
+out:
+	return ret;
+out_free_page:
+	spin_unlock(ptl);
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+	mem_cgroup_uncharge_page(page);
+	put_page(page);
+	goto out;
+}
+
+static int do_huge_pmd_wp_page_fallback(struct vm_fault *vmf,
+					pmd_t orig_pmd,
+					struct page *page)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = (unsigned long)vmf->virtual_address;
+	unsigned long haddr = address & HPAGE_PMD_MASK;
+	spinlock_t *ptl;
 	pgtable_t pgtable;
 	pmd_t _pmd = {0};
 	int ret = 0, i;
 	struct page **pages;
+	unsigned long mmun_start;	/* For mmu_notifiers */
+	unsigned long mmun_end;		/* For mmu_notifiers */
 
 	pages = kmalloc(sizeof(struct page *) * HPAGE_PMD_NR,
 			GFP_KERNEL);
@@ -795,10 +1392,12 @@ static int do_huge_pmd_wp_page_fallback(struct mm_struct *mm,
 						       GFP_KERNEL))) {
 			if (pages[i])
 				put_page(pages[i]);
+			mem_cgroup_uncharge_start();
 			while (--i >= 0) {
 				mem_cgroup_uncharge_page(pages[i]);
 				put_page(pages[i]);
 			}
+			mem_cgroup_uncharge_end();
 			kfree(pages);
 			ret |= VM_FAULT_OOM;
 			goto out;
@@ -807,20 +1406,24 @@ static int do_huge_pmd_wp_page_fallback(struct mm_struct *mm,
 
 	for (i = 0; i < HPAGE_PMD_NR; i++) {
 		copy_user_highpage(pages[i], page + i,
-				   haddr + PAGE_SHIFT*i, vma);
+				   haddr + PAGE_SIZE * i, vma);
 		__SetPageUptodate(pages[i]);
 		cond_resched();
 	}
 
-	spin_lock(&mm->page_table_lock);
-	if (unlikely(!pmd_same(*pmd, orig_pmd)))
-		goto out_free_pages;
-	VM_BUG_ON(!PageHead(page));
+	mmun_start = haddr;
+	mmun_end   = haddr + HPAGE_PMD_SIZE;
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
 
-	pmdp_clear_flush_notify(vma, haddr, pmd);
+	ptl = pmd_lock(mm, vmf->pmd);
+	if (unlikely(!pmd_same(*vmf->pmd, orig_pmd)))
+		goto out_free_pages;
+	VM_BUG_ON_PAGE(!PageHead(page), page);
+
+	pmdp_clear_flush_notify(vma, haddr, vmf->pmd);
 	/* leave pmd empty until pte is filled */
 
-	pgtable = get_pmd_huge_pte(mm);
+	pgtable = pgtable_trans_huge_withdraw(mm, vmf->pmd);
 	pmd_populate(mm, &_pmd, pgtable);
 
 	for (i = 0; i < HPAGE_PMD_NR; i++, haddr += PAGE_SIZE) {
@@ -836,9 +1439,11 @@ static int do_huge_pmd_wp_page_fallback(struct mm_struct *mm,
 	kfree(pages);
 
 	smp_wmb(); /* make pte visible before pmd */
-	pmd_populate(mm, pmd, pgtable);
+	pmd_populate(mm, vmf->pmd, pgtable);
 	page_remove_rmap(page);
-	spin_unlock(&mm->page_table_lock);
+	spin_unlock(ptl);
+
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
 
 	ret |= VM_FAULT_WRITE;
 	put_page(page);
@@ -847,286 +1452,631 @@ out:
 	return ret;
 
 out_free_pages:
-	spin_unlock(&mm->page_table_lock);
+	spin_unlock(ptl);
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+	mem_cgroup_uncharge_start();
 	for (i = 0; i < HPAGE_PMD_NR; i++) {
 		mem_cgroup_uncharge_page(pages[i]);
 		put_page(pages[i]);
 	}
+	mem_cgroup_uncharge_end();
 	kfree(pages);
 	goto out;
 }
 
-int do_huge_pmd_wp_page(struct mm_struct *mm, struct vm_area_struct *vma,
-			unsigned long address, pmd_t *pmd, pmd_t orig_pmd)
+int do_huge_pmd_wp_page(struct vm_fault *vmf, pmd_t orig_pmd)
 {
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long address = (unsigned long)vmf->virtual_address;
+	spinlock_t *ptl;
 	int ret = 0;
-	struct page *page, *new_page;
+	struct page *page = NULL, *new_page;
 	unsigned long haddr;
+	unsigned long mmun_start;	/* For mmu_notifiers */
+	unsigned long mmun_end;		/* For mmu_notifiers */
 
+	ptl = pmd_lockptr(mm, vmf->pmd);
 	VM_BUG_ON(!vma->anon_vma);
-	spin_lock(&mm->page_table_lock);
-	if (unlikely(!pmd_same(*pmd, orig_pmd)))
+	haddr = address & HPAGE_PMD_MASK;
+	if (is_huge_zero_pmd(orig_pmd))
+		goto alloc;
+	spin_lock(ptl);
+	if (unlikely(!pmd_same(*vmf->pmd, orig_pmd)))
 		goto out_unlock;
 
 	page = pmd_page(orig_pmd);
-	VM_BUG_ON(!PageCompound(page) || !PageHead(page));
-	haddr = address & HPAGE_PMD_MASK;
+	VM_BUG_ON_PAGE(!PageCompound(page) || !PageHead(page), page);
 	if (page_mapcount(page) == 1) {
 		pmd_t entry;
 		entry = pmd_mkyoung(orig_pmd);
 		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
-		if (pmdp_set_access_flags(vma, haddr, pmd, entry,  1))
-			update_mmu_cache(vma, address, entry);
+		if (pmdp_set_access_flags(vma, haddr, vmf->pmd, entry,  1))
+			update_mmu_cache_pmd(vma, address, vmf->pmd);
 		ret |= VM_FAULT_WRITE;
 		goto out_unlock;
 	}
 	get_page(page);
-	spin_unlock(&mm->page_table_lock);
-
+	spin_unlock(ptl);
+alloc:
 	if (transparent_hugepage_enabled(vma) &&
-	    !transparent_hugepage_debug_cow())
-		new_page = alloc_hugepage_vma(transparent_hugepage_defrag(vma),
-					      vma, haddr, numa_node_id(), 0);
-	else
+	    !transparent_hugepage_debug_cow()) {
+		gfp_t gfp;
+
+		gfp = alloc_hugepage_gfpmask(transparent_hugepage_defrag(vma), 0);
+		new_page = alloc_hugepage_vma(gfp, vma, haddr, HPAGE_PMD_ORDER);
+	} else
 		new_page = NULL;
 
 	if (unlikely(!new_page)) {
+		if (!page)
+			ret = do_huge_pmd_wp_zero_page_fallback(vmf, orig_pmd);
+		else {
+			ret = do_huge_pmd_wp_page_fallback(vmf, orig_pmd,
+					page);
+			if (ret & VM_FAULT_OOM) {
+				split_huge_page(page);
+				ret |= VM_FAULT_FALLBACK;
+			}
+			put_page(page);
+		}
 		count_vm_event(THP_FAULT_FALLBACK);
-		ret = do_huge_pmd_wp_page_fallback(mm, vma, address,
-						   pmd, orig_pmd, page, haddr);
-		if (ret & VM_FAULT_OOM)
-			split_huge_page(page);
-		put_page(page);
 		goto out;
 	}
-	count_vm_event(THP_FAULT_ALLOC);
 
 	if (unlikely(mem_cgroup_newpage_charge(new_page, mm, GFP_KERNEL))) {
 		put_page(new_page);
-		split_huge_page(page);
-		put_page(page);
-		ret |= VM_FAULT_OOM;
+		if (page) {
+			split_huge_page(page);
+			put_page(page);
+		} else
+			split_huge_page_pmd(vma, address, vmf->pmd);
+		ret |= VM_FAULT_FALLBACK;
+		count_vm_event(THP_FAULT_FALLBACK);
 		goto out;
 	}
 
-	copy_user_huge_page(new_page, page, haddr, vma, HPAGE_PMD_NR);
+	count_vm_event(THP_FAULT_ALLOC);
+
+	if (!page)
+		clear_huge_page(new_page, haddr, HPAGE_PMD_NR);
+	else
+		copy_user_huge_page(new_page, page, haddr, vma, HPAGE_PMD_NR);
 	__SetPageUptodate(new_page);
 
-	spin_lock(&mm->page_table_lock);
-	put_page(page);
-	if (unlikely(!pmd_same(*pmd, orig_pmd))) {
+	mmun_start = haddr;
+	mmun_end   = haddr + HPAGE_PMD_SIZE;
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+
+	spin_lock(ptl);
+	if (page)
+		put_page(page);
+	if (unlikely(!pmd_same(*vmf->pmd, orig_pmd))) {
+		spin_unlock(ptl);
 		mem_cgroup_uncharge_page(new_page);
 		put_page(new_page);
+		goto out_mn;
 	} else {
 		pmd_t entry;
-		VM_BUG_ON(!PageHead(page));
-		entry = mk_pmd(new_page, vma->vm_page_prot);
-		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
-		entry = pmd_mkhuge(entry);
-		pmdp_clear_flush_notify(vma, haddr, pmd);
+		init_trans_huge_mmu_gather_count(new_page);
+		entry = mk_huge_pmd(new_page, vma);
+		pmdp_clear_flush_notify(vma, haddr, vmf->pmd);
 		page_add_new_anon_rmap(new_page, vma, haddr);
-		set_pmd_at(mm, haddr, pmd, entry);
-		update_mmu_cache(vma, address, entry);
-		page_remove_rmap(page);
-		put_page(page);
+		set_pmd_at(mm, haddr, vmf->pmd, entry);
+		update_mmu_cache_pmd(vma, address, vmf->pmd);
+		if (!page) {
+			add_mm_counter(mm, MM_ANONPAGES, HPAGE_PMD_NR);
+			put_huge_zero_page();
+		} else {
+			VM_BUG_ON_PAGE(!PageHead(page), page);
+			page_remove_rmap(page);
+			put_page(page);
+		}
 		ret |= VM_FAULT_WRITE;
 	}
-out_unlock:
-	spin_unlock(&mm->page_table_lock);
+	spin_unlock(ptl);
+out_mn:
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
 out:
+	return ret;
+out_unlock:
+	spin_unlock(ptl);
 	return ret;
 }
 
-struct page *follow_trans_huge_pmd(struct mm_struct *mm,
+struct page *follow_trans_huge_pmd(struct vm_area_struct *vma,
 				   unsigned long addr,
 				   pmd_t *pmd,
 				   unsigned int flags)
 {
+	struct mm_struct *mm = vma->vm_mm;
 	struct page *page = NULL;
 
-	VM_BUG_ON(spin_can_lock(&mm->page_table_lock));
+	assert_spin_locked(pmd_lockptr(mm, pmd));
 
 	if (flags & FOLL_WRITE && !pmd_write(*pmd))
 		goto out;
 
+	/* Avoid dumping huge zero page */
+	if ((flags & FOLL_DUMP) && is_huge_zero_pmd(*pmd))
+		return ERR_PTR(-EFAULT);
+
+	/* Full NUMA hinting faults to serialise migration in fault paths */
+	if ((flags & FOLL_NUMA) && pmd_numa(*pmd))
+		goto out;
+
 	page = pmd_page(*pmd);
-	VM_BUG_ON(!PageHead(page));
-	if (flags & FOLL_TOUCH) {
-		pmd_t _pmd;
-		/*
-		 * We should set the dirty bit only for FOLL_WRITE but
-		 * for now the dirty bit in the pmd is meaningless.
-		 * And if the dirty bit will become meaningful and
-		 * we'll only set it with FOLL_WRITE, an atomic
-		 * set_bit will be required on the pmd to set the
-		 * young bit, instead of the current set_pmd_at.
-		 */
-		_pmd = pmd_mkyoung(pmd_mkdirty(*pmd));
-		set_pmd_at(mm, addr & HPAGE_PMD_MASK, pmd, _pmd);
+	VM_BUG_ON_PAGE(!PageHead(page), page);
+	if (flags & FOLL_TOUCH)
+		touch_pmd(vma, addr, pmd);
+	if ((flags & FOLL_MLOCK) && (vma->vm_flags & VM_LOCKED)) {
+		if (page->mapping && trylock_page(page)) {
+			lru_add_drain();
+			if (page->mapping)
+				mlock_vma_page(page);
+			unlock_page(page);
+		}
 	}
 	page += (addr & ~HPAGE_PMD_MASK) >> PAGE_SHIFT;
-	VM_BUG_ON(!PageCompound(page));
+	VM_BUG_ON_PAGE(!PageCompound(page), page);
 	if (flags & FOLL_GET)
 		if (!get_page_foll(page))
-			return ERR_PTR(-ENOMEM);
+			page = ERR_PTR(-ENOMEM);
 
 out:
 	return page;
 }
 
-int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
-		 pmd_t *pmd)
+/* NUMA hinting page fault entry point for trans huge pmds */
+int do_huge_pmd_numa_page(struct vm_fault *vmf, pmd_t orig_pmd)
 {
-	int ret = 0;
+	struct vm_area_struct *vma = vmf->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long addr = (unsigned long)vmf->virtual_address;
+	spinlock_t *ptl;
+	struct anon_vma *anon_vma = NULL;
+	struct page *page;
+	unsigned long haddr = addr & HPAGE_PMD_MASK;
+	int page_nid = -1, this_nid = numa_node_id();
+	int target_nid, last_cpupid = -1;
+	bool page_locked;
+	bool migrated = false;
+	int flags = 0;
 
-	spin_lock(&tlb->mm->page_table_lock);
-	if (likely(pmd_trans_huge(*pmd))) {
-		if (unlikely(pmd_trans_splitting(*pmd))) {
-			spin_unlock(&tlb->mm->page_table_lock);
-			wait_split_huge_page(vma->anon_vma,
-					     pmd);
-		} else {
-			struct page *page;
-			pgtable_t pgtable;
-			pgtable = get_pmd_huge_pte(tlb->mm);
-			page = pmd_page(*pmd);
-			pmd_clear(pmd);
-			page_remove_rmap(page);
-			VM_BUG_ON(page_mapcount(page) < 0);
-			add_mm_counter(tlb->mm, anon_rss, -HPAGE_PMD_NR);
-			VM_BUG_ON(!PageHead(page));
-			tlb->mm->nr_ptes--;
-			spin_unlock(&tlb->mm->page_table_lock);
-			tlb_remove_page(tlb, page);
-			pte_free(tlb->mm, pgtable);
-			ret = 1;
-		}
-	} else
-		spin_unlock(&tlb->mm->page_table_lock);
+	ptl = pmd_lock(mm, vmf->pmd);
+	if (unlikely(!pmd_same(orig_pmd, *vmf->pmd)))
+		goto out_unlock;
 
-	return ret;
+	/*
+	 * If there are potential migrations, wait for completion and retry
+	 * without disrupting NUMA hinting information. Do not relock and
+	 * check_same as the page may no longer be mapped.
+	 */
+	if (unlikely(pmd_trans_migrating(*vmf->pmd))) {
+		page = pmd_page(*vmf->pmd);
+		if (!get_page_unless_zero(page))
+			goto out_unlock;
+		spin_unlock(ptl);
+		wait_on_page_locked(page);
+		put_page(page);
+		goto out;
+	}
+
+	page = pmd_page(orig_pmd);
+	BUG_ON(is_huge_zero_page(page));
+	page_nid = page_to_nid(page);
+	last_cpupid = page_cpupid_last(page);
+	count_vm_numa_event(NUMA_HINT_FAULTS);
+	if (page_nid == this_nid) {
+		count_vm_numa_event(NUMA_HINT_FAULTS_LOCAL);
+		flags |= TNF_FAULT_LOCAL;
+	}
+
+	/*
+	 * Avoid grouping on DSO/COW pages in specific and RO pages
+	 * in general, RO pages shouldn't hurt as much anyway since
+	 * they can be in shared cache state.
+	 */
+	if (!pmd_write(orig_pmd))
+		flags |= TNF_NO_GROUP;
+
+	/*
+	 * Acquire the page lock to serialise THP migrations but avoid dropping
+	 * page_table_lock if at all possible
+	 */
+	page_locked = trylock_page(page);
+	target_nid = mpol_misplaced(page, vma, haddr);
+	if (target_nid == -1) {
+		/* If the page was locked, there are no parallel migrations */
+		if (page_locked)
+			goto clear_pmdnuma;
+	}
+
+	/* Migration could have started since the pmd_trans_migrating check */
+	if (!page_locked) {
+		page_nid = -1;
+		if (!get_page_unless_zero(page))
+			goto out_unlock;
+		spin_unlock(ptl);
+		wait_on_page_locked(page);
+		put_page(page);
+		goto out;
+	}
+
+	/* Page is misplaced, serialise migrations and parallel THP splits */
+	get_page(page);
+	spin_unlock(ptl);
+	if (!page_locked)
+		lock_page(page);
+	anon_vma = page_lock_anon_vma_read(page);
+
+	/* Confirm the PMD did not change while page_table_lock was released */
+	spin_lock(ptl);
+	if (unlikely(!pmd_same(orig_pmd, *vmf->pmd))) {
+		unlock_page(page);
+		put_page(page);
+		page_nid = -1;
+		goto out_unlock;
+	}
+
+	/* Bail if we fail to protect against THP splits for any reason */
+	if (unlikely(!anon_vma)) {
+		put_page(page);
+		page_nid = -1;
+		goto clear_pmdnuma;
+	}
+
+	/*
+	 * The page_table_lock above provides a memory barrier
+	 * with change_protection_range.
+	 */
+	if (tlb_flush_pending(vma->vm_mm)) {
+		flush_tlb_range(vma, haddr, haddr + HPAGE_PMD_SIZE);
+		/*
+		 * change_huge_pmd() released the pmd lock before
+		 * invalidating the secondary MMUs sharing the primary
+		 * MMU pagetables (with ->invalidate_range()). The
+		 * mmu_notifier_invalidate_range_end() (which
+		 * internally calls ->invalidate_range()) in
+		 * change_pmd_range() will run after us, so we can't
+		 * rely on it here and we need an explicit invalidate.
+		 */
+		mmu_notifier_invalidate_range(vma->vm_mm, haddr,
+					      haddr + HPAGE_PMD_SIZE);
+	}
+
+	/*
+	 * Migrate the THP to the requested node, returns with page unlocked
+	 * and pmd_numa cleared.
+	 */
+	spin_unlock(ptl);
+	migrated = migrate_misplaced_transhuge_page(mm, vma,
+				vmf->pmd, orig_pmd, addr, page, target_nid);
+	if (migrated) {
+		flags |= TNF_MIGRATED;
+		page_nid = target_nid;
+	}
+
+	goto out;
+clear_pmdnuma:
+	BUG_ON(!PageLocked(page));
+	orig_pmd = pmd_mknonnuma(orig_pmd);
+	set_pmd_at(mm, haddr, vmf->pmd, orig_pmd);
+	VM_BUG_ON(pmd_numa(*vmf->pmd));
+	update_mmu_cache_pmd(vma, addr, vmf->pmd);
+	unlock_page(page);
+out_unlock:
+	spin_unlock(ptl);
+
+out:
+	if (anon_vma)
+		page_unlock_anon_vma_read(anon_vma);
+
+	if (page_nid != -1)
+		task_numa_fault(last_cpupid, page_nid, HPAGE_PMD_NR, flags);
+
+	return 0;
+}
+
+int zap_huge_pmd(struct mmu_gather *tlb, struct vm_area_struct *vma,
+		 pmd_t *pmd, unsigned long addr)
+{
+	pmd_t orig_pmd;
+	spinlock_t *ptl;
+
+	if (__pmd_trans_huge_lock(pmd, vma, &ptl) != 1)
+		return 0;
+	/*
+	 * For architectures like ppc64 we look at deposited pgtable
+	 * when calling pmdp_huge_get_and_clear. So do the
+	 * pgtable_trans_huge_withdraw after finishing pmdp related
+	 * operations.
+	 */
+	orig_pmd = pmdp_get_and_clear(tlb->mm, addr, pmd);
+	tlb_remove_pmd_tlb_entry(tlb, pmd, addr);
+	if (vma_is_dax(vma)) {
+		spin_unlock(ptl);
+		if (is_huge_zero_pmd(orig_pmd))
+			tlb_remove_page(tlb, huge_zero_page_release_encode());
+	} else if (is_huge_zero_pmd(orig_pmd)) {
+		pte_free(tlb->mm, pgtable_trans_huge_withdraw(tlb->mm, pmd));
+		atomic_long_dec(&tlb->mm->nr_ptes);
+		spin_unlock(ptl);
+		tlb_remove_page(tlb, huge_zero_page_release_encode());
+	} else {
+		struct page *page = pmd_page(orig_pmd);
+		page_remove_rmap(page);
+		VM_BUG_ON_PAGE(page_mapcount(page) < 0, page);
+		add_mm_counter(tlb->mm, MM_ANONPAGES, -HPAGE_PMD_NR);
+		VM_BUG_ON_PAGE(!PageHead(page), page);
+		pte_free(tlb->mm, pgtable_trans_huge_withdraw(tlb->mm, pmd));
+		atomic_long_dec(&tlb->mm->nr_ptes);
+		/*
+		 * page_remove_rmap() already decreased the
+		 * page_mapcount(), so tail pages can be
+		 * freed after we release the pmd lock. Increase the
+		 * mmu_gather_count to prevent the tail pages to be
+		 * freed, even if the THP page get splitted.
+		 * __split_huge_page_refcount() will then see that
+		 * we're in the middle of a mmu gather and it'll add
+		 * the compound mmu_gather_count to every tail
+		 * page page_count().
+		 */
+		inc_trans_huge_mmu_gather_count(page);
+		spin_unlock(ptl);
+		tlb_remove_page(tlb, trans_huge_page_release_encode(page));
+	}
+	return 1;
 }
 
 int mincore_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
 		unsigned long addr, unsigned long end,
 		unsigned char *vec)
 {
+	spinlock_t *ptl;
 	int ret = 0;
 
-	spin_lock(&vma->vm_mm->page_table_lock);
-	if (likely(pmd_trans_huge(*pmd))) {
-		ret = !pmd_trans_splitting(*pmd);
-		spin_unlock(&vma->vm_mm->page_table_lock);
-		if (unlikely(!ret))
-			wait_split_huge_page(vma->anon_vma, pmd);
-		else {
-			/*
-			 * All logical pages in the range are present
-			 * if backed by a huge page.
-			 */
-			memset(vec, 1, (end - addr) >> PAGE_SHIFT);
-		}
-	} else
-		spin_unlock(&vma->vm_mm->page_table_lock);
+	if (__pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+		/*
+		 * All logical pages in the range are present
+		 * if backed by a huge page.
+		 */
+		spin_unlock(ptl);
+		memset(vec, 1, (end - addr) >> PAGE_SHIFT);
+		ret = 1;
+	}
 
 	return ret;
 }
 
-int move_huge_pmd(struct vm_area_struct *vma, unsigned long old_addr,
+bool move_huge_pmd(struct vm_area_struct *vma, struct vm_area_struct *new_vma,
+		  unsigned long old_addr,
 		  unsigned long new_addr, unsigned long old_end,
 		  pmd_t *old_pmd, pmd_t *new_pmd)
 {
-	int ret = 0;
+	spinlock_t *old_ptl, *new_ptl;
 	pmd_t pmd;
+	bool force_flush = false;
 
 	struct mm_struct *mm = vma->vm_mm;
 
 	if ((old_addr & ~HPAGE_PMD_MASK) ||
 	    (new_addr & ~HPAGE_PMD_MASK) ||
-	    (old_addr + HPAGE_PMD_SIZE) > old_end)
+	    old_end - old_addr < HPAGE_PMD_SIZE ||
+	    (new_vma->vm_flags & VM_NOHUGEPAGE))
 		goto out;
 
 	/*
 	 * The destination pmd shouldn't be established, free_pgtables()
 	 * should have release it.
 	 */
-	if (!pmd_none(*new_pmd)) {
-		WARN_ON(1);
+	if (WARN_ON(!pmd_none(*new_pmd))) {
 		VM_BUG_ON(pmd_trans_huge(*new_pmd));
 		goto out;
 	}
 
-	spin_lock(&mm->page_table_lock);
-	if (likely(pmd_trans_huge(*old_pmd))) {
-		if (pmd_trans_splitting(*old_pmd)) {
-			spin_unlock(&mm->page_table_lock);
-			wait_split_huge_page(vma->anon_vma, old_pmd);
-			ret = -1;
-		} else {
-			pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
-			VM_BUG_ON(!pmd_none(*new_pmd));
-			set_pmd_at(mm, new_addr, new_pmd, pmd);
-			spin_unlock(&mm->page_table_lock);
-			ret = 1;
+	/*
+	 * We don't have to worry about the ordering of src and dst
+	 * ptlocks because exclusive mmap_sem prevents deadlock.
+	 */
+	if (__pmd_trans_huge_lock(old_pmd, vma, &old_ptl) == 1) {
+		new_ptl = pmd_lockptr(mm, new_pmd);
+		if (new_ptl != old_ptl)
+			spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
+		pmd = pmdp_get_and_clear(mm, old_addr, old_pmd);
+		if (pmd_present(pmd))
+			force_flush = true;
+		VM_BUG_ON(!pmd_none(*new_pmd));
+		if (pmd_move_must_withdraw(new_ptl, old_ptl)) {
+			pgtable_t pgtable;
+			pgtable = pgtable_trans_huge_withdraw(mm, old_pmd);
+			pgtable_trans_huge_deposit(mm, new_pmd, pgtable);
 		}
-	} else
-		spin_unlock(&mm->page_table_lock);
+		set_pmd_at(mm, new_addr, new_pmd, pmd_mksoft_dirty(pmd));
+		if (force_flush)
+			flush_tlb_range(vma, old_addr, old_addr + PMD_SIZE);
+		if (new_ptl != old_ptl)
+			spin_unlock(new_ptl);
+		spin_unlock(old_ptl);
 
+		return true;
+	}
 out:
-	return ret;
+	return false;
 }
 
+/*
+ * Returns
+ *  - 0 if PMD could not be locked
+ *  - 1 if PMD was locked but protections unchange and TLB flush unnecessary
+ *  - HPAGE_PMD_NR is protections changed and TLB flush necessary
+ */
 int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
-		unsigned long addr, pgprot_t newprot)
+		unsigned long addr, pgprot_t newprot, int prot_numa)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	spinlock_t *ptl;
 	int ret = 0;
 
-	spin_lock(&mm->page_table_lock);
-	if (likely(pmd_trans_huge(*pmd))) {
-		if (unlikely(pmd_trans_splitting(*pmd))) {
-			spin_unlock(&mm->page_table_lock);
-			wait_split_huge_page(vma->anon_vma, pmd);
-		} else {
-			pmd_t entry;
-
-			entry = pmdp_get_and_clear(mm, addr, pmd);
+	if (__pmd_trans_huge_lock(pmd, vma, &ptl) == 1) {
+		pmd_t entry;
+		ret = 1;
+		if (!prot_numa) {
+			entry = pmdp_get_and_clear_notify(mm, addr, pmd);
+			if (pmd_numa(entry))
+				entry = pmd_mknonnuma(entry);
 			entry = pmd_modify(entry, newprot);
+			ret = HPAGE_PMD_NR;
 			set_pmd_at(mm, addr, pmd, entry);
-			spin_unlock(&vma->vm_mm->page_table_lock);
-			ret = 1;
+			BUG_ON(pmd_write(entry));
+		} else {
+			struct page *page = pmd_page(*pmd);
+
+			/*
+			 * Do not trap faults against the zero page. The
+			 * read-only data is likely to be read-cached on the
+			 * local CPU cache and it is less useful to know about
+			 * local vs remote hits on the zero page.
+			 */
+			if (!is_huge_zero_page(page) &&
+			    !pmd_numa(*pmd)) {
+				pmdp_set_numa(mm, addr, pmd);
+				ret = HPAGE_PMD_NR;
+			}
 		}
-	} else
-		spin_unlock(&vma->vm_mm->page_table_lock);
+		spin_unlock(ptl);
+	}
 
 	return ret;
 }
 
+/*
+ * Returns 1 if a given pmd maps a stable (not under splitting) thp.
+ * Returns -1 if it maps a thp under splitting. Returns 0 otherwise.
+ *
+ * Note that if it returns 1, this routine returns without unlocking page
+ * table locks. So callers must unlock them.
+ */
+int __pmd_trans_huge_lock(pmd_t *pmd, struct vm_area_struct *vma,
+		spinlock_t **ptl)
+{
+	*ptl = pmd_lock(vma->vm_mm, pmd);
+	if (likely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd))) {
+		if (unlikely(pmd_trans_splitting(*pmd))) {
+			spin_unlock(*ptl);
+			wait_split_huge_page(vma->anon_vma, pmd);
+			return -1;
+		} else {
+			/* Thp mapped by 'pmd' is stable, so we can
+			 * handle it as it is. */
+			return 1;
+		}
+	}
+	spin_unlock(*ptl);
+	return 0;
+}
+
+/*
+ * Returns 1 if a given pud maps a stable (not under splitting) thp.
+ * Returns -1 if it maps a thp under splitting. Returns 0 otherwise.
+ *
+ * Note that if it returns 1, this routine returns without unlocking page
+ * table locks. So callers must unlock them.
+ */
+int __pud_trans_huge_lock(pud_t *pud, struct vm_area_struct *vma,
+		spinlock_t **ptl)
+{
+	*ptl = pud_lock(vma->vm_mm, pud);
+	if (likely(pud_trans_huge(*pud) || pud_devmap(*pud))) {
+		/* Thp mapped by 'pud' is stable, so we can
+		 * handle it as it is. */
+		return 1;
+	}
+	spin_unlock(*ptl);
+	return 0;
+}
+
+#ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+int zap_huge_pud(struct mmu_gather *tlb, struct vm_area_struct *vma,
+		 pud_t *pud, unsigned long addr)
+{
+	pud_t orig_pud;
+	spinlock_t *ptl;
+
+	if (__pud_trans_huge_lock(pud, vma, &ptl) != 1)
+		return 0;
+	/*
+	 * For architectures like ppc64 we look at deposited pgtable
+	 * when calling pudp_huge_get_and_clear. So do the
+	 * pgtable_trans_huge_withdraw after finishing pudp related
+	 * operations.
+	 */
+	orig_pud = pudp_get_and_clear(tlb->mm, addr, pud);
+	tlb_remove_pud_tlb_entry(tlb, pud, addr);
+	if (vma_is_dax(vma)) {
+		spin_unlock(ptl);
+		/* No zero page support yet */
+	} else {
+		/* No support for anonymous PUD pages yet */
+		BUG();
+	}
+	return 1;
+}
+
+void __split_huge_page_pud(struct vm_area_struct *vma, unsigned long address,
+		pud_t *pud)
+{
+	spinlock_t *ptl;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long haddr = address & HPAGE_PUD_MASK;
+
+	mmu_notifier_invalidate_range_start(mm, haddr, haddr + HPAGE_PUD_SIZE);
+	ptl = pud_lock(mm, pud);
+	if (unlikely(!pud_trans_huge(*pud) && !pud_devmap(*pud)))
+		goto out;
+	BUG_ON(vma->vm_start > haddr || vma->vm_end < haddr + HPAGE_PUD_SIZE);
+	pudp_clear_flush_notify(vma, haddr, pud);
+
+out:
+	spin_unlock(ptl);
+	mmu_notifier_invalidate_range_end(mm, haddr, haddr + HPAGE_PUD_SIZE);
+}
+#endif /* CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD */
+
+/*
+ * This function returns whether a given @page is mapped onto the @address
+ * in the virtual space of @mm.
+ *
+ * When it's true, this function returns *pmd with holding the page table lock
+ * and passing it back to the caller via @ptl.
+ * If it's false, returns NULL without holding the page table lock.
+ */
 pmd_t *page_check_address_pmd(struct page *page,
 			      struct mm_struct *mm,
 			      unsigned long address,
-			      enum page_check_address_pmd_flag flag)
+			      enum page_check_address_pmd_flag flag,
+			      spinlock_t **ptl)
 {
 	pgd_t *pgd;
 	pud_t *pud;
-	pmd_t *pmd, *ret = NULL;
+	pmd_t *pmd;
 
 	if (address & ~HPAGE_PMD_MASK)
-		goto out;
+		return NULL;
 
 	pgd = pgd_offset(mm, address);
 	if (!pgd_present(*pgd))
-		goto out;
-
+		return NULL;
 	pud = pud_offset(pgd, address);
 	if (!pud_present(*pud))
-		goto out;
-
+		return NULL;
 	pmd = pmd_offset(pud, address);
-	if (pmd_none(*pmd))
-		goto out;
+
+	*ptl = pmd_lock(mm, pmd);
+	if (!pmd_present(*pmd))
+		goto unlock;
 	if (pmd_page(*pmd) != page)
-		goto out;
+		goto unlock;
 	/*
 	 * split_vma() may create temporary aliased mappings. There is
 	 * no risk as long as all huge pmd are found and have their
@@ -1136,14 +2086,15 @@ pmd_t *page_check_address_pmd(struct page *page,
 	 */
 	if (flag == PAGE_CHECK_ADDRESS_PMD_NOTSPLITTING_FLAG &&
 	    pmd_trans_splitting(*pmd))
-		goto out;
+		goto unlock;
 	if (pmd_trans_huge(*pmd)) {
 		VM_BUG_ON(flag == PAGE_CHECK_ADDRESS_PMD_SPLITTING_FLAG &&
 			  !pmd_trans_splitting(*pmd));
-		ret = pmd;
+		return pmd;
 	}
-out:
-	return ret;
+unlock:
+	spin_unlock(*ptl);
+	return NULL;
 }
 
 static int __split_huge_page_splitting(struct page *page,
@@ -1151,37 +2102,59 @@ static int __split_huge_page_splitting(struct page *page,
 				       unsigned long address)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	spinlock_t *ptl;
 	pmd_t *pmd;
 	int ret = 0;
+	/* For mmu_notifiers */
+	const unsigned long mmun_start = address;
+	const unsigned long mmun_end   = address + HPAGE_PMD_SIZE;
 
-	spin_lock(&mm->page_table_lock);
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
 	pmd = page_check_address_pmd(page, mm, address,
-				     PAGE_CHECK_ADDRESS_PMD_NOTSPLITTING_FLAG);
+			PAGE_CHECK_ADDRESS_PMD_NOTSPLITTING_FLAG, &ptl);
 	if (pmd) {
 		/*
 		 * We can't temporarily set the pmd to null in order
 		 * to split it, the pmd must remain marked huge at all
 		 * times or the VM won't take the pmd_trans_huge paths
-		 * and it won't wait on the anon_vma->root->lock to
+		 * and it won't wait on the anon_vma->root->rwsem to
 		 * serialize against split_huge_page*.
 		 */
-		pmdp_splitting_flush_notify(vma, address, pmd);
+		pmdp_splitting_flush(vma, address, pmd);
 		ret = 1;
+		spin_unlock(ptl);
 	}
-	spin_unlock(&mm->page_table_lock);
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
 
 	return ret;
 }
 
-static void __split_huge_page_refcount(struct page *page)
+static void __split_huge_page_refcount(struct page *page,
+				       struct list_head *list)
 {
 	int i;
 	struct zone *zone = page_zone(page);
+	struct lruvec *lruvec;
 	int tail_count = 0;
+	int mmu_gather_count;
 
 	/* prevent PageLRU to go away from under us, and freeze lru stats */
 	spin_lock_irq(&zone->lru_lock);
+	lruvec = mem_cgroup_page_lruvec(page, zone);
+
+	/*
+	 * No mmu_gather_count increase can happen anymore because
+	 * here all pmds are already pmd_trans_splitting(). No
+	 * decrease can happen either because it's only decreased
+	 * while holding the lru_lock. So here the mmu_gather_count is
+	 * already stable so store it on the stack. Then it'll be
+	 * overwritten when the page_tail->index is initialized.
+	 */
+	mmu_gather_count = trans_huge_mmu_gather_count(page);
+
 	compound_lock(page);
+	/* complete memcg works before add pages to LRU */
+	mem_cgroup_split_huge_fixup(page);
 
 	for (i = HPAGE_PMD_NR - 1; i >= 1; i--) {
 		struct page *page_tail = page + i;
@@ -1192,11 +2165,24 @@ static void __split_huge_page_refcount(struct page *page)
 		/* check for overflow */
 		BUG_ON(tail_count < 0);
 		BUG_ON(atomic_read(&page_tail->_count) != 0);
-		atomic_add(page_mapcount(page) + page_mapcount(page_tail) + 1,
-			   &page_tail->_count);
+		/*
+		 * tail_page->_count is zero and not changing from
+		 * under us. But get_page_unless_zero() may be running
+		 * from under us on the tail_page. If we used
+		 * atomic_set() below instead of atomic_add(), we
+		 * would then run atomic_set() concurrently with
+		 * get_page_unless_zero(), and atomic_set() is
+		 * implemented in C not using locked ops. spin_unlock
+		 * on x86 sometime uses locked ops because of PPro
+		 * errata 66, 92, so unless somebody can guarantee
+		 * atomic_set() here would be safe on all archs (and
+		 * not only on x86), it's safer to use atomic_add().
+		 */
+		atomic_add(page_mapcount(page) + page_mapcount(page_tail) +
+			   mmu_gather_count + 1, &page_tail->_count);
 
 		/* after clearing PageTail the gup refcount can be released */
-		smp_mb();
+		smp_mb__after_atomic();
 
 		/*
 		 * retain hwpoison flag of the poisoned tail page:
@@ -1208,11 +2194,18 @@ static void __split_huge_page_refcount(struct page *page)
 				     ((1L << PG_referenced) |
 				      (1L << PG_swapbacked) |
 				      (1L << PG_mlocked) |
-				      (1L << PG_uptodate)));
+				      (1L << PG_uptodate) |
+				      (1L << PG_active) |
+				      (1L << PG_unevictable)));
 		page_tail->flags |= (1L << PG_dirty);
 
 		/* clear PageTail before overwriting first_page */
 		smp_wmb();
+
+		if (page_is_young(page))
+			set_page_young(page_tail);
+		if (page_is_idle(page))
+			set_page_idle(page_tail);
 
 		/*
 		 * __split_huge_page_splitting() already set the
@@ -1234,19 +2227,19 @@ static void __split_huge_page_refcount(struct page *page)
 		page_tail->mapping = page->mapping;
 
 		page_tail->index = page->index + i;
+		page_cpupid_xchg_last(page_tail, page_cpupid_last(page));
 
 		BUG_ON(!PageAnon(page_tail));
 		BUG_ON(!PageUptodate(page_tail));
 		BUG_ON(!PageDirty(page_tail));
 		BUG_ON(!PageSwapBacked(page_tail));
 
-		mem_cgroup_split_hugepage_commit(page_tail, page);
-		lru_add_page_tail(zone, page, page_tail);
+		lru_add_page_tail(page, page_tail, lruvec, list);
 	}
 	atomic_sub(tail_count, &page->_count);
 	BUG_ON(atomic_read(&page->_count) <= 0);
 
-	__dec_zone_page_state(page, NR_ANON_TRANSPARENT_HUGEPAGES);
+	__mod_zone_page_state(zone, NR_ANON_TRANSPARENT_HUGEPAGES, -1);
 	__mod_zone_page_state(zone, NR_ANON_PAGES, HPAGE_PMD_NR);
 
 	ClearPageCompound(page);
@@ -1278,30 +2271,32 @@ static int __split_huge_page_map(struct page *page,
 				 unsigned long address)
 {
 	struct mm_struct *mm = vma->vm_mm;
+	spinlock_t *ptl;
 	pmd_t *pmd, _pmd = {0};
 	int ret = 0, i;
 	pgtable_t pgtable;
 	unsigned long haddr;
 
-	spin_lock(&mm->page_table_lock);
 	pmd = page_check_address_pmd(page, mm, address,
-				     PAGE_CHECK_ADDRESS_PMD_SPLITTING_FLAG);
+			PAGE_CHECK_ADDRESS_PMD_SPLITTING_FLAG, &ptl);
 	if (pmd) {
-		pgtable = get_pmd_huge_pte(mm);
+		pgtable = pgtable_trans_huge_withdraw(mm, pmd);
 		pmd_populate(mm, &_pmd, pgtable);
+		if (pmd_write(*pmd))
+			BUG_ON(page_mapcount(page) != 1);
 
-		for (i = 0, haddr = address; i < HPAGE_PMD_NR;
-		     i++, haddr += PAGE_SIZE) {
+		haddr = address;
+		for (i = 0; i < HPAGE_PMD_NR; i++, haddr += PAGE_SIZE) {
 			pte_t *pte, entry;
 			BUG_ON(PageCompound(page+i));
 			entry = mk_pte(page + i, vma->vm_page_prot);
 			entry = maybe_mkwrite(pte_mkdirty(entry), vma);
 			if (!pmd_write(*pmd))
 				entry = pte_wrprotect(entry);
-			else
-				BUG_ON(page_mapcount(page) != 1);
 			if (!pmd_young(*pmd))
 				entry = pte_mkold(entry);
+			if (pmd_numa(*pmd))
+				entry = pte_mknuma(entry);
 			pte = pte_offset_map(&_pmd, haddr);
 			BUG_ON(!pte_none(*pte));
 			set_pte_at(mm, haddr, pte, entry);
@@ -1335,33 +2330,32 @@ static int __split_huge_page_map(struct page *page,
 		 * SMP TLB and finally we write the non-huge version
 		 * of the pmd entry with pmd_populate.
 		 */
-		set_pmd_at(mm, address, pmd, pmd_mknotpresent(*pmd));
-		flush_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
+		pmdp_invalidate(vma, address, pmd);
 		pmd_populate(mm, pmd, pgtable);
 		ret = 1;
+		spin_unlock(ptl);
 	}
-	spin_unlock(&mm->page_table_lock);
 
 	return ret;
 }
 
-/* must be called with anon_vma->root->lock hold */
+/* must be called with anon_vma->root->rwsem held */
 static void __split_huge_page(struct page *page,
-			      struct anon_vma *anon_vma)
+			      struct anon_vma *anon_vma,
+			      struct list_head *list)
 {
 	int mapcount, mapcount2;
+	pgoff_t pgoff = page->index << (PAGE_CACHE_SHIFT - PAGE_SHIFT);
 	struct anon_vma_chain *avc;
 
 	BUG_ON(!PageHead(page));
 	BUG_ON(PageTail(page));
 
 	mapcount = 0;
-	list_for_each_entry(avc, &anon_vma->head, same_anon_vma) {
+	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, pgoff, pgoff) {
 		struct vm_area_struct *vma = avc->vma;
 		unsigned long addr = vma_address(page, vma);
 		BUG_ON(is_vma_temporary_stack(vma));
-		if (addr == -EFAULT)
-			continue;
 		mapcount += __split_huge_page_splitting(page, vma, addr);
 	}
 	/*
@@ -1374,112 +2368,119 @@ static void __split_huge_page(struct page *page,
 	 * the newly established pmd of the child later during the
 	 * walk, to be able to set it as pmd_trans_splitting too.
 	 */
-	if (mapcount != page_mapcount(page))
+	if (mapcount != page_mapcount(page)) {
 		printk(KERN_ERR "mapcount %d page_mapcount %d\n",
 		       mapcount, page_mapcount(page));
-	BUG_ON(mapcount != page_mapcount(page));
+		BUG();
+	}
 
-	__split_huge_page_refcount(page);
+	__split_huge_page_refcount(page, list);
 
 	mapcount2 = 0;
-	list_for_each_entry(avc, &anon_vma->head, same_anon_vma) {
+	anon_vma_interval_tree_foreach(avc, &anon_vma->rb_root, pgoff, pgoff) {
 		struct vm_area_struct *vma = avc->vma;
 		unsigned long addr = vma_address(page, vma);
 		BUG_ON(is_vma_temporary_stack(vma));
-		if (addr == -EFAULT)
-			continue;
 		mapcount2 += __split_huge_page_map(page, vma, addr);
 	}
-	if (mapcount != mapcount2)
+	if (mapcount != mapcount2) {
 		printk(KERN_ERR "mapcount %d mapcount2 %d page_mapcount %d\n",
 		       mapcount, mapcount2, page_mapcount(page));
-	BUG_ON(mapcount != mapcount2);
+		BUG();
+	}
 }
 
-int split_huge_page(struct page *page)
+/*
+ * Split a hugepage into normal pages. This doesn't change the position of head
+ * page. If @list is null, tail pages will be added to LRU list, otherwise, to
+ * @list. Both head page and tail pages will inherit mapping, flags, and so on
+ * from the hugepage.
+ * Return 0 if the hugepage is split successfully otherwise return 1.
+ */
+int split_huge_page_to_list(struct page *page, struct list_head *list)
 {
 	struct anon_vma *anon_vma;
 	int ret = 1;
 
+	BUG_ON(is_huge_zero_page(page));
 	BUG_ON(!PageAnon(page));
-	anon_vma = page_lock_anon_vma(page);
+
+	/*
+	 * The caller does not necessarily hold an mmap_sem that would prevent
+	 * the anon_vma disappearing so we first we take a reference to it
+	 * and then lock the anon_vma for write. This is similar to
+	 * page_lock_anon_vma_read except the write lock is taken to serialise
+	 * against parallel split or collapse operations.
+	 */
+	anon_vma = page_get_anon_vma(page);
 	if (!anon_vma)
 		goto out;
+	anon_vma_lock_write(anon_vma);
+
 	ret = 0;
 	if (!PageCompound(page))
 		goto out_unlock;
 
 	BUG_ON(!PageSwapBacked(page));
-	__split_huge_page(page, anon_vma);
+	__split_huge_page(page, anon_vma, list);
 	count_vm_event(THP_SPLIT);
 
 	BUG_ON(PageCompound(page));
 out_unlock:
-	page_unlock_anon_vma(anon_vma);
+	anon_vma_unlock_write(anon_vma);
+	put_anon_vma(anon_vma);
 out:
 	return ret;
 }
 
-int hugepage_madvise(unsigned long *vm_flags, int advice)
+#define VM_NO_THP (VM_SPECIAL | VM_HUGETLB | VM_SHARED | VM_MAYSHARE)
+
+int hugepage_madvise(struct vm_area_struct *vma,
+		     unsigned long *vm_flags, int advice)
 {
 	switch (advice) {
 	case MADV_HUGEPAGE:
+#ifdef CONFIG_S390
+		/*
+		 * qemu blindly sets MADV_HUGEPAGE on all allocations, but s390
+		 * can't handle this properly after s390_enable_sie, so we simply
+		 * ignore the madvise to prevent qemu from causing a SIGSEGV.
+		 */
+		if (mm_has_pgste(vma->vm_mm))
+			return 0;
+#endif
 		/*
 		 * Be somewhat over-protective like KSM for now!
 		 */
-		if (*vm_flags & (VM_HUGEPAGE |
-				 VM_SHARED   | VM_MAYSHARE   |
-				 VM_PFNMAP   | VM_IO      | VM_DONTEXPAND |
-				 VM_RESERVED | VM_HUGETLB | VM_INSERTPAGE |
-				 VM_MIXEDMAP | VM_SAO))
+		if (*vm_flags & (VM_HUGEPAGE | VM_NO_THP))
 			return -EINVAL;
 		*vm_flags &= ~VM_NOHUGEPAGE;
 		*vm_flags |= VM_HUGEPAGE;
+		/*
+		 * If the vma become good for khugepaged to scan,
+		 * register it here without waiting a page fault that
+		 * may not happen any time soon.
+		 */
+		if (unlikely(khugepaged_enter_vma_merge(vma, *vm_flags)))
+			return -ENOMEM;
 		break;
 	case MADV_NOHUGEPAGE:
 		/*
 		 * Be somewhat over-protective like KSM for now!
 		 */
-		if (*vm_flags & (VM_NOHUGEPAGE |
-				 VM_SHARED   | VM_MAYSHARE   |
-				 VM_PFNMAP   | VM_IO      | VM_DONTEXPAND |
-				 VM_RESERVED | VM_HUGETLB | VM_INSERTPAGE |
-				 VM_MIXEDMAP | VM_SAO))
+		if (*vm_flags & (VM_NOHUGEPAGE | VM_NO_THP))
 			return -EINVAL;
 		*vm_flags &= ~VM_HUGEPAGE;
 		*vm_flags |= VM_NOHUGEPAGE;
+		/*
+		 * Setting VM_NOHUGEPAGE will prevent khugepaged from scanning
+		 * this vma even if we leave the mm registered in khugepaged if
+		 * it got registered before VM_NOHUGEPAGE was set.
+		 */
 		break;
 	}
 
 	return 0;
-}
-
-void __split_huge_page_pmd(struct mm_struct *mm, pmd_t *pmd)
-{
-	struct page *page;
-
-again:
-	spin_lock(&mm->page_table_lock);
-	if (unlikely(!pmd_trans_huge(*pmd))) {
-		spin_unlock(&mm->page_table_lock);
-		return;
-	}
-	page = pmd_page(*pmd);
-	VM_BUG_ON(!page_count(page));
-	get_page(page);
-	spin_unlock(&mm->page_table_lock);
-
-	split_huge_page(page);
-
-	put_page(page);
-
-	/*
-	 * We don't always have down_write of mmap_sem here: a racing
-	 * do_huge_pmd_wp_page() might have copied-on-write to another
-	 * huge page before our split_huge_page() got the anon_vma lock.
-	 */
-	if (unlikely(pmd_trans_huge(*pmd)))
-		goto again;
 }
 
 static int __init khugepaged_slab_init(void)
@@ -1491,12 +2492,6 @@ static int __init khugepaged_slab_init(void)
 		return -ENOMEM;
 
 	return 0;
-}
-
-static void __init khugepaged_slab_free(void)
-{
-	kmem_cache_destroy(mm_slot_cache);
-	mm_slot_cache = NULL;
 }
 
 static inline struct mm_slot *alloc_mm_slot(void)
@@ -1511,47 +2506,22 @@ static inline void free_mm_slot(struct mm_slot *mm_slot)
 	kmem_cache_free(mm_slot_cache, mm_slot);
 }
 
-static int __init mm_slots_hash_init(void)
-{
-	mm_slots_hash = kzalloc(MM_SLOTS_HASH_HEADS * sizeof(struct hlist_head),
-				GFP_KERNEL);
-	if (!mm_slots_hash)
-		return -ENOMEM;
-	return 0;
-}
-
-#if 0
-static void __init mm_slots_hash_free(void)
-{
-	kfree(mm_slots_hash);
-	mm_slots_hash = NULL;
-}
-#endif
-
 static struct mm_slot *get_mm_slot(struct mm_struct *mm)
 {
 	struct mm_slot *mm_slot;
-	struct hlist_head *bucket;
-	struct hlist_node *node;
 
-	bucket = &mm_slots_hash[((unsigned long)mm / sizeof(struct mm_struct))
-				% MM_SLOTS_HASH_HEADS];
-	hlist_for_each_entry(mm_slot, node, bucket, hash) {
+	hash_for_each_possible(mm_slots_hash, mm_slot, hash, (unsigned long)mm)
 		if (mm == mm_slot->mm)
 			return mm_slot;
-	}
+
 	return NULL;
 }
 
 static void insert_to_mm_slots_hash(struct mm_struct *mm,
 				    struct mm_slot *mm_slot)
 {
-	struct hlist_head *bucket;
-
-	bucket = &mm_slots_hash[((unsigned long)mm / sizeof(struct mm_struct))
-				% MM_SLOTS_HASH_HEADS];
 	mm_slot->mm = mm;
-	hlist_add_head(&mm_slot->hash, bucket);
+	hash_add(mm_slots_hash, &mm_slot->hash, (long)mm);
 }
 
 static inline int khugepaged_test_exit(struct mm_struct *mm)
@@ -1592,10 +2562,8 @@ int __khugepaged_enter(struct mm_struct *mm)
 	return 0;
 }
 
-#define VM_NO_THP (VM_SPECIAL|VM_INSERTPAGE|VM_MIXEDMAP|VM_SAO| \
-		   VM_HUGETLB|VM_SHARED|VM_MAYSHARE)
-
-int khugepaged_enter_vma_merge(struct vm_area_struct *vma)
+int khugepaged_enter_vma_merge(struct vm_area_struct *vma,
+			       unsigned long vm_flags)
 {
 	unsigned long hstart, hend;
 	if (!vma->anon_vma)
@@ -1604,18 +2572,13 @@ int khugepaged_enter_vma_merge(struct vm_area_struct *vma)
 		 * page fault if needed.
 		 */
 		return 0;
-	if (vma->vm_ops)
+	if (vma->vm_ops || (vm_flags & VM_NO_THP))
 		/* khugepaged not yet working on file or special mappings */
 		return 0;
-	/*
-	 * If is_pfn_mapping() is true is_learn_pfn_mapping() must be
-	 * true too, verify it here.
-	 */
-	VM_BUG_ON(is_linear_pfn_mapping(vma) || vma->vm_flags & VM_NO_THP);
 	hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
 	hend = vma->vm_end & HPAGE_PMD_MASK;
 	if (hstart < hend)
-		return khugepaged_enter(vma);
+		return khugepaged_enter(vma, vm_flags);
 	return 0;
 }
 
@@ -1627,18 +2590,17 @@ void __khugepaged_exit(struct mm_struct *mm)
 	spin_lock(&khugepaged_mm_lock);
 	mm_slot = get_mm_slot(mm);
 	if (mm_slot && khugepaged_scan.mm_slot != mm_slot) {
-		hlist_del(&mm_slot->hash);
+		hash_del(&mm_slot->hash);
 		list_del(&mm_slot->mm_node);
 		free = 1;
 	}
+	spin_unlock(&khugepaged_mm_lock);
 
 	if (free) {
-		spin_unlock(&khugepaged_mm_lock);
 		clear_bit(MMF_VM_HUGEPAGE, &mm->flags);
 		free_mm_slot(mm_slot);
 		mmdrop(mm);
 	} else if (mm_slot) {
-		spin_unlock(&khugepaged_mm_lock);
 		/*
 		 * This is required to serialize against
 		 * khugepaged_test_exit() (which is guaranteed to run
@@ -1649,8 +2611,7 @@ void __khugepaged_exit(struct mm_struct *mm)
 		 */
 		down_write(&mm->mmap_sem);
 		up_write(&mm->mmap_sem);
-	} else
-		spin_unlock(&khugepaged_mm_lock);
+	}
 }
 
 static void release_pte_page(struct page *page)
@@ -1670,81 +2631,68 @@ static void release_pte_pages(pte_t *pte, pte_t *_pte)
 	}
 }
 
-static void release_all_pte_pages(pte_t *pte)
-{
-	release_pte_pages(pte, pte + HPAGE_PMD_NR);
-}
-
 static int __collapse_huge_page_isolate(struct vm_area_struct *vma,
 					unsigned long address,
 					pte_t *pte)
 {
 	struct page *page;
 	pte_t *_pte;
-	int referenced = 0, isolated = 0, none = 0;
+	int referenced = 0, none = 0;
 	for (_pte = pte; _pte < pte+HPAGE_PMD_NR;
 	     _pte++, address += PAGE_SIZE) {
 		pte_t pteval = *_pte;
 		if (pte_none(pteval)) {
-			if (++none <= khugepaged_max_ptes_none)
+			if (!userfaultfd_armed(vma) &&
+			    ++none <= khugepaged_max_ptes_none)
 				continue;
-			else {
-				release_pte_pages(pte, _pte);
+			else
 				goto out;
-			}
 		}
-		if (!pte_present(pteval) || !pte_write(pteval)) {
-			release_pte_pages(pte, _pte);
+		if (!pte_present(pteval) || !pte_write(pteval))
 			goto out;
-		}
 		page = vm_normal_page(vma, address, pteval);
-		if (unlikely(!page)) {
-			release_pte_pages(pte, _pte);
+		if (unlikely(!page))
 			goto out;
-		}
-		VM_BUG_ON(PageCompound(page));
-		BUG_ON(!PageAnon(page));
-		VM_BUG_ON(!PageSwapBacked(page));
+
+		VM_BUG_ON_PAGE(PageCompound(page), page);
+		VM_BUG_ON_PAGE(!PageAnon(page), page);
+		VM_BUG_ON_PAGE(!PageSwapBacked(page), page);
 
 		/* cannot use mapcount: can't collapse if there's a gup pin */
-		if (page_count(page) != 1) {
-			release_pte_pages(pte, _pte);
+		if (page_count(page) != 1)
 			goto out;
-		}
 		/*
 		 * We can do it before isolate_lru_page because the
 		 * page can't be freed from under us. NOTE: PG_lock
 		 * is needed to serialize against split_huge_page
 		 * when invoked from the VM.
 		 */
-		if (!trylock_page(page)) {
-			release_pte_pages(pte, _pte);
+		if (!trylock_page(page))
 			goto out;
-		}
 		/*
 		 * Isolate the page to avoid collapsing an hugepage
 		 * currently in use by the VM.
 		 */
 		if (isolate_lru_page(page)) {
 			unlock_page(page);
-			release_pte_pages(pte, _pte);
 			goto out;
 		}
 		/* 0 stands for page_is_file_cache(page) == false */
 		inc_zone_page_state(page, NR_ISOLATED_ANON + 0);
-		VM_BUG_ON(!PageLocked(page));
-		VM_BUG_ON(PageLRU(page));
+		VM_BUG_ON_PAGE(!PageLocked(page), page);
+		VM_BUG_ON_PAGE(PageLRU(page), page);
 
 		/* If there is no mapped pte young don't collapse the page */
-		if (pte_young(pteval) || 1)
+		if (pte_young(pteval) ||
+		    page_is_young(page) || PageReferenced(page) ||
+		    mmu_notifier_test_young(vma->vm_mm, address))
 			referenced = 1;
 	}
-	if (unlikely(!referenced))
-		release_all_pte_pages(pte);
-	else
-		isolated = 1;
+	if (likely(referenced))
+		return 1;
 out:
-	return isolated;
+	release_pte_pages(pte, _pte);
+	return 0;
 }
 
 static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
@@ -1759,12 +2707,11 @@ static void __collapse_huge_page_copy(pte_t *pte, struct page *page,
 
 		if (pte_none(pteval)) {
 			clear_user_highpage(page, address);
-			add_mm_counter(vma->vm_mm, anon_rss, 1);
+			add_mm_counter(vma->vm_mm, MM_ANONPAGES, 1);
 		} else {
 			src_page = pte_page(pteval);
 			copy_user_highpage(page, src_page, address, vma);
-			VM_BUG_ON(page_mapcount(src_page) != 1);
-			VM_BUG_ON(page_count(src_page) != 2);
+			VM_BUG_ON_PAGE(page_mapcount(src_page) != 1, src_page);
 			release_pte_page(src_page);
 			/*
 			 * ptl mostly unnecessary, but preempt has to
@@ -1843,7 +2790,13 @@ static struct page
 		       struct vm_area_struct *vma, unsigned long address,
 		       int node)
 {
-	VM_BUG_ON(*hpage);
+	gfp_t flags;
+
+	VM_BUG_ON_PAGE(*hpage, *hpage);
+
+	/* Only allocate from the target node */
+	flags = alloc_hugepage_gfpmask(khugepaged_defrag(), __GFP_OTHER_NODE) |
+	        __GFP_THISNODE;
 
 	/*
 	 * Before allocating the hugepage, release the mmap_sem read lock.
@@ -1853,8 +2806,7 @@ static struct page
 	 */
 	up_read(&mm->mmap_sem);
 
-	*hpage = alloc_pages_exact_node(node, alloc_hugepage_gfpmask(
-		khugepaged_defrag(), __GFP_OTHER_NODE), HPAGE_PMD_ORDER);
+	*hpage = alloc_pages_exact_node(node, flags, HPAGE_PMD_ORDER);
 	if (unlikely(!*hpage)) {
 		count_vm_event(THP_COLLAPSE_ALLOC_FAILED);
 		*hpage = ERR_PTR(-ENOMEM);
@@ -1868,12 +2820,6 @@ static struct page
 static int khugepaged_find_target_node(void)
 {
 	return 0;
-}
-
-static inline struct page *alloc_hugepage(int defrag)
-{
-	return alloc_pages(alloc_hugepage_gfpmask(defrag, 0),
-			   HPAGE_PMD_ORDER);
 }
 
 static struct page *khugepaged_alloc_hugepage(bool *wait)
@@ -1918,21 +2864,34 @@ static struct page
 }
 #endif
 
+static bool hugepage_vma_check(struct vm_area_struct *vma)
+{
+	if ((!(vma->vm_flags & VM_HUGEPAGE) && !khugepaged_always()) ||
+	    (vma->vm_flags & VM_NOHUGEPAGE))
+		return false;
+
+	if (!vma->anon_vma || vma->vm_ops)
+		return false;
+	if (is_vma_temporary_stack(vma))
+		return false;
+	return !(vma->vm_flags & VM_NO_THP);
+}
+
 static void collapse_huge_page(struct mm_struct *mm,
 				   unsigned long address,
 				   struct page **hpage,
 				   struct vm_area_struct *vma,
 				   int node)
 {
-	pgd_t *pgd;
-	pud_t *pud;
 	pmd_t *pmd, _pmd;
 	pte_t *pte;
 	pgtable_t pgtable;
 	struct page *new_page;
-	spinlock_t *ptl;
+	spinlock_t *pmd_ptl, *pte_ptl;
 	int isolated;
 	unsigned long hstart, hend;
+	unsigned long mmun_start;	/* For mmu_notifiers */
+	unsigned long mmun_end;		/* For mmu_notifiers */
 
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
@@ -1944,74 +2903,65 @@ static void collapse_huge_page(struct mm_struct *mm,
 	if (unlikely(mem_cgroup_newpage_charge(new_page, mm, GFP_KERNEL)))
 		return;
 
-
 	/*
 	 * Prevent all access to pagetables with the exception of
 	 * gup_fast later hanlded by the ptep_clear_flush and the VM
 	 * handled by the anon_vma lock + PG_lock.
 	 */
 	down_write(&mm->mmap_sem);
+	if (!mmget_still_valid(mm))
+		goto out;
 	if (unlikely(khugepaged_test_exit(mm)))
 		goto out;
 
 	vma = find_vma(mm, address);
+	if (!vma)
+		goto out;
 	hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
 	hend = vma->vm_end & HPAGE_PMD_MASK;
 	if (address < hstart || address + HPAGE_PMD_SIZE > hend)
 		goto out;
-
-	if (!(vma->vm_flags & VM_HUGEPAGE) && !khugepaged_always())
+	if (!hugepage_vma_check(vma))
+		goto out;
+	pmd = mm_find_pmd(mm, address);
+	if (!pmd)
 		goto out;
 
-	if (!vma->anon_vma || vma->vm_ops)
-		goto out;
-	if (is_vma_temporary_stack(vma))
-		goto out;
-	/*
-	 * If is_pfn_mapping() is true is_learn_pfn_mapping() must be
-	 * true too, verify it here.
-	 */
-	VM_BUG_ON(is_linear_pfn_mapping(vma) || vma->vm_flags & VM_NO_THP);
-
-	pgd = pgd_offset(mm, address);
-	if (!pgd_present(*pgd))
-		goto out;
-
-	pud = pud_offset(pgd, address);
-	if (!pud_present(*pud))
-		goto out;
-
-	pmd = pmd_offset(pud, address);
-	/* pmd can't go away or become huge under us */
-	if (!pmd_present(*pmd) || pmd_trans_huge(*pmd))
-		goto out;
-
-	anon_vma_lock(vma->anon_vma);
+	anon_vma_lock_write(vma->anon_vma);
 
 	pte = pte_offset_map(pmd, address);
-	ptl = pte_lockptr(mm, pmd);
+	pte_ptl = pte_lockptr(mm, pmd);
 
-	spin_lock(&mm->page_table_lock); /* probably unnecessary */
+	mmun_start = address;
+	mmun_end   = address + HPAGE_PMD_SIZE;
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+	pmd_ptl = pmd_lock(mm, pmd); /* probably unnecessary */
 	/*
 	 * After this gup_fast can't run anymore. This also removes
 	 * any huge TLB entry from the CPU so we won't allow
 	 * huge and small TLB entries for the same virtual address
 	 * to avoid the risk of CPU bugs in that area.
 	 */
-	_pmd = pmdp_clear_flush_notify(vma, address, pmd);
-	spin_unlock(&mm->page_table_lock);
+	_pmd = pmdp_clear_flush(vma, address, pmd);
+	spin_unlock(pmd_ptl);
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
 
-	spin_lock(ptl);
+	spin_lock(pte_ptl);
 	isolated = __collapse_huge_page_isolate(vma, address, pte);
-	spin_unlock(ptl);
-	pte_unmap(pte);
+	spin_unlock(pte_ptl);
 
 	if (unlikely(!isolated)) {
-		spin_lock(&mm->page_table_lock);
+		pte_unmap(pte);
+		spin_lock(pmd_ptl);
 		BUG_ON(!pmd_none(*pmd));
-		set_pmd_at(mm, address, pmd, _pmd);
-		spin_unlock(&mm->page_table_lock);
-		anon_vma_unlock(vma->anon_vma);
+		/*
+		 * We can only use set_pmd_at when establishing
+		 * hugepmds and never for establishing regular pmds that
+		 * points to regular pagetables. Use pmd_populate for that
+		 */
+		pmd_populate(mm, pmd, pmd_pgtable(_pmd));
+		spin_unlock(pmd_ptl);
+		anon_vma_unlock_write(vma->anon_vma);
 		goto out;
 	}
 
@@ -2019,17 +2969,14 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 * All pages are isolated and locked so anon_vma rmap
 	 * can't run anymore.
 	 */
-	anon_vma_unlock(vma->anon_vma);
+	anon_vma_unlock_write(vma->anon_vma);
 
-	__collapse_huge_page_copy(pte, new_page, vma, address, ptl);
+	__collapse_huge_page_copy(pte, new_page, vma, address, pte_ptl);
+	pte_unmap(pte);
 	__SetPageUptodate(new_page);
 	pgtable = pmd_pgtable(_pmd);
-	VM_BUG_ON(page_count(pgtable) != 1);
-	VM_BUG_ON(page_mapcount(pgtable) != 0);
 
-	_pmd = mk_pmd(new_page, vma->vm_page_prot);
-	_pmd = maybe_pmd_mkwrite(pmd_mkdirty(_pmd), vma);
-	_pmd = pmd_mkhuge(_pmd);
+	_pmd = mk_huge_pmd(new_page, vma);
 
 	/*
 	 * spin_lock() below is not the equivalent of smp_wmb(), so
@@ -2038,13 +2985,15 @@ static void collapse_huge_page(struct mm_struct *mm,
 	 */
 	smp_wmb();
 
-	spin_lock(&mm->page_table_lock);
+	init_trans_huge_mmu_gather_count(new_page);
+
+	spin_lock(pmd_ptl);
 	BUG_ON(!pmd_none(*pmd));
 	page_add_new_anon_rmap(new_page, vma, address);
+	pgtable_trans_huge_deposit(mm, pmd, pgtable);
 	set_pmd_at(mm, address, pmd, _pmd);
-	update_mmu_cache(vma, address, entry);
-	prepare_pmd_huge_pte(pgtable, mm);
-	spin_unlock(&mm->page_table_lock);
+	update_mmu_cache_pmd(vma, address, pmd);
+	spin_unlock(pmd_ptl);
 
 	*hpage = NULL;
 
@@ -2063,28 +3012,18 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 			       unsigned long address,
 			       struct page **hpage)
 {
-	pgd_t *pgd;
-	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte, *_pte;
 	int ret = 0, referenced = 0, none = 0;
 	struct page *page;
 	unsigned long _address;
 	spinlock_t *ptl;
-	int node = -1;
+	int node = NUMA_NO_NODE;
 
 	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
 
-	pgd = pgd_offset(mm, address);
-	if (!pgd_present(*pgd))
-		goto out;
-
-	pud = pud_offset(pgd, address);
-	if (!pud_present(*pud))
-		goto out;
-
-	pmd = pmd_offset(pud, address);
-	if (!pmd_present(*pmd) || pmd_trans_huge(*pmd))
+	pmd = mm_find_pmd(mm, address);
+	if (!pmd)
 		goto out;
 
 	memset(khugepaged_node_load, 0, sizeof(khugepaged_node_load));
@@ -2093,7 +3032,8 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 	     _pte++, _address += PAGE_SIZE) {
 		pte_t pteval = *_pte;
 		if (pte_none(pteval)) {
-			if (++none <= khugepaged_max_ptes_none)
+			if (!userfaultfd_armed(vma) &&
+			    ++none <= khugepaged_max_ptes_none)
 				continue;
 			else
 				goto out_unmap;
@@ -2111,14 +3051,15 @@ static int khugepaged_scan_pmd(struct mm_struct *mm,
 		 */
 		node = page_to_nid(page);
 		khugepaged_node_load[node]++;
-		VM_BUG_ON(PageCompound(page));
+		VM_BUG_ON_PAGE(PageCompound(page), page);
 		if (!PageLRU(page) || PageLocked(page) || !PageAnon(page))
 			goto out_unmap;
 		/* cannot use mapcount: can't collapse if there's a gup pin */
 		if (page_count(page) != 1)
 			goto out_unmap;
-		/* we miss mmu_notifier_test_young so add || 1 */
-		if (pte_young(pteval) || 1)
+		if (pte_young(pteval) ||
+		    page_is_young(page) || PageReferenced(page) ||
+		    mmu_notifier_test_young(vma->vm_mm, address))
 			referenced = 1;
 	}
 	if (referenced)
@@ -2138,11 +3079,11 @@ static void collect_mm_slot(struct mm_slot *mm_slot)
 {
 	struct mm_struct *mm = mm_slot->mm;
 
-	VM_BUG_ON(!spin_is_locked(&khugepaged_mm_lock));
+	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&khugepaged_mm_lock));
 
 	if (khugepaged_test_exit(mm)) {
 		/* free mm_slot */
-		hlist_del(&mm_slot->hash);
+		hash_del(&mm_slot->hash);
 		list_del(&mm_slot->mm_node);
 
 		/*
@@ -2159,6 +3100,8 @@ static void collect_mm_slot(struct mm_slot *mm_slot)
 
 static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
 					    struct page **hpage)
+	__releases(&khugepaged_mm_lock)
+	__acquires(&khugepaged_mm_lock)
 {
 	struct mm_slot *mm_slot;
 	struct mm_struct *mm;
@@ -2166,7 +3109,7 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
 	int progress = 0;
 
 	VM_BUG_ON(!pages);
-	VM_BUG_ON(!spin_is_locked(&khugepaged_mm_lock));
+	VM_BUG_ON(NR_CPUS != 1 && !spin_is_locked(&khugepaged_mm_lock));
 
 	if (khugepaged_scan.mm_slot)
 		mm_slot = khugepaged_scan.mm_slot;
@@ -2179,10 +3122,14 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
 	spin_unlock(&khugepaged_mm_lock);
 
 	mm = mm_slot->mm;
-	down_read(&mm->mmap_sem);
-	if (unlikely(khugepaged_test_exit(mm)))
-		vma = NULL;
-	else
+	/*
+	 * Don't wait for semaphore (to avoid long wait times).  Just move to
+	 * the next mm on the list.
+	 */
+	vma = NULL;
+	if (unlikely(!down_read_trylock(&mm->mmap_sem)))
+		goto breakouterloop_mmap_sem;
+	if (likely(!khugepaged_test_exit(mm)))
 		vma = find_vma(mm, khugepaged_scan.address);
 
 	progress++;
@@ -2194,25 +3141,11 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
 			progress++;
 			break;
 		}
-
-		if (!(vma->vm_flags & VM_HUGEPAGE) &&
-		    !khugepaged_always()) {
-		skip:
+		if (!hugepage_vma_check(vma)) {
+skip:
 			progress++;
 			continue;
 		}
-
-		if (!vma->anon_vma || vma->vm_ops)
-			goto skip;
-		if (is_vma_temporary_stack(vma))
-			goto skip;
-		/*
-		 * If is_pfn_mapping() is true is_learn_pfn_mapping()
-		 * must be true too, verify it here.
-		 */
-		VM_BUG_ON(is_linear_pfn_mapping(vma) ||
-			  vma->vm_flags & VM_NO_THP);
-
 		hstart = (vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK;
 		hend = vma->vm_end & HPAGE_PMD_MASK;
 		if (hstart >= hend)
@@ -2362,6 +3295,92 @@ static int khugepaged(void *none)
 	return 0;
 }
 
+static void __split_huge_zero_page_pmd(struct vm_area_struct *vma,
+		unsigned long haddr, pmd_t *pmd)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pgtable_t pgtable;
+	pmd_t _pmd;
+	int i;
+
+	pmdp_clear_flush_notify(vma, haddr, pmd);
+	/* leave pmd empty until pte is filled */
+
+	pgtable = pgtable_trans_huge_withdraw(mm, pmd);
+	pmd_populate(mm, &_pmd, pgtable);
+
+	for (i = 0; i < HPAGE_PMD_NR; i++, haddr += PAGE_SIZE) {
+		pte_t *pte, entry;
+		entry = pfn_pte(my_zero_pfn(haddr), vma->vm_page_prot);
+		entry = pte_mkspecial(entry);
+		pte = pte_offset_map(&_pmd, haddr);
+		VM_BUG_ON(!pte_none(*pte));
+		set_pte_at(mm, haddr, pte, entry);
+		pte_unmap(pte);
+	}
+	smp_wmb(); /* make pte visible before pmd */
+	pmd_populate(mm, pmd, pgtable);
+	put_huge_zero_page();
+}
+
+void __split_huge_page_pmd(struct vm_area_struct *vma, unsigned long address,
+		pmd_t *pmd)
+{
+	spinlock_t *ptl;
+	struct page *page = NULL;
+	struct mm_struct *mm = vma->vm_mm;
+	unsigned long haddr = address & HPAGE_PMD_MASK;
+	unsigned long mmun_start;	/* For mmu_notifiers */
+	unsigned long mmun_end;		/* For mmu_notifiers */
+
+	mmun_start = haddr;
+	mmun_end   = haddr + HPAGE_PMD_SIZE;
+again:
+	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+	ptl = pmd_lock(mm, pmd);
+	if (unlikely(!pmd_trans_huge(*pmd) && !pmd_devmap(*pmd)))
+		goto unlock;
+	BUG_ON(vma->vm_start > haddr || vma->vm_end < haddr + HPAGE_PMD_SIZE);
+	if (vma_is_dax(vma)) {
+		pmd_t _pmd = pmdp_clear_flush_notify(vma, haddr, pmd);
+		if (is_huge_zero_pmd(_pmd))
+			put_huge_zero_page();
+	} else if (is_huge_zero_pmd(*pmd)) {
+		__split_huge_zero_page_pmd(vma, haddr, pmd);
+	} else {
+		page = pmd_page(*pmd);
+		VM_BUG_ON_PAGE(!page_count(page), page);
+		get_page(page);
+	}
+ unlock:
+	spin_unlock(ptl);
+	mmu_notifier_invalidate_range_end(mm, mmun_start, mmun_end);
+
+	if (!page)
+		return;
+
+	split_huge_page(page);
+	put_page(page);
+
+	/*
+	 * We don't always have down_write of mmap_sem here: a racing
+	 * do_huge_pmd_wp_page() might have copied-on-write to another
+	 * huge page before our split_huge_page() got the anon_vma lock.
+	 */
+	if (unlikely(pmd_trans_huge(*pmd) || pmd_devmap(*pmd)))
+		goto again;
+}
+
+void split_huge_page_pmd_mm(struct mm_struct *mm, unsigned long address,
+		pmd_t *pmd)
+{
+	struct vm_area_struct *vma;
+
+	vma = find_vma(mm, address);
+	BUG_ON(vma == NULL);
+	split_huge_page_pmd(vma, address, pmd);
+}
+
 static void split_huge_page_address(struct mm_struct *mm,
 				    unsigned long address)
 {
@@ -2386,10 +3405,10 @@ static void split_huge_page_address(struct mm_struct *mm,
 	 * Caller holds the mmap_sem write mode, so a huge pmd cannot
 	 * materialize from under us.
 	 */
-	split_huge_page_pmd(mm, pmd);
+	split_huge_page_pmd_mm(mm, address, pmd);
 }
 
-void __vma_adjust_trans_huge(struct vm_area_struct *vma,
+void vma_adjust_trans_huge(struct vm_area_struct *vma,
 			     unsigned long start,
 			     unsigned long end,
 			     long adjust_next)

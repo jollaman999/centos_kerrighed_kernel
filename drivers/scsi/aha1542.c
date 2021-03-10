@@ -22,7 +22,7 @@
  *        Added module command-line options
  *        19-Jul-99
  *  Modified by Adam Fritzler
- *        Added proper detection of the AHA-1640 (MCA version of AHA-1540)
+ *        Added proper detection of the AHA-1640 (MCA, now deleted)
  */
 
 #include <linux/module.h>
@@ -37,11 +37,9 @@
 #include <linux/spinlock.h>
 #include <linux/isapnp.h>
 #include <linux/blkdev.h>
-#include <linux/mca.h>
-#include <linux/mca-legacy.h>
+#include <linux/slab.h>
 
 #include <asm/dma.h>
-#include <asm/system.h>
 #include <asm/io.h>
 
 #include "scsi.h"
@@ -51,23 +49,7 @@
 #define SCSI_BUF_PA(address)	isa_virt_to_bus(address)
 #define SCSI_SG_PA(sgent)	(isa_page_to_bus(sg_page((sgent))) + (sgent)->offset)
 
-static void BAD_SG_DMA(Scsi_Cmnd * SCpnt,
-		       struct scatterlist *sgp,
-		       int nseg,
-		       int badseg)
-{
-	printk(KERN_CRIT "sgpnt[%d:%d] page %p/0x%llx length %u\n",
-	       badseg, nseg, sg_virt(sgp),
-	       (unsigned long long)SCSI_SG_PA(sgp),
-	       sgp->length);
-
-	/*
-	 * Not safe to continue.
-	 */
-	panic("Buffer at physical address > 16Mb used for aha1542");
-}
-
-#include<linux/stat.h>
+#include <linux/stat.h>
 
 #ifdef DEBUG
 #define DEB(x) x
@@ -87,7 +69,7 @@ static void BAD_SG_DMA(Scsi_Cmnd * SCpnt,
 #define MAXBOARDS 4		/* Increase this and the sizes of the
 				   arrays below, if you need more.. */
 
-/* Boards 3,4 slots are reserved for ISAPnP/MCA scans */
+/* Boards 3,4 slots are reserved for ISAPnP scans */
 
 static unsigned int bases[MAXBOARDS] __initdata = {0x330, 0x334, 0, 0};
 
@@ -117,7 +99,7 @@ static int setup_dmaspeed[MAXBOARDS] __initdata = { -1, -1, -1, -1 };
  */
 
 #if defined(MODULE)
-static int isapnp = 0;
+static bool isapnp = 0;
 static int aha1542[] = {0x330, 11, 4, -1};
 module_param_array(aha1542, int, NULL, 0);
 module_param(isapnp, bool, 0);
@@ -573,7 +555,7 @@ static void aha1542_intr_handle(struct Scsi_Host *shost)
 	};
 }
 
-static int aha1542_queuecommand(Scsi_Cmnd * SCpnt, void (*done) (Scsi_Cmnd *))
+static int aha1542_queuecommand_lck(Scsi_Cmnd * SCpnt, void (*done) (Scsi_Cmnd *))
 {
 	unchar ahacmd = CMD_START_SCSI;
 	unchar direction;
@@ -690,8 +672,6 @@ static int aha1542_queuecommand(Scsi_Cmnd * SCpnt, void (*done) (Scsi_Cmnd *))
 		}
 		scsi_for_each_sg(SCpnt, sg, sg_count, i) {
 			any2scsi(cptr[i].dataptr, SCSI_SG_PA(sg));
-			if (SCSI_SG_PA(sg) + sg->length - 1 > ISA_DMA_THRESHOLD)
-				BAD_SG_DMA(SCpnt, scsi_sglist(SCpnt), sg_count, i);
 			any2scsi(cptr[i].datalen, sg->length);
 		};
 		any2scsi(ccb[mbo].datalen, sg_count * sizeof(struct chain));
@@ -734,6 +714,8 @@ static int aha1542_queuecommand(Scsi_Cmnd * SCpnt, void (*done) (Scsi_Cmnd *))
 
 	return 0;
 }
+
+static DEF_SCSI_QCMD(aha1542_queuecommand)
 
 /* Initialize mailboxes */
 static void setup_mailboxes(int bse, struct Scsi_Host *shpnt)
@@ -1025,66 +1007,6 @@ static int __init aha1542_detect(struct scsi_host_template * tpnt)
 #endif
 
 	/*
-	 *	Find MicroChannel cards (AHA1640)
-	 */
-#ifdef CONFIG_MCA_LEGACY
-	if(MCA_bus) {
-		int slot = 0;
-		int pos = 0;
-
-		for (indx = 0; (slot != MCA_NOTFOUND) && (indx < ARRAY_SIZE(bases)); indx++) {
-
-			if (bases[indx])
-				continue;
-
-			/* Detect only AHA-1640 cards -- MCA ID 0F1F */
-			slot = mca_find_unused_adapter(0x0f1f, slot);
-			if (slot == MCA_NOTFOUND)
-				break;
-
-			/* Found one */
-			pos = mca_read_stored_pos(slot, 3);
-
-			/* Decode address */
-			if (pos & 0x80) {
-				if (pos & 0x02) {
-					if (pos & 0x01)
-						bases[indx] = 0x334;
-					else
-						bases[indx] = 0x234;
-				} else {
-					if (pos & 0x01)
-						bases[indx] = 0x134;
-				}
-			} else {
-				if (pos & 0x02) {
-					if (pos & 0x01)
-						bases[indx] = 0x330;
-					else
-						bases[indx] = 0x230;
-				} else {
-					if (pos & 0x01)
-						bases[indx] = 0x130;
-				}
-			}
-
-			/* No need to decode IRQ and Arb level -- those are
-			 * read off the card later.
-			 */
-			printk(KERN_INFO "Found an AHA-1640 in MCA slot %d, I/O 0x%04x\n", slot, bases[indx]);
-
-			mca_set_adapter_name(slot, "Adapter AHA-1640");
-			mca_set_adapter_procfn(slot, NULL, NULL);
-			mca_mark_as_used(slot);
-
-			/* Go on */
-			slot++;
-		}
-
-	}
-#endif
-
-	/*
 	 *	Hunt for ISA Plug'n'Pray Adaptecs (AHA1535)
 	 */
 
@@ -1132,15 +1054,8 @@ static int __init aha1542_detect(struct scsi_host_template * tpnt)
 				release_region(bases[indx], 4);
 				continue;
 			}
-			/* For now we do this - until kmalloc is more intelligent
-			   we are resigned to stupid hacks like this */
-			if (SCSI_BUF_PA(shpnt) >= ISA_DMA_THRESHOLD) {
-				printk(KERN_ERR "Invalid address for shpnt with 1542.\n");
-				goto unregister;
-			}
 			if (!aha1542_test_port(bases[indx], shpnt))
 				goto unregister;
-
 
 			base_io = bases[indx];
 

@@ -72,18 +72,21 @@ Install kexec-tools
 
 2) Download the kexec-tools user-space package from the following URL:
 
-http://www.kernel.org/pub/linux/kernel/people/horms/kexec-tools/kexec-tools.tar.gz
+http://kernel.org/pub/linux/utils/kernel/kexec/kexec-tools.tar.gz
 
 This is a symlink to the latest version.
 
 The latest kexec-tools git tree is available at:
 
-git://git.kernel.org/pub/scm/linux/kernel/git/horms/kexec-tools.git
-or
-http://www.kernel.org/git/?p=linux/kernel/git/horms/kexec-tools.git
+git://git.kernel.org/pub/scm/utils/kernel/kexec/kexec-tools.git
+and
+http://www.kernel.org/pub/scm/utils/kernel/kexec/kexec-tools.git
+
+There is also a gitweb interface available at
+http://www.kernel.org/git/?p=utils/kernel/kexec/kexec-tools.git
 
 More information about kexec-tools can be found at
-http://www.kernel.org/pub/linux/kernel/people/horms/kexec-tools/README.html
+http://horms.net/projects/kexec/
 
 3) Unpack the tarball with the tar command, as follows:
 
@@ -162,6 +165,7 @@ System kernel config options
    This will let you to use "crashkernel=auto", instead of specifying
    numbers for "crashkernel=". Note, you need to have enough memory.
    The threshold and reserved memory size are arch-dependent.
+
 
 Dump-capture kernel config options (Arch Independent)
 -----------------------------------------------------
@@ -286,7 +290,7 @@ Or you can use:
 
     crashkernel=auto
 
-if you have enough memory. The threshold is 2G on ia64 and x86, for powerpc
+if you have enough memory. The threshold is 2G on x86, for powerpc
 if PAGESIZE is 4k the threshold is 2G or the threshold is 8G, below which
 this won't work. For s390x, crashkernel=auto can be used for all
 memory sizes > 256M.
@@ -296,28 +300,10 @@ and x86_64, base memory reserved is 128M and this memory is scaled based on
 physical memory present in the system. Currently dump filtering utility
 (makedumpfile) requires 2bits per 4K page of memory in its user space. So
 memory reserved is scaled accordingly. That means on top of 128MB, we reserve
-additional 2bit per 4K page of physical memory in the system. But when system
-has large memory crashkernel=auto could try to reserve very large contiguous
-memory, possibly exceed 896M. While kernel only supports reserving memory
-below 896M for kexec/kdump kernel. So the reservation size need be scaled
-down in step size of 64M until a final size is found or failed if the reserved
-size is smaller than 256M since kdump probably won't work with <256M with very
-large memory. This is fine since makedumpfile use cyclic buffer mode by default
-which need far less memory than bitmap mode.
+additional 2bit per 4K page of physical memory in the system.
 
 It will be 128M or 256M on ppc, 128M on s390x, 1/32 of your physical memory
-size on ppc64 (but it will not grow if you have more than 128G memory). IA64
-has its own policy, shown below:
-
-	Memory size	Reserved memory
-	===========	===============
-	[4G, 12G)	256M
-	[12G, 128G)	512M
-	[128G, 256G)	768M
-	[256G, 378G)	1024M
-	[378G, 512G)	1536M
-	[512G, 768G)	2048M
-	[768G, )	3072M
+size on ppc64 (but it will not grow if you have more than 128G memory).
 
 
 Boot into System Kernel
@@ -339,6 +325,7 @@ Boot into System Kernel
    On ia64, 256M@256M is a generous value that typically works.
    The region may be automatically placed on ia64, see the
    dump-capture kernel config option notes above.
+   If use sparse memory, the size should be rounded to GRANULE boundaries.
 
    On s390x, typically use "crashkernel=xxM". The value of xx is dependent
    on the memory consumption of the kdump system. In general this is not
@@ -362,7 +349,7 @@ For ppc64:
 For ia64:
 	- Use vmlinux or vmlinuz.gz
 For s390x:
-	- Use image
+	- Use image or bzImage
 
 
 If you are using a uncompressed vmlinux image then use following command
@@ -394,7 +381,6 @@ For ppc64:
 
 For s390x:
 	"1 maxcpus=1 cgroup_disable=memory"
-
 
 Notes on loading the dump-capture kernel:
 
@@ -480,11 +466,19 @@ To see the entire memory, use the following command:
 Trigger Kdump on WARN()
 =======================
 
-It is an X86 only option. Powerpc and S390 do not expect panic on warn.
 The kernel parameter, panic_on_warn, calls panic() in all WARN() paths.  This
 will cause a kdump to occur at the panic() call.  In cases where a user wants
 to specify this during runtime, /proc/sys/kernel/panic_on_warn can be set to 1
 to achieve the same behaviour.
+
+Trigger Kdump on add_taint()
+============================
+
+The kernel parameter panic_on_taint facilitates a conditional call to panic()
+from within add_taint() whenever the value set in this bitmask matches with the
+bit flag being set by add_taint().
+This will cause a kdump to occur at the add_taint()->panic() call.
+
 
 Analysis
 ========
@@ -522,6 +516,6 @@ To Do
 Contact
 =======
 
-Vivek Goyal (vgoyal@in.ibm.com)
+Vivek Goyal (vgoyal@redhat.com)
 Maneesh Soni (maneesh@in.ibm.com)
 

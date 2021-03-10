@@ -53,8 +53,10 @@ enum {
  * every to-be-taken lock to all currently held lock's own dependency
  * table (if it's not there yet), and we check it for lock order
  * conflicts and deadlocks.
+ *
+ * RHEL7 specific: Increase lock dependency entries from 32k to 40k.
  */
-#define MAX_LOCKDEP_ENTRIES	32768UL
+#define MAX_LOCKDEP_ENTRIES	40960UL
 
 #define MAX_LOCKDEP_CHAINS_BITS	16
 #define MAX_LOCKDEP_CHAINS	(1UL << MAX_LOCKDEP_CHAINS_BITS)
@@ -64,8 +66,10 @@ enum {
 /*
  * Stack-trace: tightly packed array of stack backtrace
  * addresses. Protected by the hash_lock.
+ *
+ * RHEL7 specific: Increase # of stack entries from 512k to 640k.
  */
-#define MAX_STACK_TRACE_ENTRIES	524288UL
+#define MAX_STACK_TRACE_ENTRIES	655360UL
 
 extern struct list_head all_lock_classes;
 extern struct lock_chain lock_chains[];
@@ -110,31 +114,88 @@ lockdep_count_backward_deps(struct lock_class *class)
 #endif
 
 #ifdef CONFIG_DEBUG_LOCKDEP
+
+#include <asm/local.h>
 /*
- * Various lockdep statistics:
+ * Various lockdep statistics.
+ * We want them per cpu as they are often accessed in fast path
+ * and we want to avoid too much cache bouncing.
  */
-extern atomic_t chain_lookup_hits;
-extern atomic_t chain_lookup_misses;
-extern atomic_t hardirqs_on_events;
-extern atomic_t hardirqs_off_events;
-extern atomic_t redundant_hardirqs_on;
-extern atomic_t redundant_hardirqs_off;
-extern atomic_t softirqs_on_events;
-extern atomic_t softirqs_off_events;
-extern atomic_t redundant_softirqs_on;
-extern atomic_t redundant_softirqs_off;
-extern atomic_t nr_unused_locks;
-extern atomic_t nr_cyclic_checks;
-extern atomic_t nr_cyclic_check_recursions;
-extern atomic_t nr_find_usage_forwards_checks;
-extern atomic_t nr_find_usage_forwards_recursions;
-extern atomic_t nr_find_usage_backwards_checks;
-extern atomic_t nr_find_usage_backwards_recursions;
-# define debug_atomic_inc(ptr)		atomic_inc(ptr)
-# define debug_atomic_dec(ptr)		atomic_dec(ptr)
-# define debug_atomic_read(ptr)		atomic_read(ptr)
+struct lockdep_stats {
+	int	chain_lookup_hits;
+	int	chain_lookup_misses;
+	int	hardirqs_on_events;
+	int	hardirqs_off_events;
+	int	redundant_hardirqs_on;
+	int	redundant_hardirqs_off;
+	int	softirqs_on_events;
+	int	softirqs_off_events;
+	int	redundant_softirqs_on;
+	int	redundant_softirqs_off;
+	int	nr_unused_locks;
+	int	nr_cyclic_checks;
+	int	nr_cyclic_check_recursions;
+	int	nr_find_usage_forwards_checks;
+	int	nr_find_usage_forwards_recursions;
+	int	nr_find_usage_backwards_checks;
+	int	nr_find_usage_backwards_recursions;
+
+	/*
+	 * Per lock class locking operation stat counts
+	 */
+	unsigned long lock_class_ops[MAX_LOCKDEP_KEYS];
+};
+
+DECLARE_PER_CPU(struct lockdep_stats, lockdep_stats);
+extern struct lock_class lock_classes[MAX_LOCKDEP_KEYS];
+
+#define __debug_atomic_inc(ptr)					\
+	this_cpu_inc(lockdep_stats.ptr);
+
+#define debug_atomic_inc(ptr)			{		\
+	WARN_ON_ONCE(!irqs_disabled());				\
+	__this_cpu_inc(lockdep_stats.ptr);			\
+}
+
+#define debug_atomic_dec(ptr)			{		\
+	WARN_ON_ONCE(!irqs_disabled());				\
+	__this_cpu_dec(lockdep_stats.ptr);			\
+}
+
+#define debug_atomic_read(ptr)		({				\
+	struct lockdep_stats *__cpu_lockdep_stats;			\
+	unsigned long long __total = 0;					\
+	int __cpu;							\
+	for_each_possible_cpu(__cpu) {					\
+		__cpu_lockdep_stats = &per_cpu(lockdep_stats, __cpu);	\
+		__total += __cpu_lockdep_stats->ptr;			\
+	}								\
+	__total;							\
+})
+
+static inline void debug_class_ops_inc(struct lock_class *class)
+{
+	int idx;
+
+	idx = class - lock_classes;
+	__debug_atomic_inc(lock_class_ops[idx]);
+}
+
+static inline unsigned long debug_class_ops_read(struct lock_class *class)
+{
+	int idx, cpu;
+	unsigned long ops = 0;
+
+	idx = class - lock_classes;
+	for_each_possible_cpu(cpu)
+		ops += per_cpu(lockdep_stats.lock_class_ops[idx], cpu);
+	return ops;
+}
+
 #else
+# define __debug_atomic_inc(ptr)	do { } while (0)
 # define debug_atomic_inc(ptr)		do { } while (0)
 # define debug_atomic_dec(ptr)		do { } while (0)
 # define debug_atomic_read(ptr)		0
+# define debug_class_ops_inc(ptr)	do { } while (0)
 #endif

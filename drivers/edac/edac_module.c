@@ -15,12 +15,41 @@
 #include "edac_core.h"
 #include "edac_module.h"
 
-#define EDAC_VERSION "Ver: 2.1.0 " __DATE__
+#define EDAC_VERSION "Ver: 3.0.0"
 
 #ifdef CONFIG_EDAC_DEBUG
-/* Values of 0 to 4 will generate output */
-int edac_debug_level = 2;
+
+static int edac_set_debug_level(const char *buf, struct kernel_param *kp)
+{
+	unsigned long val;
+	int ret;
+
+	ret = kstrtoul(buf, 0, &val);
+	if (ret)
+		return ret;
+
+	if (val < 0 || val > 4)
+		return -EINVAL;
+
+	return param_set_int(buf, kp);
+}
+
+/*
+ * In RHEL7 this is set to -1 to disable all output by default.  This is
+ * because there are EDAC debug events that generate a message at a rate
+ * of one/second which results in a slow flood of the printk buffer and
+ * console.  This can be changed at load time by adding
+ * 'edac_core.edac_debug_level=2' as a kernel parameter, or adding a file to
+ * /etc/modprobe.d.
+ *
+ *  Values of 0 to 4 will generate output
+ */
+int edac_debug_level = -1;
 EXPORT_SYMBOL_GPL(edac_debug_level);
+
+module_param_call(edac_debug_level, edac_set_debug_level, param_get_int,
+		  &edac_debug_level, 0644);
+MODULE_PARM_DESC(edac_debug_level, "EDAC debug level: [0-4], default: 2");
 #endif
 
 /* scope is to module level only */
@@ -90,27 +119,25 @@ static int __init edac_init(void)
 	 */
 	edac_pci_clear_parity_errors();
 
-	/*
-	 * now set up the mc_kset under the edac class object
-	 */
-	err = edac_sysfs_setup_mc_kset();
+	err = edac_mc_sysfs_init();
 	if (err)
-		goto error;
+		goto err_sysfs;
 
-	/* Setup/Initialize the workq for this core */
+	edac_debugfs_init();
+
 	err = edac_workqueue_setup();
 	if (err) {
-		edac_printk(KERN_ERR, EDAC_MC, "init WorkQueue failure\n");
-		goto workq_fail;
+		edac_printk(KERN_ERR, EDAC_MC, "Failure initializing workqueue\n");
+		goto err_wq;
 	}
 
 	return 0;
 
-	/* Error teardown stack */
-workq_fail:
-	edac_sysfs_teardown_mc_kset();
+err_wq:
+	edac_debugfs_exit();
+	edac_mc_sysfs_exit();
 
-error:
+err_sysfs:
 	return err;
 }
 
@@ -120,26 +147,20 @@ error:
  */
 static void __exit edac_exit(void)
 {
-	debugf0("%s()\n", __func__);
+	edac_dbg(0, "\n");
 
 	/* tear down the various subsystems */
 	edac_workqueue_teardown();
-	edac_sysfs_teardown_mc_kset();
+	edac_mc_sysfs_exit();
+	edac_debugfs_exit();
 }
 
 /*
  * Inform the kernel of our entry and exit points
  */
-module_init(edac_init);
+subsys_initcall(edac_init);
 module_exit(edac_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Doug Thompson www.softwarebitmaker.com, et al");
 MODULE_DESCRIPTION("Core library routines for EDAC reporting");
-
-/* refer to *_sysfs.c files for parameters that are exported via sysfs */
-
-#ifdef CONFIG_EDAC_DEBUG
-module_param(edac_debug_level, int, 0644);
-MODULE_PARM_DESC(edac_debug_level, "Debug level");
-#endif

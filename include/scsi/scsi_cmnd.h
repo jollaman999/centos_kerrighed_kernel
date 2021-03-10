@@ -9,6 +9,8 @@
 #include <linux/scatterlist.h>
 #include <scsi/scsi_device.h>
 
+#include <linux/rh_kabi.h>
+
 struct Scsi_Host;
 struct scsi_device;
 struct scsi_driver;
@@ -52,10 +54,14 @@ struct scsi_pointer {
 	volatile int phase;
 };
 
+/* for scmd->flags */
+#define SCMD_TAGGED		(1 << 0)
+
 struct scsi_cmnd {
 	struct scsi_device *device;
 	struct list_head list;  /* scsi_cmnd participates in queue lists */
 	struct list_head eh_entry; /* entry for the host eh_cmd_q */
+	struct delayed_work abort_work;
 	int eh_eflags;		/* Used by error handlr */
 
 	/*
@@ -131,21 +137,38 @@ struct scsi_cmnd {
 	int result;		/* Status code from lower level driver */
 
 	unsigned char tag;	/* SCSI-II queued command tag */
+
+	/* FOR RH USE ONLY
+	 *
+	 * The following padding has been inserted before ABI freeze to
+	 * allow extending the structure while preserve ABI.
+	 */
+	RH_KABI_USE_P(1,	int flags)	/* Command flags */
+	RH_KABI_RESERVE_P(2)
+	RH_KABI_RESERVE_P(3)
+	RH_KABI_RESERVE_P(4)
+
 };
 
+/*
+ * Return the driver private allocation behind the command.
+ * Only works if cmd_size is set in the host template.
+ */
+static inline void *scsi_cmd_priv(struct scsi_cmnd *cmd)
+{
+	return cmd + 1;
+}
+
+/* make sure not to use it with REQ_TYPE_BLOCK_PC commands */
 static inline struct scsi_driver *scsi_cmd_to_driver(struct scsi_cmnd *cmd)
 {
-	if (!cmd->request->rq_disk)
-		return NULL;
-
 	return *(struct scsi_driver **)cmd->request->rq_disk->private_data;
 }
 
 extern struct scsi_cmnd *scsi_get_command(struct scsi_device *, gfp_t);
 extern struct scsi_cmnd *__scsi_get_command(struct Scsi_Host *, gfp_t);
 extern void scsi_put_command(struct scsi_cmnd *);
-extern void __scsi_put_command(struct Scsi_Host *, struct scsi_cmnd *,
-			       struct device *);
+extern void __scsi_put_command(struct Scsi_Host *, struct scsi_cmnd *);
 extern void scsi_finish_command(struct scsi_cmnd *cmd);
 
 extern void *scsi_kmap_atomic_sg(struct scatterlist *sg, int sg_count,
@@ -157,9 +180,6 @@ extern void scsi_release_buffers(struct scsi_cmnd *cmd);
 
 extern int scsi_dma_map(struct scsi_cmnd *cmd);
 extern void scsi_dma_unmap(struct scsi_cmnd *cmd);
-
-struct scsi_cmnd *scsi_allocate_command(gfp_t gfp_mask);
-void scsi_free_command(gfp_t gfp_mask, struct scsi_cmnd *cmd);
 
 static inline unsigned scsi_sg_count(struct scsi_cmnd *cmd)
 {

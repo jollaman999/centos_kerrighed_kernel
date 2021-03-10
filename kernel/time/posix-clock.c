@@ -18,13 +18,12 @@
  *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 #include <linux/device.h>
+#include <linux/export.h>
 #include <linux/file.h>
 #include <linux/posix-clock.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
 #include <linux/uaccess.h>
-
-static void delete_clock(struct kref *kref);
 
 /*
  * Returns NULL if the posix_clock instance attached to 'fp' is old and stale.
@@ -167,7 +166,7 @@ static int posix_clock_open(struct inode *inode, struct file *fp)
 		err = 0;
 
 	if (!err) {
-		kref_get(&clk->kref);
+		get_device(clk->dev);
 		fp->private_data = clk;
 	}
 out:
@@ -183,7 +182,7 @@ static int posix_clock_release(struct inode *inode, struct file *fp)
 	if (clk->ops.release)
 		err = clk->ops.release(clk);
 
-	kref_put(&clk->kref, delete_clock);
+	put_device(clk->dev);
 
 	fp->private_data = NULL;
 
@@ -205,38 +204,35 @@ static const struct file_operations posix_clock_file_operations = {
 #endif
 };
 
-int posix_clock_register(struct posix_clock *clk, dev_t devid)
+int posix_clock_register(struct posix_clock *clk, struct device *dev)
 {
 	int err;
 
-	kref_init(&clk->kref);
 	init_rwsem(&clk->rwsem);
 
 	cdev_init(&clk->cdev, &posix_clock_file_operations);
+	err = cdev_device_add(&clk->cdev, dev);
+	if (err) {
+		pr_err("%s unable to add device %d:%d\n",
+			dev_name(dev), MAJOR(dev->devt), MINOR(dev->devt));
+		return err;
+	}
 	clk->cdev.owner = clk->ops.owner;
-	err = cdev_add(&clk->cdev, devid, 1);
+	clk->dev = dev;
 
-	return err;
+	return 0;
 }
 EXPORT_SYMBOL_GPL(posix_clock_register);
 
-static void delete_clock(struct kref *kref)
-{
-	struct posix_clock *clk = container_of(kref, struct posix_clock, kref);
-
-	if (clk->release)
-		clk->release(clk);
-}
-
 void posix_clock_unregister(struct posix_clock *clk)
 {
-	cdev_del(&clk->cdev);
+	cdev_device_del(&clk->cdev, clk->dev);
 
 	down_write(&clk->rwsem);
 	clk->zombie = true;
 	up_write(&clk->rwsem);
 
-	kref_put(&clk->kref, delete_clock);
+	put_device(clk->dev);
 }
 EXPORT_SYMBOL_GPL(posix_clock_unregister);
 
@@ -281,11 +277,16 @@ static int pc_clock_adjtime(clockid_t id, struct timex *tx)
 	if (err)
 		return err;
 
+	if ((cd.fp->f_mode & FMODE_WRITE) == 0) {
+		err = -EACCES;
+		goto out;
+	}
+
 	if (cd.clk->ops.clock_adjtime)
 		err = cd.clk->ops.clock_adjtime(cd.clk, tx);
 	else
 		err = -EOPNOTSUPP;
-
+out:
 	put_clock_desc(&cd);
 
 	return err;
@@ -338,11 +339,16 @@ static int pc_clock_settime(clockid_t id, const struct timespec *ts)
 	if (err)
 		return err;
 
+	if ((cd.fp->f_mode & FMODE_WRITE) == 0) {
+		err = -EACCES;
+		goto out;
+	}
+
 	if (cd.clk->ops.clock_settime)
 		err = cd.clk->ops.clock_settime(cd.clk, ts);
 	else
 		err = -EOPNOTSUPP;
-
+out:
 	put_clock_desc(&cd);
 
 	return err;

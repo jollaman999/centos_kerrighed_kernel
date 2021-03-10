@@ -6,12 +6,13 @@
  */
 
 #include <linux/gfp.h>
-#include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/percpu.h>
 #include <linux/sched.h>
 #include <linux/cpumask.h>
 #include <asm/apic.h>
+#include <asm/cpufeature.h>
+#include <asm/intel-family.h>
 #include <asm/processor.h>
 #include <asm/msr.h>
 #include <asm/mce.h>
@@ -25,6 +26,18 @@
  * Also supports reliable discovery of shared banks.
  */
 
+/*
+ * CMCI can be delivered to multiple cpus that share a machine check bank
+ * so we need to designate a single cpu to process errors logged in each bank
+ * in the interrupt handler (otherwise we would have many races and potential
+ * double reporting of the same error).
+ * Note that this can change when a cpu is offlined or brought online since
+ * some MCA banks are shared across cpus. When a cpu is offlined, cmci_clear()
+ * disables CMCI on all banks owned by the cpu and clears this bitfield. At
+ * this point, cmci_rediscover() kicks in and a different cpu may end up
+ * taking ownership of some of the shared MCA banks that were previously
+ * owned by the offlined cpu.
+ */
 static DEFINE_PER_CPU(mce_banks_t, mce_banks_owned);
 
 /*
@@ -40,7 +53,7 @@ static DEFINE_PER_CPU(int, cmci_backoff_cnt);
  * cmci_discover_lock protects against parallel discovery attempts
  * which could race against each other.
  */
-static DEFINE_SPINLOCK(cmci_discover_lock);
+static DEFINE_RAW_SPINLOCK(cmci_discover_lock);
 
 #define CMCI_THRESHOLD		1
 #define CMCI_POLL_INTERVAL	(30 * HZ)
@@ -63,7 +76,7 @@ static int cmci_supported(int *banks)
 {
 	u64 cap;
 
-	if (mce_cmci_disabled || mce_ignore_ce)
+	if (mca_cfg.cmci_disabled || mca_cfg.ignore_ce)
 		return 0;
 
 	/*
@@ -80,19 +93,49 @@ static int cmci_supported(int *banks)
 	return !!(cap & MCG_CMCI_P);
 }
 
+static bool lmce_supported(void)
+{
+	u64 tmp;
+
+	if (mca_cfg.lmce_disabled)
+		return false;
+
+	rdmsrl(MSR_IA32_MCG_CAP, tmp);
+
+	/*
+	 * LMCE depends on recovery support in the processor. Hence both
+	 * MCG_SER_P and MCG_LMCE_P should be present in MCG_CAP.
+	 */
+	if ((tmp & (MCG_SER_P | MCG_LMCE_P)) !=
+		   (MCG_SER_P | MCG_LMCE_P))
+		return false;
+
+	/*
+	 * BIOS should indicate support for LMCE by setting bit 20 in
+	 * IA32_FEATURE_CONTROL without which touching MCG_EXT_CTL will
+	 * generate a #GP fault.
+	 */
+	rdmsrl(MSR_IA32_FEATURE_CONTROL, tmp);
+	if ((tmp & (FEATURE_CONTROL_LOCKED | FEATURE_CONTROL_LMCE)) ==
+		   (FEATURE_CONTROL_LOCKED | FEATURE_CONTROL_LMCE))
+		return true;
+
+	return false;
+}
+
 bool mce_intel_cmci_poll(void)
 {
-	if (__get_cpu_var(cmci_storm_state) == CMCI_STORM_NONE)
+	if (__this_cpu_read(cmci_storm_state) == CMCI_STORM_NONE)
 		return false;
 
 	/*
 	 * Reset the counter if we've logged an error in the last poll
 	 * during the storm.
 	 */
-	if (machine_check_poll(MCP_TIMESTAMP, &__get_cpu_var(mce_banks_owned)))
-		__get_cpu_var(cmci_backoff_cnt) = INITIAL_CHECK_INTERVAL;
+	if (machine_check_poll(MCP_TIMESTAMP, this_cpu_ptr(&mce_banks_owned)))
+		this_cpu_write(cmci_backoff_cnt, INITIAL_CHECK_INTERVAL);
 	else
-		__get_cpu_var(cmci_backoff_cnt)--;
+		this_cpu_dec(cmci_backoff_cnt);
 
 	return true;
 }
@@ -105,17 +148,36 @@ void mce_intel_hcpu_update(unsigned long cpu)
 	per_cpu(cmci_storm_state, cpu) = CMCI_STORM_NONE;
 }
 
+static void cmci_toggle_interrupt_mode(bool on)
+{
+	unsigned long flags, *owned;
+	int bank;
+	u64 val;
+
+	raw_spin_lock_irqsave(&cmci_discover_lock, flags);
+	owned = __get_cpu_var(mce_banks_owned);
+	for_each_set_bit(bank, owned, MAX_NR_BANKS) {
+		rdmsrl(MSR_IA32_MCx_CTL2(bank), val);
+
+		if (on)
+			val |= MCI_CTL2_CMCI_EN;
+		else
+			val &= ~MCI_CTL2_CMCI_EN;
+
+		wrmsrl(MSR_IA32_MCx_CTL2(bank), val);
+	}
+	raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+}
+
 unsigned long cmci_intel_adjust_timer(unsigned long interval)
 {
-	unsigned int *state = &__get_cpu_var(cmci_storm_state);
-
-	if ((__get_cpu_var(cmci_backoff_cnt) > 0) &&
-	    (__get_cpu_var(cmci_storm_state) == CMCI_STORM_ACTIVE)) {
+	if ((this_cpu_read(cmci_backoff_cnt) > 0) &&
+	    (__this_cpu_read(cmci_storm_state) == CMCI_STORM_ACTIVE)) {
 		mce_notify_irq();
 		return CMCI_STORM_INTERVAL;
 	}
 
-	switch (*state) {
+	switch (__this_cpu_read(cmci_storm_state)) {
 	case CMCI_STORM_ACTIVE:
 
 		/*
@@ -123,7 +185,7 @@ unsigned long cmci_intel_adjust_timer(unsigned long interval)
 		 * silenced itself. That means no events recorded and the timer
 		 * interval is back to our poll interval.
 		 */
-		*state = CMCI_STORM_SUBSIDED;
+		__this_cpu_write(cmci_storm_state, CMCI_STORM_SUBSIDED);
 		if (!atomic_sub_return(1, &cmci_storm_on_cpus))
 			pr_notice("CMCI storm subsided: switching to interrupt mode\n");
 
@@ -135,8 +197,8 @@ unsigned long cmci_intel_adjust_timer(unsigned long interval)
 		 * happens we switch back to interrupt mode.
 		 */
 		if (!atomic_read(&cmci_storm_on_cpus)) {
-			*state = CMCI_STORM_NONE;
-			cmci_reenable();
+			__this_cpu_write(cmci_storm_state, CMCI_STORM_NONE);
+			cmci_toggle_interrupt_mode(true);
 			cmci_recheck();
 		}
 		return CMCI_POLL_INTERVAL;
@@ -147,48 +209,32 @@ unsigned long cmci_intel_adjust_timer(unsigned long interval)
 	}
 }
 
-static void cmci_storm_disable_banks(void)
-{
-	unsigned long flags, *owned;
-	int bank;
-	u64 val;
-
-	spin_lock_irqsave(&cmci_discover_lock, flags);
-	owned = __get_cpu_var(mce_banks_owned);
-	for_each_set_bit(bank, owned, MAX_NR_BANKS) {
-		rdmsrl(MSR_IA32_MCx_CTL2(bank), val);
-		val &= ~MCI_CTL2_CMCI_EN;
-		wrmsrl(MSR_IA32_MCx_CTL2(bank), val);
-	}
-	spin_unlock_irqrestore(&cmci_discover_lock, flags);
-}
-
 static bool cmci_storm_detect(void)
 {
-	unsigned int *state = &__get_cpu_var(cmci_storm_state);
-	unsigned int *cnt = &__get_cpu_var(cmci_storm_cnt);
-	unsigned long *ts = &__get_cpu_var(cmci_time_stamp);
+	unsigned int cnt = __this_cpu_read(cmci_storm_cnt);
+	unsigned long ts = __this_cpu_read(cmci_time_stamp);
 	unsigned long now = jiffies;
 	int r;
 
-	if (*state != CMCI_STORM_NONE)
+	if (__this_cpu_read(cmci_storm_state) != CMCI_STORM_NONE)
 		return true;
 
-	if (time_before_eq(now, *ts + CMCI_STORM_INTERVAL)) {
-		(*cnt)++;
+	if (time_before_eq(now, ts + CMCI_STORM_INTERVAL)) {
+		cnt++;
 	} else {
-		*cnt = 1;
-		*ts = now;
+		cnt = 1;
+		__this_cpu_write(cmci_time_stamp, now);
 	}
+	__this_cpu_write(cmci_storm_cnt, cnt);
 
-	if (*cnt <= CMCI_STORM_THRESHOLD)
+	if (cnt <= CMCI_STORM_THRESHOLD)
 		return false;
 
-	cmci_storm_disable_banks();
-	*state = CMCI_STORM_ACTIVE;
+	cmci_toggle_interrupt_mode(false);
+	__this_cpu_write(cmci_storm_state, CMCI_STORM_ACTIVE);
 	r = atomic_add_return(1, &cmci_storm_on_cpus);
 	mce_timer_kick(CMCI_STORM_INTERVAL);
-	__get_cpu_var(cmci_backoff_cnt) = INITIAL_CHECK_INTERVAL;
+	this_cpu_write(cmci_backoff_cnt, INITIAL_CHECK_INTERVAL);
 
 	if (r == 1)
 		pr_notice("CMCI storm detected: switching to poll mode\n");
@@ -207,7 +253,6 @@ static void intel_threshold_interrupt(void)
 		return;
 
 	machine_check_poll(MCP_TIMESTAMP, &__get_cpu_var(mce_banks_owned));
-	mce_notify_irq();
 }
 
 /*
@@ -222,7 +267,7 @@ static void cmci_discover(int banks)
 	int i;
 	int bios_wrong_thresh = 0;
 
-	spin_lock_irqsave(&cmci_discover_lock, flags);
+	raw_spin_lock_irqsave(&cmci_discover_lock, flags);
 	for (i = 0; i < banks; i++) {
 		u64 val;
 		int bios_zero_thresh = 0;
@@ -243,7 +288,7 @@ static void cmci_discover(int banks)
 			continue;
 		}
 
-		if (!mce_bios_cmci_threshold) {
+		if (!mca_cfg.bios_cmci_threshold) {
 			val &= ~MCI_CTL2_CMCI_THRESHOLD_MASK;
 			val |= CMCI_THRESHOLD;
 		} else if (!(val & MCI_CTL2_CMCI_THRESHOLD_MASK)) {
@@ -270,15 +315,15 @@ static void cmci_discover(int banks)
 			 * set the thresholds properly or does not work with
 			 * this boot option. Note down now and report later.
 			 */
-			if (mce_bios_cmci_threshold && bios_zero_thresh &&
+			if (mca_cfg.bios_cmci_threshold && bios_zero_thresh &&
 					(val & MCI_CTL2_CMCI_THRESHOLD_MASK))
 				bios_wrong_thresh = 1;
 		} else {
 			WARN_ON(!test_bit(i, __get_cpu_var(mce_poll_banks)));
 		}
 	}
-	spin_unlock_irqrestore(&cmci_discover_lock, flags);
-	if (mce_bios_cmci_threshold && bios_wrong_thresh) {
+	raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
+	if (mca_cfg.bios_cmci_threshold && bios_wrong_thresh) {
 		pr_info_once(
 			"bios_cmci_threshold: Some banks do not have valid thresholds set\n");
 		pr_info_once(
@@ -295,7 +340,7 @@ void cmci_recheck(void)
 	unsigned long flags;
 	int banks;
 
-	if (!mce_available(&current_cpu_data) || !cmci_supported(&banks))
+	if (!mce_available(__this_cpu_ptr(&cpu_info)) || !cmci_supported(&banks))
 		return;
 
 	local_irq_save(flags);
@@ -328,40 +373,30 @@ void cmci_clear(void)
 
 	if (!cmci_supported(&banks))
 		return;
-	spin_lock_irqsave(&cmci_discover_lock, flags);
+	raw_spin_lock_irqsave(&cmci_discover_lock, flags);
 	for (i = 0; i < banks; i++)
 		__cmci_disable_bank(i);
-	spin_unlock_irqrestore(&cmci_discover_lock, flags);
+	raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
 }
 
-/*
- * After a CPU went down cycle through all the others and rediscover
- * Must run in process context.
- */
-void cmci_rediscover(int dying)
+static void cmci_rediscover_work_func(void *arg)
 {
 	int banks;
-	int cpu;
-	cpumask_var_t old;
+
+	/* Recheck banks in case CPUs don't all have the same */
+	if (cmci_supported(&banks))
+		cmci_discover(banks);
+}
+
+/* After a CPU went down cycle through all the others and rediscover */
+void cmci_rediscover(void)
+{
+	int banks;
 
 	if (!cmci_supported(&banks))
 		return;
-	if (!alloc_cpumask_var(&old, GFP_KERNEL))
-		return;
-	cpumask_copy(old, &current->cpus_allowed);
 
-	for_each_online_cpu(cpu) {
-		if (cpu == dying)
-			continue;
-		if (set_cpus_allowed_ptr(current, cpumask_of(cpu)))
-			continue;
-		/* Recheck banks in case CPUs don't all have the same */
-		if (cmci_supported(&banks))
-			cmci_discover(banks);
-	}
-
-	set_cpus_allowed_ptr(current, old);
-	free_cpumask_var(old);
+	on_each_cpu(cmci_rediscover_work_func, NULL, 1);
 }
 
 /*
@@ -382,9 +417,9 @@ void cmci_disable_bank(int bank)
 	if (!cmci_supported(&banks))
 		return;
 
-	spin_lock_irqsave(&cmci_discover_lock, flags);
+	raw_spin_lock_irqsave(&cmci_discover_lock, flags);
 	__cmci_disable_bank(bank);
-	spin_unlock_irqrestore(&cmci_discover_lock, flags);
+	raw_spin_unlock_irqrestore(&cmci_discover_lock, flags);
 }
 
 static void intel_init_cmci(void)
@@ -406,8 +441,77 @@ static void intel_init_cmci(void)
 	cmci_recheck();
 }
 
+static void intel_init_lmce(void)
+{
+	u64 val;
+
+	if (!lmce_supported())
+		return;
+
+	rdmsrl(MSR_IA32_MCG_EXT_CTL, val);
+
+	if (!(val & MCG_EXT_CTL_LMCE_EN))
+		wrmsrl(MSR_IA32_MCG_EXT_CTL, val | MCG_EXT_CTL_LMCE_EN);
+}
+
+static void intel_clear_lmce(void)
+{
+	u64 val;
+
+	if (!lmce_supported())
+		return;
+
+	rdmsrl(MSR_IA32_MCG_EXT_CTL, val);
+	val &= ~MCG_EXT_CTL_LMCE_EN;
+	wrmsrl(MSR_IA32_MCG_EXT_CTL, val);
+}
+
+static void intel_ppin_init(struct cpuinfo_x86 *c)
+{
+	unsigned long long val;
+
+	/*
+	 * Even if testing the presence of the MSR would be enough, we don't
+	 * want to risk the situation where other models reuse this MSR for
+	 * other purposes.
+	 */
+	switch (c->x86_model) {
+	case INTEL_FAM6_IVYBRIDGE_X:
+	case INTEL_FAM6_HASWELL_X:
+	case INTEL_FAM6_BROADWELL_XEON_D:
+	case INTEL_FAM6_BROADWELL_X:
+	case INTEL_FAM6_SKYLAKE_X:
+	case INTEL_FAM6_XEON_PHI_KNL:
+	case INTEL_FAM6_XEON_PHI_KNM:
+
+		if (rdmsrl_safe(MSR_PPIN_CTL, &val))
+			return;
+
+		if ((val & 3UL) == 1UL) {
+			/* PPIN available but disabled: */
+			return;
+		}
+
+		/* If PPIN is disabled, but not locked, try to enable: */
+		if (!(val & 3UL)) {
+			wrmsrl_safe(MSR_PPIN_CTL,  val | 2UL);
+			rdmsrl_safe(MSR_PPIN_CTL, &val);
+		}
+
+		if ((val & 3UL) == 2UL)
+			set_cpu_cap(c, X86_FEATURE_INTEL_PPIN);
+	}
+}
+
 void mce_intel_feature_init(struct cpuinfo_x86 *c)
 {
 	intel_init_thermal(c);
 	intel_init_cmci();
+	intel_init_lmce();
+	intel_ppin_init(c);
+}
+
+void mce_intel_feature_clear(struct cpuinfo_x86 *c)
+{
+	intel_clear_lmce();
 }

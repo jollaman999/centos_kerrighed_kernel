@@ -36,7 +36,6 @@ MODULE_DESCRIPTION("ISDN4Linux: Driver for HYSDN cards");
 MODULE_AUTHOR("Werner Cornelius");
 MODULE_LICENSE("GPL");
 
-static char *hysdn_init_revision = "$Revision: 1.6.6.6 $";
 static int cardmax;		/* number of found cards */
 hysdn_card *card_root = NULL;	/* pointer to first card */
 static hysdn_card *card_last = NULL;	/* pointer to first card */
@@ -49,25 +48,6 @@ static hysdn_card *card_last = NULL;	/* pointer to first card */
 /* Additionally newer versions may be activated without rebooting.          */
 /****************************************************************************/
 
-/******************************************************/
-/* extract revision number from string for log output */
-/******************************************************/
-char *
-hysdn_getrev(const char *revision)
-{
-	char *rev;
-	char *p;
-
-	if ((p = strchr(revision, ':'))) {
-		rev = p + 2;
-		p = strchr(rev, '$');
-		*--p = 0;
-	} else
-		rev = "???";
-	return rev;
-}
-
-
 /****************************************************************************/
 /* init_module is called once when the module is loaded to do all necessary */
 /* things like autodetect...                                                */
@@ -76,8 +56,8 @@ hysdn_getrev(const char *revision)
 /* is assumed and the module will not be kept in memory.                    */
 /****************************************************************************/
 
-static int __devinit hysdn_pci_init_one(struct pci_dev *akt_pcidev,
-					const struct pci_device_id *ent)
+static int hysdn_pci_init_one(struct pci_dev *akt_pcidev,
+			      const struct pci_device_id *ent)
 {
 	hysdn_card *card;
 	int rc;
@@ -129,7 +109,7 @@ err_out:
 	return rc;
 }
 
-static void __devexit hysdn_pci_remove_one(struct pci_dev *akt_pcidev)
+static void hysdn_pci_remove_one(struct pci_dev *akt_pcidev)
 {
 	hysdn_card *card = pci_get_drvdata(akt_pcidev);
 
@@ -167,7 +147,7 @@ static struct pci_driver hysdn_pci_driver = {
 	.name		= "hysdn",
 	.id_table	= hysdn_pci_tbl,
 	.probe		= hysdn_pci_init_one,
-	.remove		= __devexit_p(hysdn_pci_remove_one),
+	.remove		= hysdn_pci_remove_one,
 };
 
 static int hysdn_have_procfs;
@@ -175,13 +155,9 @@ static int hysdn_have_procfs;
 static int __init
 hysdn_init(void)
 {
-	char tmp[50];
 	int rc;
 
-	strcpy(tmp, hysdn_init_revision);
-	printk(KERN_NOTICE "HYSDN: module Rev: %s loaded\n", hysdn_getrev(tmp));
-	strcpy(tmp, hysdn_net_revision);
-	printk(KERN_NOTICE "HYSDN: network interface Rev: %s \n", hysdn_getrev(tmp));
+	printk(KERN_NOTICE "HYSDN: module loaded\n");
 
 	rc = pci_register_driver(&hysdn_pci_driver);
 	if (rc)
@@ -193,8 +169,8 @@ hysdn_init(void)
 		hysdn_have_procfs = 1;
 
 #ifdef CONFIG_HYSDN_CAPI
-	if(cardmax > 0) {
-		if(hycapi_init()) {
+	if (cardmax > 0) {
+		if (hycapi_init()) {
 			printk(KERN_ERR "HYCAPI: init failed\n");
 
 			if (hysdn_have_procfs)

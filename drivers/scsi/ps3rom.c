@@ -20,6 +20,8 @@
 
 #include <linux/cdrom.h>
 #include <linux/highmem.h>
+#include <linux/module.h>
+#include <linux/slab.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -210,17 +212,13 @@ static int ps3rom_write_request(struct ps3_storage_device *dev,
 	return 0;
 }
 
-static int ps3rom_queuecommand(struct scsi_cmnd *cmd,
+static int ps3rom_queuecommand_lck(struct scsi_cmnd *cmd,
 			       void (*done)(struct scsi_cmnd *))
 {
 	struct ps3rom_private *priv = shost_priv(cmd->device->host);
 	struct ps3_storage_device *dev = priv->dev;
 	unsigned char opcode;
 	int res;
-
-#ifdef DEBUG
-	scsi_print_command(cmd);
-#endif
 
 	priv->curr_cmd = cmd;
 	cmd->scsi_done = done;
@@ -258,6 +256,8 @@ static int ps3rom_queuecommand(struct scsi_cmnd *cmd,
 
 	return 0;
 }
+
+static DEF_SCSI_QCMD(ps3rom_queuecommand)
 
 static int decode_lv1_status(u64 status, unsigned char *sense_key,
 			     unsigned char *asc, unsigned char *ascq)
@@ -355,7 +355,7 @@ static struct scsi_host_template ps3rom_host_template = {
 };
 
 
-static int __devinit ps3rom_probe(struct ps3_system_bus_device *_dev)
+static int ps3rom_probe(struct ps3_system_bus_device *_dev)
 {
 	struct ps3_storage_device *dev = to_ps3_storage_device(&_dev->core);
 	int error;

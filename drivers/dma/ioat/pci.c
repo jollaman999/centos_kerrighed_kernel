@@ -30,6 +30,7 @@
 #include <linux/pci.h>
 #include <linux/interrupt.h>
 #include <linux/dca.h>
+#include <linux/slab.h>
 #include "dma.h"
 #include "dma_v2.h"
 #include "registers.h"
@@ -82,6 +83,17 @@ static struct pci_device_id ioat_pci_tbl[] = {
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_SNB8) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_SNB9) },
 
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB0) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB1) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB2) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB3) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB4) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB5) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB6) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB7) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB8) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_IVB9) },
+
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_HSW0) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_HSW1) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_HSW2) },
@@ -93,13 +105,29 @@ static struct pci_device_id ioat_pci_tbl[] = {
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_HSW8) },
 	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_HSW9) },
 
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX0) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX1) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX2) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX3) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX4) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX5) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX6) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX7) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX8) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BDX9) },
+
+	/* I/OAT v3.3 platforms */
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BWD0) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BWD1) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BWD2) },
+	{ PCI_VDEVICE(INTEL, PCI_DEVICE_ID_INTEL_IOAT_BWD3) },
+
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, ioat_pci_tbl);
 
-static int __devinit ioat_pci_probe(struct pci_dev *pdev,
-				    const struct pci_device_id *id);
-static void __devexit ioat_remove(struct pci_dev *pdev);
+static int ioat_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id);
+static void ioat_remove(struct pci_dev *pdev);
 
 static int ioat_dca_enabled = 1;
 module_param(ioat_dca_enabled, int, 0644);
@@ -113,7 +141,7 @@ static struct pci_driver ioat_pci_driver = {
 	.name		= DRV_NAME,
 	.id_table	= ioat_pci_tbl,
 	.probe		= ioat_pci_probe,
-	.remove		= __devexit_p(ioat_remove),
+	.remove		= ioat_remove,
 };
 
 static struct ioatdma_device *
@@ -129,7 +157,7 @@ alloc_ioatdma(struct pci_dev *pdev, void __iomem *iobase)
 	return d;
 }
 
-static int __devinit ioat_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+static int ioat_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	void __iomem * const *iomap;
 	struct device *dev = &pdev->dev;
@@ -159,15 +187,10 @@ static int __devinit ioat_pci_probe(struct pci_dev *pdev, const struct pci_devic
 	if (err)
 		return err;
 
-	device = devm_kzalloc(dev, sizeof(*device), GFP_KERNEL);
-	if (!device)
-		return -ENOMEM;
-
-	pci_set_master(pdev);
-
 	device = alloc_ioatdma(pdev, iomap[IOAT_MMIO_BAR]);
 	if (!device)
 		return -ENOMEM;
+	pci_set_master(pdev);
 	pci_set_drvdata(pdev, device);
 
 	device->version = readb(device->reg_base + IOAT_VER_OFFSET);
@@ -188,12 +211,15 @@ static int __devinit ioat_pci_probe(struct pci_dev *pdev, const struct pci_devic
 	return 0;
 }
 
-static void __devexit ioat_remove(struct pci_dev *pdev)
+static void ioat_remove(struct pci_dev *pdev)
 {
 	struct ioatdma_device *device = pci_get_drvdata(pdev);
 
 	if (!device)
 		return;
+
+	if (device->version >= IOAT_VER_3_0)
+		ioat3_dma_remove(device);
 
 	dev_err(&pdev->dev, "Removing dma and dca services\n");
 	if (device->dca) {

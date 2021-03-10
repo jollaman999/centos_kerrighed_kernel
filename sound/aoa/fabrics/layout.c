@@ -12,6 +12,7 @@
 #include <asm/prom.h>
 #include <linux/list.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include "../aoa.h"
 #include "../soundbus/soundbus.h"
 
@@ -112,6 +113,7 @@ MODULE_ALIAS("sound-layout-100");
 MODULE_ALIAS("aoa-device-id-14");
 MODULE_ALIAS("aoa-device-id-22");
 MODULE_ALIAS("aoa-device-id-35");
+MODULE_ALIAS("aoa-device-id-44");
 
 /* onyx with all but microphone connected */
 static struct codec_connection onyx_connections_nomic[] = {
@@ -358,6 +360,13 @@ static struct layout layouts[] = {
 	  .codecs[0] = {
 		.name = "tas",
 		.connections = tas_connections_nolineout,
+	  },
+	},
+	/* PowerBook6,5 */
+	{ .device_id = 44,
+	  .codecs[0] = {
+		.name = "tas",
+		.connections = tas_connections_all,
 	  },
 	},
 	/* PowerBook6,7 */
@@ -690,7 +699,7 @@ static int detect_choice_put(struct snd_kcontrol *kcontrol,
 	return 1;
 }
 
-static struct snd_kcontrol_new headphone_detect_choice = {
+static const struct snd_kcontrol_new headphone_detect_choice = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Headphone Detect Autoswitch",
 	.info = control_info,
@@ -700,7 +709,7 @@ static struct snd_kcontrol_new headphone_detect_choice = {
 	.private_value = 0,
 };
 
-static struct snd_kcontrol_new lineout_detect_choice = {
+static const struct snd_kcontrol_new lineout_detect_choice = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Line-Out Detect Autoswitch",
 	.info = control_info,
@@ -732,7 +741,7 @@ static int detected_get(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
-static struct snd_kcontrol_new headphone_detected = {
+static const struct snd_kcontrol_new headphone_detected = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Headphone Detected",
 	.info = control_info,
@@ -741,7 +750,7 @@ static struct snd_kcontrol_new headphone_detected = {
 	.private_value = 0,
 };
 
-static struct snd_kcontrol_new lineout_detected = {
+static const struct snd_kcontrol_new lineout_detected = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Line-Out Detected",
 	.info = control_info,
@@ -768,7 +777,7 @@ static int check_codec(struct aoa_codec *codec,
 				"required property %s not present\n", propname);
 			return -ENODEV;
 		}
-		if (*ref != codec->node->linux_phandle) {
+		if (*ref != codec->node->phandle) {
 			printk(KERN_INFO "snd-aoa-fabric-layout: "
 				"%s doesn't match!\n", propname);
 			return -ENODEV;
@@ -991,7 +1000,7 @@ static int aoa_fabric_layout_probe(struct soundbus_dev *sdev)
 		return -ENODEV;
 
 	/* by breaking out we keep a reference */
-	while ((sound = of_get_next_child(sdev->ofdev.node, sound))) {
+	while ((sound = of_get_next_child(sdev->ofdev.dev.of_node, sound))) {
 		if (sound->type && strcasecmp(sound->type, "soundchip") == 0)
 			break;
 	}
@@ -1072,10 +1081,10 @@ static int aoa_fabric_layout_probe(struct soundbus_dev *sdev)
 	sdev->pcmid = -1;
 	list_del(&ldev->list);
 	layouts_list_items--;
+	kfree(ldev);
  outnodev:
  	of_node_put(sound);
  	layout_device = NULL;
- 	kfree(ldev);
 	return -ENODEV;
 }
 
@@ -1149,12 +1158,7 @@ static struct soundbus_driver aoa_soundbus_driver = {
 
 static int __init aoa_fabric_layout_init(void)
 {
-	int err;
-
-	err = soundbus_register_driver(&aoa_soundbus_driver);
-	if (err)
-		return err;
-	return 0;
+	return soundbus_register_driver(&aoa_soundbus_driver);
 }
 
 static void __exit aoa_fabric_layout_exit(void)

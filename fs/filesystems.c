@@ -10,11 +10,12 @@
 #include <linux/fs.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
-#include <linux/slab.h>
 #include <linux/kmod.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <asm/uaccess.h>
+#include <linux/hash.h>
 
 /*
  * Handling of filesystem drivers list.
@@ -31,6 +32,22 @@
 
 static struct file_system_type *file_systems;
 static DEFINE_RWLOCK(file_systems_lock);
+/*
+ * KABI: keep a hash table of file systems that registered an extended
+ * file operations struct.  There's a smallish number of registered
+ * file systems by default (31 on my machine), so we don't need a large
+ * hash table.  However, it's large enough that a linked list would likely
+ * be too much overhead.
+ */
+#define FO_EXTEND_BITS 6
+#define FO_EXTEND_SIZE (1 << FO_EXTEND_BITS)
+struct hlist_head fo_extend_hash[FO_EXTEND_SIZE];
+static DEFINE_SPINLOCK(fo_extend_lock);
+struct fo_extend_ent {
+	struct hlist_node node;
+	struct rcu_head rcu;
+	const struct file_operations_extend *foe;
+};
 
 /* WARNING: This can be used only if we _already_ own a reference */
 void get_filesystem(struct file_system_type *fs)
@@ -53,6 +70,86 @@ static struct file_system_type **find_filesystem(const char *name, unsigned len)
 	return p;
 }
 
+static struct fo_extend_ent *lookup_fo_extend_ent(
+	const struct file_operations_extend *foe)
+{
+	unsigned long bucket = hash_ptr(foe, FO_EXTEND_BITS);
+	struct hlist_head *head = &fo_extend_hash[bucket];
+	struct fo_extend_ent *pos;
+
+	hlist_for_each_entry_rcu(pos, head, node) {
+		if (pos->foe == foe)
+			return pos;
+	}
+	return NULL;
+}
+
+const struct file_operations_extend *lookup_fo_extend(
+	const struct file_operations *fops)
+{
+	struct fo_extend_ent *foe_ent;
+	const struct file_operations_extend *foe = NULL;
+
+	rcu_read_lock();
+	foe_ent = lookup_fo_extend_ent(
+		(const struct file_operations_extend *)fops);
+	if (foe_ent)
+		foe = foe_ent->foe;
+	rcu_read_unlock();
+
+	return foe;
+}
+
+EXPORT_SYMBOL(lookup_fo_extend);
+
+int register_fo_extend(const struct file_operations_extend *foe)
+{
+	unsigned long bucket = hash_ptr(foe, FO_EXTEND_BITS);
+	struct hlist_head *head = &fo_extend_hash[bucket];
+	struct fo_extend_ent *foe_ent;
+
+	foe_ent = kzalloc(sizeof(*foe_ent), GFP_KERNEL);
+	if (!foe_ent) {
+		printk("%s: kmalloc failed!\n", __func__);
+		return -1;
+	}
+	foe_ent->foe = foe;
+
+	spin_lock(&fo_extend_lock);
+	rcu_read_lock();
+	if (lookup_fo_extend_ent(foe) != NULL) {
+		WARN(1, "duplicate registration of file operations\n");
+		kfree(foe_ent);
+		goto out_unlock;
+	}
+	hlist_add_head_rcu(&foe_ent->node, head);
+
+out_unlock:
+	rcu_read_unlock();
+	spin_unlock(&fo_extend_lock);
+
+	return 0;
+}
+
+EXPORT_SYMBOL(register_fo_extend);
+
+void unregister_fo_extend(const struct file_operations_extend *foe)
+{
+	struct fo_extend_ent *foe_ent;
+
+	spin_lock(&fo_extend_lock);
+	rcu_read_lock();
+	foe_ent = lookup_fo_extend_ent(foe);
+	if (foe_ent) {
+		hlist_del_rcu(&foe_ent->node);
+		kfree_rcu(foe_ent, rcu);
+	}
+	rcu_read_unlock();
+	spin_unlock(&fo_extend_lock);
+}
+
+EXPORT_SYMBOL(unregister_fo_extend);
+
 /**
  *	register_filesystem - register a new filesystem
  *	@fs: the file system structure
@@ -74,7 +171,6 @@ int register_filesystem(struct file_system_type * fs)
 	BUG_ON(strchr(fs->name, '.'));
 	if (fs->next)
 		return -EBUSY;
-	INIT_LIST_HEAD(&fs->fs_supers);
 	write_lock(&file_systems_lock);
 	p = find_filesystem(fs->name, strlen(fs->name));
 	if (*p)
@@ -110,11 +206,13 @@ int unregister_filesystem(struct file_system_type * fs)
 			*tmp = fs->next;
 			fs->next = NULL;
 			write_unlock(&file_systems_lock);
+			synchronize_rcu();
 			return 0;
 		}
 		tmp = &(*tmp)->next;
 	}
 	write_unlock(&file_systems_lock);
+
 	return -EINVAL;
 }
 
@@ -272,7 +370,7 @@ struct file_system_type *get_fs_type(const char *name)
 	int len = dot ? dot - name : strlen(name);
 
 	fs = __get_fs_type(name, len);
-	if (!fs && (request_module("%.*s", len, name) == 0))
+	if (!fs && (request_module("fs-%.*s", len, name) == 0))
 		fs = __get_fs_type(name, len);
 
 	if (dot && fs && !(fs->fs_flags & FS_HAS_SUBTYPE)) {

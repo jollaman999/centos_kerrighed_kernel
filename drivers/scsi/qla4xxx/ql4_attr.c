@@ -35,15 +35,23 @@ qla4_8xxx_sysfs_write_fw_dump(struct file *filep, struct kobject *kobj,
 	struct scsi_qla_host *ha = to_qla_host(dev_to_shost(container_of(kobj,
 					       struct device, kobj)));
 	uint32_t dev_state;
-	int reading;
+	long reading;
+	int ret = 0;
 
 	if (is_qla40XX(ha))
 		return -EINVAL;
 
 	if (off != 0)
-		return 0;
+		return ret;
 
-	reading = simple_strtol(buf, NULL, 10);
+	buf[1] = 0;
+	ret = kstrtol(buf, 10, &reading);
+	if (ret) {
+		ql4_printk(KERN_ERR, ha, "%s: Invalid input. Return err %d\n",
+			   __func__, ret);
+		return ret;
+	}
+
 	switch (reading) {
 	case 0:
 		/* clear dump collection flags */
@@ -54,7 +62,6 @@ qla4_8xxx_sysfs_write_fw_dump(struct file *filep, struct kobject *kobj,
 			DEBUG2(ql4_printk(KERN_INFO, ha,
 					  "Firmware template reloaded\n"));
 		}
-
 		break;
 	case 1:
 		/* Set flag to read dump */
@@ -250,39 +257,6 @@ qla4xxx_hba_model_show(struct device *dev, struct device_attribute *attr,
 	return snprintf(buf, PAGE_SIZE, "%s\n", ha->model_name);
 }
 
-static int qla4xxx_check_reset_type(char *str)
-{
-	if (strncmp(str, "adapter", 10) == 0)
-		return QL4_SCSI_ADAPTER_RESET;
-	else if (strncmp(str, "firmware", 10) == 0)
-		return QL4_SCSI_FIRMWARE_RESET;
-	else
-		return 0;
-}
-
-static ssize_t
-qla4xxx_store_host_reset(struct device *dev, struct device_attribute *attr,
-			 const char *buf, size_t count)
-{
-	struct scsi_qla_host *ha = to_qla_host(class_to_shost(dev));
-	int ret = -EINVAL;
-	char str[10];
-	int type;
-
-	sscanf(buf, "%s", str);
-	type = qla4xxx_check_reset_type(str);
-
-	if (!type)
-		goto exit_store_host_reset;
-
-	ret = qla4xxx_host_reset(ha, type);
-
-exit_store_host_reset:
-	if (ret == 0)
-		ret = count;
-	return ret;
-}
-
 static ssize_t
 qla4xxx_fw_timestamp_show(struct device *dev, struct device_attribute *attr,
 			  char *buf)
@@ -350,7 +324,6 @@ static DEVICE_ATTR(phy_port_cnt, S_IRUGO, qla4xxx_phy_port_cnt_show, NULL);
 static DEVICE_ATTR(phy_port_num, S_IRUGO, qla4xxx_phy_port_num_show, NULL);
 static DEVICE_ATTR(iscsi_func_cnt, S_IRUGO, qla4xxx_iscsi_func_cnt_show, NULL);
 static DEVICE_ATTR(hba_model, S_IRUGO, qla4xxx_hba_model_show, NULL);
-static DEVICE_ATTR(host_reset, S_IWUSR, NULL, qla4xxx_store_host_reset);
 static DEVICE_ATTR(fw_timestamp, S_IRUGO, qla4xxx_fw_timestamp_show, NULL);
 static DEVICE_ATTR(fw_build_user, S_IRUGO, qla4xxx_fw_build_user_show, NULL);
 static DEVICE_ATTR(fw_ext_timestamp, S_IRUGO, qla4xxx_fw_ext_timestamp_show,
@@ -369,7 +342,6 @@ struct device_attribute *qla4xxx_host_attrs[] = {
 	&dev_attr_phy_port_num,
 	&dev_attr_iscsi_func_cnt,
 	&dev_attr_hba_model,
-	&dev_attr_host_reset,
 	&dev_attr_fw_timestamp,
 	&dev_attr_fw_build_user,
 	&dev_attr_fw_ext_timestamp,

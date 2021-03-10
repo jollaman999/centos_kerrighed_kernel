@@ -93,15 +93,16 @@ void set_break_vector(int n, irqvectptr addr);
   "push $r10\n\t"       /* push orig_r10 */ \
   "clear.d [$sp=$sp-4]\n\t"  /* frametype - this is a normal stackframe */
 
-  /* BLOCK_IRQ and UNBLOCK_IRQ do the same as mask_irq and unmask_irq */
+/* BLOCK_IRQ and UNBLOCK_IRQ do the same as
+ * crisv10_mask_irq and crisv10_unmask_irq */
 
 #define BLOCK_IRQ(mask,nr) \
   "move.d " #mask ",$r0\n\t" \
-  "move.d $r0,[0xb00000d8]\n\t" 
-  
+  "move.d $r0,[0xb00000d8]\n\t"
+
 #define UNBLOCK_IRQ(mask) \
   "move.d " #mask ",$r0\n\t" \
-  "move.d $r0,[0xb00000dc]\n\t" 
+  "move.d $r0,[0xb00000dc]\n\t"
 
 #define IRQ_NAME2(nr) nr##_interrupt(void)
 #define IRQ_NAME(nr) IRQ_NAME2(IRQ##nr)
@@ -141,7 +142,7 @@ __asm__ ( \
  * it here, we would not get the multiple_irq at all.
  *
  * The non-blocking here is based on the knowledge that the timer interrupt is 
- * registred as a fast interrupt (IRQF_DISABLED) so that we _know_ there will not
+ * registered as a fast interrupt (IRQF_DISABLED) so that we _know_ there will not
  * be an sti() before the timer irq handler is run to acknowledge the interrupt.
  */
 

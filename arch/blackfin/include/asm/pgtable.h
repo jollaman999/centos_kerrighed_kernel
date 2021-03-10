@@ -80,9 +80,8 @@ PTE_BIT_FUNC(mkyoung, |= _PAGE_ACCESSED);
  * ZERO_PAGE is a global shared page that is always zero: used
  * for zero-mapped memory areas etc..
  */
-#define ZERO_PAGE(vaddr)	(virt_to_page(0))
-
-extern unsigned int kobjsize(const void *objp);
+#define ZERO_PAGE(vaddr)	virt_to_page(empty_zero_page)
+extern char empty_zero_page[];
 
 #define swapper_pg_dir ((pgd_t *) 0)
 /*

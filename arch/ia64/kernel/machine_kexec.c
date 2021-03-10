@@ -27,11 +27,11 @@
 #include <asm/sal.h>
 #include <asm/mca.h>
 
-typedef NORET_TYPE void (*relocate_new_kernel_t)(
+typedef void (*relocate_new_kernel_t)(
 					unsigned long indirection_page,
 					unsigned long start_address,
 					struct ia64_boot_param *boot_param,
-					unsigned long pal_addr) ATTRIB_NORET;
+					unsigned long pal_addr) __noreturn;
 
 struct kimage *ia64_kimage;
 
@@ -85,12 +85,13 @@ static void ia64_machine_kexec(struct unw_frame_info *info, void *arg)
 	struct kimage *image = arg;
 	relocate_new_kernel_t rnk;
 	void *pal_addr = efi_get_pal_addr();
-	unsigned long code_addr = (unsigned long)page_address(image->control_code_page);
+	unsigned long code_addr;
 	int ii;
 	u64 fp, gp;
 	ia64_fptr_t *init_handler = (ia64_fptr_t *)ia64_os_init_on_kdump;
 
 	BUG_ON(!image);
+	code_addr = (unsigned long)page_address(image->control_code_page);
 	if (image->type == KEXEC_TYPE_CRASH) {
 		crash_save_this_cpu();
 		current->thread.ksp = (__u64)info->sw - 16;
@@ -157,48 +158,10 @@ void arch_crash_save_vmcoreinfo(void)
 #endif
 #ifdef CONFIG_PGTABLE_3
 	VMCOREINFO_CONFIG(PGTABLE_3);
-#elif  CONFIG_PGTABLE_4
+#elif defined(CONFIG_PGTABLE_4)
 	VMCOREINFO_CONFIG(PGTABLE_4);
 #endif
 }
-
-#ifdef CONFIG_KEXEC_AUTO_RESERVE
-#define MBYTES(n) ((n)*1024*1024ULL)
-#define GBYTES(n) ((n)*1024*1024*1024ULL)
-/*
-       Memory size     Reserved memory
-       ===========     ===============
-       [4G, 12G)       256M
-       [12G, 128G)     512M
-       [128G, 256G)    768M
-       [256G, 378G)    1024M
-       [378G, 512G)    1536M
-       [512G, 768G)    2048M
-       [768G, )        3072M
- */
-unsigned long long __init arch_default_crash_size(unsigned long long total_size)
-{
-	unsigned long long ret;
-
-	if (total_size >= GBYTES(4) && total_size < GBYTES(12))
-		ret = MBYTES(256);
-	else if (total_size >= GBYTES(12) && total_size < GBYTES(128))
-		ret = MBYTES(512);
-	else if (total_size >= GBYTES(128) && total_size < GBYTES(256))
-		ret = MBYTES(768);
-	else if (total_size >= GBYTES(256) && total_size < GBYTES(378))
-		ret = MBYTES(1024);
-	else if (total_size >= GBYTES(318) && total_size < GBYTES(512))
-		ret = MBYTES(1536);
-	else if (total_size >= GBYTES(512) && total_size < GBYTES(768))
-		ret = MBYTES(2048);
-	else
-		ret = MBYTES(3072);
-	return ret;
-}
-#undef GBYTES
-#undef MBYTES
-#endif
 
 unsigned long paddr_vmcoreinfo_note(void)
 {

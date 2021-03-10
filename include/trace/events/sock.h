@@ -37,7 +37,7 @@ TRACE_EVENT(sock_exceed_buf_limit,
 
 	TP_STRUCT__entry(
 		__array(char, name, 32)
-		__field(int *, sysctl_mem)
+		__field(long *, sysctl_mem)
 		__field(long, allocated)
 		__field(int, sysctl_rmem)
 		__field(int, rmem_alloc)
@@ -51,7 +51,7 @@ TRACE_EVENT(sock_exceed_buf_limit,
 		__entry->rmem_alloc = atomic_read(&sk->sk_rmem_alloc);
 	),
 
-	TP_printk("proto:%s sysctl_mem=%d,%d,%d allocated=%ld "
+	TP_printk("proto:%s sysctl_mem=%ld,%ld,%ld allocated=%ld "
 		"sysctl_rmem=%d rmem_alloc=%d",
 		__entry->name,
 		__entry->sysctl_mem[0],

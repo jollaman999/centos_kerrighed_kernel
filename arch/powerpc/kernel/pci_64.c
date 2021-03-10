@@ -18,6 +18,7 @@
 #include <linux/string.h>
 #include <linux/init.h>
 #include <linux/bootmem.h>
+#include <linux/export.h>
 #include <linux/mm.h>
 #include <linux/list.h>
 #include <linux/syscalls.h>
@@ -59,7 +60,7 @@ static int __init pcibios_init(void)
 
 	/* Scan all of the recorded PCI controllers.  */
 	list_for_each_entry_safe(hose, tmp, &hose_list, list_node) {
-		pcibios_scan_phb(hose, hose->dn);
+		pcibios_scan_phb(hose);
 		pci_bus_add_devices(hose->bus);
 	}
 
@@ -72,8 +73,6 @@ static int __init pcibios_init(void)
 }
 
 subsys_initcall(pcibios_init);
-
-#ifdef CONFIG_HOTPLUG
 
 int pcibios_unmap_io_space(struct pci_bus *bus)
 {
@@ -110,7 +109,7 @@ int pcibios_unmap_io_space(struct pci_bus *bus)
 	hose = pci_bus_to_host(bus);
 
 	/* Check if we have IOs allocated */
-	if (hose->io_base_alloc == 0)
+	if (hose->io_base_alloc == NULL)
 		return 0;
 
 	pr_debug("IO unmapping for PHB %s\n", hose->dn->full_name);
@@ -123,9 +122,7 @@ int pcibios_unmap_io_space(struct pci_bus *bus)
 }
 EXPORT_SYMBOL_GPL(pcibios_unmap_io_space);
 
-#endif /* CONFIG_HOTPLUG */
-
-static int __devinit pcibios_map_phb_io_space(struct pci_controller *hose)
+static int pcibios_map_phb_io_space(struct pci_controller *hose)
 {
 	struct vm_struct *area;
 	unsigned long phys_page;
@@ -167,17 +164,16 @@ static int __devinit pcibios_map_phb_io_space(struct pci_controller *hose)
 		return -ENOMEM;
 
 	/* Fixup hose IO resource */
-	io_virt_offset = (unsigned long)hose->io_base_virt - _IO_BASE;
+	io_virt_offset = pcibios_io_space_offset(hose);
 	hose->io_resource.start += io_virt_offset;
 	hose->io_resource.end += io_virt_offset;
 
-	pr_debug("  hose->io_resource=0x%016llx...0x%016llx\n",
-		 hose->io_resource.start, hose->io_resource.end);
+	pr_debug("  hose->io_resource=%pR\n", &hose->io_resource);
 
 	return 0;
 }
 
-int __devinit pcibios_map_io_space(struct pci_bus *bus)
+int pcibios_map_io_space(struct pci_bus *bus)
 {
 	WARN_ON(bus == NULL);
 
@@ -197,7 +193,7 @@ int __devinit pcibios_map_io_space(struct pci_bus *bus)
 }
 EXPORT_SYMBOL_GPL(pcibios_map_io_space);
 
-void __devinit pcibios_setup_phb_io_space(struct pci_controller *hose)
+void pcibios_setup_phb_io_space(struct pci_controller *hose)
 {
 	pcibios_map_phb_io_space(hose);
 }
@@ -212,8 +208,7 @@ long sys_pciconfig_iobase(long which, unsigned long in_bus,
 			  unsigned long in_devfn)
 {
 	struct pci_controller* hose;
-	struct list_head *ln;
-	struct pci_bus *bus = NULL;
+	struct pci_bus *tmp_bus, *bus = NULL;
 	struct device_node *hose_node;
 
 	/* Argh ! Please forgive me for that hack, but that's the
@@ -221,7 +216,7 @@ long sys_pciconfig_iobase(long which, unsigned long in_bus,
 	 * G5 machines... So when something asks for bus 0 io base
 	 * (bus 0 is HT root), we return the AGP one instead.
 	 */
-	if (in_bus == 0 && machine_is_compatible("MacRISC4")) {
+	if (in_bus == 0 && of_machine_is_compatible("MacRISC4")) {
 		struct device_node *agp;
 
 		agp = of_find_compatible_node(NULL, NULL, "u3-agp");
@@ -234,16 +229,17 @@ long sys_pciconfig_iobase(long which, unsigned long in_bus,
 	 * used on pre-domains setup. We return the first match
 	 */
 
-	for (ln = pci_root_buses.next; ln != &pci_root_buses; ln = ln->next) {
-		bus = pci_bus_b(ln);
-		if (in_bus >= bus->number && in_bus <= bus->subordinate)
+	list_for_each_entry(tmp_bus, &pci_root_buses, node) {
+		if (in_bus >= tmp_bus->number &&
+		    in_bus <= tmp_bus->busn_res.end) {
+			bus = tmp_bus;
 			break;
-		bus = NULL;
+		}
 	}
-	if (bus == NULL || bus->sysdata == NULL)
+	if (bus == NULL || bus->dev.of_node == NULL)
 		return -ENODEV;
 
-	hose_node = (struct device_node *)bus->sysdata;
+	hose_node = bus->dev.of_node;
 	hose = PCI_DN(hose_node)->phb;
 
 	switch (which) {

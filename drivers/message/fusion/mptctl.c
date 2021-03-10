@@ -54,9 +54,8 @@
 #include <linux/pci.h>
 #include <linux/delay.h>	/* for mdelay */
 #include <linux/miscdevice.h>
-#include <linux/smp_lock.h>
+#include <linux/mutex.h>
 #include <linux/compat.h>
-#include <linux/nospec.h>
 
 #include <asm/io.h>
 #include <asm/uaccess.h>
@@ -84,6 +83,7 @@ MODULE_VERSION(my_VERSION);
 
 /*=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=*/
 
+static DEFINE_MUTEX(mpctl_mutex);
 static u8 mptctl_id = MPT_MAX_PROTOCOL_DRIVERS;
 static u8 mptctl_taskmgmt_id = MPT_MAX_PROTOCOL_DRIVERS;
 
@@ -602,12 +602,12 @@ mptctl_fasync(int fd, struct file *filep, int mode)
 	MPT_ADAPTER	*ioc;
 	int ret;
 
-	lock_kernel();
+	mutex_lock(&mpctl_mutex);
 	list_for_each_entry(ioc, &ioc_list, list)
 		ioc->aen_event_read_flag=0;
 
 	ret = fasync_helper(fd, filep, mode, &async_queue);
-	unlock_kernel();
+	mutex_unlock(&mpctl_mutex);
 	return ret;
 }
 
@@ -699,9 +699,9 @@ static long
 mptctl_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	long ret;
-	lock_kernel();
+	mutex_lock(&mpctl_mutex);
 	ret = __mptctl_ioctl(file, cmd, arg);
-	unlock_kernel();
+	mutex_unlock(&mpctl_mutex);
 	return ret;
 }
 
@@ -978,7 +978,7 @@ retry_wait:
 	ReplyMsg = (pFWDownloadReply_t)iocp->ioctl_cmds.reply;
 	iocstat = le16_to_cpu(ReplyMsg->IOCStatus) & MPI_IOCSTATUS_MASK;
 	if (iocstat == MPI_IOCSTATUS_SUCCESS) {
-		printk(MYIOC_s_INFO_FMT "F/W update successfull!\n", iocp->name);
+		printk(MYIOC_s_INFO_FMT "F/W update successful!\n", iocp->name);
 		return 0;
 	} else if (iocstat == MPI_IOCSTATUS_INVALID_FUNCTION) {
 		printk(MYIOC_s_WARN_FMT "Hmmm...  F/W download not supported!?!\n",
@@ -1243,7 +1243,6 @@ mptctl_getiocinfo (unsigned long arg, unsigned int data_size)
 	int			iocnum;
 	unsigned int		port;
 	int			cim_rev;
-	u8			revision;
 	struct scsi_device 	*sdev;
 	VirtDevice		*vdevice;
 
@@ -1307,16 +1306,17 @@ mptctl_getiocinfo (unsigned long arg, unsigned int data_size)
 	else
 		karg->adapterType = MPT_IOCTL_INTERFACE_SCSI;
 
-	if (karg->hdr.port > 1)
+	if (karg->hdr.port > 1) {
+		kfree(karg);
 		return -EINVAL;
-	port = array_index_nospec(karg->hdr.port, 2);
+	}
+	port = karg->hdr.port;
 
 	karg->port = port;
 	pdev = (struct pci_dev *) ioc->pcidev;
 
 	karg->pciId = pdev->device;
-	pci_read_config_byte(pdev, PCI_CLASS_REVISION, &revision);
-	karg->hwRev = revision;
+	karg->hwRev = pdev->revision;
 	karg->subSystemDevice = pdev->subsystem_device;
 	karg->subSystemVendor = pdev->subsystem_vendor;
 
@@ -2398,7 +2398,7 @@ done_free_mem:
 	}
 
 	/* mf is null if command issued successfully
-	 * otherwise, failure occured after mf acquired.
+	 * otherwise, failure occurred after mf acquired.
 	 */
 	if (mf)
 		mpt_free_msg_frame(ioc, mf);
@@ -2793,11 +2793,8 @@ mptctl_hp_targetinfo(unsigned long arg)
 		}
 	}
 	hd = shost_priv(ioc->sh);
-	if (hd != NULL) {
-		unsigned int id = array_index_nospec(karg.hdr.id,
-						     MPT_MAX_FC_DEVICES);
-		karg.select_timeouts = hd->sel_timeout[id];
-	}
+	if (hd != NULL)
+		karg.select_timeouts = hd->sel_timeout[karg.hdr.id];
 
 	/* Copy the data from kernel memory to user memory
 	 */
@@ -2930,7 +2927,7 @@ compat_mpt_command(struct file *filp, unsigned int cmd,
 static long compat_mpctl_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 {
 	long ret;
-	lock_kernel();
+	mutex_lock(&mpctl_mutex);
 	switch (cmd) {
 	case MPTIOCINFO:
 	case MPTIOCINFO1:
@@ -2955,7 +2952,7 @@ static long compat_mpctl_ioctl(struct file *f, unsigned int cmd, unsigned long a
 		ret = -ENOIOCTLCMD;
 		break;
 	}
-	unlock_kernel();
+	mutex_unlock(&mpctl_mutex);
 	return ret;
 }
 

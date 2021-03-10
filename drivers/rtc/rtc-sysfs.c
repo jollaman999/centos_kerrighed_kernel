@@ -102,13 +102,20 @@ rtc_sysfs_set_max_user_freq(struct device *dev, struct device_attribute *attr,
 	return n;
 }
 
+/**
+ * rtc_sysfs_show_hctosys - indicate if the given RTC set the system time
+ *
+ * Returns 1 if the system clock was set by this RTC at the last
+ * boot or resume event.
+ */
 static ssize_t
 rtc_sysfs_show_hctosys(struct device *dev, struct device_attribute *attr,
 		char *buf)
 {
 #ifdef CONFIG_RTC_HCTOSYS_DEVICE
-	if (strcmp(dev_name(&to_rtc_device(dev)->dev),
-		   CONFIG_RTC_HCTOSYS_DEVICE) == 0)
+	if (rtc_hctosys_ret == 0 &&
+			strcmp(dev_name(&to_rtc_device(dev)->dev),
+				CONFIG_RTC_HCTOSYS_DEVICE) == 0)
 		return sprintf(buf, "1\n");
 	else
 #endif

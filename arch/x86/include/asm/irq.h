@@ -15,23 +15,23 @@ static inline int irq_canonicalize(int irq)
 	return ((irq == 2) ? 9 : irq);
 }
 
-#ifdef CONFIG_4KSTACKS
-  extern void irq_ctx_init(int cpu);
-  extern void irq_ctx_exit(int cpu);
-# define __ARCH_HAS_DO_SOFTIRQ
+#ifdef CONFIG_X86_32
+extern void irq_ctx_init(int cpu);
 #else
 # define irq_ctx_init(cpu) do { } while (0)
-# define irq_ctx_exit(cpu) do { } while (0)
-# ifdef CONFIG_X86_64
-#  define __ARCH_HAS_DO_SOFTIRQ
-# endif
 #endif
+
+#define __ARCH_HAS_DO_SOFTIRQ
 
 #ifdef CONFIG_HOTPLUG_CPU
 #include <linux/cpumask.h>
 extern int check_irq_vectors_for_cpu_disable(void);
 extern void fixup_irqs(void);
 extern void irq_force_complete_move(int);
+#endif
+
+#ifdef CONFIG_HAVE_KVM
+extern void kvm_set_posted_intr_wakeup_handler(void (*handler)(void));
 #endif
 
 extern void (*x86_platform_ipi_callback)(void);
@@ -45,5 +45,10 @@ extern DECLARE_BITMAP(used_vectors, NR_VECTORS);
 extern int vector_used_by_percpu_irq(unsigned int vector);
 
 extern void init_ISA_irqs(void);
+
+#ifdef CONFIG_X86_LOCAL_APIC
+void arch_trigger_all_cpu_backtrace(bool);
+#define arch_trigger_all_cpu_backtrace arch_trigger_all_cpu_backtrace
+#endif
 
 #endif /* _ASM_X86_IRQ_H */

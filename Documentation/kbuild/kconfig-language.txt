@@ -112,7 +112,41 @@ applicable everywhere (see syntax).
 	(no prompts anywhere) and for symbols with no dependencies.
 	That will limit the usefulness but on the other hand avoid
 	the illegal configurations all over.
-	kconfig should one day warn about such things.
+
+- weak reverse dependencies: "imply" <symbol> ["if" <expr>]
+  This is similar to "select" as it enforces a lower limit on another
+  symbol except that the "implied" symbol's value may still be set to n
+  from a direct dependency or with a visible prompt.
+
+  Given the following example:
+
+  config FOO
+	tristate
+	imply BAZ
+
+  config BAZ
+	tristate
+	depends on BAR
+
+  The following values are possible:
+
+	FOO		BAR		BAZ's default	choice for BAZ
+	---		---		-------------	--------------
+	n		y		n		N/m/y
+	m		y		m		M/y/n
+	y		y		y		Y/n
+	y		n		*		N
+
+  This is useful e.g. with multiple drivers that want to indicate their
+  ability to hook into a secondary subsystem while allowing the user to
+  configure that subsystem out without also having to unset these drivers.
+
+- limiting menu display: "visible if" <expr>
+  This attribute is only applicable to menu blocks, if the condition is
+  false, the menu block is not displayed to the user (the symbols
+  contained there can still be selected by other symbols, though). It is
+  similar to a conditional "prompt" attribute for individual menu
+  entries. Default value of "visible" is true.
 
 - numerical ranges: "range" <symbol> <symbol> ["if" <expr>]
   This allows to limit the range of possible input values for int
@@ -150,6 +184,10 @@ applicable everywhere (see syntax).
     to the build environment (if this is desired, it can be done via
     another symbol).
 
+  - "allnoconfig_y"
+    This declares the symbol as one that should have the value y when
+    using "allnoconfig". Used for symbols that hide other symbols.
+
 Menu dependencies
 -----------------
 
@@ -181,7 +219,7 @@ Expressions are listed in decreasing order of precedence.
 (7) Returns the result of max(/expr/, /expr/).
 
 An expression can have a value of 'n', 'm' or 'y' (or 0, 1, 2
-respectively for calculations). A menu entry becomes visible when it's
+respectively for calculations). A menu entry becomes visible when its
 expression evaluates to 'm' or 'y'.
 
 There are two types of symbols: constant and non-constant symbols.
@@ -268,7 +306,7 @@ separate list of options.
 
 choices:
 
-	"choice"
+	"choice" [symbol]
 	<choice options>
 	<choice block>
 	"endchoice"
@@ -282,6 +320,10 @@ single driver can be compiled/loaded into the kernel, but all drivers
 can be compiled as modules.
 A choice accepts another option "optional", which allows to set the
 choice to 'n' and no entry needs to be selected.
+If no [symbol] is associated with a choice, then you can not have multiple
+definitions of that choice. If a [symbol] is associated to the choice,
+then you may define the same choice (ie. with the same entries) in another
+place.
 
 comment:
 
@@ -300,7 +342,8 @@ menu:
 	"endmenu"
 
 This defines a menu block, see "Menu structure" above for more
-information. The only possible options are dependencies.
+information. The only possible options are dependencies and "visible"
+attributes.
 
 if:
 
@@ -322,7 +365,8 @@ mainmenu:
 	"mainmenu" <prompt>
 
 This sets the config program's title bar if the config program chooses
-to use it.
+to use it. It should be placed at the top of the configuration, before any
+other statement.
 
 
 Kconfig hints
@@ -376,4 +420,3 @@ config FOO
 	depends on BAR && m
 
 limits FOO to module (=m) or disabled (=n).
-

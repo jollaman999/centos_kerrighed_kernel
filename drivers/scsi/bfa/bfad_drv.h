@@ -28,7 +28,6 @@
 #define __BFAD_DRV_H__
 
 #include <linux/types.h>
-#include <linux/version.h>
 #include <linux/pci.h>
 #include <linux/dma-mapping.h>
 #include <linux/idr.h>
@@ -46,6 +45,7 @@
 #include <scsi/scsi_transport_fc.h>
 #include <scsi/scsi_transport.h>
 #include <scsi/scsi_bsg_fc.h>
+#include <scsi/scsi_devinfo.h>
 
 #include "bfa_modules.h"
 #include "bfa_fcs.h"
@@ -58,7 +58,7 @@
 #ifdef BFA_DRIVER_VERSION
 #define BFAD_DRIVER_VERSION    BFA_DRIVER_VERSION
 #else
-#define BFAD_DRIVER_VERSION    "3.2.25.0"
+#define BFAD_DRIVER_VERSION    "3.2.25.1"
 #endif
 
 #define BFAD_PROTO_NAME FCPI_NAME
@@ -232,6 +232,7 @@ struct bfad_s {
 	struct list_head	active_aen_q;
 	struct bfa_aen_entry_s	aen_list[BFA_AEN_MAX_ENTRY];
 	spinlock_t		bfad_aen_spinlock;
+	struct list_head	vport_list;
 };
 
 /* BFAD state machine events */

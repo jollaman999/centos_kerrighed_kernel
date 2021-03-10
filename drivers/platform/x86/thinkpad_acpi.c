@@ -23,7 +23,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#define TPACPI_VERSION "0.24"
+#define TPACPI_VERSION "0.25"
 #define TPACPI_SYSFS_VERSION 0x020700
 
 /*
@@ -61,6 +61,7 @@
 #include <linux/freezer.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
+
 #include <linux/nvram.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
@@ -73,17 +74,21 @@
 #include <linux/input.h>
 #include <linux/leds.h>
 #include <linux/rfkill.h>
+#include <asm/uaccess.h>
+
 #include <linux/dmi.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
-#include <linux/acpi.h>
-#include <linux/pci_ids.h>
-#include <linux/thinkpad_acpi.h>
-#include <linux/nospec.h>
+
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/initval.h>
-#include <asm/uaccess.h>
+
+#include <acpi/acpi_drivers.h>
+
+#include <linux/pci_ids.h>
+
+#include <linux/thinkpad_acpi.h>
 
 /* ThinkPad CMOS commands */
 #define TP_CMOS_VOLUME_DOWN	0
@@ -128,6 +133,7 @@ enum {
 /* ACPI HIDs */
 #define TPACPI_ACPI_IBM_HKEY_HID	"IBM0068"
 #define TPACPI_ACPI_LENOVO_HKEY_HID	"LEN0068"
+#define TPACPI_ACPI_LENOVO_HKEY_V2_HID	"LEN0268"
 #define TPACPI_ACPI_EC_HID		"PNP0C09"
 
 /* Input IDs */
@@ -190,6 +196,9 @@ enum tpacpi_hkey_event_t {
 	TP_HKEY_EV_LID_OPEN		= 0x5002, /* laptop lid opened */
 	TP_HKEY_EV_TABLET_TABLET	= 0x5009, /* tablet swivel up */
 	TP_HKEY_EV_TABLET_NOTEBOOK	= 0x500a, /* tablet swivel down */
+	TP_HKEY_EV_TABLET_CHANGED	= 0x60c0, /* X1 Yoga (2016):
+						   * enter/leave tablet mode
+						   */
 	TP_HKEY_EV_PEN_INSERTED		= 0x500b, /* tablet pen inserted */
 	TP_HKEY_EV_PEN_REMOVED		= 0x500c, /* tablet pen removed */
 	TP_HKEY_EV_BRGHT_CHANGED	= 0x5010, /* backlight control event */
@@ -197,7 +206,6 @@ enum tpacpi_hkey_event_t {
 	/* Key-related user-interface events */
 	TP_HKEY_EV_KEY_NUMLOCK		= 0x6000, /* NumLock key pressed */
 	TP_HKEY_EV_KEY_FN		= 0x6005, /* Fn key pressed? E420 */
-	TP_HKEY_EV_KEY_FN_ESC           = 0x6060, /* Fn+Esc key pressed X240 */
 
 	/* Thermal events */
 	TP_HKEY_EV_ALARM_BAT_HOT	= 0x6011, /* battery too hot */
@@ -208,6 +216,10 @@ enum tpacpi_hkey_event_t {
 
 	/* AC-related events */
 	TP_HKEY_EV_AC_CHANGED		= 0x6040, /* AC status changed */
+
+	/* Further user-interface events */
+	TP_HKEY_EV_PALM_DETECTED	= 0x60b0, /* palm hoveres keyboard */
+	TP_HKEY_EV_PALM_UNDETECTED	= 0x60b1, /* palm removed */
 
 	/* Misc */
 	TP_HKEY_EV_RFKILL_CHANGED	= 0x7000, /* rfkill switch changed */
@@ -302,7 +314,11 @@ static struct {
 	u32 hotkey:1;
 	u32 hotkey_mask:1;
 	u32 hotkey_wlsw:1;
-	u32 hotkey_tablet:1;
+	enum {
+		TP_HOTKEY_TABLET_NONE = 0,
+		TP_HOTKEY_TABLET_USES_MHKG,
+		TP_HOTKEY_TABLET_USES_GMMS,
+	} hotkey_tablet;
 	u32 light:1;
 	u32 light_status:1;
 	u32 bright_acpimode:1;
@@ -320,6 +336,7 @@ static struct {
 	u32 sensors_pdrv_attrs_registered:1;
 	u32 sensors_pdev_attrs_registered:1;
 	u32 hotkey_poll_active:1;
+	u32 has_adaptive_kbd:1;
 } tp_features;
 
 static struct {
@@ -366,7 +383,7 @@ struct tpacpi_led_classdev {
 	struct led_classdev led_classdev;
 	struct work_struct work;
 	enum led_status_t new_state;
-	int led;
+	unsigned int led;
 };
 
 /* brightness level capabilities */
@@ -518,7 +535,7 @@ static acpi_handle ec_handle;
 
 #define TPACPI_HANDLE(object, parent, paths...)			\
 	static acpi_handle  object##_handle;			\
-	static const acpi_handle *object##_parent __initdata =	\
+	static const acpi_handle * const object##_parent __initconst =	\
 						&parent##_handle; \
 	static char *object##_paths[] __initdata = { paths }
 
@@ -849,14 +866,14 @@ static int dispatch_proc_show(struct seq_file *m, void *v)
 
 static int dispatch_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, dispatch_proc_show, PDE(inode)->data);
+	return single_open(file, dispatch_proc_show, PDE_DATA(inode));
 }
 
 static ssize_t dispatch_proc_write(struct file *file,
 			const char __user *userbuf,
 			size_t count, loff_t *pos)
 {
-	struct ibm_struct *ibm = PDE(file->f_path.dentry->d_inode)->data;
+	struct ibm_struct *ibm = PDE_DATA(file_inode(file));
 	char *kernbuf;
 	int ret;
 
@@ -1369,8 +1386,7 @@ static ssize_t tpacpi_rfk_sysfs_enable_store(const enum tpacpi_rfk_id id,
 }
 
 /* procfs -------------------------------------------------------------- */
-static int tpacpi_rfk_procfs_read(const enum tpacpi_rfk_id id,
-				  struct seq_file *m)
+static int tpacpi_rfk_procfs_read(const enum tpacpi_rfk_id id, struct seq_file *m)
 {
 	if (id >= TPACPI_RFK_SW_MAX)
 		seq_printf(m, "status:\t\tnot supported\n");
@@ -1915,6 +1931,38 @@ enum {	/* hot key scan codes (derived from ACPI DSDT) */
 	TP_ACPI_HOTKEYSCAN_UNK7,
 	TP_ACPI_HOTKEYSCAN_UNK8,
 
+	/* Adaptive keyboard keycodes */
+	TP_ACPI_HOTKEYSCAN_ADAPTIVE_START,
+	TP_ACPI_HOTKEYSCAN_MUTE2        = TP_ACPI_HOTKEYSCAN_ADAPTIVE_START,
+	TP_ACPI_HOTKEYSCAN_BRIGHTNESS_ZERO,
+	TP_ACPI_HOTKEYSCAN_CLIPPING_TOOL,
+	TP_ACPI_HOTKEYSCAN_CLOUD,
+	TP_ACPI_HOTKEYSCAN_UNK9,
+	TP_ACPI_HOTKEYSCAN_VOICE,
+	TP_ACPI_HOTKEYSCAN_UNK10,
+	TP_ACPI_HOTKEYSCAN_GESTURES,
+	TP_ACPI_HOTKEYSCAN_UNK11,
+	TP_ACPI_HOTKEYSCAN_UNK12,
+	TP_ACPI_HOTKEYSCAN_UNK13,
+	TP_ACPI_HOTKEYSCAN_CONFIG,
+	TP_ACPI_HOTKEYSCAN_NEW_TAB,
+	TP_ACPI_HOTKEYSCAN_RELOAD,
+	TP_ACPI_HOTKEYSCAN_BACK,
+	TP_ACPI_HOTKEYSCAN_MIC_DOWN,
+	TP_ACPI_HOTKEYSCAN_MIC_UP,
+	TP_ACPI_HOTKEYSCAN_MIC_CANCELLATION,
+	TP_ACPI_HOTKEYSCAN_CAMERA_MODE,
+	TP_ACPI_HOTKEYSCAN_ROTATE_DISPLAY,
+
+	/* Lenovo extended keymap, starting at 0x1300 */
+	TP_ACPI_HOTKEYSCAN_EXTENDED_START,
+	/* first new observed key (star, favorites) is 0x1311 */
+	TP_ACPI_HOTKEYSCAN_STAR = 69,
+	TP_ACPI_HOTKEYSCAN_CLIPPING_TOOL2,
+	TP_ACPI_HOTKEYSCAN_UNK25,
+	TP_ACPI_HOTKEYSCAN_BLUETOOTH,
+	TP_ACPI_HOTKEYSCAN_KEYBOARD,
+
 	/* Hotkey keymap size */
 	TPACPI_HOTKEY_MAP_LEN
 };
@@ -2023,6 +2071,7 @@ static int hotkey_autosleep_ack;
 
 static u32 hotkey_orig_mask;		/* events the BIOS had enabled */
 static u32 hotkey_all_mask;		/* all events supported in fw */
+static u32 hotkey_adaptive_all_mask;	/* all adaptive events supported in fw */
 static u32 hotkey_reserved_mask;	/* events better left disabled */
 static u32 hotkey_driver_mask;		/* events needed by the driver */
 static u32 hotkey_user_mask;		/* events visible to userspace */
@@ -2040,6 +2089,28 @@ static void hotkey_poll_setup(const bool may_warn);
 
 /* HKEY.MHKG() return bits */
 #define TP_HOTKEY_TABLET_MASK (1 << 3)
+enum {
+	TP_ACPI_MULTI_MODE_INVALID	= 0,
+	TP_ACPI_MULTI_MODE_UNKNOWN	= 1 << 0,
+	TP_ACPI_MULTI_MODE_LAPTOP	= 1 << 1,
+	TP_ACPI_MULTI_MODE_TABLET	= 1 << 2,
+	TP_ACPI_MULTI_MODE_FLAT		= 1 << 3,
+	TP_ACPI_MULTI_MODE_STAND	= 1 << 4,
+	TP_ACPI_MULTI_MODE_TENT		= 1 << 5,
+	TP_ACPI_MULTI_MODE_STAND_TENT	= 1 << 6,
+};
+
+enum {
+	/* The following modes are considered tablet mode for the purpose of
+	 * reporting the status to userspace. i.e. in all these modes it makes
+	 * sense to disable the laptop input devices such as touchpad and
+	 * keyboard.
+	 */
+	TP_ACPI_MULTI_MODE_TABLET_LIKE	= TP_ACPI_MULTI_MODE_TABLET |
+					  TP_ACPI_MULTI_MODE_STAND |
+					  TP_ACPI_MULTI_MODE_TENT |
+					  TP_ACPI_MULTI_MODE_STAND_TENT,
+};
 
 static int hotkey_get_wlsw(void)
 {
@@ -2060,14 +2131,109 @@ static int hotkey_get_wlsw(void)
 	return (status) ? TPACPI_RFK_RADIO_ON : TPACPI_RFK_RADIO_OFF;
 }
 
+static int hotkey_gmms_get_tablet_mode(int s, int *has_tablet_mode)
+{
+	int type = (s >> 16) & 0xffff;
+	int value = s & 0xffff;
+	int mode = TP_ACPI_MULTI_MODE_INVALID;
+	int valid_modes = 0;
+
+	if (has_tablet_mode)
+		*has_tablet_mode = 0;
+
+	switch (type) {
+	case 1:
+		valid_modes = TP_ACPI_MULTI_MODE_LAPTOP |
+			      TP_ACPI_MULTI_MODE_TABLET |
+			      TP_ACPI_MULTI_MODE_STAND_TENT;
+		break;
+	case 2:
+		valid_modes = TP_ACPI_MULTI_MODE_LAPTOP |
+			      TP_ACPI_MULTI_MODE_FLAT |
+			      TP_ACPI_MULTI_MODE_TABLET |
+			      TP_ACPI_MULTI_MODE_STAND |
+			      TP_ACPI_MULTI_MODE_TENT;
+		break;
+	case 3:
+		valid_modes = TP_ACPI_MULTI_MODE_LAPTOP |
+			      TP_ACPI_MULTI_MODE_FLAT;
+		break;
+	case 4:
+	case 5:
+		/* In mode 4, FLAT is not specified as a valid mode. However,
+		 * it can be seen at least on the X1 Yoga 2nd Generation.
+		 */
+		valid_modes = TP_ACPI_MULTI_MODE_LAPTOP |
+			      TP_ACPI_MULTI_MODE_FLAT |
+			      TP_ACPI_MULTI_MODE_TABLET |
+			      TP_ACPI_MULTI_MODE_STAND |
+			      TP_ACPI_MULTI_MODE_TENT;
+		break;
+	default:
+		pr_err("Unknown multi mode status type %d with value 0x%04X, please report this to %s\n",
+		       type, value, TPACPI_MAIL);
+		return 0;
+	}
+
+	if (has_tablet_mode && (valid_modes & TP_ACPI_MULTI_MODE_TABLET_LIKE))
+		*has_tablet_mode = 1;
+
+	switch (value) {
+	case 1:
+		mode = TP_ACPI_MULTI_MODE_LAPTOP;
+		break;
+	case 2:
+		mode = TP_ACPI_MULTI_MODE_FLAT;
+		break;
+	case 3:
+		mode = TP_ACPI_MULTI_MODE_TABLET;
+		break;
+	case 4:
+		if (type == 1)
+			mode = TP_ACPI_MULTI_MODE_STAND_TENT;
+		else
+			mode = TP_ACPI_MULTI_MODE_STAND;
+		break;
+	case 5:
+		mode = TP_ACPI_MULTI_MODE_TENT;
+		break;
+	default:
+		if (type == 5 && value == 0xffff) {
+			pr_warn("Multi mode status is undetected, assuming laptop\n");
+			return 0;
+		}
+	}
+
+	if (!(mode & valid_modes)) {
+		pr_err("Unknown/reserved multi mode value 0x%04X for type %d, please report this to %s\n",
+		       value, type, TPACPI_MAIL);
+		return 0;
+	}
+
+	return !!(mode & TP_ACPI_MULTI_MODE_TABLET_LIKE);
+}
+
 static int hotkey_get_tablet_mode(int *status)
 {
 	int s;
 
-	if (!acpi_evalf(hkey_handle, &s, "MHKG", "d"))
-		return -EIO;
+	switch (tp_features.hotkey_tablet) {
+	case TP_HOTKEY_TABLET_USES_MHKG:
+		if (!acpi_evalf(hkey_handle, &s, "MHKG", "d"))
+			return -EIO;
 
-	*status = ((s & TP_HOTKEY_TABLET_MASK) != 0);
+		*status = ((s & TP_HOTKEY_TABLET_MASK) != 0);
+		break;
+	case TP_HOTKEY_TABLET_USES_GMMS:
+		if (!acpi_evalf(hkey_handle, &s, "GMMS", "dd", 0))
+			return -EIO;
+
+		*status = hotkey_gmms_get_tablet_mode(s, NULL);
+		break;
+	default:
+		break;
+	}
+
 	return 0;
 }
 
@@ -2193,7 +2359,7 @@ static int hotkey_user_mask_set(const u32 mask)
  *
  * Can be called even if the hotkey subdriver is inactive
  */
-static __used int tpacpi_hotkey_driver_mask_set(const u32 mask)
+static int tpacpi_hotkey_driver_mask_set(const u32 mask)
 {
 	int rc;
 
@@ -2330,55 +2496,53 @@ static void hotkey_read_nvram(struct tp_nvram_state *n, const u32 m)
 	}
 }
 
-#define TPACPI_COMPARE_KEY(__scancode, __member) \
-do { \
-	if ((event_mask & (1 << __scancode)) && \
-	    oldn->__member != newn->__member) \
-		tpacpi_hotkey_send_key(__scancode); \
-} while (0)
-
-#define TPACPI_MAY_SEND_KEY(__scancode) \
-do { \
-	if (event_mask & (1 << __scancode)) \
-		tpacpi_hotkey_send_key(__scancode); \
-} while (0)
-
-static void issue_volchange(const unsigned int oldvol,
-			    const unsigned int newvol,
-			    const u32 event_mask)
-{
-	unsigned int i = oldvol;
-
-	while (i > newvol) {
-		TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_VOLUMEDOWN);
-		i--;
-	}
-	while (i < newvol) {
-		TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_VOLUMEUP);
-		i++;
-	}
-}
-
-static void issue_brightnesschange(const unsigned int oldbrt,
-				   const unsigned int newbrt,
-				   const u32 event_mask)
-{
-	unsigned int i = oldbrt;
-
-	while (i > newbrt) {
-		TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_FNEND);
-		i--;
-	}
-	while (i < newbrt) {
-		TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_FNHOME);
-		i++;
-	}
-}
-
 static void hotkey_compare_and_issue_event(struct tp_nvram_state *oldn,
 					   struct tp_nvram_state *newn,
 					   const u32 event_mask)
 {
+
+#define TPACPI_COMPARE_KEY(__scancode, __member) \
+	do { \
+		if ((event_mask & (1 << __scancode)) && \
+		    oldn->__member != newn->__member) \
+			tpacpi_hotkey_send_key(__scancode); \
+	} while (0)
+
+#define TPACPI_MAY_SEND_KEY(__scancode) \
+	do { \
+		if (event_mask & (1 << __scancode)) \
+			tpacpi_hotkey_send_key(__scancode); \
+	} while (0)
+
+	void issue_volchange(const unsigned int oldvol,
+			     const unsigned int newvol)
+	{
+		unsigned int i = oldvol;
+
+		while (i > newvol) {
+			TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_VOLUMEDOWN);
+			i--;
+		}
+		while (i < newvol) {
+			TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_VOLUMEUP);
+			i++;
+		}
+	}
+
+	void issue_brightnesschange(const unsigned int oldbrt,
+				    const unsigned int newbrt)
+	{
+		unsigned int i = oldbrt;
+
+		while (i > newbrt) {
+			TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_FNEND);
+			i--;
+		}
+		while (i < newbrt) {
+			TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_FNHOME);
+			i++;
+		}
+	}
 
 	TPACPI_COMPARE_KEY(TP_ACPI_HOTKEYSCAN_THINKPAD, thinkpad_toggle);
 	TPACPI_COMPARE_KEY(TP_ACPI_HOTKEYSCAN_FNSPACE, zoom_toggle);
@@ -2413,8 +2577,7 @@ static void hotkey_compare_and_issue_event(struct tp_nvram_state *oldn,
 		    oldn->volume_level != newn->volume_level) {
 			/* recently muted, or repeated mute keypress, or
 			 * multiple presses ending in mute */
-			issue_volchange(oldn->volume_level, newn->volume_level,
-				event_mask);
+			issue_volchange(oldn->volume_level, newn->volume_level);
 			TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_MUTE);
 		}
 	} else {
@@ -2424,8 +2587,7 @@ static void hotkey_compare_and_issue_event(struct tp_nvram_state *oldn,
 			TPACPI_MAY_SEND_KEY(TP_ACPI_HOTKEYSCAN_VOLUMEUP);
 		}
 		if (oldn->volume_level != newn->volume_level) {
-			issue_volchange(oldn->volume_level, newn->volume_level,
-				event_mask);
+			issue_volchange(oldn->volume_level, newn->volume_level);
 		} else if (oldn->volume_toggle != newn->volume_toggle) {
 			/* repeated vol up/down keypress at end of scale ? */
 			if (newn->volume_level == 0)
@@ -2438,7 +2600,7 @@ static void hotkey_compare_and_issue_event(struct tp_nvram_state *oldn,
 	/* handle brightness */
 	if (oldn->brightness_level != newn->brightness_level) {
 		issue_brightnesschange(oldn->brightness_level,
-				       newn->brightness_level, event_mask);
+				       newn->brightness_level);
 	} else if (oldn->brightness_toggle != newn->brightness_toggle) {
 		/* repeated key presses that didn't change state */
 		if (newn->brightness_level == 0)
@@ -2465,8 +2627,9 @@ static int hotkey_kthread(void *data)
 	u32 poll_mask, event_mask;
 	unsigned int si, so;
 	unsigned long t;
-	unsigned int change_detector, must_reset;
+	unsigned int change_detector;
 	unsigned int poll_freq;
+	bool was_frozen;
 
 	if (tpacpi_lifecycle == TPACPI_LIFE_EXITING)
 		goto exit;
@@ -2495,14 +2658,14 @@ static int hotkey_kthread(void *data)
 				t = 100;	/* should never happen... */
 		}
 		t = msleep_interruptible(t);
-		if (unlikely(kthread_should_stop()))
+		if (unlikely(kthread_freezable_should_stop(&was_frozen)))
 			break;
-		must_reset = try_to_freeze();
-		if (t > 0 && !must_reset)
+
+		if (t > 0 && !was_frozen)
 			continue;
 
 		mutex_lock(&hotkey_thread_data_mutex);
-		if (must_reset || hotkey_config_change != change_detector) {
+		if (was_frozen || hotkey_config_change != change_detector) {
 			/* forget old state on thaw or config change */
 			si = so;
 			t = 0;
@@ -2534,10 +2697,6 @@ exit:
 static void hotkey_poll_stop_sync(void)
 {
 	if (tpacpi_hotkey_task) {
-		if (frozen(tpacpi_hotkey_task) ||
-		    freezing(tpacpi_hotkey_task))
-			thaw_process(tpacpi_hotkey_task);
-
 		kthread_stop(tpacpi_hotkey_task);
 		tpacpi_hotkey_task = NULL;
 	}
@@ -2737,6 +2896,17 @@ static ssize_t hotkey_all_mask_show(struct device *dev,
 
 static struct device_attribute dev_attr_hotkey_all_mask =
 	__ATTR(hotkey_all_mask, S_IRUGO, hotkey_all_mask_show, NULL);
+
+/* sysfs hotkey all_mask ----------------------------------------------- */
+static ssize_t hotkey_adaptive_all_mask_show(struct device *dev,
+			   struct device_attribute *attr,
+			   char *buf)
+{
+	return snprintf(buf, PAGE_SIZE, "0x%08x\n",
+			hotkey_adaptive_all_mask | hotkey_source_mask);
+}
+
+static DEVICE_ATTR_RO(hotkey_adaptive_all_mask);
 
 /* sysfs hotkey recommended_mask --------------------------------------- */
 static ssize_t hotkey_recommended_mask_show(struct device *dev,
@@ -2942,6 +3112,57 @@ static void hotkey_wakeup_hotunplug_complete_notify_change(void)
 		     "wakeup_hotunplug_complete");
 }
 
+/* sysfs adaptive kbd mode --------------------------------------------- */
+
+static int adaptive_keyboard_get_mode(void);
+static int adaptive_keyboard_set_mode(int new_mode);
+
+enum ADAPTIVE_KEY_MODE {
+	HOME_MODE,
+	WEB_BROWSER_MODE,
+	WEB_CONFERENCE_MODE,
+	FUNCTION_MODE,
+	LAYFLAT_MODE
+};
+
+static ssize_t adaptive_kbd_mode_show(struct device *dev,
+			   struct device_attribute *attr,
+			   char *buf)
+{
+	u32 current_mode;
+
+	current_mode = adaptive_keyboard_get_mode();
+	if (current_mode < 0)
+		return current_mode;
+
+	return snprintf(buf, PAGE_SIZE, "%d\n", current_mode);
+}
+
+static ssize_t adaptive_kbd_mode_store(struct device *dev,
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	unsigned long t;
+	int res;
+
+	if (parse_strtoul(buf, LAYFLAT_MODE, &t))
+		return -EINVAL;
+
+	res = adaptive_keyboard_set_mode(t);
+	return (res < 0) ? res : count;
+}
+
+static DEVICE_ATTR_RW(adaptive_kbd_mode);
+
+static struct attribute *adaptive_kbd_attributes[] = {
+	&dev_attr_adaptive_kbd_mode.attr,
+	NULL
+};
+
+static const struct attribute_group adaptive_kbd_attr_group = {
+	.attrs = adaptive_kbd_attributes,
+};
+
 /* --------------------------------------------------------------------- */
 
 static struct attribute *hotkey_attributes[] __initdata = {
@@ -2953,6 +3174,7 @@ static struct attribute *hotkey_attributes[] __initdata = {
 	&dev_attr_hotkey_wakeup_hotunplug_complete.attr,
 	&dev_attr_hotkey_mask.attr,
 	&dev_attr_hotkey_all_mask.attr,
+	&dev_attr_hotkey_adaptive_all_mask.attr,
 	&dev_attr_hotkey_recommended_mask.attr,
 #ifdef CONFIG_THINKPAD_ACPI_HOTKEY_POLL
 	&dev_attr_hotkey_source_mask.attr,
@@ -3072,6 +3294,40 @@ static const struct tpacpi_quirk tpacpi_hotkey_qtable[] __initconst = {
 typedef u16 tpacpi_keymap_entry_t;
 typedef tpacpi_keymap_entry_t tpacpi_keymap_t[TPACPI_HOTKEY_MAP_LEN];
 
+static int hotkey_init_tablet_mode(void)
+{
+	int in_tablet_mode = 0, res;
+	char *type = NULL;
+
+	if (acpi_evalf(hkey_handle, &res, "GMMS", "qdd", 0)) {
+		int has_tablet_mode;
+
+		in_tablet_mode = hotkey_gmms_get_tablet_mode(res,
+							     &has_tablet_mode);
+		if (has_tablet_mode)
+			tp_features.hotkey_tablet = TP_HOTKEY_TABLET_USES_GMMS;
+		type = "GMMS";
+	} else if (acpi_evalf(hkey_handle, &res, "MHKG", "qd")) {
+		/* For X41t, X60t, X61t Tablets... */
+		tp_features.hotkey_tablet = TP_HOTKEY_TABLET_USES_MHKG;
+		in_tablet_mode = !!(res & TP_HOTKEY_TABLET_MASK);
+		type = "MHKG";
+	}
+
+	if (!tp_features.hotkey_tablet)
+		return 0;
+
+	pr_info("Tablet mode switch found (type: %s), currently in %s mode\n",
+		type, in_tablet_mode ? "tablet" : "laptop");
+
+	res = add_to_attr_set(hotkey_dev_attributes,
+			      &dev_attr_hotkey_tablet_mode.attr);
+	if (res)
+		return -1;
+
+	return in_tablet_mode;
+}
+
 static int __init hotkey_init(struct ibm_init_struct *iibm)
 {
 	/* Requirements for changing the default keymaps:
@@ -3144,6 +3400,22 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 		/* (assignments unknown, please report if found) */
 		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
 		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+
+		/* No assignments, only used for Adaptive keyboards. */
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+
+		/* No assignment, used for newer Lenovo models */
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN
+
 		},
 
 	/* Generic keymap for Lenovo ThinkPads */
@@ -3200,6 +3472,58 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 
 		/* Extra keys in use since the X240 / T440 / T540 */
 		KEY_CONFIG, KEY_SEARCH, KEY_SCALE, KEY_FILE,
+
+		/*
+		 * These are the adaptive keyboard keycodes for Carbon X1 2014.
+		 * The first item in this list is the Mute button which is
+		 * emitted with 0x103 through
+		 * adaptive_keyboard_hotkey_notify_hotkey() when the sound
+		 * symbol is held.
+		 * We'll need to offset those by 0x20.
+		 */
+		KEY_RESERVED,        /* Mute held, 0x103 */
+		KEY_BRIGHTNESS_MIN,  /* Backlight off */
+		KEY_RESERVED,        /* Clipping tool */
+		KEY_RESERVED,        /* Cloud */
+		KEY_RESERVED,
+		KEY_VOICECOMMAND,    /* Voice */
+		KEY_RESERVED,
+		KEY_RESERVED,        /* Gestures */
+		KEY_RESERVED,
+		KEY_RESERVED,
+		KEY_RESERVED,
+		KEY_CONFIG,          /* Settings */
+		KEY_RESERVED,        /* New tab */
+		KEY_REFRESH,         /* Reload */
+		KEY_BACK,            /* Back */
+		KEY_RESERVED,        /* Microphone down */
+		KEY_RESERVED,        /* Microphone up */
+		KEY_RESERVED,        /* Microphone cancellation */
+		KEY_RESERVED,        /* Camera mode */
+		KEY_RESERVED,        /* Rotate display, 0x116 */
+
+		/*
+		 * These are found in 2017 models (e.g. T470s, X270).
+		 * The lowest known value is 0x311, which according to
+		 * the manual should launch a user defined favorite
+		 * application.
+		 *
+		 * The offset for these is TP_ACPI_HOTKEYSCAN_EXTENDED_START,
+		 * corresponding to 0x34.
+		 */
+
+		/* (assignments unknown, please report if found) */
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN, KEY_UNKNOWN,
+		KEY_UNKNOWN,
+
+		KEY_FAVORITES,       /* Favorite app, 0x311 */
+		KEY_RESERVED,        /* Clipping tool */
+		KEY_RESERVED,
+		KEY_BLUETOOTH,       /* Bluetooth */
+		KEY_KEYBOARD         /* Keyboard, 0x315 */
 		},
 	};
 
@@ -3219,7 +3543,7 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 
 #define TPACPI_HOTKEY_MAP_SIZE		sizeof(tpacpi_keymap_t)
 #define TPACPI_HOTKEY_MAP_TYPESIZE	sizeof(tpacpi_keymap_entry_t)
- 
+
 	int res, i;
 	int status;
 	int hkeyv;
@@ -3275,18 +3599,16 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 	   A30, R30, R31, T20-22, X20-21, X22-24.  Detected by checking
 	   for HKEY interface version 0x100 */
 	if (acpi_evalf(hkey_handle, &hkeyv, "MHKV", "qd")) {
-		if ((hkeyv >> 8) != 1) {
-			pr_err("unknown version of the HKEY interface: 0x%x\n",
-			       hkeyv);
-			pr_err("please report this to %s\n", TPACPI_MAIL);
-		} else {
+		vdbg_printk(TPACPI_DBG_INIT | TPACPI_DBG_HKEY,
+			    "firmware HKEY interface version: 0x%x\n",
+			    hkeyv);
+
+		switch (hkeyv >> 8) {
+		case 1:
 			/*
 			 * MHKV 0x100 in A31, R40, R40e,
 			 * T4x, X31, and later
 			 */
-			vdbg_printk(TPACPI_DBG_INIT | TPACPI_DBG_HKEY,
-				"firmware HKEY interface version: 0x%x\n",
-				hkeyv);
 
 			/* Paranoia check AND init hotkey_all_mask */
 			if (!acpi_evalf(hkey_handle, &hotkey_all_mask,
@@ -3299,6 +3621,49 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 			} else {
 				tp_features.hotkey_mask = 1;
 			}
+			break;
+
+		case 2:
+			/*
+			 * MHKV 0x200 in X1, T460s, X260, T560, X1 Tablet (2016)
+			 */
+
+			/* Paranoia check AND init hotkey_all_mask */
+			if (!acpi_evalf(hkey_handle, &hotkey_all_mask,
+					"MHKA", "dd", 1)) {
+				pr_err("missing MHKA handler, please report this to %s\n",
+				       TPACPI_MAIL);
+				/* Fallback: pre-init for FN+F3,F4,F12 */
+				hotkey_all_mask = 0x080cU;
+			} else {
+				tp_features.hotkey_mask = 1;
+			}
+
+			/*
+			 * Check if we have an adaptive keyboard, like on the
+			 * Lenovo Carbon X1 2014 (2nd Gen).
+			 */
+			if (acpi_evalf(hkey_handle, &hotkey_adaptive_all_mask,
+				       "MHKA", "dd", 2)) {
+				if (hotkey_adaptive_all_mask != 0) {
+					tp_features.has_adaptive_kbd = true;
+					res = sysfs_create_group(
+						&tpacpi_pdev->dev.kobj,
+						&adaptive_kbd_attr_group);
+					if (res)
+						goto err_exit;
+				}
+			} else {
+				tp_features.has_adaptive_kbd = false;
+				hotkey_adaptive_all_mask = 0x0U;
+			}
+			break;
+
+		default:
+			pr_err("unknown version of the HKEY interface: 0x%x\n",
+			       hkeyv);
+			pr_err("please report this to %s\n", TPACPI_MAIL);
+			break;
 		}
 	}
 
@@ -3343,21 +3708,14 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 		res = add_to_attr_set(hotkey_dev_attributes,
 				&dev_attr_hotkey_radio_sw.attr);
 
-	/* For X41t, X60t, X61t Tablets... */
-	if (!res && acpi_evalf(hkey_handle, &status, "MHKG", "qd")) {
-		tp_features.hotkey_tablet = 1;
-		tabletsw_state = !!(status & TP_HOTKEY_TABLET_MASK);
-		pr_info("possible tablet mode switch found; "
-			"ThinkPad in %s mode\n",
-			(tabletsw_state) ? "tablet" : "laptop");
-		res = add_to_attr_set(hotkey_dev_attributes,
-				&dev_attr_hotkey_tablet_mode.attr);
-	}
+	res = hotkey_init_tablet_mode();
+	if (res < 0)
+		goto err_exit;
 
-	if (!res)
-		res = register_attr_set_with_sysfs(
-				hotkey_dev_attributes,
-				&tpacpi_pdev->dev.kobj);
+	tabletsw_state = res;
+
+	res = register_attr_set_with_sysfs(hotkey_dev_attributes,
+					   &tpacpi_pdev->dev.kobj);
 	if (res)
 		goto err_exit;
 
@@ -3468,9 +3826,12 @@ static int __init hotkey_init(struct ibm_init_struct *iibm)
 
 err_exit:
 	delete_attr_set(hotkey_dev_attributes, &tpacpi_pdev->dev.kobj);
+	sysfs_remove_group(&tpacpi_pdev->dev.kobj,
+			&adaptive_kbd_attr_group);
+
 	hotkey_dev_attributes = NULL;
 
-	return (res < 0) ? res : 1;
+	return (res < 0)? res : 1;
 }
 
 /* Thinkpad X1 Carbon support 5 modes including Home mode, Web browser
@@ -3480,14 +3841,6 @@ err_exit:
  * Will consider support rest of modes in future.
  *
  */
-enum ADAPTIVE_KEY_MODE {
-	HOME_MODE,
-	WEB_BROWSER_MODE,
-	WEB_CONFERENCE_MODE,
-	FUNCTION_MODE,
-	LAYFLAT_MODE
-};
-
 const int adaptive_keyboard_modes[] = {
 	HOME_MODE,
 /*	WEB_BROWSER_MODE = 2,
@@ -3497,12 +3850,39 @@ const int adaptive_keyboard_modes[] = {
 
 #define DFR_CHANGE_ROW			0x101
 #define DFR_SHOW_QUICKVIEW_ROW		0x102
+#define FIRST_ADAPTIVE_KEY		0x103
 
 /* press Fn key a while second, it will switch to Function Mode. Then
  * release Fn key, previous mode be restored.
  */
 static bool adaptive_keyboard_mode_is_saved;
 static int adaptive_keyboard_prev_mode;
+
+static int adaptive_keyboard_get_mode(void)
+{
+	int mode = 0;
+
+	if (!acpi_evalf(hkey_handle, &mode, "GTRW", "dd", 0)) {
+		pr_err("Cannot read adaptive keyboard mode\n");
+		return -EIO;
+	}
+
+	return mode;
+}
+
+static int adaptive_keyboard_set_mode(int new_mode)
+{
+	if (new_mode < 0 ||
+		new_mode > LAYFLAT_MODE)
+		return -EINVAL;
+
+	if (!acpi_evalf(hkey_handle, NULL, "STRW", "vd", new_mode)) {
+		pr_err("Cannot set adaptive keyboard mode\n");
+		return -EIO;
+	}
+
+	return 0;
+}
 
 static int adaptive_keyboard_get_next_mode(int mode)
 {
@@ -3526,6 +3906,7 @@ static bool adaptive_keyboard_hotkey_notify_hotkey(unsigned int scancode)
 {
 	u32 current_mode = 0;
 	int new_mode = 0;
+	int keycode;
 
 	switch (scancode) {
 	case DFR_CHANGE_ROW:
@@ -3533,43 +3914,53 @@ static bool adaptive_keyboard_hotkey_notify_hotkey(unsigned int scancode)
 			new_mode = adaptive_keyboard_prev_mode;
 			adaptive_keyboard_mode_is_saved = false;
 		} else {
-			if (!acpi_evalf(
-					hkey_handle, &current_mode,
-					"GTRW", "dd", 0)) {
-				pr_err("Cannot read adaptive keyboard mode\n");
+			current_mode = adaptive_keyboard_get_mode();
+			if (current_mode < 0)
 				return false;
-			} else {
-				new_mode = adaptive_keyboard_get_next_mode(
-						current_mode);
-			}
+			new_mode = adaptive_keyboard_get_next_mode(
+					current_mode);
 		}
 
-		if (!acpi_evalf(hkey_handle, NULL, "STRW", "vd", new_mode)) {
-			pr_err("Cannot set adaptive keyboard mode\n");
+		if (adaptive_keyboard_set_mode(new_mode) < 0)
 			return false;
-		}
 
 		return true;
 
 	case DFR_SHOW_QUICKVIEW_ROW:
-		if (!acpi_evalf(hkey_handle,
-				&adaptive_keyboard_prev_mode,
-				"GTRW", "dd", 0)) {
-			pr_err("Cannot read adaptive keyboard mode\n");
+		current_mode = adaptive_keyboard_get_mode();
+		if (current_mode < 0)
 			return false;
-		} else {
-			adaptive_keyboard_mode_is_saved = true;
 
-			if (!acpi_evalf(hkey_handle,
-					NULL, "STRW", "vd", FUNCTION_MODE)) {
-				pr_err("Cannot set adaptive keyboard mode\n");
-				return false;
-			}
-		}
+		adaptive_keyboard_prev_mode = current_mode;
+		adaptive_keyboard_mode_is_saved = true;
+
+		if (adaptive_keyboard_set_mode (FUNCTION_MODE) < 0)
+			return false;
 		return true;
 
 	default:
-		return false;
+		if (scancode < FIRST_ADAPTIVE_KEY ||
+		    scancode >= FIRST_ADAPTIVE_KEY +
+		    TP_ACPI_HOTKEYSCAN_EXTENDED_START -
+		    TP_ACPI_HOTKEYSCAN_ADAPTIVE_START) {
+			pr_info("Unhandled adaptive keyboard key: 0x%x\n",
+					scancode);
+			return false;
+		}
+		keycode = hotkey_keycode_map[scancode - FIRST_ADAPTIVE_KEY +
+					     TP_ACPI_HOTKEYSCAN_ADAPTIVE_START];
+		if (keycode != KEY_RESERVED) {
+			mutex_lock(&tpacpi_inputdev_send_mutex);
+
+			input_report_key(tpacpi_inputdev, keycode, 1);
+			input_sync(tpacpi_inputdev);
+
+			input_report_key(tpacpi_inputdev, keycode, 0);
+			input_sync(tpacpi_inputdev);
+
+			mutex_unlock(&tpacpi_inputdev_send_mutex);
+		}
+		return true;
 	}
 }
 
@@ -3582,19 +3973,44 @@ static bool hotkey_notify_hotkey(const u32 hkey,
 	*send_acpi_ev = true;
 	*ignore_acpi_ev = false;
 
-	/* HKEY event 0x1001 is scancode 0x00 */
-	if (scancode > 0 && scancode <= TPACPI_HOTKEY_MAP_LEN) {
-		scancode--;
-		if (!(hotkey_source_mask & (1 << scancode))) {
-			tpacpi_input_send_key_masked(scancode);
-			*send_acpi_ev = false;
-		} else {
-			*ignore_acpi_ev = true;
+	/*
+	 * Original events are in the 0x10XX range, the adaptive keyboard
+	 * found in 2014 X1 Carbon emits events are of 0x11XX. In 2017
+	 * models, additional keys are emitted through 0x13XX.
+	 */
+	switch ((hkey >> 8) & 0xf) {
+	case 0:
+		if (scancode > 0 &&
+		    scancode <= TP_ACPI_HOTKEYSCAN_ADAPTIVE_START) {
+			/* HKEY event 0x1001 is scancode 0x00 */
+			scancode--;
+			if (!(hotkey_source_mask & (1 << scancode))) {
+				tpacpi_input_send_key_masked(scancode);
+				*send_acpi_ev = false;
+			} else {
+				*ignore_acpi_ev = true;
+			}
+			return true;
 		}
-		return true;
-	} else {
+		break;
+
+	case 1:
 		return adaptive_keyboard_hotkey_notify_hotkey(scancode);
+
+	case 3:
+		/* Extended keycodes start at 0x300 and our offset into the map
+		 * TP_ACPI_HOTKEYSCAN_EXTENDED_START. The calculated scancode
+		 * will be positive, but might not be in the correct range.
+		 */
+		scancode -= (0x300 - TP_ACPI_HOTKEYSCAN_EXTENDED_START);
+		if (scancode >= TP_ACPI_HOTKEYSCAN_EXTENDED_START &&
+		    scancode < TPACPI_HOTKEY_MAP_LEN) {
+			tpacpi_input_send_key(scancode);
+			return true;
+		}
+		break;
 	}
+
 	return false;
 }
 
@@ -3744,11 +4160,22 @@ static bool hotkey_notify_6xxx(const u32 hkey,
 
 	case TP_HKEY_EV_KEY_NUMLOCK:
 	case TP_HKEY_EV_KEY_FN:
-	case TP_HKEY_EV_KEY_FN_ESC:
 		/* key press events, we just ignore them as long as the EC
 		 * is still reporting them in the normal keyboard stream */
 		*send_acpi_ev = false;
 		*ignore_acpi_ev = true;
+		return true;
+
+	case TP_HKEY_EV_TABLET_CHANGED:
+		tpacpi_input_send_tabletsw();
+		hotkey_tablet_mode_notify_change();
+		*send_acpi_ev = false;
+		break;
+
+	case TP_HKEY_EV_PALM_DETECTED:
+	case TP_HKEY_EV_PALM_UNDETECTED:
+		/* palm detected hovering the keyboard, forward to user-space
+		 * via netlink for consumption */
 		return true;
 
 	default:
@@ -3874,28 +4301,21 @@ static void hotkey_notify(struct ibm_struct *ibm, u32 event)
 
 static void hotkey_suspend(void)
 {
-	int hkeyv;
-
 	/* Do these on suspend, we get the events on early resume! */
 	hotkey_wakeup_reason = TP_ACPI_WAKEUP_NONE;
 	hotkey_autosleep_ack = 0;
 
 	/* save previous mode of adaptive keyboard of X1 Carbon */
-	if (acpi_evalf(hkey_handle, &hkeyv, "MHKV", "qd")) {
-		if ((hkeyv >> 8) == 2) {
-			if (!acpi_evalf(hkey_handle,
-						&adaptive_keyboard_prev_mode,
-						"GTRW", "dd", 0)) {
-				pr_err("Cannot read adaptive keyboard mode.\n");
-			}
+	if (tp_features.has_adaptive_kbd) {
+		if (!acpi_evalf(hkey_handle, &adaptive_keyboard_prev_mode,
+					"GTRW", "dd", 0)) {
+			pr_err("Cannot read adaptive keyboard mode.\n");
 		}
 	}
 }
 
 static void hotkey_resume(void)
 {
-	int hkeyv;
-
 	tpacpi_disable_brightness_delay();
 
 	if (hotkey_status_set(true) < 0 ||
@@ -3910,14 +4330,10 @@ static void hotkey_resume(void)
 	hotkey_poll_setup_safe(false);
 
 	/* restore previous mode of adapive keyboard of X1 Carbon */
-	if (acpi_evalf(hkey_handle, &hkeyv, "MHKV", "qd")) {
-		if ((hkeyv >> 8) == 2) {
-			if (!acpi_evalf(hkey_handle,
-						NULL,
-						"STRW", "vd",
-						adaptive_keyboard_prev_mode)) {
-				pr_err("Cannot set adaptive keyboard mode.\n");
-			}
+	if (tp_features.has_adaptive_kbd) {
+		if (!acpi_evalf(hkey_handle, NULL, "STRW", "vd",
+					adaptive_keyboard_prev_mode)) {
+			pr_err("Cannot set adaptive keyboard mode.\n");
 		}
 	}
 }
@@ -4013,6 +4429,7 @@ errexit:
 static const struct acpi_device_id ibm_htk_device_ids[] = {
 	{TPACPI_ACPI_IBM_HKEY_HID, 0},
 	{TPACPI_ACPI_LENOVO_HKEY_HID, 0},
+	{TPACPI_ACPI_LENOVO_HKEY_V2_HID, 0},
 	{"", 0},
 };
 
@@ -4614,7 +5031,7 @@ static int __init video_init(struct ibm_init_struct *iibm)
 		str_supported(video_supported != TPACPI_VIDEO_NONE),
 		video_supported);
 
-	return (video_supported != TPACPI_VIDEO_NONE) ? 0 : 1;
+	return (video_supported != TPACPI_VIDEO_NONE)? 0 : 1;
 }
 
 static void video_exit(void)
@@ -4707,7 +5124,7 @@ static int video_outputsw_set(int status)
 		return -ENOSYS;
 	}
 
-	return (res) ? 0 : -EIO;
+	return (res)? 0 : -EIO;
 }
 
 static int video_autosw_get(void)
@@ -4733,7 +5150,7 @@ static int video_autosw_get(void)
 
 static int video_autosw_set(int enable)
 {
-	if (!acpi_evalf(vid_handle, NULL, "_DOS", "vd", (enable) ? 1 : 0))
+	if (!acpi_evalf(vid_handle, NULL, "_DOS", "vd", (enable)? 1 : 0))
 		return -EIO;
 	return 0;
 }
@@ -4768,20 +5185,20 @@ static int video_outputsw_cycle(void)
 		return -EIO;
 	}
 
-	return (res) ? 0 : -EIO;
+	return (res)? 0 : -EIO;
 }
 
 static int video_expand_toggle(void)
 {
 	switch (video_supported) {
 	case TPACPI_VIDEO_570:
-		return acpi_evalf(ec_handle, NULL, "_Q17", "v") ?
+		return acpi_evalf(ec_handle, NULL, "_Q17", "v")?
 			0 : -EIO;
 	case TPACPI_VIDEO_770:
-		return acpi_evalf(vid_handle, NULL, "VEXP", "v") ?
+		return acpi_evalf(vid_handle, NULL, "VEXP", "v")?
 			0 : -EIO;
 	case TPACPI_VIDEO_NEW:
-		return acpi_evalf(NULL, NULL, "\\VEXP", "v") ?
+		return acpi_evalf(NULL, NULL, "\\VEXP", "v")?
 			0 : -EIO;
 	default:
 		return -ENOSYS;
@@ -4925,14 +5342,14 @@ static int light_set_status(int status)
 	if (tp_features.light) {
 		if (cmos_handle) {
 			rc = acpi_evalf(cmos_handle, NULL, NULL, "vd",
-					(status) ?
+					(status)?
 						TP_CMOS_THINKLIGHT_ON :
 						TP_CMOS_THINKLIGHT_OFF);
 		} else {
 			rc = acpi_evalf(lght_handle, NULL, NULL, "vd",
-					(status) ? 1 : 0);
+					(status)? 1 : 0);
 		}
-		return (rc) ? 0 : -EIO;
+		return (rc)? 0 : -EIO;
 	}
 
 	return -ENXIO;
@@ -4961,7 +5378,7 @@ static void light_sysfs_set(struct led_classdev *led_cdev,
 
 static enum led_brightness light_sysfs_get(struct led_classdev *led_cdev)
 {
-	return (light_get_status() == 1) ? LED_FULL : LED_OFF;
+	return (light_get_status() == 1)? LED_FULL : LED_OFF;
 }
 
 static struct tpacpi_led_classdev tpacpi_led_thinklight = {
@@ -5083,7 +5500,7 @@ static ssize_t cmos_command_store(struct device *dev,
 		return -EINVAL;
 
 	res = issue_thinkpad_cmos_command(cmos_cmd);
-	return (res) ? res : count;
+	return (res)? res : count;
 }
 
 static struct device_attribute dev_attr_cmos_command =
@@ -5107,7 +5524,7 @@ static int __init cmos_init(struct ibm_init_struct *iibm)
 	if (res)
 		return res;
 
-	return (cmos_handle) ? 0 : 1;
+	return (cmos_handle)? 0 : 1;
 }
 
 static void cmos_exit(void)
@@ -5217,9 +5634,9 @@ static int led_get_status(const unsigned int led)
 		if (!acpi_evalf(ec_handle,
 				&status, "GLED", "dd", 1 << led))
 			return -EIO;
-		led_s = (status == 0) ?
+		led_s = (status == 0)?
 				TPACPI_LED_OFF :
-				((status == 1) ?
+				((status == 1)?
 					TPACPI_LED_ON :
 					TPACPI_LED_BLINK);
 		tpacpi_led_state_cache[led] = led_s;
@@ -5280,7 +5697,7 @@ static int led_set_status(const unsigned int led,
 	}
 
 	if (!rc)
-		tpacpi_led_state_cache[array_index_nospec(led, TPACPI_LED_NUMLEDS)] = ledstatus;
+		tpacpi_led_state_cache[led] = ledstatus;
 
 	return rc;
 }
@@ -5472,16 +5889,6 @@ static int __init led_init(struct ibm_init_struct *iibm)
 
 	led_supported = led_init_detect_mode();
 
-	if (led_supported != TPACPI_LED_NONE) {
-		useful_leds = tpacpi_check_quirks(led_useful_qtable,
-				ARRAY_SIZE(led_useful_qtable));
-
-		if (!useful_leds) {
-			led_handle = NULL;
-			led_supported = TPACPI_LED_NONE;
-		}
-	}
-
 	vdbg_printk(TPACPI_DBG_INIT, "LED commands are %s, mode %d\n",
 		str_supported(led_supported), led_supported);
 
@@ -5495,9 +5902,10 @@ static int __init led_init(struct ibm_init_struct *iibm)
 		return -ENOMEM;
 	}
 
-	for (i = 0; i < TPACPI_LED_NUMLEDS; i++) {
-		tpacpi_leds[i].led = -1;
+	useful_leds = tpacpi_check_quirks(led_useful_qtable,
+					  ARRAY_SIZE(led_useful_qtable));
 
+	for (i = 0; i < TPACPI_LED_NUMLEDS; i++) {
 		if (!tpacpi_is_led_restricted(i) &&
 		    test_bit(i, &useful_leds)) {
 			rc = tpacpi_init_led(i);
@@ -5555,12 +5963,8 @@ static int led_write(char *buf)
 		return -ENODEV;
 
 	while ((cmd = next_cmd(&buf))) {
-		if (sscanf(cmd, "%d", &led) != 1)
+		if (sscanf(cmd, "%d", &led) != 1 || led < 0 || led > 15)
 			return -EINVAL;
-
-		if (led < 0 || led > (TPACPI_LED_NUMLEDS - 1) ||
-		    tpacpi_leds[array_index_nospec(led, TPACPI_LED_NUMLEDS)].led < 0)
-			return -ENODEV;
 
 		if (strstr(cmd, "off")) {
 			s = TPACPI_LED_OFF;
@@ -5616,7 +6020,7 @@ static int __init beep_init(struct ibm_init_struct *iibm)
 
 	tp_features.beep_needs_two_args = !!(quirks & TPACPI_BEEP_Q1);
 
-	return (beep_handle) ? 0 : 1;
+	return (beep_handle)? 0 : 1;
 }
 
 static int beep_read(struct seq_file *m)
@@ -6015,75 +6419,6 @@ static struct ibm_struct thermal_driver_data = {
 };
 
 /*************************************************************************
- * EC Dump subdriver
- */
-
-static u8 ecdump_regs[256];
-
-static int ecdump_read(struct seq_file *m)
-{
-	int i, j;
-	u8 v;
-
-	seq_printf(m, "EC      "
-		       " +00 +01 +02 +03 +04 +05 +06 +07"
-		       " +08 +09 +0a +0b +0c +0d +0e +0f\n");
-	for (i = 0; i < 256; i += 16) {
-		seq_printf(m, "EC 0x%02x:", i);
-		for (j = 0; j < 16; j++) {
-			if (!acpi_ec_read(i + j, &v))
-				break;
-			if (v != ecdump_regs[i + j])
-				seq_printf(m, " *%02x", v);
-			else
-				seq_printf(m, "  %02x", v);
-			ecdump_regs[i + j] = v;
-		}
-		seq_putc(m, '\n');
-		if (j != 16)
-			break;
-	}
-
-	/* These are way too dangerous to advertise openly... */
-#if 0
-	seq_printf(m, "commands:\t0x<offset> 0x<value>"
-		       " (<offset> is 00-ff, <value> is 00-ff)\n");
-	seq_printf(m, "commands:\t0x<offset> <value>  "
-		       " (<offset> is 00-ff, <value> is 0-255)\n");
-#endif
-	return 0;
-}
-
-static int ecdump_write(char *buf)
-{
-	char *cmd;
-	int i, v;
-
-	while ((cmd = next_cmd(&buf))) {
-		if (sscanf(cmd, "0x%x 0x%x", &i, &v) == 2) {
-			/* i and v set */
-		} else if (sscanf(cmd, "0x%x %u", &i, &v) == 2) {
-			/* i and v set */
-		} else
-			return -EINVAL;
-		if (i >= 0 && i < 256 && v >= 0 && v < 256) {
-			if (!acpi_ec_write(i, v))
-				return -EIO;
-		} else
-			return -EINVAL;
-	}
-
-	return 0;
-}
-
-static struct ibm_struct ecdump_driver_data = {
-	.name = "ecdump",
-	.read = ecdump_read,
-	.write = ecdump_write,
-	.flags.experimental = 1,
-};
-
-/*************************************************************************
  * Backlight/brightness subdriver
  */
 
@@ -6251,7 +6586,7 @@ static int brightness_set(unsigned int value)
 {
 	int res;
 
-	if (value > bright_maxlvl)
+	if (value > bright_maxlvl || value < 0)
 		return -EINVAL;
 
 	vdbg_printk(TPACPI_DBG_BRGHT,
@@ -6319,7 +6654,7 @@ static void tpacpi_brightness_notify_change(void)
 			       BACKLIGHT_UPDATE_HOTKEY);
 }
 
-static struct backlight_ops ibm_backlight_data = {
+static const struct backlight_ops ibm_backlight_data = {
 	.get_brightness = brightness_get,
 	.update_status  = brightness_update_status,
 };
@@ -6362,6 +6697,7 @@ static int __init tpacpi_query_bcl_levels(acpi_handle handle)
 	kfree(buffer.pointer);
 	return rc;
 }
+
 
 /*
  * Returns 0 (no ACPI _BCL or _BCL invalid), or size of brightness map
@@ -6441,8 +6777,7 @@ static void __init tpacpi_detect_brightness_capabilities(void)
 		pr_info("detected a 8-level brightness capable ThinkPad\n");
 		break;
 	default:
-		pr_err("Unsupported brightness interface, "
-		       "please contact %s\n", TPACPI_MAIL);
+		pr_info("Unsupported brightness interface\n");
 		tp_features.bright_unkfw = 1;
 		bright_maxlvl = b - 1;
 	}
@@ -6450,6 +6785,7 @@ static void __init tpacpi_detect_brightness_capabilities(void)
 
 static int __init brightness_init(struct ibm_init_struct *iibm)
 {
+	struct backlight_properties props;
 	int b;
 	unsigned long quirks;
 
@@ -6520,9 +6856,14 @@ static int __init brightness_init(struct ibm_init_struct *iibm)
 	if (tpacpi_brightness_get_raw(&b) < 0)
 		return 1;
 
-	ibm_backlight_device = backlight_device_register(
-					TPACPI_BACKLIGHT_DEV_NAME, NULL, NULL,
-					&ibm_backlight_data);
+	memset(&props, 0, sizeof(struct backlight_properties));
+	props.type = BACKLIGHT_PLATFORM;
+	props.max_brightness = bright_maxlvl;
+	props.brightness = b & TP_EC_BACKLIGHT_LVLMSK;
+	ibm_backlight_device = backlight_device_register(TPACPI_BACKLIGHT_DEV_NAME,
+							 NULL, NULL,
+							 &ibm_backlight_data,
+							 &props);
 	if (IS_ERR(ibm_backlight_device)) {
 		int rc = PTR_ERR(ibm_backlight_device);
 		ibm_backlight_device = NULL;
@@ -6539,8 +6880,10 @@ static int __init brightness_init(struct ibm_init_struct *iibm)
 			  "or not on your ThinkPad\n", TPACPI_MAIL);
 	}
 
-	ibm_backlight_device->props.max_brightness = bright_maxlvl;
-	ibm_backlight_device->props.brightness = b & TP_EC_BACKLIGHT_LVLMSK;
+	/* Added by mistake in early 2007.  Probably useless, but it could
+	 * be working around some unknown firmware problem where the value
+	 * read at startup doesn't match the real hardware state... so leave
+	 * it in place just in case */
 	backlight_update_status(ibm_backlight_device);
 
 	vdbg_printk(TPACPI_DBG_INIT | TPACPI_DBG_BRGHT,
@@ -6625,7 +6968,7 @@ static int brightness_write(char *buf)
 	if (!rc && ibm_backlight_device)
 		backlight_force_update(ibm_backlight_device,
 					BACKLIGHT_UPDATE_SYSFS);
-	return (rc == -EINTR) ? -ERESTARTSYS : rc;
+	return (rc == -EINTR)? -ERESTARTSYS : rc;
 }
 
 static struct ibm_struct brightness_driver_data = {
@@ -6657,6 +7000,17 @@ static struct ibm_struct brightness_driver_data = {
  * bits 3-0 (volume).  Other bits in NVRAM may have other functions,
  * such as bit 7 which is used to detect repeated presses of MUTE,
  * and we leave them unchanged.
+ *
+ * On newer Lenovo ThinkPads, the EC can automatically change the volume
+ * in response to user input.  Unfortunately, this rarely works well.
+ * The laptop changes the state of its internal MUTE gate and, on some
+ * models, sends KEY_MUTE, causing any user code that responds to the
+ * mute button to get confused.  The hardware MUTE gate is also
+ * unnecessary, since user code can handle the mute button without
+ * kernel or EC help.
+ *
+ * To avoid confusing userspace, we simply disable all EC-based mute
+ * and volume controls when possible.
  */
 
 #ifdef CONFIG_THINKPAD_ACPI_ALSA_SUPPORT
@@ -6665,12 +7019,7 @@ static struct ibm_struct brightness_driver_data = {
 #define TPACPI_ALSA_SHRTNAME "ThinkPad Console Audio Control"
 #define TPACPI_ALSA_MIXERNAME TPACPI_ALSA_SHRTNAME
 
-#if SNDRV_CARDS <= 32
-#define DEFAULT_ALSA_IDX		~((1 << (SNDRV_CARDS - 3)) - 1)
-#else
-#define DEFAULT_ALSA_IDX		~((1 << (32 - 3)) - 1)
-#endif
-static int alsa_index = DEFAULT_ALSA_IDX; /* last three slots */
+static int alsa_index = ~((1 << (SNDRV_CARDS - 3)) - 1); /* last three slots */
 static char *alsa_id = "ThinkPadEC";
 static bool alsa_enable = SNDRV_DEFAULT_ENABLE1;
 
@@ -6711,11 +7060,21 @@ enum tpacpi_volume_capabilities {
 	TPACPI_VOL_CAP_MAX
 };
 
+enum tpacpi_mute_btn_mode {
+	TP_EC_MUTE_BTN_LATCH  = 0,	/* Mute mutes; up/down unmutes */
+	/* We don't know what mode 1 is. */
+	TP_EC_MUTE_BTN_NONE   = 2,	/* Mute and up/down are just keys */
+	TP_EC_MUTE_BTN_TOGGLE = 3,	/* Mute toggles; up/down unmutes */
+};
+
 static enum tpacpi_volume_access_mode volume_mode =
 	TPACPI_VOL_MODE_MAX;
 
 static enum tpacpi_volume_capabilities volume_capabilities;
 static bool volume_control_allowed;
+static bool software_mute_requested = true;
+static bool software_mute_active;
+static int software_mute_orig_mode;
 
 /*
  * Used to syncronize writers to TP_EC_AUDIO and
@@ -6732,6 +7091,8 @@ static void tpacpi_volume_checkpoint_nvram(void)
 	if (volume_mode != TPACPI_VOL_MODE_ECNVRAM)
 		return;
 	if (!volume_control_allowed)
+		return;
+	if (software_mute_active)
 		return;
 
 	vdbg_printk(TPACPI_DBG_MIXER,
@@ -6793,6 +7154,12 @@ static int volume_set_status_ec(const u8 status)
 		return -EIO;
 
 	dbg_printk(TPACPI_DBG_MIXER, "set EC mixer to 0x%02x\n", status);
+
+	/*
+	 * On X200s, and possibly on others, it can take a while for
+	 * reads to become correct.
+	 */
+	msleep(1);
 
 	return 0;
 }
@@ -6874,6 +7241,57 @@ static int __volume_set_volume_ec(const u8 vol)
 unlock:
 	mutex_unlock(&volume_mutex);
 	return rc;
+}
+
+static int volume_set_software_mute(bool startup)
+{
+	int result;
+
+	if (!tpacpi_is_lenovo())
+		return -ENODEV;
+
+	if (startup) {
+		if (!acpi_evalf(ec_handle, &software_mute_orig_mode,
+				"HAUM", "qd"))
+			return -EIO;
+
+		dbg_printk(TPACPI_DBG_INIT | TPACPI_DBG_MIXER,
+			    "Initial HAUM setting was %d\n",
+			    software_mute_orig_mode);
+	}
+
+	if (!acpi_evalf(ec_handle, &result, "SAUM", "qdd",
+			(int)TP_EC_MUTE_BTN_NONE))
+		return -EIO;
+
+	if (result != TP_EC_MUTE_BTN_NONE)
+		pr_warn("Unexpected SAUM result %d\n",
+			result);
+
+	/*
+	 * In software mute mode, the standard codec controls take
+	 * precendence, so we unmute the ThinkPad HW switch at
+	 * startup.  Just on case there are SAUM-capable ThinkPads
+	 * with level controls, set max HW volume as well.
+	 */
+	if (tp_features.mixer_no_level_control)
+		result = volume_set_mute(false);
+	else
+		result = volume_set_status(TP_EC_VOLUME_MAX);
+
+	if (result != 0)
+		pr_warn("Failed to unmute the HW mute switch\n");
+
+	return 0;
+}
+
+static void volume_exit_software_mute(void)
+{
+	int r;
+
+	if (!acpi_evalf(ec_handle, &r, "SAUM", "qdd", software_mute_orig_mode)
+	    || r != software_mute_orig_mode)
+		pr_warn("Failed to restore mute mode\n");
 }
 
 static int volume_alsa_set_volume(const u8 vol)
@@ -6958,7 +7376,7 @@ static int volume_alsa_mute_put(struct snd_kcontrol *kcontrol,
 	return volume_alsa_set_mute(!ucontrol->value.integer.value[0]);
 }
 
-static struct snd_kcontrol_new volume_alsa_control_vol __devinitdata = {
+static struct snd_kcontrol_new volume_alsa_control_vol = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Console Playback Volume",
 	.index = 0,
@@ -6967,7 +7385,7 @@ static struct snd_kcontrol_new volume_alsa_control_vol __devinitdata = {
 	.get = volume_alsa_vol_get,
 };
 
-static struct snd_kcontrol_new volume_alsa_control_mute __devinitdata = {
+static struct snd_kcontrol_new volume_alsa_control_mute = {
 	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 	.name = "Console Playback Switch",
 	.index = 0,
@@ -6983,7 +7401,12 @@ static void volume_suspend(void)
 
 static void volume_resume(void)
 {
-	volume_alsa_notify_change();
+	if (software_mute_active) {
+		if (volume_set_software_mute(false) < 0)
+			pr_warn("Failed to restore software mute\n");
+	} else {
+		volume_alsa_notify_change();
+	}
 }
 
 static void volume_shutdown(void)
@@ -6999,6 +7422,9 @@ static void volume_exit(void)
 	}
 
 	tpacpi_volume_checkpoint_nvram();
+
+	if (software_mute_active)
+		volume_exit_software_mute();
 }
 
 static int __init volume_create_alsa_mixer(void)
@@ -7183,16 +7609,20 @@ static int __init volume_init(struct ibm_init_struct *iibm)
 			"mute is supported, volume control is %s\n",
 			str_supported(!tp_features.mixer_no_level_control));
 
-	rc = volume_create_alsa_mixer();
-	if (rc) {
-		pr_err("Could not create the ALSA mixer interface\n");
-		return rc;
-	}
+	if (software_mute_requested && volume_set_software_mute(true) == 0) {
+		software_mute_active = true;
+	} else {
+		rc = volume_create_alsa_mixer();
+		if (rc) {
+			pr_err("Could not create the ALSA mixer interface\n");
+			return rc;
+		}
 
-	pr_info("Console audio control enabled, mode: %s\n",
-		(volume_control_allowed) ?
-			"override (read/write)" :
-			"monitor (read only)");
+		pr_info("Console audio control enabled, mode: %s\n",
+			(volume_control_allowed) ?
+				"override (read/write)" :
+				"monitor (read only)");
+	}
 
 	vdbg_printk(TPACPI_DBG_INIT | TPACPI_DBG_MIXER,
 		"registering volume hotkeys as change notification\n");
@@ -8082,7 +8512,7 @@ static ssize_t fan_pwm1_store(struct device *dev,
 	}
 
 	mutex_unlock(&fan_mutex);
-	return (rc) ? rc : count;
+	return (rc)? rc : count;
 }
 
 static struct device_attribute dev_attr_fan_pwm1 =
@@ -8630,7 +9060,7 @@ static int mute_led_on_off(struct tp_led_table *t, bool state)
 	acpi_handle temp;
 	int output;
 
-	if (!ACPI_SUCCESS(acpi_get_handle(hkey_handle, t->name, &temp))) {
+	if (ACPI_FAILURE(acpi_get_handle(hkey_handle, t->name, &temp))) {
 		pr_warn("Thinkpad ACPI has no %s interface.\n", t->name);
 		return -EIO;
 	}
@@ -8760,7 +9190,7 @@ static const char * __init str_supported(int is_supported)
 {
 	static char text_unsupported[] __initdata = "not supported";
 
-	return (is_supported) ? &text_unsupported[4] : &text_unsupported[0];
+	return (is_supported)? &text_unsupported[4] : &text_unsupported[0];
 }
 #endif /* CONFIG_THINKPAD_ACPI_DEBUG */
 
@@ -8881,7 +9311,7 @@ err_out:
 		ibm->name, ret);
 
 	ibm_exit(ibm);
-	return (ret < 0) ? ret : 0;
+	return (ret < 0)? ret : 0;
 }
 
 /* Probing */
@@ -8891,7 +9321,7 @@ static bool __pure __init tpacpi_is_fw_digit(const char c)
 	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z');
 }
 
-static bool __pure __init tpacpi_is_valid_fw_id(const char * const s,
+static bool __pure __init tpacpi_is_valid_fw_id(const char* const s,
 						const char t)
 {
 	/*
@@ -8990,13 +9420,13 @@ static int __must_check __init get_thinkpad_model_data(
 	}
 
 	s = dmi_get_system_info(DMI_PRODUCT_VERSION);
-	if (s && !(strncasecmp(s, "ThinkPad", 8) && strncasecmp(s, "Lenovo", 6))) {
+	if (s && !(strnicmp(s, "ThinkPad", 8) && strnicmp(s, "Lenovo", 6))) {
 		tp->model_str = kstrdup(s, GFP_KERNEL);
 		if (!tp->model_str)
 			return -ENOMEM;
 	} else {
 		s = dmi_get_system_info(DMI_BIOS_VENDOR);
-		if (s && !(strncasecmp(s, "Lenovo", 6))) {
+		if (s && !(strnicmp(s, "Lenovo", 6))) {
 			tp->model_str = kstrdup(s, GFP_KERNEL);
 			if (!tp->model_str)
 				return -ENOMEM;
@@ -9118,9 +9548,6 @@ static struct ibm_init_struct ibms_init[] __initdata = {
 		.data = &thermal_driver_data,
 	},
 	{
-		.data = &ecdump_driver_data,
-	},
-	{
 		.init = brightness_init,
 		.data = &brightness_driver_data,
 	},
@@ -9211,6 +9638,10 @@ MODULE_PARM_DESC(volume_control,
 		 "Enables software override for the console audio "
 		 "control when true");
 
+module_param_named(software_mute, software_mute_requested, bool, 0444);
+MODULE_PARM_DESC(software_mute,
+		 "Request full software mute control");
+
 /* ALSA module API parameters */
 module_param_named(index, alsa_index, int, 0444);
 MODULE_PARM_DESC(index, "ALSA index for the ACPI EC Mixer");
@@ -9232,7 +9663,6 @@ TPACPI_PARAM(light);
 TPACPI_PARAM(cmos);
 TPACPI_PARAM(led);
 TPACPI_PARAM(beep);
-TPACPI_PARAM(ecdump);
 TPACPI_PARAM(brightness);
 TPACPI_PARAM(volume);
 TPACPI_PARAM(fan);
@@ -9434,6 +9864,7 @@ static int __init thinkpad_acpi_module_init(void)
 	mutex_init(&tpacpi_inputdev_send_mutex);
 	tpacpi_inputdev = input_allocate_device();
 	if (!tpacpi_inputdev) {
+		pr_err("unable to allocate input device\n");
 		thinkpad_acpi_module_exit();
 		return -ENOMEM;
 	} else {

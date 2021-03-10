@@ -17,19 +17,6 @@
 #ifdef __HAVE_ARCH_PTE_SPECIAL
 
 /*
- * Return the compund head page with ref appropriately incremented,
- * or NULL if that failed.
- */
-static inline struct page *try_get_compound_head(struct page *head, int refs)
-{
-       if (WARN_ON_ONCE(page_count(head) < 0))
-               return NULL;
-       if (unlikely(!page_cache_add_speculative(head, refs)))
-               return NULL;
-       return head;
-}
-
-/*
  * The performance critical leaf functions are made noinline otherwise gcc
  * inlines everything into a single function which results in too much
  * register pressure.
@@ -47,8 +34,13 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 
 	ptep = pte_offset_kernel(&pmd, addr);
 	do {
-		pte_t pte = *ptep;
+		pte_t pte = ACCESS_ONCE(*ptep);
 		struct page *page;
+		/*
+		 * Similar to the PMD case, NUMA hinting must take slow path
+		 */
+		if (pte_numa(pte))
+			return 0;
 
 		if ((pte_val(pte) & mask) != result)
 			return 0;
@@ -68,68 +60,6 @@ static noinline int gup_pte_range(pmd_t pmd, unsigned long addr,
 	return 1;
 }
 
-#ifdef CONFIG_HUGETLB_PAGE
-static noinline int gup_huge_pte(pte_t *ptep, struct hstate *hstate,
-				 unsigned long *addr, unsigned long end,
-				 int write, struct page **pages, int *nr)
-{
-	unsigned long mask;
-	unsigned long pte_end;
-	struct page *head, *page, *tail;
-	pte_t pte;
-	int refs;
-
-	pte_end = (*addr + huge_page_size(hstate)) & huge_page_mask(hstate);
-	if (pte_end < end)
-		end = pte_end;
-
-	pte = *ptep;
-	mask = _PAGE_PRESENT|_PAGE_USER;
-	if (write)
-		mask |= _PAGE_RW;
-	if ((pte_val(pte) & mask) != mask)
-		return 0;
-	/* hugepages are never "special" */
-	VM_BUG_ON(!pfn_valid(pte_pfn(pte)));
-
-	refs = 0;
-	head = pte_page(pte);
-	page = head + ((*addr & ~huge_page_mask(hstate)) >> PAGE_SHIFT);
-	tail = page;
-	do {
-		VM_BUG_ON(compound_head(page) != head);
-		pages[*nr] = page;
-		(*nr)++;
-		page++;
-		refs++;
-	} while (*addr += PAGE_SIZE, *addr != end);
-
-	if (!try_get_compound_head(head, refs)) {
-		*nr -= refs;
-		return 0;
-	}
-	if (unlikely(pte_val(pte) != pte_val(*ptep))) {
-		/* Could be optimized better */
-		*nr -= refs;
-		while (refs--)
-			put_page(head);
-		return 0;
-	}
-
-	/*
-	 * Any tail page need their mapcount reference taken before we
-	 * return.
-	 */
-	while (refs--) {
-		if (PageTail(tail))
-			get_huge_page_tail(tail);
-		tail++;
-	}
-
-	return 1;
-}
-#endif /* CONFIG_HUGETLB_PAGE */
-
 static int gup_pmd_range(pud_t pud, unsigned long addr, unsigned long end,
 		int write, struct page **pages, int *nr)
 {
@@ -138,12 +68,34 @@ static int gup_pmd_range(pud_t pud, unsigned long addr, unsigned long end,
 
 	pmdp = pmd_offset(&pud, addr);
 	do {
-		pmd_t pmd = *pmdp;
+		pmd_t pmd = ACCESS_ONCE(*pmdp);
 
 		next = pmd_addr_end(addr, end);
-		if (pmd_none(pmd))
+		/*
+		 * If we find a splitting transparent hugepage we
+		 * return zero. That will result in taking the slow
+		 * path which will call wait_split_huge_page()
+		 * if the pmd is still in splitting state
+		 */
+		if (pmd_none(pmd) || pmd_trans_splitting(pmd))
 			return 0;
-		if (!gup_pte_range(pmd, addr, next, write, pages, nr))
+		if (pmd_huge(pmd) || pmd_large(pmd)) {
+			/*
+			 * NUMA hinting faults need to be handled in the GUP
+			 * slowpath for accounting purposes and so that they
+			 * can be serialised against THP migration.
+			 */
+			if (pmd_numa(pmd))
+				return 0;
+
+			if (!gup_hugepte((pte_t *)pmdp, PMD_SIZE, addr, next,
+					 write, pages, nr))
+				return 0;
+		} else if (is_hugepd(pmdp)) {
+			if (!gup_hugepd((hugepd_t *)pmdp, PMD_SHIFT,
+					addr, next, write, pages, nr))
+				return 0;
+		} else if (!gup_pte_range(pmd, addr, next, write, pages, nr))
 			return 0;
 	} while (pmdp++, addr = next, addr != end);
 
@@ -158,30 +110,35 @@ static int gup_pud_range(pgd_t pgd, unsigned long addr, unsigned long end,
 
 	pudp = pud_offset(&pgd, addr);
 	do {
-		pud_t pud = *pudp;
+		pud_t pud = ACCESS_ONCE(*pudp);
 
 		next = pud_addr_end(addr, end);
 		if (pud_none(pud))
 			return 0;
-		if (!gup_pmd_range(pud, addr, next, write, pages, nr))
+		if (pud_huge(pud)) {
+			if (!gup_hugepte((pte_t *)pudp, PUD_SIZE, addr, next,
+					 write, pages, nr))
+				return 0;
+		} else if (is_hugepd(pudp)) {
+			if (!gup_hugepd((hugepd_t *)pudp, PUD_SHIFT,
+					addr, next, write, pages, nr))
+				return 0;
+		} else if (!gup_pmd_range(pud, addr, next, write, pages, nr))
 			return 0;
 	} while (pudp++, addr = next, addr != end);
 
 	return 1;
 }
 
-int get_user_pages_fast(unsigned long start, int nr_pages, int write,
-			struct page **pages)
+int __get_user_pages_fast(unsigned long start, int nr_pages, int write,
+			  struct page **pages)
 {
 	struct mm_struct *mm = current->mm;
 	unsigned long addr, len, end;
 	unsigned long next;
+	unsigned long flags;
 	pgd_t *pgdp;
 	int nr = 0;
-#ifdef CONFIG_PPC64
-	unsigned int shift;
-	int psize;
-#endif
 
 	pr_devel("%s(%lx,%x,%s)\n", __func__, start, nr_pages, write ? "write" : "read");
 
@@ -192,28 +149,9 @@ int get_user_pages_fast(unsigned long start, int nr_pages, int write,
 
 	if (unlikely(!access_ok(write ? VERIFY_WRITE : VERIFY_READ,
 					start, len)))
-		goto slow_irqon;
+		return 0;
 
 	pr_devel("  aligned: %lx .. %lx\n", start, end);
-
-#ifdef CONFIG_HUGETLB_PAGE
-	/* We bail out on slice boundary crossing when hugetlb is
-	 * enabled in order to not have to deal with two different
-	 * page table formats
-	 */
-	if (addr < SLICE_LOW_TOP) {
-		if (end > SLICE_LOW_TOP)
-			goto slow_irqon;
-
-		if (unlikely(GET_LOW_SLICE_INDEX(addr) !=
-			     GET_LOW_SLICE_INDEX(end - 1)))
-			goto slow_irqon;
-	} else {
-		if (unlikely(GET_HIGH_SLICE_INDEX(addr) !=
-			     GET_HIGH_SLICE_INDEX(end - 1)))
-			goto slow_irqon;
-	}
-#endif /* CONFIG_HUGETLB_PAGE */
 
 	/*
 	 * XXX: batch / limit 'nr', to avoid large irq off latency
@@ -232,77 +170,54 @@ int get_user_pages_fast(unsigned long start, int nr_pages, int write,
 	 * So long as we atomically load page table pointers versus teardown,
 	 * we can follow the address down to the the page and take a ref on it.
 	 */
-	local_irq_disable();
+	local_irq_save(flags);
 
-#ifdef CONFIG_PPC64
-	/* Those bits are related to hugetlbfs implementation and only exist
-	 * on 64-bit for now
-	 */
-	psize = get_slice_psize(mm, addr);
-	shift = mmu_psize_defs[psize].shift;
-#endif /* CONFIG_PPC64 */
+	pgdp = pgd_offset(mm, addr);
+	do {
+		pgd_t pgd = ACCESS_ONCE(*pgdp);
 
-#ifdef CONFIG_HUGETLB_PAGE
-	if (unlikely(mmu_huge_psizes[psize])) {
-		pte_t *ptep;
-		unsigned long a = addr;
-		unsigned long sz = ((1UL) << shift);
-		struct hstate *hstate = size_to_hstate(sz);
+		pr_devel("  %016lx: normal pgd %p\n", addr,
+			 (void *)pgd_val(pgd));
+		next = pgd_addr_end(addr, end);
+		if (pgd_none(pgd))
+			break;
+		if (pgd_huge(pgd)) {
+			if (!gup_hugepte((pte_t *)pgdp, PGDIR_SIZE, addr, next,
+					 write, pages, &nr))
+				break;
+		} else if (is_hugepd(pgdp)) {
+			if (!gup_hugepd((hugepd_t *)pgdp, PGDIR_SHIFT,
+					addr, next, write, pages, &nr))
+				break;
+		} else if (!gup_pud_range(pgd, addr, next, write, pages, &nr))
+			break;
+	} while (pgdp++, addr = next, addr != end);
 
-		BUG_ON(!hstate);
-		/*
-		 * XXX: could be optimized to avoid hstate
-		 * lookup entirely (just use shift)
-		 */
+	local_irq_restore(flags);
 
-		do {
-			VM_BUG_ON(shift != mmu_psize_defs[get_slice_psize(mm, a)].shift);
-			ptep = huge_pte_offset(mm, a);
-			pr_devel(" %016lx: huge ptep %p\n", a, ptep);
-			if (!ptep || !gup_huge_pte(ptep, hstate, &a, end, write, pages,
-						   &nr))
-				goto slow;
-		} while (a != end);
-	} else
-#endif /* CONFIG_HUGETLB_PAGE */
-	{
-		pgdp = pgd_offset(mm, addr);
-		do {
-			pgd_t pgd = *pgdp;
-
-#ifdef CONFIG_PPC64
-			VM_BUG_ON(shift != mmu_psize_defs[get_slice_psize(mm, addr)].shift);
-#endif
-			pr_devel("  %016lx: normal pgd %p\n", addr,
-				 (void *)pgd_val(pgd));
-			next = pgd_addr_end(addr, end);
-			if (pgd_none(pgd))
-				goto slow;
-			if (!gup_pud_range(pgd, addr, next, write, pages, &nr))
-				goto slow;
-		} while (pgdp++, addr = next, addr != end);
-	}
-	local_irq_enable();
-
-	VM_BUG_ON(nr != (end - start) >> PAGE_SHIFT);
 	return nr;
+}
 
-	{
-		int ret;
+int get_user_pages_fast(unsigned long start, int nr_pages, int write,
+			struct page **pages)
+{
+	struct mm_struct *mm = current->mm;
+	int nr, ret;
 
-slow:
-		local_irq_enable();
-slow_irqon:
+	start &= PAGE_MASK;
+	nr = __get_user_pages_fast(start, nr_pages, write, pages);
+	ret = nr;
+
+	if (nr < nr_pages) {
 		pr_devel("  slow path ! nr = %d\n", nr);
 
 		/* Try to get the remaining pages with get_user_pages */
 		start += nr << PAGE_SHIFT;
 		pages += nr;
 
-		down_read(&mm->mmap_sem);
-		ret = get_user_pages(current, mm, start,
-			(end - start) >> PAGE_SHIFT, write, 0, pages, NULL);
-		up_read(&mm->mmap_sem);
+		ret = get_user_pages_unlocked(current, mm, start,
+					     nr_pages - nr,
+					     write, 0, pages);
 
 		/* Have to be a bit careful with return values */
 		if (nr > 0) {
@@ -311,9 +226,9 @@ slow_irqon:
 			else
 				ret += nr;
 		}
-
-		return ret;
 	}
+
+	return ret;
 }
 
 #endif /* __HAVE_ARCH_PTE_SPECIAL */

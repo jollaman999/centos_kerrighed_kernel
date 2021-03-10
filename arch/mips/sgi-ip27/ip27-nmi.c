@@ -3,7 +3,7 @@
 #include <linux/nodemask.h>
 #include <linux/spinlock.h>
 #include <linux/smp.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <asm/sn/types.h>
 #include <asm/sn/addrs.h>
 #include <asm/sn/nmi.h>
@@ -17,11 +17,10 @@
 #endif
 
 #define CNODEID_NONE (cnodeid_t)-1
-#define enter_panic_mode()	spin_lock(&nmi_lock)
 
 typedef unsigned long machreg_t;
 
-DEFINE_SPINLOCK(nmi_lock);
+static arch_spinlock_t nmi_lock = __ARCH_SPIN_LOCK_UNLOCKED;
 
 /*
  * Lets see what else we need to do here. Set up sp, gp?
@@ -55,7 +54,7 @@ void install_cpu_nmi_handler(int slice)
 void nmi_cpu_eframe_save(nasid_t nasid, int slice)
 {
 	struct reg_struct *nr;
-	int 		i;
+	int		i;
 
 	/* Get the pointer to the current cpu's register set. */
 	nr = (struct reg_struct *)
@@ -87,12 +86,12 @@ void nmi_cpu_eframe_save(nasid_t nasid, int slice)
 	printk("%s\n", print_tainted());
 	printk("ErrEPC: %016lx %pS\n", nr->error_epc, (void *) nr->error_epc);
 	printk("ra    : %016lx %pS\n", nr->gpr[31], (void *) nr->gpr[31]);
-	printk("Status: %08lx         ", nr->sr);
+	printk("Status: %08lx	      ", nr->sr);
 
 	if (nr->sr & ST0_KX)
 		printk("KX ");
 	if (nr->sr & ST0_SX)
-		printk("SX 	");
+		printk("SX	");
 	if (nr->sr & ST0_UX)
 		printk("UX ");
 
@@ -193,9 +192,9 @@ cont_nmi_dump(void)
 	atomic_inc(&nmied_cpus);
 #endif
 	/*
-	 * Use enter_panic_mode to allow only 1 cpu to proceed
+	 * Only allow 1 cpu to proceed
 	 */
-	enter_panic_mode();
+	arch_spin_lock(&nmi_lock);
 
 #ifdef REAL_NMI_SIGNAL
 	/*

@@ -2,8 +2,6 @@
 	- this file.
 README.cycladesZ
 	- info on Cyclades-Z firmware loading.
-computone.txt
-	- info on Computone Intelliport II/Plus Multiport Serial Driver.
 digiepca.txt
 	- info on Digi Intl. {PC,PCI,EISA}Xx and Xem series cards.
 hayes-esp.txt
@@ -14,6 +12,8 @@ riscom8.txt
 	- notes on using the RISCom/8 multi-port serial driver.
 rocket.txt
 	- info on the Comtrol RocketPort multiport serial driver.
+serial-rs485.txt
+	- info about RS485 structures and support in the kernel.
 specialix.txt
 	- info on hardware/driver for specialix IO8+ multiport serial card.
 stallion.txt

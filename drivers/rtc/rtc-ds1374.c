@@ -24,6 +24,8 @@
 #include <linux/rtc.h>
 #include <linux/bcd.h>
 #include <linux/workqueue.h>
+#include <linux/slab.h>
+#include <linux/pm.h>
 
 #define DS1374_REG_TOD0		0x00 /* Time of Day */
 #define DS1374_REG_TOD1		0x01
@@ -306,42 +308,25 @@ unlock:
 	mutex_unlock(&ds1374->mutex);
 }
 
-static int ds1374_ioctl(struct device *dev, unsigned int cmd, unsigned long arg)
+static int ds1374_alarm_irq_enable(struct device *dev, unsigned int enabled)
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct ds1374 *ds1374 = i2c_get_clientdata(client);
-	int ret = -ENOIOCTLCMD;
+	int ret;
 
 	mutex_lock(&ds1374->mutex);
 
-	switch (cmd) {
-	case RTC_AIE_OFF:
-		ret = i2c_smbus_read_byte_data(client, DS1374_REG_CR);
-		if (ret < 0)
-			goto out;
+	ret = i2c_smbus_read_byte_data(client, DS1374_REG_CR);
+	if (ret < 0)
+		goto out;
 
-		ret &= ~DS1374_REG_CR_WACE;
-
-		ret = i2c_smbus_write_byte_data(client, DS1374_REG_CR, ret);
-		if (ret < 0)
-			goto out;
-
-		break;
-
-	case RTC_AIE_ON:
-		ret = i2c_smbus_read_byte_data(client, DS1374_REG_CR);
-		if (ret < 0)
-			goto out;
-
+	if (enabled) {
 		ret |= DS1374_REG_CR_WACE | DS1374_REG_CR_AIE;
 		ret &= ~DS1374_REG_CR_WDALM;
-
-		ret = i2c_smbus_write_byte_data(client, DS1374_REG_CR, ret);
-		if (ret < 0)
-			goto out;
-
-		break;
+	} else {
+		ret &= ~DS1374_REG_CR_WACE;
 	}
+	ret = i2c_smbus_write_byte_data(client, DS1374_REG_CR, ret);
 
 out:
 	mutex_unlock(&ds1374->mutex);
@@ -353,7 +338,7 @@ static const struct rtc_class_ops ds1374_rtc_ops = {
 	.set_time = ds1374_set_time,
 	.read_alarm = ds1374_read_alarm,
 	.set_alarm = ds1374_set_alarm,
-	.ioctl = ds1374_ioctl,
+	.alarm_irq_enable = ds1374_alarm_irq_enable,
 };
 
 static int ds1374_probe(struct i2c_client *client,
@@ -362,7 +347,7 @@ static int ds1374_probe(struct i2c_client *client,
 	struct ds1374 *ds1374;
 	int ret;
 
-	ds1374 = kzalloc(sizeof(struct ds1374), GFP_KERNEL);
+	ds1374 = devm_kzalloc(&client->dev, sizeof(struct ds1374), GFP_KERNEL);
 	if (!ds1374)
 		return -ENOMEM;
 
@@ -374,38 +359,30 @@ static int ds1374_probe(struct i2c_client *client,
 
 	ret = ds1374_check_rtc_status(client);
 	if (ret)
-		goto out_free;
+		return ret;
 
 	if (client->irq > 0) {
-		ret = request_irq(client->irq, ds1374_irq, 0,
+		ret = devm_request_irq(&client->dev, client->irq, ds1374_irq, 0,
 		                  "ds1374", client);
 		if (ret) {
 			dev_err(&client->dev, "unable to request IRQ\n");
-			goto out_free;
+			return ret;
 		}
+
+		device_set_wakeup_capable(&client->dev, 1);
 	}
 
-	ds1374->rtc = rtc_device_register(client->name, &client->dev,
+	ds1374->rtc = devm_rtc_device_register(&client->dev, client->name,
 	                                  &ds1374_rtc_ops, THIS_MODULE);
 	if (IS_ERR(ds1374->rtc)) {
-		ret = PTR_ERR(ds1374->rtc);
 		dev_err(&client->dev, "unable to register the class device\n");
-		goto out_irq;
+		return PTR_ERR(ds1374->rtc);
 	}
 
 	return 0;
-
-out_irq:
-	if (client->irq > 0)
-		free_irq(client->irq, client);
-
-out_free:
-	i2c_set_clientdata(client, NULL);
-	kfree(ds1374);
-	return ret;
 }
 
-static int __devexit ds1374_remove(struct i2c_client *client)
+static int ds1374_remove(struct i2c_client *client)
 {
 	struct ds1374 *ds1374 = i2c_get_clientdata(client);
 
@@ -414,59 +391,47 @@ static int __devexit ds1374_remove(struct i2c_client *client)
 		ds1374->exiting = 1;
 		mutex_unlock(&ds1374->mutex);
 
-		free_irq(client->irq, client);
-		flush_scheduled_work();
+		devm_free_irq(&client->dev, client->irq, client);
+		cancel_work_sync(&ds1374->work);
 	}
 
-	rtc_device_unregister(ds1374->rtc);
-	i2c_set_clientdata(client, NULL);
-	kfree(ds1374);
 	return 0;
 }
 
-#ifdef CONFIG_PM
-static int ds1374_suspend(struct i2c_client *client, pm_message_t state)
+#ifdef CONFIG_PM_SLEEP
+static int ds1374_suspend(struct device *dev)
 {
+	struct i2c_client *client = to_i2c_client(dev);
+
 	if (client->irq >= 0 && device_may_wakeup(&client->dev))
 		enable_irq_wake(client->irq);
 	return 0;
 }
 
-static int ds1374_resume(struct i2c_client *client)
+static int ds1374_resume(struct device *dev)
 {
+	struct i2c_client *client = to_i2c_client(dev);
+
 	if (client->irq >= 0 && device_may_wakeup(&client->dev))
 		disable_irq_wake(client->irq);
 	return 0;
 }
-#else
-#define ds1374_suspend	NULL
-#define ds1374_resume	NULL
 #endif
+
+static SIMPLE_DEV_PM_OPS(ds1374_pm, ds1374_suspend, ds1374_resume);
 
 static struct i2c_driver ds1374_driver = {
 	.driver = {
 		.name = "rtc-ds1374",
 		.owner = THIS_MODULE,
+		.pm = &ds1374_pm,
 	},
 	.probe = ds1374_probe,
-	.suspend = ds1374_suspend,
-	.resume = ds1374_resume,
-	.remove = __devexit_p(ds1374_remove),
+	.remove = ds1374_remove,
 	.id_table = ds1374_id,
 };
 
-static int __init ds1374_init(void)
-{
-	return i2c_add_driver(&ds1374_driver);
-}
-
-static void __exit ds1374_exit(void)
-{
-	i2c_del_driver(&ds1374_driver);
-}
-
-module_init(ds1374_init);
-module_exit(ds1374_exit);
+module_i2c_driver(ds1374_driver);
 
 MODULE_AUTHOR("Scott Wood <scottwood@freescale.com>");
 MODULE_DESCRIPTION("Maxim/Dallas DS1374 RTC Driver");

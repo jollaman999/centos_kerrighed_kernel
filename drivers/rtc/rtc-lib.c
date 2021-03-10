@@ -13,7 +13,6 @@
 
 #include <linux/module.h>
 #include <linux/rtc.h>
-#include <linux/nospec.h>
 
 static const unsigned char rtc_days_in_month[] = {
 	31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
@@ -33,7 +32,6 @@ static const unsigned short rtc_ydays[2][13] = {
  */
 int rtc_month_days(unsigned int month, unsigned int year)
 {
-	month = array_index_nospec(month, ARRAY_SIZE(rtc_days_in_month));
 	return rtc_days_in_month[month] + (is_leap_year(year) && month == 1);
 }
 EXPORT_SYMBOL(rtc_month_days);
@@ -87,6 +85,8 @@ void rtc_time_to_tm(unsigned long time, struct rtc_time *tm)
 	time -= tm->tm_hour * 3600;
 	tm->tm_min = time / 60;
 	tm->tm_sec = time - tm->tm_min * 60;
+
+	tm->tm_isdst = 0;
 }
 EXPORT_SYMBOL(rtc_time_to_tm);
 
@@ -118,5 +118,33 @@ int rtc_tm_to_time(struct rtc_time *tm, unsigned long *time)
 	return 0;
 }
 EXPORT_SYMBOL(rtc_tm_to_time);
+
+/*
+ * Convert rtc_time to ktime
+ */
+ktime_t rtc_tm_to_ktime(struct rtc_time tm)
+{
+	time_t time;
+	rtc_tm_to_time(&tm, &time);
+	return ktime_set(time, 0);
+}
+EXPORT_SYMBOL_GPL(rtc_tm_to_ktime);
+
+/*
+ * Convert ktime to rtc_time
+ */
+struct rtc_time rtc_ktime_to_tm(ktime_t kt)
+{
+	struct timespec ts;
+	struct rtc_time ret;
+
+	ts = ktime_to_timespec(kt);
+	/* Round up any ns */
+	if (ts.tv_nsec)
+		ts.tv_sec++;
+	rtc_time_to_tm(ts.tv_sec, &ret);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(rtc_ktime_to_tm);
 
 MODULE_LICENSE("GPL");

@@ -16,6 +16,7 @@
 #include <linux/delay.h>
 #include <linux/ioc3.h>
 #include <linux/rwsem.h>
+#include <linux/slab.h>
 
 #define IOC3_PCI_SIZE 0x100000
 
@@ -574,9 +575,8 @@ void ioc3_unregister_submodule(struct ioc3_submodule *is)
  * Device management *
  *********************/
 
-static char *
-ioc3_class_names[]={"unknown", "IP27 BaseIO", "IP30 system", "MENET 1/2/3",
-			"MENET 4", "CADduo", "Altix Serial"};
+static char *ioc3_class_names[] = { "unknown", "IP27 BaseIO", "IP30 system",
+			"MENET 1/2/3", "MENET 4", "CADduo", "Altix Serial" };
 
 static int ioc3_class(struct ioc3_driver_data *idd)
 {
@@ -815,15 +815,15 @@ MODULE_DEVICE_TABLE(pci, ioc3_id_table);
  *********************/
 
 /* Module load */
-static int __devinit ioc3_init(void)
+static int __init ioc3_init(void)
 {
 	if (ia64_platform_is("sn2"))
 		return pci_register_driver(&ioc3_driver);
-	return 0;
+	return -ENODEV;
 }
 
 /* Module unload */
-static void __devexit ioc3_exit(void)
+static void __exit ioc3_exit(void)
 {
 	pci_unregister_driver(&ioc3_driver);
 }

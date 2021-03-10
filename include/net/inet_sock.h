@@ -31,6 +31,7 @@
 /** struct ip_options - IP Options
  *
  * @faddr - Saved first hop address
+ * @nexthop - Saved nexthop address in LSRR and SSRR
  * @is_data - Options in __data, rather than skb
  * @is_strictroute - Strict source route
  * @srr_is_hit - Packet destination addr was our one
@@ -41,6 +42,7 @@
  */
 struct ip_options {
 	__be32		faddr;
+	__be32		nexthop;
 	unsigned char	optlen;
 	unsigned char	srr;
 	unsigned char	rr;
@@ -53,16 +55,9 @@ struct ip_options {
 			ts_needaddr:1;
 	unsigned char	router_alert;
 	unsigned char	cipso;
-
-#ifndef __GENKSYMS__
-	unsigned char	rhel_alloc_flag:1;
-#else
 	unsigned char	__pad2;
-#endif
 	unsigned char	__data[0];
 };
-
-#define optlength(opt) (sizeof(struct ip_options) + opt->optlen)
 
 struct ip_options_rcu {
 	struct rcu_head rcu;
@@ -70,58 +65,21 @@ struct ip_options_rcu {
 };
 
 struct ip_options_data {
-	struct ip_options	opt;
+	struct ip_options_rcu	opt;
 	char			data[40];
 };
 
-static inline struct ip_options_rcu *get_ip_options_rcu(struct ip_options *opt)
-{
-	if (!opt)
-		return NULL;
-	/*
-	 * Warn if someone allocated opt directly without using
-	 * rhel_ip_options_set_alloc_flag().
-	 */
-	WARN_ON(!opt->rhel_alloc_flag);
-
-	return container_of(opt, struct ip_options_rcu, opt);
-}
-
-static inline void rhel_ip_options_set_alloc_flag(struct ip_options *opt)
-{
-	opt->rhel_alloc_flag = 1;
-}
-
-static inline struct ip_options *kmalloc_ip_options(size_t opt_len, gfp_t flags)
-{
-	struct ip_options_rcu *opt_rcu;
-
-	opt_rcu = kmalloc(sizeof(struct ip_options_rcu) + opt_len, flags);
-	if (!opt_rcu)
-		return NULL;
-	rhel_ip_options_set_alloc_flag(&opt_rcu->opt);
-	return &opt_rcu->opt;
-}
-
-static inline struct ip_options *kzalloc_ip_options(size_t opt_len, gfp_t flags)
-{
-	return kmalloc_ip_options(opt_len, flags | __GFP_ZERO);
-}
-
-static inline void kfree_ip_options(struct ip_options *opt)
-{
-	kfree(get_ip_options_rcu(opt));
-}
-
 struct inet_request_sock {
 	struct request_sock	req;
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
-	u16			inet6_rsk_offset;
-#endif
-	__be16			loc_port;
-	__be32			loc_addr;
-	__be32			rmt_addr;
-	__be16			rmt_port;
+#define ir_loc_addr		req.__req_common.skc_rcv_saddr
+#define ir_rmt_addr		req.__req_common.skc_daddr
+#define ir_num			req.__req_common.skc_num
+#define ir_rmt_port		req.__req_common.skc_dport
+#define ir_v6_rmt_addr		req.__req_common.skc_v6_daddr
+#define ir_v6_loc_addr		req.__req_common.skc_v6_rcv_saddr
+#define ir_iif			req.__req_common.skc_bound_dev_if
+#define ireq_family		req.__req_common.skc_family
+
 	kmemcheck_bitfield_begin(flags);
 	u16			snd_wscale : 4,
 				rcv_wscale : 4,
@@ -132,13 +90,34 @@ struct inet_request_sock {
 				acked	   : 1,
 				no_srccheck: 1;
 	kmemcheck_bitfield_end(flags);
-	struct ip_options	*opt;
+	union {
+		struct ip_options_rcu	*opt;
+		struct sk_buff		*pktopts;
+	};
 };
 
 static inline struct inet_request_sock *inet_rsk(const struct request_sock *sk)
 {
 	return (struct inet_request_sock *)sk;
 }
+
+struct inet_cork {
+	unsigned int		flags;
+	__be32			addr;
+	struct ip_options	*opt;
+	unsigned int		fragsize;
+	int			length; /* Total length of all frames */
+	struct dst_entry	*dst;
+	u8			tx_flags;
+	__u8			ttl;
+	__s16			tos;
+	char			priority;
+};
+
+struct inet_cork_full {
+	struct inet_cork	base;
+	struct flowi		fl;
+};
 
 struct ip_mc_socklist;
 struct ipv6_pinfo;
@@ -148,17 +127,18 @@ struct rtable;
  *
  * @sk - ancestor class
  * @pinet6 - pointer to IPv6 control block
- * @daddr - Foreign IPv4 addr
- * @rcv_saddr - Bound local IPv4 addr
- * @dport - Destination port
- * @num - Local port
- * @saddr - Sending source
+ * @inet_daddr - Foreign IPv4 addr
+ * @inet_rcv_saddr - Bound local IPv4 addr
+ * @inet_dport - Destination port
+ * @inet_num - Local port
+ * @inet_saddr - Sending source
  * @uc_ttl - Unicast TTL
- * @sport - Source port
- * @id - ID counter for DF pkts
+ * @inet_sport - Source port
+ * @inet_id - ID counter for DF pkts
  * @tos - TOS
  * @mc_ttl - Multicasting TTL
  * @is_icsk - is this an inet_connection_sock?
+ * @uc_index - Unicast outgoing device index
  * @mc_index - Multicast device index
  * @mc_list - Group array
  * @cork - info to build ip hdr on each ip frag while socket is corked
@@ -166,21 +146,25 @@ struct rtable;
 struct inet_sock {
 	/* sk and pinet6 has to be the first two members of inet_sock */
 	struct sock		sk;
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
+#if IS_ENABLED(CONFIG_IPV6)
 	struct ipv6_pinfo	*pinet6;
 #endif
 	/* Socket demultiplex comparisons on incoming packets. */
-	__be32			daddr;
-	__be32			rcv_saddr;
-	__be16			dport;
-	__u16			num;
-	__be32			saddr;
+#define inet_daddr		sk.__sk_common.skc_daddr
+#define inet_rcv_saddr		sk.__sk_common.skc_rcv_saddr
+#define inet_dport		sk.__sk_common.skc_dport
+#define inet_num		sk.__sk_common.skc_num
+
+	__be32			inet_saddr;
 	__s16			uc_ttl;
 	__u16			cmsg_flags;
-	struct ip_options	*opt;
-	__be16			sport;
-	__u16			id;
+	__be16			inet_sport;
+	__u16			inet_id;
+
+	struct ip_options_rcu __rcu	*inet_opt;
+	int			rx_dst_ifindex;
 	__u8			tos;
+	__u8			min_ttl;
 	__u8			mc_ttl;
 	__u8			pmtudisc;
 	__u8			recverr:1,
@@ -189,30 +173,57 @@ struct inet_sock {
 				hdrincl:1,
 				mc_loop:1,
 				transparent:1,
-				mc_all:1;
+				mc_all:1,
+				nodefrag:1;
+	__u8			bind_address_no_port:1;
+	__u8			rcv_tos;
+	__u8			convert_csum;
+	int			uc_index;
 	int			mc_index;
 	__be32			mc_addr;
-	struct ip_mc_socklist	*mc_list;
-	struct {
-		unsigned int		flags;
-		unsigned int		fragsize;
-		struct ip_options	*opt;
-		struct dst_entry	*dst;
-		int			length; /* Total length of all frames */
-		__be32			addr;
-		struct flowi		fl;
-	} cork;
+	struct ip_mc_socklist __rcu	*mc_list;
+	struct inet_cork_full	cork;
 };
-
-static inline __u32 inet_sk_rxhash(struct sock *sk)
-{
-	struct sock_extended *ske = sk_extended(sk);
-
-	return ske->inet_sock_extended.rxhash;
-}
 
 #define IPCORK_OPT	1	/* ip-options has been held in ipcork.opt */
 #define IPCORK_ALLFRAG	2	/* always fragment (for ipv6 for now) */
+
+/**
+ * sk_to_full_sk - Access to a full socket
+ * @sk: pointer to a socket
+ *
+ * SYNACK messages might be attached to request sockets.
+ * Some places want to reach the listener in this case.
+ */
+static inline struct sock *sk_to_full_sk(struct sock *sk)
+{
+#ifdef CONFIG_INET
+	/* RHEL7 note: it doesn't attach SYNACK messages to request
+	 * sockets instead of listener.
+	 * if (sk && sk->sk_state == TCP_NEW_SYN_RECV)
+	 *	sk = inet_reqsk(sk)->rsk_listener;
+	 */
+#endif
+	return sk;
+}
+
+/* sk_to_full_sk() variant with a const argument */
+static inline const struct sock *sk_const_to_full_sk(const struct sock *sk)
+{
+#ifdef CONFIG_INET
+	/* RHEL7 note: it doesn't attach SYNACK messages to request
+	 * sockets instead of listener.
+	 * if (sk && sk->sk_state == TCP_NEW_SYN_RECV)
+	 * 	sk = ((const struct request_sock *)sk)->rsk_listener;
+	 */
+#endif
+	return sk;
+}
+
+static inline struct sock *skb_to_full_sk(const struct sk_buff *skb)
+{
+	return sk_to_full_sk(skb->sk);
+}
 
 static inline struct inet_sock *inet_sk(const struct sock *sk)
 {
@@ -226,7 +237,7 @@ static inline void __inet_sk_copy_descendant(struct sock *sk_to,
 	memcpy(inet_sk(sk_to) + 1, inet_sk(sk_from) + 1,
 	       sk_from->sk_prot->obj_size - ancestor_size);
 }
-#if !(defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE))
+#if !(IS_ENABLED(CONFIG_IPV6))
 static inline void inet_sk_copy_descendant(struct sock *sk_to,
 					   const struct sock *sk_from)
 {
@@ -234,31 +245,18 @@ static inline void inet_sk_copy_descendant(struct sock *sk_to,
 }
 #endif
 
-extern int inet_sk_rebuild_header(struct sock *sk);
+int inet_sk_rebuild_header(struct sock *sk);
 
-extern u32 inet_ehash_secret;
-extern void build_ehash_secret(void);
-
-static inline unsigned int inet_ehashfn(struct net *net,
-					const __be32 laddr, const __u16 lport,
-					const __be32 faddr, const __be16 fport)
+static inline unsigned int __inet_ehashfn(const __be32 laddr,
+					  const __u16 lport,
+					  const __be32 faddr,
+					  const __be16 fport,
+					  u32 initval)
 {
 	return jhash_3words((__force __u32) laddr,
 			    (__force __u32) faddr,
 			    ((__u32) lport) << 16 | (__force __u32)fport,
-			    inet_ehash_secret + net_hash_mix(net));
-}
-
-static inline int inet_sk_ehashfn(const struct sock *sk)
-{
-	const struct inet_sock *inet = inet_sk(sk);
-	const __be32 laddr = inet->rcv_saddr;
-	const __u16 lport = inet->num;
-	const __be32 faddr = inet->daddr;
-	const __be16 fport = inet->dport;
-	struct net *net = sock_net(sk);
-
-	return inet_ehashfn(net, laddr, lport, faddr, fport);
+			    initval);
 }
 
 static inline struct request_sock *inet_reqsk_alloc(struct request_sock_ops *ops)
@@ -276,36 +274,27 @@ static inline struct request_sock *inet_reqsk_alloc(struct request_sock_ops *ops
 
 static inline __u8 inet_sk_flowi_flags(const struct sock *sk)
 {
-	return inet_sk(sk)->transparent ? FLOWI_FLAG_ANYSRC : 0;
+	__u8 flags = 0;
+
+	if (inet_sk(sk)->transparent || inet_sk(sk)->hdrincl)
+		flags |= FLOWI_FLAG_ANYSRC;
+	return flags;
 }
 
-static inline void inet_rps_record_flow(struct sock *sk)
+static inline void inet_inc_convert_csum(struct sock *sk)
 {
-	struct rps_sock_flow_table *sock_flow_table;
-
-	rcu_read_lock();
-	sock_flow_table = rcu_dereference(rps_sock_flow_table);
-	rps_record_sock_flow(sock_flow_table, inet_sk_rxhash(sk));
-	rcu_read_unlock();
+	inet_sk(sk)->convert_csum++;
 }
 
-static inline void inet_rps_reset_flow(struct sock *sk)
+static inline void inet_dec_convert_csum(struct sock *sk)
 {
-	struct rps_sock_flow_table *sock_flow_table;
-
-	rcu_read_lock();
-	sock_flow_table = rcu_dereference(rps_sock_flow_table);
-	rps_reset_sock_flow(sock_flow_table, inet_sk_rxhash(sk));
-	rcu_read_unlock();
+	if (inet_sk(sk)->convert_csum > 0)
+		inet_sk(sk)->convert_csum--;
 }
 
-static inline void inet_rps_save_rxhash(struct sock *sk, u32 rxhash)
+static inline bool inet_get_convert_csum(struct sock *sk)
 {
-	struct sock_extended *ske = sk_extended(sk);
-
-	if (unlikely(ske->inet_sock_extended.rxhash != rxhash)) {
-		inet_rps_reset_flow(sk);
-		ske->inet_sock_extended.rxhash = rxhash;
-	}
+	return !!inet_sk(sk)->convert_csum;
 }
+
 #endif	/* _INET_SOCK_H */

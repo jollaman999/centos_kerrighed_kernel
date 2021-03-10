@@ -116,7 +116,7 @@ u8 tfrc_lh_update_i_mean(struct tfrc_loss_hist *lh, struct sk_buff *skb)
 	cur->li_length = len;
 	tfrc_lh_calc_i_mean(lh);
 
-	return (lh->i_mean < old_i_mean);
+	return lh->i_mean < old_i_mean;
 }
 
 /* Determine if `new_loss' does begin a new loss interval [RFC 4342, 10.2] */
@@ -133,6 +133,7 @@ static inline u8 tfrc_lh_is_new_loss(struct tfrc_loss_interval *cur,
  * @rh:		   Receive history containing a fresh loss event
  * @calc_first_li: Caller-dependent routine to compute length of first interval
  * @sk:		   Used by @calc_first_li in caller-specific way (subtyping)
+ *
  * Updates I_mean and returns 1 if a new interval has in fact been added to @lh.
  */
 int tfrc_lh_interval_add(struct tfrc_loss_hist *lh, struct tfrc_rx_hist *rh,

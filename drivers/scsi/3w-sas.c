@@ -50,7 +50,7 @@
 
    History
    -------
-   3.26.00.000 - Initial driver release.
+   3.26.02.000 - Initial driver release.
 */
 
 #include <linux/module.h>
@@ -64,7 +64,7 @@
 #include <linux/pci.h>
 #include <linux/time.h>
 #include <linux/mutex.h>
-#include <linux/smp_lock.h>
+#include <linux/slab.h>
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/uaccess.h>
@@ -75,7 +75,8 @@
 #include "3w-sas.h"
 
 /* Globals */
-#define TW_DRIVER_VERSION "3.26.00.028-2.6.32RH"
+#define TW_DRIVER_VERSION "3.26.02.000"
+static DEFINE_MUTEX(twl_chrdev_mutex);
 static TW_Device_Extension *twl_device_extension_list[TW_MAX_SLOT];
 static unsigned int twl_device_extension_count;
 static int twl_major = -1;
@@ -87,7 +88,7 @@ MODULE_DESCRIPTION ("LSI 3ware SAS/SATA-RAID Linux Driver");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(TW_DRIVER_VERSION);
 
-static int use_msi = 0;
+static int use_msi;
 module_param(use_msi, int, S_IRUGO);
 MODULE_PARM_DESC(use_msi, "Use Message Signaled Interrupts. Default: 0");
 
@@ -122,7 +123,7 @@ static struct bin_attribute twl_sysfs_aen_read_attr = {
 	.attr = {
 		.name = "3ware_aen_read",
 		.mode = S_IRUSR,
-	},
+	}, 
 	.size = 0,
 	.read = twl_sysfs_aen_read
 };
@@ -153,7 +154,7 @@ static struct bin_attribute twl_sysfs_compat_info_attr = {
 	.attr = {
 		.name = "3ware_compat_info",
 		.mode = S_IRUSR,
-	},
+	}, 
 	.size = 0,
 	.read = twl_sysfs_compat_info
 };
@@ -176,7 +177,7 @@ static ssize_t twl_show_stats(struct device *dev,
 		       "Last sector count:         %4d\n"
 		       "Max sector count:          %4d\n"
 		       "SCSI Host Resets:          %4d\n"
-		       "AEN's:                     %4d\n",
+		       "AEN's:                     %4d\n", 
 		       TW_DRIVER_VERSION,
 		       tw_dev->posted_request_count,
 		       tw_dev->max_posted_request_count,
@@ -302,26 +303,6 @@ static int twl_post_command_packet(TW_Device_Extension *tw_dev, int request_id)
 	return 0;
 } /* End twl_post_command_packet() */
 
-/* This function will perform a pci-dma mapping for a scatter gather list */
-static int twl_map_scsi_sg_data(TW_Device_Extension *tw_dev, int request_id)
-{
-	int use_sg;
-	struct scsi_cmnd *cmd = tw_dev->srb[request_id];
-
-	use_sg = scsi_dma_map(cmd);
-	if (!use_sg)
-		return 0;
-	else if (use_sg < 0) {
-		TW_PRINTK(tw_dev->host, TW_DRIVER, 0x1, "Failed to map scatter gather list");
-		return 0;
-	}
-
-	cmd->SCp.phase = TW_PHASE_SGLIST;
-	cmd->SCp.have_data_in = use_sg;
-
-	return use_sg;
-} /* End twl_map_scsi_sg_data() */
-
 /* This function hands scsi cdb's to the firmware */
 static int twl_scsiop_execute_scsi(TW_Device_Extension *tw_dev, int request_id, char *cdb, int use_sg, TW_SG_Entry_ISO *sglistarg)
 {
@@ -369,8 +350,8 @@ static int twl_scsiop_execute_scsi(TW_Device_Extension *tw_dev, int request_id, 
 	if (!sglistarg) {
 		/* Map sglist from scsi layer to cmd packet */
 		if (scsi_sg_count(srb)) {
-			sg_count = twl_map_scsi_sg_data(tw_dev, request_id);
-			if (sg_count == 0)
+			sg_count = scsi_dma_map(srb);
+			if (sg_count <= 0)
 				goto out;
 
 			scsi_for_each_sg(srb, sg, sg_count, i) {
@@ -467,7 +448,7 @@ static void twl_aen_sync_time(TW_Device_Extension *tw_dev, int request_id)
 	param->parameter_id = cpu_to_le16(0x3); /* SchedulerTime */
 	param->parameter_size_bytes = cpu_to_le16(4);
 
-	/* Convert system time in UTC to local time seconds since last
+	/* Convert system time in UTC to local time seconds since last 
            Sunday 12:00AM */
 	do_gettimeofday(&utc);
 	local_time = (u32)(utc.tv_sec - (sys_tz.tz_minuteswest * 60));
@@ -584,7 +565,7 @@ static int twl_poll_response(TW_Device_Extension *tw_dev, int request_id, int se
 		msleep(50);
 	}
 	retval = 0;
-out:
+out: 
 	return retval;
 } /* End twl_poll_response() */
 
@@ -749,18 +730,21 @@ static void twl_load_sgl(TW_Device_Extension *tw_dev, TW_Command_Full *full_comm
 
 /* This function handles ioctl for the character device
    This interface is used by smartmontools open source software */
-static int twl_chrdev_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg)
+static long twl_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	long timeout;
 	unsigned long *cpu_addr, data_buffer_length_adjusted = 0, flags = 0;
 	dma_addr_t dma_handle;
 	int request_id = 0;
 	TW_Ioctl_Driver_Command driver_command;
+	struct inode *inode = file_inode(file);
 	TW_Ioctl_Buf_Apache *tw_ioctl;
 	TW_Command_Full *full_command_packet;
 	TW_Device_Extension *tw_dev = twl_device_extension_list[iminor(inode)];
 	int retval = -EFAULT;
 	void __user *argp = (void __user *)arg;
+
+	mutex_lock(&twl_chrdev_mutex);
 
 	/* Only let one of these through at a time */
 	if (mutex_lock_interruptible(&tw_dev->ioctl_lock)) {
@@ -835,7 +819,7 @@ static int twl_chrdev_ioctl(struct inode *inode, struct file *file, unsigned int
 
 		/* Now copy in the command packet response */
 		memcpy(&(tw_ioctl->firmware_command), tw_dev->command_packet_virt[request_id], sizeof(TW_Command_Full));
-
+		
 		/* Now complete the io */
 		spin_lock_irqsave(tw_dev->host->host_lock, flags);
 		tw_dev->posted_request_count--;
@@ -857,6 +841,7 @@ out3:
 out2:
 	mutex_unlock(&tw_dev->ioctl_lock);
 out:
+	mutex_unlock(&twl_chrdev_mutex);
 	return retval;
 } /* End twl_chrdev_ioctl() */
 
@@ -871,7 +856,6 @@ static int twl_chrdev_open(struct inode *inode, struct file *file)
 		goto out;
 	}
 
-	cycle_kernel_lock();
 	minor_number = iminor(inode);
 	if (minor_number >= twl_device_extension_count)
 		goto out;
@@ -883,9 +867,10 @@ out:
 /* File operations struct for character device */
 static const struct file_operations twl_fops = {
 	.owner		= THIS_MODULE,
-	.ioctl		= twl_chrdev_ioctl,
+	.unlocked_ioctl	= twl_chrdev_ioctl,
 	.open		= twl_chrdev_open,
-	.release	= NULL
+	.release	= NULL,
+	.llseek		= noop_llseek,
 };
 
 /* This function passes sense data from firmware to scsi layer */
@@ -911,7 +896,7 @@ static int twl_fill_sense(TW_Device_Extension *tw_dev, int i, int request_id, in
 			       tw_dev->host->host_no,
 			       TW_MESSAGE_SOURCE_CONTROLLER_ERROR,
 			       header->status_block.error,
-			       error_str,
+			       error_str, 
 			       header->err_specific_desc);
 		else
 			printk(KERN_WARNING "3w-sas: ERROR: (0x%02X:0x%04X): %s:%s.\n",
@@ -1000,14 +985,14 @@ static void *twl_get_param(TW_Device_Extension *tw_dev, int request_id, int tabl
 
 /* This function will send an initconnection command to controller */
 static int twl_initconnection(TW_Device_Extension *tw_dev, int message_credits,
- 			      u32 set_features, unsigned short current_fw_srl,
-			      unsigned short current_fw_arch_id,
-			      unsigned short current_fw_branch,
-			      unsigned short current_fw_build,
-			      unsigned short *fw_on_ctlr_srl,
-			      unsigned short *fw_on_ctlr_arch_id,
-			      unsigned short *fw_on_ctlr_branch,
-			      unsigned short *fw_on_ctlr_build,
+ 			      u32 set_features, unsigned short current_fw_srl, 
+			      unsigned short current_fw_arch_id, 
+			      unsigned short current_fw_branch, 
+			      unsigned short current_fw_build, 
+			      unsigned short *fw_on_ctlr_srl, 
+			      unsigned short *fw_on_ctlr_arch_id, 
+			      unsigned short *fw_on_ctlr_branch, 
+			      unsigned short *fw_on_ctlr_build, 
 			      u32 *init_connect_result)
 {
 	TW_Command_Full *full_command_packet;
@@ -1018,7 +1003,7 @@ static int twl_initconnection(TW_Device_Extension *tw_dev, int message_credits,
 	full_command_packet = tw_dev->command_packet_virt[request_id];
 	memset(full_command_packet, 0, sizeof(TW_Command_Full));
 	full_command_packet->header.header_desc.size_header = 128;
-
+	
 	tw_initconnect = (TW_Initconnect *)&full_command_packet->command.oldcommand;
 	tw_initconnect->opcode__reserved = TW_OPRES_IN(0, TW_OP_INIT_CONNECTION);
 	tw_initconnect->request_id = request_id;
@@ -1036,7 +1021,7 @@ static int twl_initconnection(TW_Device_Extension *tw_dev, int message_credits,
 		tw_initconnect->fw_arch_id = cpu_to_le16(current_fw_arch_id);
 		tw_initconnect->fw_branch = cpu_to_le16(current_fw_branch);
 		tw_initconnect->fw_build = cpu_to_le16(current_fw_build);
-	} else
+	} else 
 		tw_initconnect->size = TW_INIT_COMMAND_PACKET_SIZE;
 
 	/* Send command packet to the board */
@@ -1110,15 +1095,6 @@ static int twl_initialize_device_extension(TW_Device_Extension *tw_dev)
 out:
 	return retval;
 } /* End twl_initialize_device_extension() */
-
-/* This function will perform a pci-dma unmap */
-static void twl_unmap_scsi_data(TW_Device_Extension *tw_dev, int request_id)
-{
-	struct scsi_cmnd *cmd = tw_dev->srb[request_id];
-
-	if (cmd->SCp.phase == TW_PHASE_SGLIST)
-		scsi_dma_unmap(cmd);
-} /* End twl_unmap_scsi_data() */
 
 /* This function will handle attention interrupts */
 static int twl_handle_attention_interrupt(TW_Device_Extension *tw_dev)
@@ -1252,7 +1228,7 @@ static irqreturn_t twl_interrupt(int irq, void *dev_instance)
 
 			if (!error)
 				cmd->result = (DID_OK << 16);
-
+			
 			/* Report residual bytes for single sgl */
 			if ((scsi_sg_count(cmd) <= 1) && (full_command_packet->command.newcommand.status == 0)) {
 				if (full_command_packet->command.newcommand.sg_list[0].length < scsi_bufflen(tw_dev->srb[request_id]))
@@ -1260,11 +1236,11 @@ static irqreturn_t twl_interrupt(int irq, void *dev_instance)
 			}
 
 			/* Now complete the io */
+			scsi_dma_unmap(cmd);
+			cmd->scsi_done(cmd);
 			tw_dev->state[request_id] = TW_S_COMPLETED;
 			twl_free_request_id(tw_dev, request_id);
 			tw_dev->posted_request_count--;
-			tw_dev->srb[request_id]->scsi_done(tw_dev->srb[request_id]);
-			twl_unmap_scsi_data(tw_dev, request_id);
 		}
 
 		/* Check for another response interrupt */
@@ -1409,10 +1385,12 @@ static int twl_reset_device_extension(TW_Device_Extension *tw_dev, int ioctl_res
 		if ((tw_dev->state[i] != TW_S_FINISHED) &&
 		    (tw_dev->state[i] != TW_S_INITIAL) &&
 		    (tw_dev->state[i] != TW_S_COMPLETED)) {
-			if (tw_dev->srb[i]) {
-				tw_dev->srb[i]->result = (DID_RESET << 16);
-				tw_dev->srb[i]->scsi_done(tw_dev->srb[i]);
-				twl_unmap_scsi_data(tw_dev, i);
+			struct scsi_cmnd *cmd = tw_dev->srb[i];
+
+			if (cmd) {
+				cmd->result = (DID_RESET << 16);
+				scsi_dma_unmap(cmd);
+				cmd->scsi_done(cmd);
 			}
 		}
 	}
@@ -1446,7 +1424,7 @@ out:
 /* This funciton returns unit geometry in cylinders/heads/sectors */
 static int twl_scsi_biosparam(struct scsi_device *sdev, struct block_device *bdev, sector_t capacity, int geom[])
 {
-	int heads, sectors, cylinders;
+	int heads, sectors;
 	TW_Device_Extension *tw_dev;
 
 	tw_dev = (TW_Device_Extension *)sdev->host->hostdata;
@@ -1454,16 +1432,14 @@ static int twl_scsi_biosparam(struct scsi_device *sdev, struct block_device *bde
 	if (capacity >= 0x200000) {
 		heads = 255;
 		sectors = 63;
-		cylinders = sector_div(capacity, heads * sectors);
 	} else {
 		heads = 64;
 		sectors = 32;
-		cylinders = sector_div(capacity, heads * sectors);
 	}
 
 	geom[0] = heads;
 	geom[1] = sectors;
-	geom[2] = cylinders;
+	geom[2] = sector_div(capacity, heads * sectors); /* cylinders */
 
 	return 0;
 } /* End twl_scsi_biosparam() */
@@ -1498,7 +1474,7 @@ out:
 } /* End twl_scsi_eh_reset() */
 
 /* This is the main scsi queue function to handle scsi opcodes */
-static int twl_scsi_queue(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd *))
+static int twl_scsi_queue_lck(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd *))
 {
 	int request_id, retval;
 	TW_Device_Extension *tw_dev = (TW_Device_Extension *)SCpnt->device->host->hostdata;
@@ -1511,15 +1487,12 @@ static int twl_scsi_queue(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd
 
 	/* Save done function into scsi_cmnd struct */
 	SCpnt->scsi_done = done;
-
+		
 	/* Get a free request id */
 	twl_get_request_id(tw_dev, &request_id);
 
 	/* Save the scsi command for use by the ISR */
 	tw_dev->srb[request_id] = SCpnt;
-
-	/* Initialize phase to zero */
-	SCpnt->SCp.phase = TW_PHASE_INITIAL;
 
 	retval = twl_scsiop_execute_scsi(tw_dev, request_id, NULL, 0, NULL);
 	if (retval) {
@@ -1532,6 +1505,8 @@ static int twl_scsi_queue(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd
 out:
 	return retval;
 } /* End twl_scsi_queue() */
+
+static DEF_SCSI_QCMD(twl_scsi_queue)
 
 /* This function tells the controller to shut down */
 static void __twl_shutdown(TW_Device_Extension *tw_dev)
@@ -1566,7 +1541,7 @@ static void twl_shutdown(struct pci_dev *pdev)
 
 	tw_dev = (TW_Device_Extension *)host->hostdata;
 
-	if (tw_dev->online)
+	if (tw_dev->online) 
 		__twl_shutdown(tw_dev);
 } /* End twl_shutdown() */
 
@@ -1595,15 +1570,15 @@ static struct scsi_host_template driver_template = {
 	.cmd_per_lun		= TW_MAX_CMDS_PER_LUN,
 	.use_clustering		= ENABLE_CLUSTERING,
 	.shost_attrs		= twl_host_attrs,
-	.emulated		= 1
+	.emulated		= 1,
+	.no_write_same		= 1,
 };
 
 /* This function will probe and initialize a card */
-static int __devinit twl_probe(struct pci_dev *pdev, const struct pci_device_id *dev_id)
+static int twl_probe(struct pci_dev *pdev, const struct pci_device_id *dev_id)
 {
 	struct Scsi_Host *host = NULL;
 	TW_Device_Extension *tw_dev;
-	resource_size_t mem_addr, mem_len;
 	int retval = -ENODEV;
 	int *ptr_phycount, phycount=0;
 
@@ -1631,7 +1606,7 @@ static int __devinit twl_probe(struct pci_dev *pdev, const struct pci_device_id 
 		retval = -ENOMEM;
 		goto out_disable_device;
 	}
-	tw_dev = (TW_Device_Extension *)host->hostdata;
+	tw_dev = shost_priv(host);
 
 	/* Save values to device extension */
 	tw_dev->host = host;
@@ -1649,13 +1624,8 @@ static int __devinit twl_probe(struct pci_dev *pdev, const struct pci_device_id 
 		goto out_free_device_extension;
 	}
 
-	/* Use region 1 */
-	mem_addr = pci_resource_start(pdev, 1);
-	mem_len = pci_resource_len(pdev, 1);
-
-	/* Save base address */
-	tw_dev->base_addr = ioremap(mem_addr, mem_len);
-
+	/* Save base address, use region 1 */
+	tw_dev->base_addr = pci_iomap(pdev, 1, 0);
 	if (!tw_dev->base_addr) {
 		TW_PRINTK(tw_dev->host, TW_DRIVER, 0x1c, "Failed to ioremap");
 		goto out_release_mem_region;
@@ -1689,7 +1659,7 @@ static int __devinit twl_probe(struct pci_dev *pdev, const struct pci_device_id 
 	       host->host_no,
 	       (char *)twl_get_param(tw_dev, 1, TW_VERSION_TABLE,
 				     TW_PARAM_MODEL, TW_PARAM_MODEL_LENGTH),
-	       (u64)mem_addr, pdev->irq);
+	       (u64)pci_resource_start(pdev, 1), pdev->irq);
 
 	ptr_phycount = twl_get_param(tw_dev, 2, TW_PARAM_PHY_SUMMARY_TABLE,
 				     TW_PARAM_PHYCOUNT, TW_PARAM_PHYCOUNT_LENGTH);
@@ -1720,7 +1690,7 @@ static int __devinit twl_probe(struct pci_dev *pdev, const struct pci_device_id 
 
 	/* Re-enable interrupts on the card */
 	TWL_UNMASK_INTERRUPTS(tw_dev);
-
+	
 	/* Finally, scan the host */
 	scsi_scan_host(host);
 
@@ -1894,9 +1864,8 @@ out_disable_device:
 #endif
 
 /* PCI Devices supported by this driver */
-static struct pci_device_id twl_pci_tbl[] __devinitdata = {
-	{ PCI_VENDOR_ID_3WARE, PCI_DEVICE_ID_3WARE_9750,
-	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0},
+static struct pci_device_id twl_pci_tbl[] = {
+	{ PCI_VDEVICE(3WARE, PCI_DEVICE_ID_3WARE_9750) },
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, twl_pci_tbl);
@@ -1917,7 +1886,7 @@ static struct pci_driver twl_driver = {
 /* This function is called on driver initialization */
 static int __init twl_init(void)
 {
-	printk(KERN_WARNING "LSI 3ware SAS/SATA-RAID Controller device driver for Linux v%s.\n", TW_DRIVER_VERSION);
+	printk(KERN_INFO "LSI 3ware SAS/SATA-RAID Controller device driver for Linux v%s.\n", TW_DRIVER_VERSION);
 
 	return pci_register_driver(&twl_driver);
 } /* End twl_init() */

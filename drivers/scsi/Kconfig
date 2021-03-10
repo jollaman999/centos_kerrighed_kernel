@@ -1,9 +1,15 @@
 menu "SCSI device support"
 
+config SCSI_MOD
+       tristate
+       default y if SCSI=n || SCSI=y
+       default m if SCSI=m
+
 config RAID_ATTRS
 	tristate "RAID Transport Class"
 	default n
 	depends on BLOCK
+	depends on SCSI_MOD
 	---help---
 	  Provides RAID
 
@@ -11,6 +17,7 @@ config SCSI
 	tristate "SCSI device support"
 	depends on BLOCK
 	select SCSI_DMA if HAS_DMA
+	select SG_POOL
 	---help---
 	  If you want to use a SCSI hard disk, SCSI tape drive, SCSI CD-ROM or
 	  any other SCSI device under Linux, say Y and make sure that you know
@@ -36,7 +43,7 @@ config SCSI_DMA
 
 config SCSI_TGT
 	tristate "SCSI target support"
-	depends on SCSI && EXPERIMENTAL
+	depends on SCSI
 	---help---
 	  If you want to use SCSI target mode drivers enable this option.
 	  If you choose M, the module will be called scsi_tgt.
@@ -110,7 +117,7 @@ config CHR_DEV_OSST
 	  <http://www.tldp.org/docs.html#howto>  and
 	  <file:Documentation/scsi/osst.txt>  in the kernel source.
 	  More info on the OnStream driver may be found on
-	  <http://linux1.onstream.nl/test/>
+	  <http://sourceforge.net/projects/osst/>
 	  Please also have a look at the standard st docu, as most of it
 	  applies to osst as well.
 
@@ -150,9 +157,9 @@ config CHR_DEV_SG
 	  directly, so you need some additional software which knows how to
 	  talk to these devices using the SCSI protocol:
 
-	  For scanners, look at SANE (<http://www.mostang.com/sane/>). For CD
+	  For scanners, look at SANE (<http://www.sane-project.org/>). For CD
 	  writer software look at Cdrtools
-	  (<http://www.fokus.gmd.de/research/cc/glone/employees/joerg.schilling/private/cdrecord.html>)
+	  (<http://cdrecord.berlios.de/private/cdrecord.html>)
 	  and for burning a "disk at once": CDRDAO
 	  (<http://cdrdao.sourceforge.net/>). Cdparanoia is a high
 	  quality digital reader of audio CDs (<http://www.xiph.org/paranoia/>).
@@ -185,6 +192,7 @@ config CHR_DEV_SCH
 config SCSI_ENCLOSURE
 	tristate "SCSI Enclosure Support"
 	depends on SCSI && ENCLOSURE_SERVICES
+	depends on m || SCSI_SAS_ATTRS != m
 	help
 	  Enclosures are devices sitting on or in SCSI backplanes that
 	  manage devices.  If you have a disk cage, the chances are that
@@ -206,12 +214,12 @@ config SCSI_MULTI_LUN
 	  multiple LUNs.
 
 config SCSI_CONSTANTS
-	bool "Verbose SCSI error reporting (kernel size +=12K)"
+	bool "Verbose SCSI error reporting (kernel size +=75K)"
 	depends on SCSI
 	help
 	  The error messages regarding your SCSI hardware will be easier to
 	  understand if you say Y here; it will enlarge your kernel by about
-	  12 KB. If in doubt, say Y.
+	  75 KB. If in doubt, say Y.
 
 config SCSI_LOGGING
 	bool "SCSI logging facility"
@@ -247,32 +255,8 @@ config SCSI_SCAN_ASYNC
 	  system continues booting, and even probe devices on different
 	  busses in parallel, leading to a significant speed-up.
 
-	  If you have built SCSI as modules, enabling this option can
-	  be a problem as the devices may not have been found by the
-	  time your system expects them to have been.  You can load the
-	  scsi_wait_scan module to ensure that all scans have completed.
-	  If you build your SCSI drivers into the kernel, then everything
-	  will work fine if you say Y here.
-
 	  You can override this choice by specifying "scsi_mod.scan=sync"
 	  or async on the kernel's command line.
-
-config SCSI_WAIT_SCAN
-	tristate  # No prompt here, this is an invisible symbol.
-	default m
-	depends on SCSI
-	depends on MODULES
-# scsi_wait_scan is a loadable module which waits until all the async scans are
-# complete.  The idea is to use it in initrd/ initramfs scripts.  You modprobe
-# it after all the modprobes of the root SCSI drivers and it will wait until
-# they have all finished scanning their buses before allowing the boot to
-# proceed.  (This method is not applicable if targets boot independently in
-# parallel with the initiator, or with transports with non-deterministic target
-# discovery schemes, or if a transport driver does not support scsi_wait_scan.)
-#
-# This symbol is not exposed as a prompt because little is to be gained by
-# disabling it, whereas people who accidentally switch it off may wonder why
-# their mkinitrd gets into trouble.
 
 menu "SCSI Transports"
 	depends on SCSI
@@ -311,7 +295,8 @@ config SCSI_ISCSI_ATTRS
 
 config SCSI_SAS_ATTRS
 	tristate "SAS Transport Attributes"
-	depends on SCSI && BLK_DEV_BSG
+	depends on SCSI
+	select BLK_DEV_BSG
 	help
 	  If you wish to export transport-specific information about
 	  each attached SAS device to sysfs, say Y.
@@ -377,6 +362,7 @@ source "drivers/scsi/cxgbi/Kconfig"
 source "drivers/scsi/bnx2i/Kconfig"
 source "drivers/scsi/bnx2fc/Kconfig"
 source "drivers/scsi/be2iscsi/Kconfig"
+source "drivers/scsi/cxlflash/Kconfig"
 
 config SGIWD93_SCSI
 	tristate "SGI WD93C93 SCSI Driver"
@@ -402,6 +388,7 @@ config SCSI_HPSA
 	tristate "HP Smart Array SCSI driver"
 	depends on PCI && SCSI
 	select CHECK_SIGNATURE
+	select SCSI_SAS_ATTRS
 	help
 	  This driver supports HP Smart Array Controllers (circa 2009).
 	  It is a SCSI alternative to the cciss driver, which is a block
@@ -454,7 +441,7 @@ config SCSI_ACARD
 
 config SCSI_AHA152X
 	tristate "Adaptec AHA152X/2825 support"
-	depends on ISA && SCSI && !64BIT
+	depends on ISA && SCSI
 	select SCSI_SPI_ATTRS
 	select CHECK_SIGNATURE
 	---help---
@@ -554,6 +541,15 @@ source "drivers/scsi/aic7xxx/Kconfig.aic79xx"
 source "drivers/scsi/aic94xx/Kconfig"
 source "drivers/scsi/mvsas/Kconfig"
 
+config SCSI_MVUMI
+	tristate "Marvell UMI driver"
+	depends on SCSI && PCI
+	help
+	  Module for Marvell Universal Message Interface(UMI) driver
+
+	  To compile this driver as a module, choose M here: the
+	  module will be called mvumi.
+
 config SCSI_DPT_I2O
 	tristate "Adaptec I2O RAID support "
 	depends on SCSI && PCI && VIRT_TO_BUS
@@ -602,23 +598,10 @@ config SCSI_ARCMSR
 	  To compile this driver as a module, choose M here: the
 	  module will be called arcmsr (modprobe arcmsr).
 
-config SCSI_ARCMSR_AER
-	bool "Enable PCI Error Recovery Capability in Areca Driver(ARCMSR)"
-	depends on SCSI_ARCMSR && PCIEAER
-	default n
-	help
-	  The advanced error reporting(AER) capability is "NOT" provided by
-	  ARC1200/1201/1202 SATA RAID controllers cards.
-	  If your card is one of ARC1200/1201/1202, please use the default setting, n.
-	  If your card is other models, you could pick it
-	  on condition that the kernel version is greater than 2.6.19.
-	  This function is maintained driver by Nick Cheng. If you have any
-	  problems or suggestion, you are welcome to contact with <nick.cheng@areca.com.tw>.
-	  To enable this function, choose Y here.
-
 source "drivers/scsi/megaraid/Kconfig.megaraid"
 source "drivers/scsi/mpt3sas/Kconfig"
 source "drivers/scsi/smartpqi/Kconfig"
+source "drivers/scsi/ufs/Kconfig"
 
 config SCSI_HPTIOP
 	tristate "HighPoint RocketRAID 3xxx/4xxx Controller support"
@@ -692,7 +675,7 @@ config FCOE
 config FCOE_FNIC
 	tristate "Cisco FNIC Driver"
 	depends on PCI && X86
-	select LIBFC
+	select LIBFCOE
 	help
 	  This is support for the Cisco PCI-Express FCoE HBA.
 
@@ -806,19 +789,6 @@ config SCSI_FUTURE_DOMAIN
 	  To compile this driver as a module, choose M here: the
 	  module will be called fdomain.
 
-config SCSI_FD_MCS
-	tristate "Future Domain MCS-600/700 SCSI support"
-	depends on MCA_LEGACY && SCSI
-	---help---
-	  This is support for Future Domain MCS 600/700 MCA SCSI adapters.
-	  Some PS/2 computers are equipped with IBM Fast SCSI Adapter/A which
-	  is identical to the MCS 700 and hence also supported by this driver.
-	  This driver also supports the Reply SB16/SCSI card (the SCSI part).
-	  It supports multiple adapters in the same system.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called fd_mcs.
-
 config SCSI_GDTH
 	tristate "Intel/ICP (former GDT SCSI Disk Array) RAID Controller support"
 	depends on (ISA || EISA || PCI) && SCSI && ISA_DMA_API
@@ -888,82 +858,13 @@ config SCSI_GENERIC_NCR53C400
 	  not detect your card.  See the file
 	  <file:Documentation/scsi/g_NCR5380.txt> for details.
 
-config SCSI_IBMMCA
-	tristate "IBMMCA SCSI support"
-	depends on MCA && SCSI
-	---help---
-	  This is support for the IBM SCSI adapter found in many of the PS/2
-	  series computers.  These machines have an MCA bus, so you need to
-	  answer Y to "MCA support" as well and read
-	  <file:Documentation/mca.txt>.
-
-	  If the adapter isn't found during boot (a common problem for models
-	  56, 57, 76, and 77) you'll need to use the 'ibmmcascsi=<pun>' kernel
-	  option, where <pun> is the id of the SCSI subsystem (usually 7, but
-	  if that doesn't work check your reference diskette).  Owners of
-	  model 95 with a LED-matrix-display can in addition activate some
-	  activity info like under OS/2, but more informative, by setting
-	  'ibmmcascsi=display' as an additional kernel parameter.  Try "man
-	  bootparam" or see the documentation of your boot loader about how to
-	  pass options to the kernel.
-
-	  To compile this driver as a module, choose M here: the
-	  module will be called ibmmca.
-
-config IBMMCA_SCSI_ORDER_STANDARD
-	bool "Standard SCSI-order"
-	depends on SCSI_IBMMCA
-	---help---
-	  In the PC-world and in most modern SCSI-BIOS-setups, SCSI-hard disks
-	  are assigned to the drive letters, starting with the lowest SCSI-id
-	  (physical number -- pun) to be drive C:, as seen from DOS and
-	  similar operating systems. When looking into papers describing the
-	  ANSI-SCSI-standard, this assignment of drives appears to be wrong.
-	  The SCSI-standard follows a hardware-hierarchy which says that id 7
-	  has the highest priority and id 0 the lowest. Therefore, the host
-	  adapters are still today everywhere placed as SCSI-id 7 by default.
-	  In the SCSI-standard, the drive letters express the priority of the
-	  disk. C: should be the hard disk, or a partition on it, with the
-	  highest priority. This must therefore be the disk with the highest
-	  SCSI-id (e.g. 6) and not the one with the lowest! IBM-BIOS kept the
-	  original definition of the SCSI-standard as also industrial- and
-	  process-control-machines, like VME-CPUs running under realtime-OSes
-	  (e.g. LynxOS, OS9) do.
-
-	  If you like to run Linux on your MCA-machine with the same
-	  assignment of hard disks as seen from e.g. DOS or OS/2 on your
-	  machine, which is in addition conformant to the SCSI-standard, you
-	  must say Y here. This is also necessary for MCA-Linux users who want
-	  to keep downward compatibility to older releases of the
-	  IBM-MCA-SCSI-driver (older than driver-release 2.00 and older than
-	  June 1997).
-
-	  If you like to have the lowest SCSI-id assigned as drive C:, as
-	  modern SCSI-BIOSes do, which does not conform to the standard, but
-	  is widespread and common in the PC-world of today, you must say N
-	  here. If unsure, say Y.
-
-config IBMMCA_SCSI_DEV_RESET
-	bool "Reset SCSI-devices at boottime"
-	depends on SCSI_IBMMCA
-	---help---
-	  By default, SCSI-devices are reset when the machine is powered on.
-	  However, some devices exist, like special-control-devices,
-	  SCSI-CNC-machines, SCSI-printer or scanners of older type, that do
-	  not reset when switched on. If you say Y here, each device connected
-	  to your SCSI-bus will be issued a reset-command after it has been
-	  probed, while the kernel is booting. This may cause problems with
-	  more modern devices, like hard disks, which do not appreciate these
-	  reset commands, and can cause your system to hang. So say Y only if
-	  you know that one of your older devices needs it; N is the safe
-	  answer.
-
 config SCSI_IPS
 	tristate "IBM ServeRAID support"
 	depends on PCI && SCSI
 	---help---
 	  This is support for the IBM ServeRAID hardware RAID controllers.
 	  See <http://www.developer.ibm.com/welcome/netfinity/serveraid.html>
+	  and <http://www-947.ibm.com/support/entry/portal/docdisplay?brand=5000008&lndocid=SERV-RAID>
 	  for more information.  If this driver does not work correctly
 	  without modification please contact the author by email at
 	  <ipslinux@adaptec.com>.
@@ -973,14 +874,13 @@ config SCSI_IPS
 
 config SCSI_IBMVSCSI
 	tristate "IBM Virtual SCSI support"
-	depends on PPC_PSERIES || PPC_ISERIES
+	depends on PPC_PSERIES
 	select SCSI_SRP_ATTRS
-	select VIOPATH if PPC_ISERIES
 	help
 	  This is the IBM POWER Virtual SCSI Client
 
 	  To compile this driver as a module, choose M here: the
-	  module will be called ibmvscsic.
+	  module will be called ibmvscsi.
 
 config SCSI_IBMVSCSIS
 	tristate "IBM Virtual SCSI Server support"
@@ -1255,6 +1155,7 @@ config SCSI_IPR
 	tristate "IBM Power Linux RAID adapter support"
 	depends on PCI && SCSI && ATA
 	select FW_LOADER
+	select IRQ_POLL
 	---help---
 	  This driver supports the IBM Power Linux family RAID adapters.
 	  This includes IBM pSeries 5712, 5703, 5709, and 570A, as well
@@ -1445,19 +1346,22 @@ config SCSI_QLOGICPTI
 
 source "drivers/scsi/qla2xxx/Kconfig"
 source "drivers/scsi/qla4xxx/Kconfig"
+source "drivers/scsi/qedi/Kconfig"
+source "drivers/scsi/qedf/Kconfig"
 
 config SCSI_LPFC
 	tristate "Emulex LightPulse Fibre Channel Support"
 	depends on PCI && SCSI
 	select SCSI_FC_ATTRS
-	help
+	select CRC_T10DIF
+	---help---
           This lpfc driver supports the Emulex LightPulse
           Family of Fibre Channel PCI host adapters.
 
 config SCSI_LPFC_DEBUG_FS
 	bool "Emulex LightPulse Fibre Channel debugfs Support"
 	depends on SCSI_LPFC && DEBUG_FS
-	help
+	---help---
 	  This makes debugging information from the lpfc driver
 	  available via the debugfs filesystem.
 
@@ -1489,8 +1393,8 @@ config SCSI_SYM53C416
 	  module will be called sym53c416.
 
 config SCSI_DC395x
-	tristate "Tekram DC395(U/UW/F) and DC315(U) SCSI support (EXPERIMENTAL)"
-	depends on PCI && SCSI && EXPERIMENTAL
+	tristate "Tekram DC395(U/UW/F) and DC315(U) SCSI support"
+	depends on PCI && SCSI
 	---help---
 	  This driver supports PCI SCSI host adapters based on the ASIC
 	  TRM-S1040 chip, e.g Tekram DC395(U/UW/F) and DC315(U) variants.
@@ -1614,18 +1518,17 @@ config SCSI_NSP32
 	  module will be called nsp32.
 
 config SCSI_DEBUG
-	tristate "SCSI debugging host simulator"
+	tristate "SCSI debugging host and device simulator"
 	depends on SCSI
 	select CRC_T10DIF
 	help
-	  This is a host adapter simulator that can simulate multiple hosts
-	  each with multiple dummy SCSI devices (disks). It defaults to one
-	  host adapter with one dummy SCSI disk. Each dummy disk uses kernel
-	  RAM as storage (i.e. it is a ramdisk). To save space when multiple
-	  dummy disks are simulated, they share the same kernel RAM for 
-	  their storage. See <http://www.torque.net/sg/sdebug.html> for more
-	  information. This driver is primarily of use to those testing the
-	  SCSI and block subsystems. If unsure, say N.
+	  This pseudo driver simulates one or more hosts (SCSI initiators),
+	  each with one or more targets, each with one or more logical units.
+	  Defaults to one of each, creating a small RAM disk device. Many
+	  parameters found in the /sys/bus/pseudo/drivers/scsi_debug
+	  directory can be tweaked at run time.
+	  See <http://sg.danny.cz/sg/sdebug26.html> for more information.
+	  Mainly used for testing and best as a module. If unsure, say N.
 
 config SCSI_MESH
 	tristate "MESH (Power Mac internal SCSI) support"
@@ -1715,8 +1618,8 @@ config GVP11_SCSI
 	  module will be called gvp11.
 
 config SCSI_A4000T
-	tristate "A4000T NCR53c710 SCSI support (EXPERIMENTAL)"
-	depends on AMIGA && SCSI && EXPERIMENTAL
+	tristate "A4000T NCR53c710 SCSI support"
+	depends on AMIGA && SCSI
 	select SCSI_SPI_ATTRS
 	help
 	  If you have an Amiga 4000T and have SCSI devices connected to the
@@ -1726,8 +1629,8 @@ config SCSI_A4000T
 	  module will be called a4000t.
 
 config SCSI_ZORRO7XX
-	tristate "Zorro NCR53c710 SCSI support (EXPERIMENTAL)"
-	depends on ZORRO && SCSI && EXPERIMENTAL
+	tristate "Zorro NCR53c710 SCSI support"
+	depends on ZORRO && SCSI
 	select SCSI_SPI_ATTRS
 	help
 	  Support for various NCR53c710-based SCSI controllers on Zorro
@@ -1871,7 +1774,7 @@ config ZFCP
 
 config SCSI_PMCRAID
 	tristate "PMC SIERRA Linux MaxRAID adapter support"
-	depends on PCI && SCSI
+	depends on PCI && SCSI && NET
 	---help---
 	  This driver supports the PMC SIERRA MaxRAID adapters.
 
@@ -1904,12 +1807,13 @@ config SCSI_BFA_FC
 	  be called bfa.
 
 config SCSI_VIRTIO
-       tristate "virtio-scsi support (EXPERIMENTAL)"
-       depends on EXPERIMENTAL && VIRTIO
-       help
+	tristate "virtio-scsi support"
+	depends on VIRTIO
+	help
           This is the virtual HBA driver for virtio.  If the kernel will
           be used in a virtual machine, say Y or M.
 
+source "drivers/scsi/csiostor/Kconfig"
 
 endif # SCSI_LOWLEVEL
 

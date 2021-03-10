@@ -8,7 +8,7 @@
 #include <linux/nfs_xdr.h>
 #include <linux/sunrpc/xprt.h>
 
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 
 struct nfs4_session;
 struct nfs_iostats;
@@ -17,6 +17,8 @@ struct nfs4_sequence_args;
 struct nfs4_sequence_res;
 struct nfs_server;
 struct nfs4_minor_version_ops;
+struct nfs41_server_scope;
+struct nfs41_impl_id;
 
 /*
  * The nfs_client identifies our client state to the server.
@@ -37,20 +39,26 @@ struct nfs_client {
 	unsigned long		cl_flags;	/* behavior switches */
 #define NFS_CS_NORESVPORT	0		/* - use ephemeral src port */
 #define NFS_CS_DISCRTRY		1		/* - disconnect on RPC retry */
+#define NFS_CS_MIGRATION	2		/* - transparent state migr */
+#define NFS_CS_INFINITE_SLOTS	3		/* - don't limit TCP slots */
+#define NFS_CS_NO_RETRANS_TIMEOUT	4	/* - Disable retransmit timeouts */
 	struct sockaddr_storage	cl_addr;	/* server identifier */
 	size_t			cl_addrlen;
 	char *			cl_hostname;	/* hostname of server */
+	char *			cl_acceptor;	/* GSSAPI acceptor name */
 	struct list_head	cl_share_link;	/* link in global client list */
 	struct list_head	cl_superblocks;	/* List of nfs_server structs */
 
 	struct rpc_clnt *	cl_rpcclient;
 	const struct nfs_rpc_ops *rpc_ops;	/* NFS protocol vector */
 	int			cl_proto;	/* Network transport protocol */
+	struct nfs_subversion *	cl_nfs_mod;	/* pointer to nfs version module */
 
 	u32			cl_minorversion;/* NFSv4 minorversion */
 	struct rpc_cred		*cl_machine_cred;
 
-#ifdef CONFIG_NFS_V4
+#if IS_ENABLED(CONFIG_NFS_V4)
+	struct list_head	cl_ds_clients; /* auth flavor data servers */
 	u64			cl_clientid;	/* constant */
 	nfs4_verifier		cl_confirm;	/* Clientid verifier */
 	unsigned long		cl_state;
@@ -63,34 +71,52 @@ struct nfs_client {
 
 	struct rpc_wait_queue	cl_rpcwaitq;
 
-	/* used for the setclientid verifier */
-	struct timespec		cl_boot_time;
-
 	/* idmapper */
 	struct idmap *		cl_idmap;
 
-	/* Our own IP address, as a null-terminated string.
-	 * This is used to generate the clientid, and the callback address.
-	 */
-	char			cl_ipaddr[48];
-	unsigned char		cl_id_uniquifier;
+	/* Client owner identifier */
+	const char *		cl_owner_id;
+
 	u32			cl_cb_ident;	/* v4.0 callback identifier */
 	const struct nfs4_minor_version_ops *cl_mvops;
+	unsigned long		cl_mig_gen;
+
+	/* NFSv4.0 transport blocking */
+	struct nfs4_slot_table	*cl_slot_tbl;
 
 	/* The sequence id to use for the next CREATE_SESSION */
 	u32			cl_seqid;
 	/* The flags used for obtaining the clientid during EXCHANGE_ID */
 	u32			cl_exchange_flags;
-	struct nfs4_session	*cl_session; 	/* sharred session */
-	/* the following fields are protected by nfs_client->cl_lock */
-	struct rb_root		cl_openowner_id;
-	struct rb_root		cl_lockowner_id;
-	struct rb_root		cl_state_owners;
+	struct nfs4_session	*cl_session;	/* shared session */
+	bool			cl_preserve_clid;
+	struct nfs41_server_owner *cl_serverowner;
+	struct nfs41_server_scope *cl_serverscope;
+	struct nfs41_impl_id	*cl_implid;
+	/* nfs 4.1+ state protection modes: */
+	unsigned long		cl_sp4_flags;
+#define NFS_SP4_MACH_CRED_MINIMAL  1	/* Minimal sp4_mach_cred - state ops
+					 * must use machine cred */
+#define NFS_SP4_MACH_CRED_CLEANUP  2	/* CLOSE and LOCKU */
+#define NFS_SP4_MACH_CRED_SECINFO  3	/* SECINFO and SECINFO_NO_NAME */
+#define NFS_SP4_MACH_CRED_STATEID  4	/* TEST_STATEID and FREE_STATEID */
+#define NFS_SP4_MACH_CRED_WRITE    5	/* WRITE */
+#define NFS_SP4_MACH_CRED_COMMIT   6	/* COMMIT */
+#if IS_ENABLED(CONFIG_NFS_V4_1)
+	wait_queue_head_t	cl_lock_waitq;
+#endif /* CONFIG_NFS_V4_1 */
 #endif /* CONFIG_NFS_V4 */
+
+	/* Our own IP address, as a null-terminated string.
+	 * This is used to generate the mv0 callback address.
+	 */
+	char			cl_ipaddr[48];
 
 #ifdef CONFIG_NFS_FSCACHE
 	struct fscache_cookie	*fscache;	/* client index cache cookie */
 #endif
+
+	struct net		*cl_net;
 };
 
 /*
@@ -105,7 +131,7 @@ struct nfs_server {
 	struct rpc_clnt *	client;		/* RPC client handle */
 	struct rpc_clnt *	client_acl;	/* ACL RPC client handle */
 	struct nlm_host		*nlm_host;	/* NLM client handle */
-	struct nfs_iostats *	io_stats;	/* I/O statistics */
+	struct nfs_iostats __percpu *io_stats;	/* I/O statistics */
 	struct backing_dev_info	backing_dev_info;
 	atomic_long_t		writeback;	/* number of writeback pages */
 	int			flags;		/* various flags */
@@ -124,24 +150,39 @@ struct nfs_server {
 	unsigned int		acdirmax;
 	unsigned int		namelen;
 	unsigned int		options;	/* extra options enabled by mount */
+	unsigned int		clone_blksize;	/* granularity of a CLONE operation */
 #define NFS_OPTION_FSCACHE	0x00000001	/* - local caching enabled */
+#define NFS_OPTION_MIGRATION	0x00000002	/* - NFSv4 migration enabled */
 
 	struct nfs_fsid		fsid;
 	__u64			maxfilesize;	/* maximum file size */
 	struct timespec		time_delta;	/* smallest time granularity */
 	unsigned long		mount_time;	/* when this fs was mounted */
+	struct super_block	*super;		/* VFS super block */
 	dev_t			s_dev;		/* superblock dev numbers */
+	struct nfs_auth_info	auth_info;	/* parsed auth flavors */
 
 #ifdef CONFIG_NFS_FSCACHE
 	struct nfs_fscache_key	*fscache_key;	/* unique key for superblock */
 	struct fscache_cookie	*fscache;	/* superblock cookie */
 #endif
 
-#ifdef CONFIG_NFS_V4
-	u32			attr_bitmask[2];/* V4 bitmask representing the set
+	u32			pnfs_blksize;	/* layout_blksize attr */
+#if IS_ENABLED(CONFIG_NFS_V4)
+	u32			attr_bitmask[3];/* V4 bitmask representing the set
 						   of attributes supported on this
 						   filesystem */
-	u32			cache_consistency_bitmask[2];
+	u32			attr_bitmask_nl[3];
+						/* V4 bitmask representing the
+						   set of attributes supported
+						   on this filesystem excluding
+						   the label support bit. */
+	u32			exclcreat_bitmask[3];
+						/* V4 bitmask representing the
+						   set of attributes supported
+						   on this filesystem for the
+						   exclusive create. */
+	u32			cache_consistency_bitmask[3];
 						/* V4 bitmask representing the subset
 						   of change attribute, size, ctime
 						   and mtime attributes supported by
@@ -149,8 +190,12 @@ struct nfs_server {
 	u32			acl_bitmask;	/* V4 bitmask representing the ACEs
 						   that are supported on this
 						   filesystem */
+	u32			fh_expire_type;	/* V4 bitmask representing file
+						   handle volatility type for
+						   this filesystem */
 	struct pnfs_layoutdriver_type  *pnfs_curr_ld; /* Active layout driver */
 	struct rpc_wait_queue	roc_rpcwaitq;
+	void			*pnfs_ld_data;	/* per mount point data */
 
 	/* the following fields are protected by nfs_client->cl_lock */
 	struct rb_root		state_owners;
@@ -159,7 +204,13 @@ struct nfs_server {
 	struct ida		lockowner_id;
 	struct list_head	state_owners_lru;
 	struct list_head	layouts;
-	struct list_head        delegations;
+	struct list_head	delegations;
+
+	unsigned long		mig_gen;
+	unsigned long		mig_status;
+#define NFS_MIG_IN_TRANSITION		(1)
+#define NFS_MIG_FAILED			(2)
+
 	void (*destroy)(struct nfs_server *);
 
 	atomic_t active; /* Keep trace of any activity to this server */
@@ -170,6 +221,7 @@ struct nfs_server {
 	u32			mountd_version;
 	unsigned short		mountd_port;
 	unsigned short		mountd_protocol;
+	struct rpc_wait_queue	uoc_rpcwaitq;
 };
 
 /* Server capabilities */
@@ -178,7 +230,7 @@ struct nfs_server {
 #define NFS_CAP_SYMLINKS	(1U << 2)
 #define NFS_CAP_ACLS		(1U << 3)
 #define NFS_CAP_ATOMIC_OPEN	(1U << 4)
-#define NFS_CAP_CHANGE_ATTR	(1U << 5)
+/* #define NFS_CAP_CHANGE_ATTR	(1U << 5) */
 #define NFS_CAP_FILEID		(1U << 6)
 #define NFS_CAP_MODE		(1U << 7)
 #define NFS_CAP_NLINK		(1U << 8)
@@ -191,54 +243,12 @@ struct nfs_server {
 #define NFS_CAP_UIDGID_NOMAP	(1U << 15)
 #define NFS_CAP_STATEID_NFSV41	(1U << 16)
 #define NFS_CAP_ATOMIC_OPEN_V1	(1U << 17)
+#define NFS_CAP_SECURITY_LABEL	(1U << 18)
+#define NFS_CAP_SEEK		(1U << 19)
+#define NFS_CAP_ALLOCATE	(1U << 20)
+#define NFS_CAP_DEALLOCATE	(1U << 21)
+#define NFS_CAP_LAYOUTSTATS	(1U << 22)
+#define NFS_CAP_CLONE		(1U << 23)
+#define NFS_CAP_COPY		(1U << 24)
 
-
-/* maximum number of slots to use */
-#define NFS4_DEF_SLOT_TABLE_SIZE (16U)
-#define NFS4_MAX_SLOT_TABLE (250U)
-
-#if defined(CONFIG_NFS_V4)
-
-/* Sessions */
-#define SLOT_TABLE_SZ DIV_ROUND_UP(NFS4_MAX_SLOT_TABLE, 8*sizeof(long))
-
-struct nfs4_slot_table {
-	struct nfs4_session *session;		/* Parent session */
-	struct nfs4_slot *slots;		/* seqid per slot */
-	unsigned long   used_slots[SLOT_TABLE_SZ]; /* used/unused bitmap */
-	spinlock_t	slot_tbl_lock;
-	struct rpc_wait_queue	slot_tbl_waitq;	/* allocators may wait here */
-	int		max_slots;		/* # slots in table */
-	int		highest_used_slotid;	/* sent to server on each SEQ.
-						 * op for dynamic resizing */
-	int		target_max_slots;	/* Set by CB_RECALL_SLOT as
-						 * the new max_slots */
-	struct completion complete;
-	unsigned long	slot_tbl_state;
-};
-
-static inline int slot_idx(struct nfs4_slot_table *tbl, struct nfs4_slot *sp)
-{
-	return sp - tbl->slots;
-}
-
-/*
- * Session related parameters
- */
-struct nfs4_session {
-	struct nfs4_sessionid		sess_id;
-	u32				flags;
-	unsigned long			session_state;
-	u32				hash_alg;
-	u32				ssv_len;
-
-	/* The fore and back channel */
-	struct nfs4_channel_attrs	fc_attrs;
-	struct nfs4_slot_table		fc_slot_table;
-	struct nfs4_channel_attrs	bc_attrs;
-	struct nfs4_slot_table		bc_slot_table;
-	struct nfs_client		*clp;
-};
-
-#endif /* CONFIG_NFS_V4 */
 #endif

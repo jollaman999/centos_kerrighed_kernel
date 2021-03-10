@@ -19,9 +19,8 @@
  *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
-#include <asm/io.h>
+#include <linux/io.h>
 #include <linux/init.h>
-#include <linux/slab.h>
 #include <linux/delay.h>
 #include <sound/core.h>
 #include "pmac.h"
@@ -468,7 +467,7 @@ static int snd_pmac_burgundy_put_switch_b(struct snd_kcontrol *kcontrol,
 /*
  * Burgundy mixers
  */
-static struct snd_kcontrol_new snd_pmac_burgundy_mixers[] __devinitdata = {
+static struct snd_kcontrol_new snd_pmac_burgundy_mixers[] = {
 	BURGUNDY_VOLUME_W("Master Playback Volume", 0,
 			MASK_ADDR_BURGUNDY_MASTER_VOLUME, 8),
 	BURGUNDY_VOLUME_W("CD Capture Volume", 0,
@@ -496,7 +495,7 @@ static struct snd_kcontrol_new snd_pmac_burgundy_mixers[] __devinitdata = {
  */	BURGUNDY_SWITCH_B("PCM Capture Switch", 0,
 			MASK_ADDR_BURGUNDY_HOSTIFEH, 0x01, 0, 0)
 };
-static struct snd_kcontrol_new snd_pmac_burgundy_mixers_imac[] __devinitdata = {
+static struct snd_kcontrol_new snd_pmac_burgundy_mixers_imac[] = {
 	BURGUNDY_VOLUME_W("Line in Capture Volume", 0,
 			MASK_ADDR_BURGUNDY_VOLLINE, 16),
 	BURGUNDY_VOLUME_W("Mic Capture Volume", 0,
@@ -505,7 +504,7 @@ static struct snd_kcontrol_new snd_pmac_burgundy_mixers_imac[] __devinitdata = {
 			MASK_ADDR_BURGUNDY_GAINLINE, 1, 0),
 	BURGUNDY_VOLUME_B("Mic Gain Capture Volume", 0,
 			MASK_ADDR_BURGUNDY_GAINMIC, 1, 0),
-	BURGUNDY_VOLUME_B("PC Speaker Playback Volume", 0,
+	BURGUNDY_VOLUME_B("Speaker Playback Volume", 0,
 			MASK_ADDR_BURGUNDY_ATTENSPEAKER, 1, 1),
 	BURGUNDY_VOLUME_B("Line out Playback Volume", 0,
 			MASK_ADDR_BURGUNDY_ATTENLINEOUT, 1, 1),
@@ -522,12 +521,12 @@ static struct snd_kcontrol_new snd_pmac_burgundy_mixers_imac[] __devinitdata = {
 	BURGUNDY_SWITCH_B("Mic Boost Capture Switch", 0,
 			MASK_ADDR_BURGUNDY_INPBOOST, 0x40, 0x80, 1)
 };
-static struct snd_kcontrol_new snd_pmac_burgundy_mixers_pmac[] __devinitdata = {
+static struct snd_kcontrol_new snd_pmac_burgundy_mixers_pmac[] = {
 	BURGUNDY_VOLUME_W("Line in Capture Volume", 0,
 			MASK_ADDR_BURGUNDY_VOLMIC, 16),
 	BURGUNDY_VOLUME_B("Line in Gain Capture Volume", 0,
 			MASK_ADDR_BURGUNDY_GAINMIC, 1, 0),
-	BURGUNDY_VOLUME_B("PC Speaker Playback Volume", 0,
+	BURGUNDY_VOLUME_B("Speaker Playback Volume", 0,
 			MASK_ADDR_BURGUNDY_ATTENMONO, 0, 1),
 	BURGUNDY_VOLUME_B("Line out Playback Volume", 0,
 			MASK_ADDR_BURGUNDY_ATTENSPEAKER, 1, 1),
@@ -538,33 +537,33 @@ static struct snd_kcontrol_new snd_pmac_burgundy_mixers_pmac[] __devinitdata = {
 /*	BURGUNDY_SWITCH_B("Line in Boost Capture Switch", 0,
  *		MASK_ADDR_BURGUNDY_INPBOOST, 0x40, 0x80, 1) */
 };
-static struct snd_kcontrol_new snd_pmac_burgundy_master_sw_imac __devinitdata =
+static struct snd_kcontrol_new snd_pmac_burgundy_master_sw_imac =
 BURGUNDY_SWITCH_B("Master Playback Switch", 0,
 	MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES,
 	BURGUNDY_OUTPUT_LEFT | BURGUNDY_LINEOUT_LEFT | BURGUNDY_HP_LEFT,
 	BURGUNDY_OUTPUT_RIGHT | BURGUNDY_LINEOUT_RIGHT | BURGUNDY_HP_RIGHT, 1);
-static struct snd_kcontrol_new snd_pmac_burgundy_master_sw_pmac __devinitdata =
+static struct snd_kcontrol_new snd_pmac_burgundy_master_sw_pmac =
 BURGUNDY_SWITCH_B("Master Playback Switch", 0,
 	MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES,
 	BURGUNDY_OUTPUT_INTERN
 	| BURGUNDY_OUTPUT_LEFT, BURGUNDY_OUTPUT_RIGHT, 1);
-static struct snd_kcontrol_new snd_pmac_burgundy_speaker_sw_imac __devinitdata =
-BURGUNDY_SWITCH_B("PC Speaker Playback Switch", 0,
+static struct snd_kcontrol_new snd_pmac_burgundy_speaker_sw_imac =
+BURGUNDY_SWITCH_B("Speaker Playback Switch", 0,
 	MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES,
 	BURGUNDY_OUTPUT_LEFT, BURGUNDY_OUTPUT_RIGHT, 1);
-static struct snd_kcontrol_new snd_pmac_burgundy_speaker_sw_pmac __devinitdata =
-BURGUNDY_SWITCH_B("PC Speaker Playback Switch", 0,
+static struct snd_kcontrol_new snd_pmac_burgundy_speaker_sw_pmac =
+BURGUNDY_SWITCH_B("Speaker Playback Switch", 0,
 	MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES,
 	BURGUNDY_OUTPUT_INTERN, 0, 0);
-static struct snd_kcontrol_new snd_pmac_burgundy_line_sw_imac __devinitdata =
+static struct snd_kcontrol_new snd_pmac_burgundy_line_sw_imac =
 BURGUNDY_SWITCH_B("Line out Playback Switch", 0,
 	MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES,
 	BURGUNDY_LINEOUT_LEFT, BURGUNDY_LINEOUT_RIGHT, 1);
-static struct snd_kcontrol_new snd_pmac_burgundy_line_sw_pmac __devinitdata =
+static struct snd_kcontrol_new snd_pmac_burgundy_line_sw_pmac =
 BURGUNDY_SWITCH_B("Line out Playback Switch", 0,
 	MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES,
 	BURGUNDY_OUTPUT_LEFT, BURGUNDY_OUTPUT_RIGHT, 1);
-static struct snd_kcontrol_new snd_pmac_burgundy_hp_sw_imac __devinitdata =
+static struct snd_kcontrol_new snd_pmac_burgundy_hp_sw_imac =
 BURGUNDY_SWITCH_B("Headphone Playback Switch", 0,
 	MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES,
 	BURGUNDY_HP_LEFT, BURGUNDY_HP_RIGHT, 1);
@@ -582,7 +581,7 @@ static int snd_pmac_burgundy_detect_headphone(struct snd_pmac *chip)
 static void snd_pmac_burgundy_update_automute(struct snd_pmac *chip, int do_notify)
 {
 	if (chip->auto_mute) {
-		int imac = machine_is_compatible("iMac");
+		int imac = of_machine_is_compatible("iMac");
 		int reg, oreg;
 		reg = oreg = snd_pmac_burgundy_rcb(chip,
 				MASK_ADDR_BURGUNDY_MORE_OUTPUTENABLES);
@@ -618,9 +617,9 @@ static void snd_pmac_burgundy_update_automute(struct snd_pmac *chip, int do_noti
 /*
  * initialize burgundy
  */
-int __devinit snd_pmac_burgundy_init(struct snd_pmac *chip)
+int snd_pmac_burgundy_init(struct snd_pmac *chip)
 {
-	int imac = machine_is_compatible("iMac");
+	int imac = of_machine_is_compatible("iMac");
 	int i, err;
 
 	/* Checks to see the chip is alive and kicking */

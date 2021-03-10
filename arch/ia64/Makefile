@@ -22,13 +22,13 @@ CHECKFLAGS	+= -m64 -D__ia64=1 -D__ia64__=1 -D_LP64 -D__LP64__
 
 OBJCOPYFLAGS	:= --strip-all
 LDFLAGS_vmlinux	:= -static
-LDFLAGS_MODULE	+= -T $(srctree)/arch/ia64/module.lds
-AFLAGS_KERNEL	:= -mconstant-gp
+KBUILD_LDFLAGS_MODULE += -T $(srctree)/arch/ia64/module.lds
+KBUILD_AFLAGS_KERNEL := -mconstant-gp
 EXTRA		:=
 
 cflags-y	:= -pipe $(EXTRA) -ffixed-r13 -mfixed-range=f12-f15,f32-f127 \
 		   -falign-functions=32 -frename-registers -fno-optimize-sibling-calls
-CFLAGS_KERNEL	:= -mconstant-gp
+KBUILD_CFLAGS_KERNEL := -mconstant-gp
 
 GAS_STATUS	= $(shell $(srctree)/arch/ia64/scripts/check-gas "$(CC)" "$(OBJDUMP)")
 KBUILD_CPPFLAGS += $(shell $(srctree)/arch/ia64/scripts/toolchain-flags "$(CC)" "$(OBJDUMP)" "$(READELF)")
@@ -46,7 +46,6 @@ head-y := arch/ia64/kernel/head.o arch/ia64/kernel/init_task.o
 
 libs-y				+= arch/ia64/lib/
 core-y				+= arch/ia64/kernel/ arch/ia64/mm/
-core-$(CONFIG_IA32_SUPPORT)	+= arch/ia64/ia32/
 core-$(CONFIG_IA64_DIG) 	+= arch/ia64/dig/
 core-$(CONFIG_IA64_DIG_VTD) 	+= arch/ia64/dig/
 core-$(CONFIG_IA64_GENERIC) 	+= arch/ia64/dig/
@@ -55,7 +54,6 @@ core-$(CONFIG_IA64_HP_ZX1_SWIOTLB) += arch/ia64/dig/
 core-$(CONFIG_IA64_XEN_GUEST)	+= arch/ia64/dig/
 core-$(CONFIG_IA64_SGI_SN2)	+= arch/ia64/sn/
 core-$(CONFIG_IA64_SGI_UV)	+= arch/ia64/uv/
-core-$(CONFIG_KVM) 		+= arch/ia64/kvm/
 core-$(CONFIG_XEN)		+= arch/ia64/xen/
 
 drivers-$(CONFIG_PCI)		+= arch/ia64/pci/
@@ -103,4 +101,4 @@ archprepare: make_nr_irqs_h FORCE
 PHONY += make_nr_irqs_h FORCE
 
 make_nr_irqs_h: FORCE
-	$(Q)$(MAKE) $(build)=arch/ia64/kernel include/asm-ia64/nr-irqs.h
+	$(Q)$(MAKE) $(build)=arch/ia64/kernel include/generated/nr-irqs.h

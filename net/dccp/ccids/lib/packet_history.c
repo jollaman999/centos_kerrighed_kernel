@@ -38,18 +38,6 @@
 #include "packet_history.h"
 #include "../../dccp.h"
 
-/**
- *  tfrc_tx_hist_entry  -  Simple singly-linked TX history list
- *  @next:  next oldest entry (LIFO order)
- *  @seqno: sequence number of this entry
- *  @stamp: send time of packet with sequence number @seqno
- */
-struct tfrc_tx_hist_entry {
-	struct tfrc_tx_hist_entry *next;
-	u64			  seqno;
-	ktime_t			  stamp;
-};
-
 /*
  * Transmitter History Routines
  */
@@ -69,15 +57,6 @@ void tfrc_tx_packet_history_exit(void)
 		kmem_cache_destroy(tfrc_tx_hist_slab);
 		tfrc_tx_hist_slab = NULL;
 	}
-}
-
-static struct tfrc_tx_hist_entry *
-	tfrc_tx_hist_find_entry(struct tfrc_tx_hist_entry *head, u64 seqno)
-{
-	while (head != NULL && head->seqno != seqno)
-		head = head->next;
-
-	return head;
 }
 
 int tfrc_tx_hist_add(struct tfrc_tx_hist_entry **headp, u64 seqno)
@@ -106,24 +85,6 @@ void tfrc_tx_hist_purge(struct tfrc_tx_hist_entry **headp)
 
 	*headp = NULL;
 }
-
-u32 tfrc_tx_hist_rtt(struct tfrc_tx_hist_entry *head, const u64 seqno,
-		     const ktime_t now)
-{
-	u32 rtt = 0;
-	struct tfrc_tx_hist_entry *packet = tfrc_tx_hist_find_entry(head, seqno);
-
-	if (packet != NULL) {
-		rtt = ktime_us_delta(now, packet->stamp);
-		/*
-		 * Garbage-collect older (irrelevant) entries:
-		 */
-		tfrc_tx_hist_purge(&packet->next);
-	}
-
-	return rtt;
-}
-
 
 /*
  *	Receiver History Routines
@@ -354,6 +315,7 @@ static void __three_after_loss(struct tfrc_rx_hist *h)
  *  @ndp:	    The NDP count belonging to @skb
  *  @calc_first_li: Caller-dependent computation of first loss interval in @lh
  *  @sk:	    Used by @calc_first_li (see tfrc_lh_interval_add)
+ *
  *  Chooses action according to pending loss, updates LI database when a new
  *  loss was detected, and does required post-processing. Returns 1 when caller
  *  should send feedback, 0 otherwise.
@@ -426,7 +388,7 @@ static inline struct tfrc_rx_hist_entry *
 }
 
 /**
- * tfrc_rx_hist_rtt_prev_s: previously suitable (wrt rtt_last_s) RTT-sampling entry
+ * tfrc_rx_hist_rtt_prev_s - previously suitable (wrt rtt_last_s) RTT-sampling entry
  */
 static inline struct tfrc_rx_hist_entry *
 			tfrc_rx_hist_rtt_prev_s(const struct tfrc_rx_hist *h)

@@ -26,14 +26,13 @@
 #include <linux/types.h>
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
-#include <asm/io.h>
 
 MODULE_AUTHOR("Hu Tao <hutao@cn.fujitsu.com>");
 MODULE_DESCRIPTION("pvpanic device driver");
 MODULE_LICENSE("GPL");
 
 static int pvpanic_add(struct acpi_device *device);
-static int pvpanic_remove(struct acpi_device *device, int type);
+static int pvpanic_remove(struct acpi_device *device);
 
 static const struct acpi_device_id pvpanic_device_ids[] = {
 	{ "QEMU0001", 0 },
@@ -72,6 +71,7 @@ pvpanic_panic_notify(struct notifier_block *nb, unsigned long code,
 
 static struct notifier_block pvpanic_panic_nb = {
 	.notifier_call = pvpanic_panic_notify,
+	.priority = 1, /* let this called before broken drm_fb_helper */
 };
 
 
@@ -114,7 +114,7 @@ static int pvpanic_add(struct acpi_device *device)
 	return 0;
 }
 
-static int pvpanic_remove(struct acpi_device *device, int type)
+static int pvpanic_remove(struct acpi_device *device)
 {
 
 	atomic_notifier_chain_unregister(&panic_notifier_list,
@@ -122,5 +122,4 @@ static int pvpanic_remove(struct acpi_device *device, int type)
 	return 0;
 }
 
-module_driver(pvpanic_driver, acpi_bus_register_driver,
-	      acpi_bus_unregister_driver);
+module_acpi_driver(pvpanic_driver);

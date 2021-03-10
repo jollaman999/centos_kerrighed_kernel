@@ -40,6 +40,7 @@ struct lpc_ich_info {
 	char name[32];
 	unsigned int iTCO_version;
 	unsigned int gpio_version;
+	u8 use_gpio;
 };
 
 #endif

@@ -46,7 +46,9 @@ For 32-bit we have the following conventions - kernel is built with
 
 */
 
-#include <asm/cpufeature.h>
+#include <asm/dwarf2.h>
+#include <asm/cpufeatures.h>
+#include <asm/nops.h>
 
 /*
  * 64-bit system call stack frame layout defines and helpers,
@@ -83,72 +85,57 @@ For 32-bit we have the following conventions - kernel is built with
 #define ARGOFFSET	R11
 #define SWFRAME		ORIG_RAX
 
-	.macro SAVE_ARGS addskip=0, norcx=0, nor891011=0
+	.macro SAVE_ARGS addskip=0, save_rcx=1, save_r891011=1
 	subq  $9*8+\addskip, %rsp
 	CFI_ADJUST_CFA_OFFSET	9*8+\addskip
-	movq  %rdi, 8*8(%rsp)
-	CFI_REL_OFFSET	rdi, 8*8
-	movq  %rsi, 7*8(%rsp)
-	CFI_REL_OFFSET	rsi, 7*8
-	movq  %rdx, 6*8(%rsp)
-	CFI_REL_OFFSET	rdx, 6*8
-	.if \norcx
-	.else
-	movq  %rcx, 5*8(%rsp)
-	CFI_REL_OFFSET	rcx, 5*8
+	movq_cfi rdi, 8*8
+	movq_cfi rsi, 7*8
+	movq_cfi rdx, 6*8
+
+	.if \save_rcx
+	movq_cfi rcx, 5*8
 	.endif
-	movq  %rax, 4*8(%rsp)
-	CFI_REL_OFFSET	rax, 4*8
-	.if \nor891011
-	.else
-	movq  %r8, 3*8(%rsp)
-	CFI_REL_OFFSET	r8,  3*8
-	movq  %r9, 2*8(%rsp)
-	CFI_REL_OFFSET	r9,  2*8
-	movq  %r10, 1*8(%rsp)
-	CFI_REL_OFFSET	r10, 1*8
-	movq  %r11, (%rsp)
-	CFI_REL_OFFSET	r11, 0*8
+
+	movq_cfi rax, 4*8
+
+	.if \save_r891011
+	movq_cfi r8,  3*8
+	movq_cfi r9,  2*8
+	movq_cfi r10, 1*8
+	movq_cfi r11, 0*8
 	.endif
+
 	.endm
 
-#define ARG_SKIP	9*8
+#define ARG_SKIP	(9*8)
 
-	.macro RESTORE_ARGS skiprax=0, addskip=0, skiprcx=0, skipr11=0, \
-			    skipr8910=0, skiprdx=0
-	.if \skipr11
-	.else
-	movq (%rsp), %r11
-	CFI_RESTORE r11
+	.macro RESTORE_ARGS rstor_rax=1, addskip=0, rstor_rcx=1, rstor_r11=1, \
+			    rstor_r8910=1, rstor_rdx=1
+	.if \rstor_r11
+	movq_cfi_restore 0*8, r11
 	.endif
-	.if \skipr8910
-	.else
-	movq 1*8(%rsp), %r10
-	CFI_RESTORE r10
-	movq 2*8(%rsp), %r9
-	CFI_RESTORE r9
-	movq 3*8(%rsp), %r8
-	CFI_RESTORE r8
+
+	.if \rstor_r8910
+	movq_cfi_restore 1*8, r10
+	movq_cfi_restore 2*8, r9
+	movq_cfi_restore 3*8, r8
 	.endif
-	.if \skiprax
-	.else
-	movq 4*8(%rsp), %rax
-	CFI_RESTORE rax
+
+	.if \rstor_rax
+	movq_cfi_restore 4*8, rax
 	.endif
-	.if \skiprcx
-	.else
-	movq 5*8(%rsp), %rcx
-	CFI_RESTORE rcx
+
+	.if \rstor_rcx
+	movq_cfi_restore 5*8, rcx
 	.endif
-	.if \skiprdx
-	.else
-	movq 6*8(%rsp), %rdx
-	CFI_RESTORE rdx
+
+	.if \rstor_rdx
+	movq_cfi_restore 6*8, rdx
 	.endif
-	movq 7*8(%rsp), %rsi
-	CFI_RESTORE rsi
-	movq 8*8(%rsp), %rdi
-	CFI_RESTORE rdi
+
+	movq_cfi_restore 7*8, rsi
+	movq_cfi_restore 8*8, rdi
+
 	.if ARG_SKIP+\addskip > 0
 	addq $ARG_SKIP+\addskip, %rsp
 	CFI_ADJUST_CFA_OFFSET	-(ARG_SKIP+\addskip)
@@ -170,38 +157,26 @@ For 32-bit we have the following conventions - kernel is built with
 	.endif
 	.endm
 
-#define REST_SKIP	6*8
+#define REST_SKIP	(6*8)
 
 	.macro SAVE_REST
 	subq $REST_SKIP, %rsp
 	CFI_ADJUST_CFA_OFFSET	REST_SKIP
-	movq %rbx, 5*8(%rsp)
-	CFI_REL_OFFSET	rbx, 5*8
-	movq %rbp, 4*8(%rsp)
-	CFI_REL_OFFSET	rbp, 4*8
-	movq %r12, 3*8(%rsp)
-	CFI_REL_OFFSET	r12, 3*8
-	movq %r13, 2*8(%rsp)
-	CFI_REL_OFFSET	r13, 2*8
-	movq %r14, 1*8(%rsp)
-	CFI_REL_OFFSET	r14, 1*8
-	movq %r15, (%rsp)
-	CFI_REL_OFFSET	r15, 0*8
+	movq_cfi rbx, 5*8
+	movq_cfi rbp, 4*8
+	movq_cfi r12, 3*8
+	movq_cfi r13, 2*8
+	movq_cfi r14, 1*8
+	movq_cfi r15, 0*8
 	.endm
 
 	.macro RESTORE_REST
-	movq (%rsp),     %r15
-	CFI_RESTORE r15
-	movq 1*8(%rsp),  %r14
-	CFI_RESTORE r14
-	movq 2*8(%rsp),  %r13
-	CFI_RESTORE r13
-	movq 3*8(%rsp),  %r12
-	CFI_RESTORE r12
-	movq 4*8(%rsp),  %rbp
-	CFI_RESTORE rbp
-	movq 5*8(%rsp),  %rbx
-	CFI_RESTORE rbx
+	movq_cfi_restore 0*8, r15
+	movq_cfi_restore 1*8, r14
+	movq_cfi_restore 2*8, r13
+	movq_cfi_restore 3*8, r12
+	movq_cfi_restore 4*8, rbp
+	movq_cfi_restore 5*8, rbx
 	addq $REST_SKIP, %rsp
 	CFI_ADJUST_CFA_OFFSET	-(REST_SKIP)
 	.endm
@@ -213,7 +188,7 @@ For 32-bit we have the following conventions - kernel is built with
 
 	.macro RESTORE_ALL addskip=0
 	RESTORE_REST
-	RESTORE_ARGS 0, \addskip
+	RESTORE_ARGS 1, \addskip
 	.endm
 
 	.macro icebp
@@ -231,7 +206,23 @@ For 32-bit we have the following conventions - kernel is built with
 	.macro ARRAY_INDEX_NOSPEC_SYSCALL clobber_reg
 		sbb \clobber_reg, \clobber_reg
 		and \clobber_reg, %rax
+		/* prevent a data "leak" */
+		xorq \clobber_reg, \clobber_reg
 	.endm
+
+.macro UNWIND_END_OF_STACK
+	417:
+	.pushsection __unwind_end_of_stack, "a"
+		.quad 417b
+	.popsection
+.endm
+
+.macro UNWIND_UNSAFE_STACK
+	417:
+	.pushsection __unwind_unsafe_stack, "a"
+		.quad 417b
+	.popsection
+.endm
 
 /*
  * Mitigate Spectre v1 for conditional swapgs code paths.
@@ -242,10 +233,29 @@ For 32-bit we have the following conventions - kernel is built with
  * FENCE_SWAPGS_KERNEL_ENTRY is used in the kernel entry non-swapgs code path,
  * to prevent the swapgs from getting speculatively skipped when coming from
  * user space.
+ *
+ * RHEL7 uses gs-indexed per-cpu variables for dynamic PTI enabling/disabling.
+ * So that on/off state of PTI doesn't matter in determining if fencing should
+ * be used or not. We have to properly fence swapgs before the invocation
+ * of the PTI macros.
+ *
+ * RHEL7 also doesn't have the ALTERNATIVE asm macro. So we have to open-code
+ * it. The lfence instruction is 3 bytes long.
  */
-.macro FENCE_SWAPGS_USER_ENTRY
-	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_USER
+ .macro _FENCE_SWAPGS feature
+	661: ASM_NOP3; 662:
+	.pushsection .altinstr_replacement, "ax"
+	663: lfence; 664:
+	.popsection
+	.pushsection .altinstructions, "a"
+	altinstruction_entry 661b, 663b, \feature, 662b-661b, 664b-663b
+	.popsection
 .endm
+
+.macro FENCE_SWAPGS_USER_ENTRY
+	_FENCE_SWAPGS X86_FEATURE_FENCE_SWAPGS_USER
+.endm
+
 .macro FENCE_SWAPGS_KERNEL_ENTRY
-	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_KERNEL
+	_FENCE_SWAPGS X86_FEATURE_FENCE_SWAPGS_KERNEL
 .endm

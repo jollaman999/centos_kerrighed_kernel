@@ -1,9 +1,8 @@
 /*
- *  drivers/s390/char/tape.c
  *    tape device driver for S/390 and zSeries tapes.
  *
  *  S390 and zSeries version
- *    Copyright (C) 2001 IBM Corporation
+ *    Copyright IBM Corp. 2001
  *    Author(s): Carsten Otte <cotte@de.ibm.com>
  *		 Michael Holzheu <holzheu@de.ibm.com>
  *		 Tuan Ngo-Anh <ngoanh@de.ibm.com>
@@ -48,7 +47,7 @@ static int tape_proc_show(struct seq_file *m, void *v)
 		seq_printf(m, "TapeNo\tBusID      CuType/Model\t"
 			"DevType/Model\tBlkSize\tState\tOp\tMedState\n");
 	}
-	device = tape_get_device(n);
+	device = tape_find_device(n);
 	if (IS_ERR(device))
 		return 0;
 	spin_lock_irq(get_ccwdev_lock(device->cdev));

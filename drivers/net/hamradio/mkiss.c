@@ -17,7 +17,6 @@
  * Copyright (C) 2004, 05 Thomas Osterried DL9SAU <thomas@x-berg.in-berlin.de>
  */
 #include <linux/module.h>
-#include <asm/system.h>
 #include <linux/bitops.h>
 #include <asm/uaccess.h>
 #include <linux/crc16.h>
@@ -26,6 +25,7 @@
 #include <linux/interrupt.h>
 #include <linux/in.h>
 #include <linux/inet.h>
+#include <linux/slab.h>
 #include <linux/tty.h>
 #include <linux/errno.h>
 #include <linux/netdevice.h>
@@ -36,6 +36,7 @@
 #include <linux/skbuff.h>
 #include <linux/if_arp.h>
 #include <linux/jiffies.h>
+#include <linux/compat.h>
 
 #include <net/ax25.h>
 
@@ -484,7 +485,7 @@ static void ax_encaps(struct net_device *dev, unsigned char *icp, int len)
 
 			return;
 		default:
-			count = kiss_esc(p, (unsigned char *)ax->xbuff, len);
+			count = kiss_esc(p, ax->xbuff, len);
 		}
 	} else {
 		unsigned short crc;
@@ -496,7 +497,7 @@ static void ax_encaps(struct net_device *dev, unsigned char *icp, int len)
 		case CRC_MODE_SMACK:
 			*p |= 0x80;
 			crc = swab16(crc16(0, p, len));
-			count = kiss_esc_crc(p, (unsigned char *)ax->xbuff, crc, len+2);
+			count = kiss_esc_crc(p, ax->xbuff, crc, len+2);
 			break;
 		case CRC_MODE_FLEX_TEST:
 			ax->crcmode = CRC_MODE_NONE;
@@ -505,11 +506,11 @@ static void ax_encaps(struct net_device *dev, unsigned char *icp, int len)
 		case CRC_MODE_FLEX:
 			*p |= 0x20;
 			crc = calc_crc_flex(p, len);
-			count = kiss_esc_crc(p, (unsigned char *)ax->xbuff, crc, len+2);
+			count = kiss_esc_crc(p, ax->xbuff, crc, len+2);
 			break;
 
 		default:
-			count = kiss_esc(p, (unsigned char *)ax->xbuff, len);
+			count = kiss_esc(p, ax->xbuff, len);
 		}
   	}
 	spin_unlock_bh(&ax->buflock);
@@ -519,7 +520,7 @@ static void ax_encaps(struct net_device *dev, unsigned char *icp, int len)
 	dev->stats.tx_packets++;
 	dev->stats.tx_bytes += actual;
 
-	ax->dev->trans_start = jiffies;
+	netif_trans_update(ax->dev);
 	ax->xleft = count - actual;
 	ax->xhead = ax->xbuff + actual;
 }
@@ -539,7 +540,7 @@ static netdev_tx_t ax_xmit(struct sk_buff *skb, struct net_device *dev)
 		 * May be we must check transmitter timeout here ?
 		 *      14 Oct 1994 Dmitry Gorodchanin.
 		 */
-		if (time_before(jiffies, dev->trans_start + 20 * HZ)) {
+		if (time_before(jiffies, dev_trans_start(dev) + 20 * HZ)) {
 			/* 20 sec timeout not reached */
 			return NETDEV_TX_BUSY;
 		}
@@ -745,7 +746,7 @@ static int mkiss_open(struct tty_struct *tty)
 
 	spin_lock_init(&ax->buflock);
 	atomic_set(&ax->refcnt, 1);
-	init_MUTEX_LOCKED(&ax->dead_sem);
+	sema_init(&ax->dead_sem, 0);
 
 	ax->tty = tty;
 	tty->disc_data = ax;
@@ -811,10 +812,10 @@ static void mkiss_close(struct tty_struct *tty)
 {
 	struct mkiss *ax;
 
-	write_lock(&disc_data_lock);
+	write_lock_bh(&disc_data_lock);
 	ax = tty->disc_data;
 	tty->disc_data = NULL;
-	write_unlock(&disc_data_lock);
+	write_unlock_bh(&disc_data_lock);
 
 	if (!ax)
 		return;
@@ -898,6 +899,23 @@ static int mkiss_ioctl(struct tty_struct *tty, struct file *file,
 	return err;
 }
 
+#ifdef CONFIG_COMPAT
+static long mkiss_compat_ioctl(struct tty_struct *tty, struct file *file,
+	unsigned int cmd, unsigned long arg)
+{
+	switch (cmd) {
+	case SIOCGIFNAME:
+	case SIOCGIFENCAP:
+	case SIOCSIFENCAP:
+	case SIOCSIFHWADDR:
+		return mkiss_ioctl(tty, file, cmd,
+				   (unsigned long)compat_ptr(arg));
+	}
+
+	return -ENOIOCTLCMD;
+}
+#endif
+
 /*
  * Handle the 'receiver data ready' interrupt.
  * This function is called by the 'tty_io' module in the kernel when
@@ -972,13 +990,16 @@ static struct tty_ldisc_ops ax_ldisc = {
 	.open		= mkiss_open,
 	.close		= mkiss_close,
 	.ioctl		= mkiss_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= mkiss_compat_ioctl,
+#endif
 	.receive_buf	= mkiss_receive_buf,
 	.write_wakeup	= mkiss_write_wakeup
 };
 
-static const char banner[] __initdata = KERN_INFO \
+static const char banner[] __initconst = KERN_INFO \
 	"mkiss: AX.25 Multikiss, Hans Albas PE1AYX\n";
-static const char msg_regfail[] __initdata = KERN_ERR \
+static const char msg_regfail[] __initconst = KERN_ERR \
 	"mkiss: can't register line discipline (err = %d)\n";
 
 static int __init mkiss_init_driver(void)
@@ -994,7 +1015,7 @@ static int __init mkiss_init_driver(void)
 	return status;
 }
 
-static const char msg_unregfail[] __exitdata = KERN_ERR \
+static const char msg_unregfail[] = KERN_ERR \
 	"mkiss: can't unregister line discipline (err = %d)\n";
 
 static void __exit mkiss_exit_driver(void)

@@ -10,14 +10,20 @@
 
 #include <linux/kernel.h>
 #include <linux/kmemcheck.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 #include <net/inet_hashtables.h>
 #include <net/inet_timewait_sock.h>
 #include <net/ip.h>
 
 
-/*
- * unhash a timewait socket from established hash
- * lock must be hold by caller
+/**
+ *	inet_twsk_unhash - unhash a timewait socket from established hash
+ *	@tw: timewait socket
+ *
+ *	unhash a timewait socket from established hash, if hashed.
+ *	ehash lock must be held by caller.
+ *	Returns 1 if caller should call inet_twsk_put() after lock release.
  */
 int inet_twsk_unhash(struct inet_timewait_sock *tw)
 {
@@ -26,12 +32,21 @@ int inet_twsk_unhash(struct inet_timewait_sock *tw)
 
 	hlist_nulls_del_rcu(&tw->tw_node);
 	sk_nulls_node_init(&tw->tw_node);
+	/*
+	 * We cannot call inet_twsk_put() ourself under lock,
+	 * caller must call it for us.
+	 */
 	return 1;
 }
 
-/*
- * unhash a timewait socket from bind hash
- * lock must be hold by caller
+/**
+ *	inet_twsk_bind_unhash - unhash a timewait socket from bind hash
+ *	@tw: timewait socket
+ *	@hashinfo: hashinfo pointer
+ *
+ *	unhash a timewait socket from bind hash, if hashed.
+ *	bind hash lock must be held by caller.
+ *	Returns 1 if caller should call inet_twsk_put() after lock release.
  */
 int inet_twsk_bind_unhash(struct inet_timewait_sock *tw,
 			  struct inet_hashinfo *hashinfo)
@@ -44,6 +59,10 @@ int inet_twsk_bind_unhash(struct inet_timewait_sock *tw,
 	__hlist_del(&tw->tw_bind_node);
 	tw->tw_tb = NULL;
 	inet_bind_bucket_destroy(hashinfo->bind_bucket_cachep, tb);
+	/*
+	 * We cannot call inet_twsk_put() ourself under lock,
+	 * caller must call it for us.
+	 */
 	return 1;
 }
 
@@ -68,26 +87,17 @@ static void __inet_twsk_kill(struct inet_timewait_sock *tw,
 	refcnt += inet_twsk_bind_unhash(tw, hashinfo);
 	spin_unlock(&bhead->lock);
 
-#ifdef SOCK_REFCNT_DEBUG
-	if (atomic_read(&tw->tw_refcnt) != 1) {
-		printk(KERN_DEBUG "%s timewait_sock %p refcnt=%d\n",
-		       tw->tw_prot->name, tw, atomic_read(&tw->tw_refcnt));
-	}
-#endif
-	while (refcnt) {
-		inet_twsk_put(tw);
-		refcnt--;
-	}
+	BUG_ON(refcnt >= atomic_read(&tw->tw_refcnt));
+	atomic_sub(refcnt, &tw->tw_refcnt);
 }
 
-static noinline void inet_twsk_free(struct inet_timewait_sock *tw)
+void inet_twsk_free(struct inet_timewait_sock *tw)
 {
 	struct module *owner = tw->tw_prot->owner;
 	twsk_destructor((struct sock *)tw);
 #ifdef SOCK_REFCNT_DEBUG
 	pr_debug("%s timewait_sock %p released\n", tw->tw_prot->name, tw);
 #endif
-	release_net(twsk_net(tw));
 	kmem_cache_free(tw->tw_prot->twsk_prot->twsk_slab, tw);
 	module_put(owner);
 }
@@ -98,6 +108,18 @@ void inet_twsk_put(struct inet_timewait_sock *tw)
 		inet_twsk_free(tw);
 }
 EXPORT_SYMBOL_GPL(inet_twsk_put);
+
+static void inet_twsk_add_node_rcu(struct inet_timewait_sock *tw,
+				   struct hlist_nulls_head *list)
+{
+	hlist_nulls_add_head_rcu(&tw->tw_node, list);
+}
+
+static void inet_twsk_add_bind_node(struct inet_timewait_sock *tw,
+				    struct hlist_head *list)
+{
+	hlist_add_head(&tw->tw_bind_node, list);
+}
 
 /*
  * Enter the time wait state. This is called with locally disabled BH.
@@ -116,7 +138,7 @@ void __inet_twsk_hashdance(struct inet_timewait_sock *tw, struct sock *sk,
 	   Note, that any socket with inet->num != 0 MUST be bound in
 	   binding cache, even if it is closed.
 	 */
-	bhead = &hashinfo->bhash[inet_bhashfn(twsk_net(tw), inet->num,
+	bhead = &hashinfo->bhash[inet_bhashfn(twsk_net(tw), inet->inet_num,
 			hashinfo->bhash_size)];
 	spin_lock(&bhead->lock);
 	tw->tw_tb = icsk->icsk_bind_hash;
@@ -127,29 +149,23 @@ void __inet_twsk_hashdance(struct inet_timewait_sock *tw, struct sock *sk,
 	spin_lock(lock);
 
 	/*
-	 * Step 2: Hash TW into TIMEWAIT chain.
-	 * Should be done before removing sk from established chain
-	 * because readers are lockless and search established first.
+	 * Step 2: Hash TW into tcp ehash chain.
+	 * Notes :
+	 * - tw_refcnt is set to 3 because :
+	 * - We have one reference from bhash chain.
+	 * - We have one reference from ehash chain.
+	 * We can use atomic_set() because prior spin_lock()/spin_unlock()
+	 * committed into memory all tw fields.
 	 */
-	inet_twsk_add_node_rcu(tw, &ehead->twchain);
+	atomic_set(&tw->tw_refcnt, 1 + 1 + 1);
+	inet_twsk_add_node_rcu(tw, &ehead->chain);
 
-	/* Step 3: Remove SK from established hash. */
+	/* Step 3: Remove SK from hash chain */
 	if (__sk_nulls_del_node_init_rcu(sk))
 		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, -1);
 
-	/*
-	 * Notes :
- 	 * - We initially set tw_refcnt to 0 in inet_twsk_alloc()
-	 * - We add one reference for the bhash link
-	 * - We add one reference for the ehash link
-	 * - We want this refcnt update done before allowing other
-	 *   threads to find this tw in ehash chain.
-	 */
-	atomic_add(1 + 1 + 1, &tw->tw_refcnt);
-
 	spin_unlock(lock);
 }
-
 EXPORT_SYMBOL_GPL(__inet_twsk_hashdance);
 
 struct inet_timewait_sock *inet_twsk_alloc(const struct sock *sk, const int state)
@@ -163,21 +179,22 @@ struct inet_timewait_sock *inet_twsk_alloc(const struct sock *sk, const int stat
 		kmemcheck_annotate_bitfield(tw, flags);
 
 		/* Give us an identity. */
-		tw->tw_daddr	    = inet->daddr;
-		tw->tw_rcv_saddr    = inet->rcv_saddr;
+		tw->tw_daddr	    = inet->inet_daddr;
+		tw->tw_rcv_saddr    = inet->inet_rcv_saddr;
 		tw->tw_bound_dev_if = sk->sk_bound_dev_if;
-		tw->tw_num	    = inet->num;
+		tw->tw_tos	    = inet->tos;
+		tw->tw_num	    = inet->inet_num;
 		tw->tw_state	    = TCP_TIME_WAIT;
 		tw->tw_substate	    = state;
-		tw->tw_sport	    = inet->sport;
-		tw->tw_dport	    = inet->dport;
+		tw->tw_sport	    = inet->inet_sport;
+		tw->tw_dport	    = inet->inet_dport;
 		tw->tw_family	    = sk->sk_family;
 		tw->tw_reuse	    = sk->sk_reuse;
 		tw->tw_hash	    = sk->sk_hash;
 		tw->tw_ipv6only	    = 0;
 		tw->tw_transparent  = inet->transparent;
 		tw->tw_prot	    = sk->sk_prot_creator;
-		twsk_net_set(tw, hold_net(sock_net(sk)));
+		twsk_net_set(tw, sock_net(sk));
 		/*
 		 * Because we use RCU lookups, we should not set tw_refcnt
 		 * to a non null value before everything is setup for this
@@ -190,7 +207,6 @@ struct inet_timewait_sock *inet_twsk_alloc(const struct sock *sk, const int stat
 
 	return tw;
 }
-
 EXPORT_SYMBOL_GPL(inet_twsk_alloc);
 
 /* Returns non-zero if quota exceeded.  */
@@ -198,7 +214,6 @@ static int inet_twdr_do_twkill_work(struct inet_timewait_death_row *twdr,
 				    const int slot)
 {
 	struct inet_timewait_sock *tw;
-	struct hlist_node *node;
 	unsigned int killed;
 	int ret;
 
@@ -211,7 +226,7 @@ static int inet_twdr_do_twkill_work(struct inet_timewait_death_row *twdr,
 	killed = 0;
 	ret = 0;
 rescan:
-	inet_twsk_for_each_inmate(tw, node, &twdr->cells[slot]) {
+	inet_twsk_for_each_inmate(tw, &twdr->cells[slot]) {
 		__inet_twsk_del_dead_node(tw);
 		spin_unlock(&twdr->death_lock);
 		__inet_twsk_kill(tw, twdr->hashinfo);
@@ -245,7 +260,7 @@ rescan:
 void inet_twdr_hangman(unsigned long data)
 {
 	struct inet_timewait_death_row *twdr;
-	int unsigned need_timer;
+	unsigned int need_timer;
 
 	twdr = (struct inet_timewait_death_row *)data;
 	spin_lock(&twdr->death_lock);
@@ -269,13 +284,13 @@ void inet_twdr_hangman(unsigned long data)
 out:
 	spin_unlock(&twdr->death_lock);
 }
-
 EXPORT_SYMBOL_GPL(inet_twdr_hangman);
 
 void inet_twdr_twkill_work(struct work_struct *work)
 {
 	struct inet_timewait_death_row *twdr =
 		container_of(work, struct inet_timewait_death_row, twkill_work);
+	bool rearm_timer = false;
 	int i;
 
 	BUILD_BUG_ON((INET_TWDR_TWKILL_SLOTS - 1) >
@@ -288,6 +303,7 @@ void inet_twdr_twkill_work(struct work_struct *work)
 				continue;
 
 			while (inet_twdr_do_twkill_work(twdr, i) != 0) {
+				rearm_timer = true;
 				if (need_resched()) {
 					spin_unlock_bh(&twdr->death_lock);
 					schedule();
@@ -299,8 +315,24 @@ void inet_twdr_twkill_work(struct work_struct *work)
 		}
 		spin_unlock_bh(&twdr->death_lock);
 	}
-}
 
+	/* RHEL hack: re-arm hangman timer with short delay (one second instead
+	 * of TCP_TIMEWAIT_LEN / INET_TWDR_TWKILL_SLOTS) if we exceeded
+	 * TIME_WAIT reaping quota for at least one of the thread slots.
+	 * Otherwise, with high CPU load, inet_twdr_do_twkill_work() won't run
+	 * frequently enough to empty the slots in a reasonable timeframe, and
+	 * we just end up clearing thread slot bits too early. Up to 45s
+	 * additional reaping time was observed for bursts of 2000 TCP closing
+	 * sockets after the 60s TIME_WAIT expiration time on 4 loaded CPUs.
+	 *
+	 * This doesn't need to be fixed upstream as commit 789f558cfb36
+	 * ("tcp/dccp: get rid of central timewait timer") gets rid of the
+	 * centralized timer wheel altogether and spreads TIME_WAIT reaping load
+	 * to all CPUs, without using thread slots at all.
+	 */
+	if (rearm_timer)
+		mod_timer(&twdr->tw_timer, jiffies + HZ);
+}
 EXPORT_SYMBOL_GPL(inet_twdr_twkill_work);
 
 /* These are always called from BH context.  See callers in
@@ -320,7 +352,6 @@ void inet_twsk_deschedule(struct inet_timewait_sock *tw,
 	spin_unlock(&twdr->death_lock);
 	__inet_twsk_kill(tw, twdr->hashinfo);
 }
-
 EXPORT_SYMBOL(inet_twsk_deschedule);
 
 void inet_twsk_schedule(struct inet_timewait_sock *tw,
@@ -373,11 +404,11 @@ void inet_twsk_schedule(struct inet_timewait_sock *tw,
 			if (slot >= INET_TWDR_TWKILL_SLOTS)
 				slot = INET_TWDR_TWKILL_SLOTS - 1;
 		}
-		tw->tw_ttd = jiffies + timeo;
+		tw->tw_ttd = inet_tw_time_stamp() + timeo;
 		slot = (twdr->slot + slot) & (INET_TWDR_TWKILL_SLOTS - 1);
 		list = &twdr->cells[slot];
 	} else {
-		tw->tw_ttd = jiffies + (slot << INET_TWDR_RECYCLE_TICK);
+		tw->tw_ttd = inet_tw_time_stamp() + (slot << INET_TWDR_RECYCLE_TICK);
 
 		if (twdr->twcal_hand < 0) {
 			twdr->twcal_hand = 0;
@@ -401,7 +432,6 @@ void inet_twsk_schedule(struct inet_timewait_sock *tw,
 		mod_timer(&twdr->tw_timer, jiffies + twdr->period);
 	spin_unlock(&twdr->death_lock);
 }
-
 EXPORT_SYMBOL_GPL(inet_twsk_schedule);
 
 void inet_twdr_twcal_tick(unsigned long data)
@@ -424,10 +454,10 @@ void inet_twdr_twcal_tick(unsigned long data)
 
 	for (n = 0; n < INET_TWDR_RECYCLE_SLOTS; n++) {
 		if (time_before_eq(j, now)) {
-			struct hlist_node *node, *safe;
+			struct hlist_node *safe;
 			struct inet_timewait_sock *tw;
 
-			inet_twsk_for_each_inmate_safe(tw, node, safe,
+			inet_twsk_for_each_inmate_safe(tw, safe,
 						       &twdr->twcal_row[slot]) {
 				__inet_twsk_del_dead_node(tw);
 				__inet_twsk_kill(tw, twdr->hashinfo);
@@ -462,40 +492,52 @@ out:
 #endif
 	spin_unlock(&twdr->death_lock);
 }
-
 EXPORT_SYMBOL_GPL(inet_twdr_twcal_tick);
 
-void inet_twsk_purge(struct net *net, struct inet_hashinfo *hashinfo,
+void inet_twsk_purge(struct inet_hashinfo *hashinfo,
 		     struct inet_timewait_death_row *twdr, int family)
 {
 	struct inet_timewait_sock *tw;
 	struct sock *sk;
 	struct hlist_nulls_node *node;
-	int h;
+	unsigned int slot;
 
-	local_bh_disable();
-	for (h = 0; h < (hashinfo->ehash_size); h++) {
-		struct inet_ehash_bucket *head =
-			inet_ehash_bucket(hashinfo, h);
-		spinlock_t *lock = inet_ehash_lockp(hashinfo, h);
+	for (slot = 0; slot <= hashinfo->ehash_mask; slot++) {
+		struct inet_ehash_bucket *head = &hashinfo->ehash[slot];
+restart_rcu:
+		rcu_read_lock();
 restart:
-		spin_lock(lock);
-		sk_nulls_for_each(sk, node, &head->twchain) {
-
+		sk_nulls_for_each_rcu(sk, node, &head->chain) {
+			if (sk->sk_state != TCP_TIME_WAIT)
+				continue;
 			tw = inet_twsk(sk);
-			if (!net_eq(twsk_net(tw), net) ||
-			    tw->tw_family != family)
+			if ((tw->tw_family != family) ||
+				atomic_read(&twsk_net(tw)->count))
 				continue;
 
-			atomic_inc(&tw->tw_refcnt);
-			spin_unlock(lock);
-			inet_twsk_deschedule(tw, twdr);
-			inet_twsk_put(tw);
+			if (unlikely(!atomic_inc_not_zero(&tw->tw_refcnt)))
+				continue;
 
-			goto restart;
+			if (unlikely((tw->tw_family != family) ||
+				     atomic_read(&twsk_net(tw)->count))) {
+				inet_twsk_put(tw);
+				goto restart;
+			}
+
+			rcu_read_unlock();
+			local_bh_disable();
+			inet_twsk_deschedule(tw, twdr);
+			local_bh_enable();
+			inet_twsk_put(tw);
+			goto restart_rcu;
 		}
-		spin_unlock(lock);
+		/* If the nulls value we got at the end of this lookup is
+		 * not the expected one, we must restart lookup.
+		 * We probably met an item that was moved to another chain.
+		 */
+		if (get_nulls_value(node) != slot)
+			goto restart;
+		rcu_read_unlock();
 	}
-	local_bh_enable();
 }
 EXPORT_SYMBOL_GPL(inet_twsk_purge);

@@ -14,6 +14,7 @@
 #include <linux/regset.h>
 #include <linux/compat.h>
 #include <linux/slab.h>
+#include <linux/pkeys.h>
 #include <asm/asm.h>
 #include <asm/cpufeature.h>
 #include <asm/processor.h>
@@ -21,13 +22,15 @@
 #include <asm/user.h>
 #include <asm/uaccess.h>
 #include <asm/xsave.h>
+#include <asm/smap.h>
 
 #ifdef CONFIG_X86_64
 # include <asm/sigcontext32.h>
 # include <asm/user32.h>
-int ia32_setup_rt_frame(int sig, struct k_sigaction *ka, siginfo_t *info,
+struct ksignal;
+int ia32_setup_rt_frame(int sig, struct ksignal *ksig,
 			compat_sigset_t *set, struct pt_regs *regs);
-int ia32_setup_frame(int sig, struct k_sigaction *ka,
+int ia32_setup_frame(int sig, struct ksignal *ksig,
 		     compat_sigset_t *set, struct pt_regs *regs);
 #else
 # define user_i387_ia32_struct	user_i387_struct
@@ -39,6 +42,8 @@ int ia32_setup_frame(int sig, struct k_sigaction *ka,
 extern unsigned int mxcsr_feature_mask;
 extern void fpu_init(void);
 extern void eager_fpu_init(void);
+
+DECLARE_PER_CPU(struct task_struct *, fpu_owner_task);
 
 extern void convert_from_fxsr(struct user_i387_ia32_struct *env,
 			      struct task_struct *tsk);
@@ -76,6 +81,11 @@ static inline int is_ia32_frame(void)
 	return config_enabled(CONFIG_X86_32) || is_ia32_compat_frame();
 }
 
+static inline int is_x32_frame(void)
+{
+	return config_enabled(CONFIG_X86_X32_ABI) && test_thread_flag(TIF_X32);
+}
+
 #define X87_FSW_ES (1 << 7)	/* Exception Summary */
 
 static __always_inline __pure bool use_eager_fpu(void)
@@ -100,9 +110,9 @@ static __always_inline __pure bool use_fxsr(void)
 
 static inline void fx_finit(struct i387_fxsave_struct *fx)
 {
+	memset(fx, 0, xstate_size);
 	fx->cwd = 0x37f;
-	if (cpu_has_xmm)
-		fx->mxcsr = MXCSR_DEFAULT;
+	fx->mxcsr = MXCSR_DEFAULT;
 }
 
 extern void __sanitize_i387_state(struct task_struct *);
@@ -113,6 +123,22 @@ static inline void sanitize_i387_state(struct task_struct *tsk)
 		return;
 	__sanitize_i387_state(tsk);
 }
+
+#define user_insn(insn, output, input...)				\
+({									\
+	int err;							\
+	asm volatile(ASM_STAC "\n"					\
+		     "1:" #insn "\n\t"					\
+		     "2: " ASM_CLAC "\n"				\
+		     ".section .fixup,\"ax\"\n"				\
+		     "3:  movl $-1,%[err]\n"				\
+		     "    jmp  2b\n"					\
+		     ".previous\n"					\
+		     _ASM_EXTABLE(1b, 3b)				\
+		     : [err] "=r" (err), output				\
+		     : "0"(0), input);					\
+	err;								\
+})
 
 #define check_insn(insn, output, input...)				\
 ({									\
@@ -131,25 +157,41 @@ static inline void sanitize_i387_state(struct task_struct *tsk)
 
 static inline int fsave_user(struct i387_fsave_struct __user *fx)
 {
-	return check_insn(fnsave %[fx]; fwait,  [fx] "=m" (*fx), "m" (*fx));
+	return user_insn(fnsave %[fx]; fwait,  [fx] "=m" (*fx), "m" (*fx));
 }
 
 static inline int fxsave_user(struct i387_fxsave_struct __user *fx)
 {
 	if (config_enabled(CONFIG_X86_32))
-		return check_insn(fxsave %[fx], [fx] "=m" (*fx), "m" (*fx));
+		return user_insn(fxsave %[fx], [fx] "=m" (*fx), "m" (*fx));
+	else if (config_enabled(CONFIG_AS_FXSAVEQ))
+		return user_insn(fxsaveq %[fx], [fx] "=m" (*fx), "m" (*fx));
 
 	/* See comment in fpu_fxsave() below. */
-	return check_insn(rex64/fxsave (%[fx]), "=m" (*fx), [fx] "R" (fx));
+	return user_insn(rex64/fxsave (%[fx]), "=m" (*fx), [fx] "R" (fx));
 }
 
 static inline int fxrstor_checking(struct i387_fxsave_struct *fx)
 {
 	if (config_enabled(CONFIG_X86_32))
 		return check_insn(fxrstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+	else if (config_enabled(CONFIG_AS_FXSAVEQ))
+		return check_insn(fxrstorq %[fx], "=m" (*fx), [fx] "m" (*fx));
 
 	/* See comment in fpu_fxsave() below. */
 	return check_insn(rex64/fxrstor (%[fx]), "=m" (*fx), [fx] "R" (fx),
+			  "m" (*fx));
+}
+
+static inline int fxrstor_user(struct i387_fxsave_struct __user *fx)
+{
+	if (config_enabled(CONFIG_X86_32))
+		return user_insn(fxrstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+	else if (config_enabled(CONFIG_AS_FXSAVEQ))
+		return user_insn(fxrstorq %[fx], "=m" (*fx), [fx] "m" (*fx));
+
+	/* See comment in fpu_fxsave() below. */
+	return user_insn(rex64/fxrstor (%[fx]), "=m" (*fx), [fx] "R" (fx),
 			  "m" (*fx));
 }
 
@@ -158,10 +200,17 @@ static inline int frstor_checking(struct i387_fsave_struct *fx)
 	return check_insn(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
 }
 
+static inline int frstor_user(struct i387_fsave_struct __user *fx)
+{
+	return user_insn(frstor %[fx], "=m" (*fx), [fx] "m" (*fx));
+}
+
 static inline void fpu_fxsave(struct fpu *fpu)
 {
 	if (config_enabled(CONFIG_X86_32))
 		asm volatile( "fxsave %[fx]" : [fx] "=m" (fpu->state->fxsave));
+	else if (config_enabled(CONFIG_AS_FXSAVEQ))
+		asm volatile("fxsaveq %0" : "=m" (fpu->state->fxsave));
 	else {
 		/* Using "rex64; fxsave %0" is broken because, if the memory
 		 * operand uses any extended registers for addressing, a second
@@ -229,7 +278,7 @@ static inline int fpu_save_init(struct fpu *fpu)
 
 static inline int __save_init_fpu(struct task_struct *tsk)
 {
-	return fpu_save_init((struct fpu *)&tsk->thread.xstate);
+	return fpu_save_init(&tsk->thread.fpu);
 }
 
 static inline int fpu_restore_checking(struct fpu *fpu)
@@ -247,15 +296,15 @@ static inline int restore_fpu_checking(struct task_struct *tsk)
 	/* AMD K7/K8 CPUs don't save/restore FDP/FIP/FOP unless an exception
 	   is pending.  Clear the x87 state here by setting it to fixed
 	   values. "m" is a random variable that should be in L1 */
-	alternative_input(
-		_ASM_MK_NOP(GENERIC_NOP8)
-		_ASM_MK_NOP(GENERIC_NOP2),
-		"emms\n\t"		/* clear stack tags */
-		"fildl %P[addr]",	/* set F?P to defined value */
-		X86_FEATURE_FXSAVE_LEAK,
-		[addr] "m" (tsk->has_fpu));
+	if (unlikely(static_cpu_has(X86_FEATURE_FXSAVE_LEAK))) {
+		asm volatile(
+			"fnclex\n\t"
+			"emms\n\t"
+			"fildl %P[addr]"	/* set F?P to defined value */
+			: : [addr] "m" (tsk->thread.fpu.has_fpu));
+	}
 
-	return fpu_restore_checking((struct fpu *)&tsk->thread.xstate);
+	return fpu_restore_checking(&tsk->thread.fpu);
 }
 
 /*
@@ -265,19 +314,21 @@ static inline int restore_fpu_checking(struct task_struct *tsk)
  */
 static inline int __thread_has_fpu(struct task_struct *tsk)
 {
-	return tsk->has_fpu;
+	return tsk->thread.fpu.has_fpu;
 }
 
 /* Must be paired with an 'stts' after! */
 static inline void __thread_clear_has_fpu(struct task_struct *tsk)
 {
-	tsk->has_fpu = 0;
+	tsk->thread.fpu.has_fpu = 0;
+	this_cpu_write(fpu_owner_task, NULL);
 }
 
 /* Must be paired with a 'clts' before! */
 static inline void __thread_set_has_fpu(struct task_struct *tsk)
 {
-	tsk->has_fpu = 1;
+	tsk->thread.fpu.has_fpu = 1;
+	this_cpu_write(fpu_owner_task, tsk);
 }
 
 /*
@@ -301,14 +352,8 @@ static inline void __thread_fpu_begin(struct task_struct *tsk)
 	__thread_set_has_fpu(tsk);
 }
 
-static inline void drop_fpu(struct task_struct *tsk)
+static inline void __drop_fpu(struct task_struct *tsk)
 {
-	/*
-	 * Forget coprocessor state..
-	 */
-	preempt_disable();
-	tsk->fpu_counter = 0;
-
 	if (__thread_has_fpu(tsk)) {
 		/* Ignore delayed exceptions from user space */
 		asm volatile("1: fwait\n"
@@ -316,29 +361,33 @@ static inline void drop_fpu(struct task_struct *tsk)
 			     _ASM_EXTABLE(1b, 2b));
 		__thread_fpu_end(tsk);
 	}
+}
 
-	clear_stopped_child_used_math(tsk);
+static inline void drop_fpu(struct task_struct *tsk)
+{
+	/*
+	 * Forget coprocessor state..
+	 */
+	preempt_disable();
+	tsk->fpu_counter = 0;
+	__drop_fpu(tsk);
+	clear_used_math();
 	preempt_enable();
 }
 
-static inline void restore_init_xstate(void)
-{
-	if (use_xsave())
-		xrstor_state(init_xstate_buf, -1);
-	else
-		fxrstor_checking(&init_xstate_buf->i387);
-}
-
-/*
- * Reset the FPU state in the eager case and drop it in the lazy case (later use
- * will reinit it).
- */
-static inline void fpu_reset_state(struct task_struct *tsk)
+static inline void drop_init_fpu(struct task_struct *tsk)
 {
 	if (!use_eager_fpu())
 		drop_fpu(tsk);
-	else
-		restore_init_xstate();
+	else {
+		if (use_xsave())
+			xrstor_state(init_xstate_buf, -1);
+		else
+			fxrstor_checking(&init_xstate_buf->i387);
+
+		if (boot_cpu_has(X86_FEATURE_OSPKE))
+			copy_init_pkru_to_fpregs();
+	}
 }
 
 /*
@@ -356,17 +405,21 @@ static inline void fpu_reset_state(struct task_struct *tsk)
 typedef struct { int preload; } fpu_switch_t;
 
 /*
- * FIXME! We could do a totally lazy restore, but we need to
- * add a per-cpu "this was the task that last touched the FPU
- * on this CPU" variable, and the task needs to have a "I last
- * touched the FPU on this CPU" and check them.
+ * Must be run with preemption disabled: this clears the fpu_owner_task,
+ * on this CPU.
  *
- * We don't do that yet, so "fpu_lazy_restore()" always returns
- * false, but some day..
+ * This will disable any lazy FPU state restore of the current FPU state,
+ * but if the current thread owns the FPU, it will still be saved by.
  */
+static inline void __cpu_disable_lazy_restore(unsigned int cpu)
+{
+	per_cpu(fpu_owner_task, cpu) = NULL;
+}
+
 static inline int fpu_lazy_restore(struct task_struct *new, unsigned int cpu)
 {
-	return 0;
+	return new == this_cpu_read_stable(fpu_owner_task) &&
+		cpu == new->thread.fpu.last_cpu;
 }
 
 static inline fpu_switch_t switch_fpu_prepare(struct task_struct *old, struct task_struct *new, int cpu)
@@ -382,23 +435,25 @@ static inline fpu_switch_t switch_fpu_prepare(struct task_struct *old, struct ta
 	if (__thread_has_fpu(old)) {
 		if (!__save_init_fpu(old))
 			cpu = ~0;
-		old->has_fpu = 0;
+		old->thread.fpu.last_cpu = cpu;
+		old->thread.fpu.has_fpu = 0;	/* But leave fpu_owner_task! */
 
 		/* Don't change CR0.TS if we just switch! */
 		if (fpu.preload) {
 			new->fpu_counter++;
 			__thread_set_has_fpu(new);
-			prefetch(new->thread.xstate);
+			prefetch(new->thread.fpu.state);
 		} else if (!use_eager_fpu())
 			stts();
 	} else {
 		old->fpu_counter = 0;
+		old->thread.fpu.last_cpu = ~0;
 		if (fpu.preload) {
 			new->fpu_counter++;
 			if (!use_eager_fpu() && fpu_lazy_restore(new, cpu))
 				fpu.preload = 0;
 			else
-				prefetch(new->thread.xstate);
+				prefetch(new->thread.fpu.state);
 			__thread_fpu_begin(new);
 		}
 	}
@@ -415,7 +470,7 @@ static inline void switch_fpu_finish(struct task_struct *new, fpu_switch_t fpu)
 {
 	if (fpu.preload) {
 		if (unlikely(restore_fpu_checking(new)))
-			fpu_reset_state(new);
+			drop_init_fpu(new);
 	}
 }
 
@@ -444,12 +499,10 @@ static inline int restore_xstate_sig(void __user *buf, int ia32_frame)
 }
 
 /*
- * Needs to be preemption-safe.
+ * Need to be preemption-safe.
  *
  * NOTE! user_fpu_begin() must be used only immediately before restoring
- * the save state. It does not do any saving/restoring on its own. In
- * lazy FPU mode, it is just an optimization to avoid a #NM exception,
- * the task can lose the FPU right after preempt_enable().
+ * it. This function does not do any save/restore on their own.
  */
 static inline void user_fpu_begin(void)
 {
@@ -461,10 +514,31 @@ static inline void user_fpu_begin(void)
 
 static inline void __save_fpu(struct task_struct *tsk)
 {
-	if (use_xsave())
-		xsave_state(&tsk->thread.xstate->xsave, -1);
-	else
-		fpu_fxsave((struct fpu *)&tsk->thread.xstate);
+	if (use_xsave()) {
+		if (unlikely(system_state == SYSTEM_BOOTING))
+			xsave_state_booting(&tsk->thread.fpu.state->xsave, -1);
+		else
+			xsave_state(&tsk->thread.fpu.state->xsave, -1);
+	} else
+		fpu_fxsave(&tsk->thread.fpu);
+}
+
+/*
+ * These disable preemption on their own and are safe
+ */
+static inline void save_init_fpu(struct task_struct *tsk)
+{
+	WARN_ON_ONCE(!__thread_has_fpu(tsk));
+
+	if (use_eager_fpu()) {
+		__save_fpu(tsk);
+		return;
+	}
+
+	preempt_disable();
+	__save_init_fpu(tsk);
+	__thread_fpu_end(tsk);
+	preempt_enable();
 }
 
 /*
@@ -473,25 +547,25 @@ static inline void __save_fpu(struct task_struct *tsk)
 static inline unsigned short get_fpu_cwd(struct task_struct *tsk)
 {
 	if (cpu_has_fxsr) {
-		return tsk->thread.xstate->fxsave.cwd;
+		return tsk->thread.fpu.state->fxsave.cwd;
 	} else {
-		return (unsigned short)tsk->thread.xstate->fsave.cwd;
+		return (unsigned short)tsk->thread.fpu.state->fsave.cwd;
 	}
 }
 
 static inline unsigned short get_fpu_swd(struct task_struct *tsk)
 {
 	if (cpu_has_fxsr) {
-		return tsk->thread.xstate->fxsave.swd;
+		return tsk->thread.fpu.state->fxsave.swd;
 	} else {
-		return (unsigned short)tsk->thread.xstate->fsave.swd;
+		return (unsigned short)tsk->thread.fpu.state->fsave.swd;
 	}
 }
 
 static inline unsigned short get_fpu_mxcsr(struct task_struct *tsk)
 {
 	if (cpu_has_xmm) {
-		return tsk->thread.xstate->fxsave.mxcsr;
+		return tsk->thread.fpu.state->fxsave.mxcsr;
 	} else {
 		return MXCSR_DEFAULT;
 	}
@@ -524,11 +598,14 @@ static inline void fpu_free(struct fpu *fpu)
 static inline void fpu_copy(struct task_struct *dst, struct task_struct *src)
 {
 	if (use_eager_fpu()) {
-		memset(dst->thread.xstate, 0, xstate_size);
+		memset(&dst->thread.fpu.state->xsave, 0, xstate_size);
 		__save_fpu(dst);
 	} else {
+		struct fpu *dfpu = &dst->thread.fpu;
+		struct fpu *sfpu = &src->thread.fpu;
+
 		unlazy_fpu(src);
-		memcpy(dst->thread.xstate, src->thread.xstate, xstate_size);
+		memcpy(dfpu->state, sfpu->state, xstate_size);
 	}
 }
 

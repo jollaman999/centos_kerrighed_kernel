@@ -28,6 +28,7 @@
 #include <linux/device.h>
 #include <linux/list.h>
 #include <linux/err.h>
+#include <linux/prefetch.h>
 #include <asm/uv/uv_hub.h>
 #include "gru.h"
 #include "grutables.h"
@@ -814,11 +815,11 @@ void gru_steal_context(struct gru_thread_state *gts)
 					break;
 				ngts = gru->gs_gts[ctxnum];
 				/*
-				* We are grabbing locks out of order, so trylock is
-				* needed. GTSs are usually not locked, so the odds of
-				* success are high. If trylock fails, try to steal a
-				* different GSEG.
-				*/
+			 	* We are grabbing locks out of order, so trylock is
+			 	* needed. GTSs are usually not locked, so the odds of
+			 	* success are high. If trylock fails, try to steal a
+			 	* different GSEG.
+			 	*/
 				if (ngts && is_gts_stealable(ngts, blade))
 					break;
 				ngts = NULL;

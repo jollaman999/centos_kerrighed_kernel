@@ -10,6 +10,7 @@
 #include <asm/addrspace.h>
 #include <asm/byteorder.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <asm/cacheflush.h>
 #include <asm/io.h>
@@ -21,7 +22,7 @@ static inline void remap_area_pte(pte_t * pte, unsigned long address,
 	phys_t end;
 	unsigned long pfn;
 	pgprot_t pgprot = __pgprot(_PAGE_GLOBAL | _PAGE_PRESENT | __READABLE
-	                           | __WRITEABLE | flags);
+				   | __WRITEABLE | flags);
 
 	address &= ~PMD_MASK;
 	end = address + size;
@@ -184,7 +185,7 @@ void __iounmap(const volatile void __iomem *addr)
 	if (!p)
 		printk(KERN_ERR "iounmap: bad address %p\n", addr);
 
-        kfree(p);
+	kfree(p);
 }
 
 EXPORT_SYMBOL(__ioremap);

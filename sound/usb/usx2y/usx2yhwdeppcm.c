@@ -20,7 +20,7 @@
  at standard samplerates,
  what led to this part of the usx2y module: 
  It provides the alsa kernel half of the usx2y-alsa-jack driver pair.
- The pair uses a hardware dependant alsa-device for mmaped pcm transport.
+ The pair uses a hardware dependent alsa-device for mmaped pcm transport.
  Advantage achieved:
          The usb_hc moves pcm data from/into memory via DMA.
          That memory is mmaped by jack's usx2y driver.
@@ -38,7 +38,7 @@
          2periods works but is useless cause of crackling).
 
  This is a first "proof of concept" implementation.
- Later, functionalities should migrate to more apropriate places:
+ Later, functionalities should migrate to more appropriate places:
  Userland:
  - The jackd could mmap its float-pcm buffers directly from alsa-lib.
  - alsa-lib could provide power of 2 period sized shaping combined with int/float
@@ -51,6 +51,7 @@
 */
 
 #include <linux/delay.h>
+#include <linux/gfp.h>
 #include "usbusx2yaudio.c"
 
 #if defined(USX2Y_NRPACKS_VARIABLE) || USX2Y_NRPACKS == 1
@@ -437,7 +438,6 @@ static int usX2Y_usbpcm_urbs_start(struct snd_usX2Y_substream *subs)
 					if (0 == u)
 						atomic_set(&subs->state, state_STARTING3);
 					urb->dev = usX2Y->dev;
-					urb->transfer_flags = URB_ISO_ASAP;
 					for (pack = 0; pack < nr_of_packs(); pack++) {
 						urb->iso_frame_desc[pack].offset = subs->maxpacksize * (pack + u * nr_of_packs());
 						urb->iso_frame_desc[pack].length = subs->maxpacksize;
@@ -488,7 +488,9 @@ static int snd_usX2Y_usbpcm_prepare(struct snd_pcm_substream *substream)
 	snd_printdd("snd_usX2Y_pcm_prepare(%p)\n", substream);
 
 	if (NULL == usX2Y->hwdep_pcm_shm) {
-		if (NULL == (usX2Y->hwdep_pcm_shm = snd_malloc_pages(sizeof(struct snd_usX2Y_hwdep_pcm_shm), GFP_KERNEL)))
+		usX2Y->hwdep_pcm_shm = alloc_pages_exact(sizeof(struct snd_usX2Y_hwdep_pcm_shm),
+							 GFP_KERNEL);
+		if (!usX2Y->hwdep_pcm_shm)
 			return -ENOMEM;
 		memset(usX2Y->hwdep_pcm_shm, 0, sizeof(struct snd_usX2Y_hwdep_pcm_shm));
 	}
@@ -587,7 +589,7 @@ static int snd_usX2Y_usbpcm_close(struct snd_pcm_substream *substream)
 }
 
 
-static struct snd_pcm_ops snd_usX2Y_usbpcm_ops = 
+static const struct snd_pcm_ops snd_usX2Y_usbpcm_ops =
 {
 	.open =		snd_usX2Y_usbpcm_open,
 	.close =	snd_usX2Y_usbpcm_close,
@@ -691,7 +693,7 @@ static int snd_usX2Y_hwdep_pcm_mmap(struct snd_hwdep * hw, struct file *filp, st
 		return -ENODEV;
 	}
 	area->vm_ops = &snd_usX2Y_hwdep_pcm_vm_ops;
-	area->vm_flags |= VM_RESERVED | VM_DONTEXPAND;
+	area->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
 	area->vm_private_data = hw->private_data;
 	return 0;
 }
@@ -701,7 +703,7 @@ static void snd_usX2Y_hwdep_pcm_private_free(struct snd_hwdep *hwdep)
 {
 	struct usX2Ydev *usX2Y = hwdep->private_data;
 	if (NULL != usX2Y->hwdep_pcm_shm)
-		snd_free_pages(usX2Y->hwdep_pcm_shm, sizeof(struct snd_usX2Y_hwdep_pcm_shm));
+		free_pages_exact(usX2Y->hwdep_pcm_shm, sizeof(struct snd_usX2Y_hwdep_pcm_shm));
 }
 
 
@@ -724,7 +726,7 @@ int usX2Y_hwdep_pcm_new(struct snd_card *card)
 	hw->ops.release = snd_usX2Y_hwdep_pcm_release;
 	hw->ops.mmap = snd_usX2Y_hwdep_pcm_mmap;
 	hw->exclusive = 1;
-	sprintf(hw->name, "/proc/bus/usb/%03d/%03d/hwdeppcm", dev->bus->busnum, dev->devnum);
+	sprintf(hw->name, "/dev/bus/usb/%03d/%03d/hwdeppcm", dev->bus->busnum, dev->devnum);
 
 	err = snd_pcm_new(card, NAME_ALLCAPS" hwdep Audio", 2, 1, 1, &pcm);
 	if (err < 0) {
@@ -737,17 +739,14 @@ int usX2Y_hwdep_pcm_new(struct snd_card *card)
 	pcm->info_flags = 0;
 
 	sprintf(pcm->name, NAME_ALLCAPS" hwdep Audio");
-	if (0 > (err = snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream,
-						     SNDRV_DMA_TYPE_CONTINUOUS,
-						     snd_dma_continuous_data(GFP_KERNEL),
-						     64*1024, 128*1024)) ||
-	    0 > (err = snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream,
-	    					     SNDRV_DMA_TYPE_CONTINUOUS,
-	    					     snd_dma_continuous_data(GFP_KERNEL),
-						     64*1024, 128*1024))) {
-		return err;
-	}
-
+	snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream,
+				      SNDRV_DMA_TYPE_CONTINUOUS,
+				      snd_dma_continuous_data(GFP_KERNEL),
+				      64*1024, 128*1024);
+	snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream,
+				      SNDRV_DMA_TYPE_CONTINUOUS,
+				      snd_dma_continuous_data(GFP_KERNEL),
+				      64*1024, 128*1024);
 
 	return 0;
 }

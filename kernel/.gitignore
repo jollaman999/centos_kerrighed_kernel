@@ -4,3 +4,7 @@
 config_data.h
 config_data.gz
 timeconst.h
+hz.bc
+
+# qrwlock generated files
+qrwlock_gen.c

@@ -219,7 +219,7 @@ static inline int read_reg(struct stir_cb *stir, __u16 reg,
 
 static inline int isfir(u32 speed)
 {
-	return (speed == 4000000);
+	return speed == 4000000;
 }
 
 /*
@@ -612,16 +612,16 @@ static int fifo_txwait(struct stir_cb *stir, int space)
 		pr_debug("fifo status 0x%lx count %lu\n", status, count);
 
 		/* is fifo receiving already, or empty */
-		if (!(status & FIFOCTL_DIR)
-		    || (status & FIFOCTL_EMPTY))
+		if (!(status & FIFOCTL_DIR) ||
+		    (status & FIFOCTL_EMPTY))
 			return 0;
 
 		if (signal_pending(current))
 			return -EINTR;
 
 		/* shutting down? */
-		if (!netif_running(stir->netdev)
-		    || !netif_device_present(stir->netdev))
+		if (!netif_running(stir->netdev) ||
+		    !netif_device_present(stir->netdev))
 			return -ESHUTDOWN;
 
 		/* only waiting for some space */
@@ -721,7 +721,7 @@ static void stir_send(struct stir_cb *stir, struct sk_buff *skb)
 
 	stir->netdev->stats.tx_packets++;
 	stir->netdev->stats.tx_bytes += skb->len;
-	stir->netdev->trans_start = jiffies;
+	netif_trans_update(stir->netdev);
 	pr_debug("send %d (%d)\n", skb->len, wraplen);
 
 	if (usb_bulk_msg(stir->usbdev, usb_sndbulkpipe(stir->usbdev, 1),
@@ -750,7 +750,7 @@ static int stir_transmit_thread(void *arg)
 
 			write_reg(stir, REG_CTRL1, CTRL1_TXPWD|CTRL1_RXPWD);
 
-			refrigerator();
+			try_to_freeze();
 
 			if (change_speed(stir, stir->speed))
 				break;
@@ -776,8 +776,8 @@ static int stir_transmit_thread(void *arg)
 		}
 
 		/* nothing to send? start receiving */
-		if (!stir->receiving 
-		    && irda_device_txqueue_empty(dev)) {
+		if (!stir->receiving &&
+		    irda_device_txqueue_empty(dev)) {
 			/* Wait otherwise chip gets confused. */
 			if (fifo_txwait(stir, -1))
 				break;
@@ -904,7 +904,7 @@ static int stir_net_open(struct net_device *netdev)
 	sprintf(hwname, "usb#%d", stir->usbdev->devnum);
 	stir->irlap = irlap_open(netdev, &stir->qos, hwname);
 	if (!stir->irlap) {
-		err("stir4200: irlap_open failed");
+		dev_err(&stir->usbdev->dev, "irlap_open failed\n");
 		goto err_out5;
 	}
 
@@ -913,7 +913,7 @@ static int stir_net_open(struct net_device *netdev)
 				   "%s", stir->netdev->name);
         if (IS_ERR(stir->thread)) {
                 err = PTR_ERR(stir->thread);
-		err("stir4200: unable to start kernel thread");
+		dev_err(&stir->usbdev->dev, "unable to start kernel thread\n");
 		goto err_out6;
 	}
 
@@ -1042,7 +1042,7 @@ static int stir_probe(struct usb_interface *intf,
 
 	ret = usb_reset_configuration(dev);
 	if (ret != 0) {
-		err("stir4200: usb reset configuration failed");
+		dev_err(&intf->dev, "usb reset configuration failed\n");
 		goto err_out2;
 	}
 
@@ -1133,21 +1133,4 @@ static struct usb_driver irda_driver = {
 #endif
 };
 
-/*
- * Module insertion
- */
-static int __init stir_init(void)
-{
-	return usb_register(&irda_driver);
-}
-module_init(stir_init);
-
-/*
- * Module removal
- */
-static void __exit stir_cleanup(void)
-{
-	/* Deregister the driver and remove all pending instances */
-	usb_deregister(&irda_driver);
-}
-module_exit(stir_cleanup);
+module_usb_driver(irda_driver);

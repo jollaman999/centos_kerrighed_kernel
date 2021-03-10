@@ -16,7 +16,7 @@
 #include <linux/file.h>
 #include <linux/delay.h>
 #include <linux/msm_mdp.h>
-#include <mach/msm_fb.h>
+#include <linux/platform_data/video-msm_fb.h>
 
 #include "mdp_hw.h"
 #include "mdp_scale_tables.h"
@@ -69,6 +69,7 @@ static uint32_t bytes_per_pixel[] = {
 	[MDP_ARGB_8888] = 4,
 	[MDP_RGBA_8888] = 4,
 	[MDP_BGRA_8888] = 4,
+	[MDP_RGBX_8888] = 4,
 	[MDP_Y_CBCR_H2V1] = 1,
 	[MDP_Y_CBCR_H2V2] = 1,
 	[MDP_Y_CRCB_H2V1] = 1,

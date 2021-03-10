@@ -15,93 +15,15 @@
 #include <linux/nmi.h>
 
 #include <asm/stacktrace.h>
-#include <asm/processor.h>
 
 
-void dump_trace(struct task_struct *task,
-		struct pt_regs *regs, unsigned long *stack,
-		const struct stacktrace_ops *ops, void *data)
-{
-	int graph = 0;
-	unsigned long bp;
-
-	if (!task)
-		task = current;
-
-	if (!stack) {
-		unsigned long dummy;
-
-		stack = &dummy;
-		if (task && task != current)
-			stack = (unsigned long *)task->thread.sp;
-	}
-
-	bp = stack_frame(task, regs);
-	for (;;) {
-		struct thread_info *context;
-		struct tss_struct *t = &per_cpu(init_tss, smp_processor_id());
-
-		/*
-		 * With PTI-32, it is possible that the given stack is
-		 * pointing to the trampoline stack. In such case, we need
-		 * to use current_thread_info() instead.
-		 */
-		if ((stack >= t->stack) &&
-		    (stack <= t->stack + ARRAY_SIZE(t->stack)))
-			context = current_thread_info();
-		else
-			context = (struct thread_info *)
-			((unsigned long)stack & (~(THREAD_SIZE - 1)));
-		bp = ops->walk_stack(context, stack, bp, ops, data, NULL, &graph);
-
-		stack = (unsigned long *)context->previous_esp;
-		if (!stack)
-			break;
-		if (ops->stack(data, "IRQ") < 0)
-			break;
-		touch_nmi_watchdog();
-	}
-}
-EXPORT_SYMBOL(dump_trace);
-
-void
-show_stack_log_lvl(struct task_struct *task, struct pt_regs *regs,
-		   unsigned long *sp, char *log_lvl)
-{
-	unsigned long *stack;
-	int i;
-
-	if (sp == NULL) {
-		if (task)
-			sp = (unsigned long *)task->thread.sp;
-		else
-			sp = (unsigned long *)&sp;
-	}
-
-	stack = sp;
-	for (i = 0; i < kstack_depth_to_print; i++) {
-		if (kstack_end(stack))
-			break;
-		if (i && ((i % STACKSLOTS_PER_LINE) == 0))
-			printk("\n%s", log_lvl);
-		printk(" %08lx", *stack++);
-		touch_nmi_watchdog();
-	}
-	printk("\n");
-	show_trace_log_lvl(task, regs, sp, log_lvl);
-}
-
-
-void show_registers(struct pt_regs *regs)
+void show_regs(struct pt_regs *regs)
 {
 	int i;
 
-	print_modules();
-	__show_regs(regs, 0);
+	show_regs_print_info(KERN_EMERG);
+	__show_regs(regs, !user_mode_vm(regs));
 
-	printk(KERN_EMERG "Process %.*s (pid: %d, ti=%p task=%p task.ti=%p)\n",
-		TASK_COMM_LEN, current->comm, task_pid_nr(current),
-		current_thread_info(), current, task_thread_info(current));
 	/*
 	 * When in-kernel, we also print out the stack and code at the
 	 * time of the fault..
@@ -112,10 +34,9 @@ void show_registers(struct pt_regs *regs)
 		unsigned char c;
 		u8 *ip;
 
-		printk(KERN_EMERG "Stack:\n");
-		show_stack_log_lvl(NULL, regs, &regs->sp, KERN_EMERG);
+		show_trace_log_lvl(current, regs, NULL, KERN_EMERG);
 
-		printk(KERN_EMERG "Code: ");
+		pr_emerg("Code:");
 
 		ip = (u8 *)regs->ip - code_prologue;
 		if (ip < (u8 *)PAGE_OFFSET || probe_kernel_address(ip, c)) {
@@ -126,16 +47,16 @@ void show_registers(struct pt_regs *regs)
 		for (i = 0; i < code_len; i++, ip++) {
 			if (ip < (u8 *)PAGE_OFFSET ||
 					probe_kernel_address(ip, c)) {
-				printk(" Bad EIP value.");
+				pr_cont("  Bad EIP value.");
 				break;
 			}
 			if (ip == (u8 *)regs->ip)
-				printk("<%02x> ", c);
+				pr_cont(" <%02x>", c);
 			else
-				printk("%02x ", c);
+				pr_cont(" %02x", c);
 		}
 	}
-	printk("\n");
+	pr_cont("\n");
 }
 
 int is_valid_bugaddr(unsigned long ip)

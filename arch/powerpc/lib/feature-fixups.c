@@ -12,12 +12,14 @@
  *  2 of the License, or (at your option) any later version.
  */
 
+#include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/init.h>
 #include <asm/cputable.h>
 #include <asm/code-patching.h>
-#include <asm/system.h>
+#include <asm/page.h>
+#include <asm/sections.h>
 #include <asm/setup.h>
 #include <asm/security_features.h>
 
@@ -59,7 +61,7 @@ static int patch_alt_instruction(unsigned int *src, unsigned int *dest,
 		}
 	}
 
-	patch_instruction(dest, instr);
+	raw_patch_instruction(dest, instr);
 
 	return 0;
 }
@@ -88,7 +90,7 @@ static int patch_feature_section(unsigned long value, struct fixup_entry *fcur)
 	}
 
 	for (; dest < end; dest++)
-		patch_instruction(dest, PPC_INST_NOP);
+		raw_patch_instruction(dest, PPC_INST_NOP);
 
 	return 0;
 }
@@ -182,13 +184,21 @@ void do_stf_exit_barrier_fixups(enum stf_barrier_type types)
 
 	i = 0;
 	if (types & STF_BARRIER_FALLBACK || types & STF_BARRIER_SYNC_ORI) {
-		/* RHEL6 does not support CPU_FTR_HVMODE (thus no HSPRG0/1) */
-		instrs[i++] = 0x7db243a6; /* mtsprg 2,r13	*/
-		instrs[i++] = 0x7db142a6; /* mfsprg r13,1    */
+		if (cpu_has_feature(CPU_FTR_HVMODE)) {
+			instrs[i++] = 0x7db14ba6; /* mtspr 0x131, r13 (HSPRG1) */
+			instrs[i++] = 0x7db04aa6; /* mfspr r13, 0x130 (HSPRG0) */
+		} else {
+			instrs[i++] = 0x7db243a6; /* mtsprg 2,r13	*/
+			instrs[i++] = 0x7db142a6; /* mfsprg r13,1    */
+	        }
 		instrs[i++] = 0x7c0004ac; /* hwsync		*/
 		instrs[i++] = 0xe9ad0000; /* ld r13,0(r13)	*/
 		instrs[i++] = 0x63ff0000; /* ori 31,31,0 speculation barrier */
-		instrs[i++] = 0x7db242a6; /* mfsprg r13,2 */
+		if (cpu_has_feature(CPU_FTR_HVMODE)) {
+			instrs[i++] = 0x7db14aa6; /* mfspr r13, 0x131 (HSPRG1) */
+		} else {
+			instrs[i++] = 0x7db242a6; /* mfsprg r13,2 */
+		}
 	} else if (types & STF_BARRIER_EIEIO) {
 		instrs[i++] = 0x7e0006ac; /* eieio + bit 6 hint */
 	}
@@ -308,7 +318,8 @@ void do_barrier_nospec_fixups(bool enable)
 
 void do_lwsync_fixups(unsigned long value, void *fixup_start, void *fixup_end)
 {
-	unsigned int *start, *end, *dest;
+	long *start, *end;
+	unsigned int *dest;
 
 	if (!(value & CPU_FTR_LWSYNC))
 		return ;
@@ -318,8 +329,29 @@ void do_lwsync_fixups(unsigned long value, void *fixup_start, void *fixup_end)
 
 	for (; start < end; start++) {
 		dest = (void *)start + *start;
-		patch_instruction(dest, PPC_INST_LWSYNC);
+		raw_patch_instruction(dest, PPC_INST_LWSYNC);
 	}
+}
+
+void do_final_fixups(void)
+{
+#if defined(CONFIG_PPC64) && defined(CONFIG_RELOCATABLE)
+	int *src, *dest;
+	unsigned long length;
+
+	if (PHYSICAL_START == 0)
+		return;
+
+	src = (int *)(KERNELBASE + PHYSICAL_START);
+	dest = (int *)KERNELBASE;
+	length = (__end_interrupts - _stext) / sizeof(int);
+
+	while (length--) {
+		raw_patch_instruction(dest, *src);
+		src++;
+		dest++;
+	}
+#endif
 }
 
 #ifdef CONFIG_FTR_FIXUP_SELFTEST
@@ -483,8 +515,8 @@ static void test_alternative_case_with_external_branch(void)
 
 static void test_cpu_macros(void)
 {
-	extern void ftr_fixup_test_FTR_macros;
-	extern void ftr_fixup_test_FTR_macros_expected;
+	extern u8 ftr_fixup_test_FTR_macros;
+	extern u8 ftr_fixup_test_FTR_macros_expected;
 	unsigned long size = &ftr_fixup_test_FTR_macros_expected -
 			     &ftr_fixup_test_FTR_macros;
 
@@ -496,8 +528,8 @@ static void test_cpu_macros(void)
 static void test_fw_macros(void)
 {
 #ifdef CONFIG_PPC64
-	extern void ftr_fixup_test_FW_FTR_macros;
-	extern void ftr_fixup_test_FW_FTR_macros_expected;
+	extern u8 ftr_fixup_test_FW_FTR_macros;
+	extern u8 ftr_fixup_test_FW_FTR_macros_expected;
 	unsigned long size = &ftr_fixup_test_FW_FTR_macros_expected -
 			     &ftr_fixup_test_FW_FTR_macros;
 
@@ -509,10 +541,10 @@ static void test_fw_macros(void)
 
 static void test_lwsync_macros(void)
 {
-	extern void lwsync_fixup_test;
-	extern void end_lwsync_fixup_test;
-	extern void lwsync_fixup_test_expected_LWSYNC;
-	extern void lwsync_fixup_test_expected_SYNC;
+	extern u8 lwsync_fixup_test;
+	extern u8 end_lwsync_fixup_test;
+	extern u8 lwsync_fixup_test_expected_LWSYNC;
+	extern u8 lwsync_fixup_test_expected_SYNC;
 	unsigned long size = &end_lwsync_fixup_test -
 			     &lwsync_fixup_test;
 

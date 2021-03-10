@@ -22,9 +22,10 @@ MODULE_ALIAS("ipt_NFLOG");
 MODULE_ALIAS("ip6t_NFLOG");
 
 static unsigned int
-nflog_tg(struct sk_buff *skb, const struct xt_target_param *par)
+nflog_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	const struct xt_nflog_info *info = par->targinfo;
+	struct net *net = xt_net(par);
 	struct nf_loginfo li;
 
 	li.type		     = NF_LOG_TYPE_ULOG;
@@ -32,20 +33,20 @@ nflog_tg(struct sk_buff *skb, const struct xt_target_param *par)
 	li.u.ulog.group	     = info->group;
 	li.u.ulog.qthreshold = info->threshold;
 
-	nfulnl_log_packet(par->family, par->hooknum, skb, par->in,
-			  par->out, &li, info->prefix);
+	nfulnl_log_packet(net, xt_family(par), xt_hooknum(par), skb,
+			  xt_in(par), xt_out(par), &li, info->prefix);
 	return XT_CONTINUE;
 }
 
-static bool nflog_tg_check(const struct xt_tgchk_param *par)
+static int nflog_tg_check(const struct xt_tgchk_param *par)
 {
 	const struct xt_nflog_info *info = par->targinfo;
 
 	if (info->flags & ~XT_NFLOG_MASK)
-		return false;
+		return -EINVAL;
 	if (info->prefix[sizeof(info->prefix) - 1] != '\0')
-		return false;
-	return true;
+		return -EINVAL;
+	return 0;
 }
 
 static struct xt_target nflog_tg_reg __read_mostly = {

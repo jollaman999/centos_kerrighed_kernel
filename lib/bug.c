@@ -37,6 +37,9 @@
 
     Jeremy Fitzhardinge <jeremy@goop.org> 2006
  */
+
+#define pr_fmt(fmt) fmt
+
 #include <linux/list.h>
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -55,6 +58,7 @@ static inline unsigned long bug_addr(const struct bug_entry *bug)
 }
 
 #ifdef CONFIG_MODULES
+/* Updates are protected by module mutex */
 static LIST_HEAD(module_bug_list);
 
 static const struct bug_entry *module_find_bug(unsigned long bugaddr)
@@ -72,8 +76,8 @@ static const struct bug_entry *module_find_bug(unsigned long bugaddr)
 	return NULL;
 }
 
-int module_bug_finalize(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
-			struct module *mod)
+void module_bug_finalize(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
+			 struct module *mod)
 {
 	char *secstrings;
 	unsigned int i;
@@ -97,8 +101,6 @@ int module_bug_finalize(const Elf_Ehdr *hdr, const Elf_Shdr *sechdrs,
 	 * could potentially lead to deadlock and thus be counter-productive.
 	 */
 	list_add(&mod->bug_list, &module_bug_list);
-
-	return 0;
 }
 
 void module_bug_cleanup(struct module *mod)
@@ -136,8 +138,6 @@ enum bug_trap_type report_bug(unsigned long bugaddr, struct pt_regs *regs)
 
 	bug = find_bug(bugaddr);
 
-	printk(KERN_DEFAULT "------------[ cut here ]------------\n");
-
 	file = NULL;
 	line = 0;
 	warning = 0;
@@ -156,26 +156,18 @@ enum bug_trap_type report_bug(unsigned long bugaddr, struct pt_regs *regs)
 
 	if (warning) {
 		/* this is a WARN_ON rather than BUG/BUG_ON */
-		if (file)
-			printk(KERN_ERR "Badness at %s:%u\n",
-			       file, line);
-		else
-			printk(KERN_ERR "Badness at %p "
-			       "[verbose debug info unavailable]\n",
-			       (void *)bugaddr);
-
-		show_regs(regs);
-		add_taint(BUG_GET_TAINT(bug));
+		__warn(file, line, (void *)bugaddr, BUG_GET_TAINT(bug), regs,
+		       NULL);
 		return BUG_TRAP_TYPE_WARN;
 	}
 
+	printk(KERN_DEFAULT CUT_HERE);
+
 	if (file)
-		printk(KERN_CRIT "kernel BUG at %s:%u!\n",
-		       file, line);
+		pr_crit("kernel BUG at %s:%u!\n", file, line);
 	else
-		printk(KERN_CRIT "Kernel BUG at %p "
-		       "[verbose debug info unavailable]\n",
-		       (void *)bugaddr);
+		pr_crit("Kernel BUG at %p [verbose debug info unavailable]\n",
+			(void *)bugaddr);
 
 	return BUG_TRAP_TYPE_BUG;
 }

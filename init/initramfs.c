@@ -1,3 +1,13 @@
+/*
+ * Many of the syscalls used in this file expect some of the arguments
+ * to be __user pointers not __kernel pointers.  To limit the sparse
+ * noise, turn off sparse checking for this file.
+ */
+#ifdef __CHECKER__
+#undef __CHECKER__
+#warning "Sparse checking disabled for this file"
+#endif
+
 #include <linux/init.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
@@ -22,7 +32,7 @@ static void __init error(char *x)
 
 static __initdata struct hash {
 	int ino, minor, major;
-	mode_t mode;
+	umode_t mode;
 	struct hash *next;
 	char name[N_ALIGN(PATH_MAX)];
 } *head[32];
@@ -35,7 +45,7 @@ static inline int hash(int major, int minor, int ino)
 }
 
 static char __init *find_link(int major, int minor, int ino,
-			      mode_t mode, char *name)
+			      umode_t mode, char *name)
 {
 	struct hash **p, *q;
 	for (p = head + hash(major, minor, ino); *p; p = &(*p)->next) {
@@ -74,7 +84,7 @@ static void __init free_hash(void)
 	}
 }
 
-static long __init do_utime(char __user *filename, time_t mtime)
+static long __init do_utime(char *filename, time_t mtime)
 {
 	struct timespec t[2];
 
@@ -120,7 +130,7 @@ static __initdata time_t mtime;
 /* cpio header parsing */
 
 static __initdata unsigned long ino, major, minor, nlink;
-static __initdata mode_t mode;
+static __initdata umode_t mode;
 static __initdata unsigned long body_len, name_len;
 static __initdata uid_t uid;
 static __initdata gid_t gid;
@@ -164,7 +174,7 @@ static __initdata enum state {
 } state, next_state;
 
 static __initdata char *victim;
-static __initdata unsigned count;
+static unsigned long count __initdata;
 static __initdata loff_t this_header, next_header;
 
 static inline void __init eat(unsigned n)
@@ -176,7 +186,7 @@ static inline void __init eat(unsigned n)
 
 static __initdata char *vcollected;
 static __initdata char *collected;
-static __initdata int remains;
+static long remains __initdata;
 static __initdata char *collect;
 
 static void __init read_into(char *buf, unsigned size, enum state next)
@@ -203,7 +213,7 @@ static int __init do_start(void)
 
 static int __init do_collect(void)
 {
-	unsigned n = remains;
+	unsigned long n = remains;
 	if (count < n)
 		n = count;
 	memcpy(collect, victim, n);
@@ -276,7 +286,7 @@ static int __init maybe_link(void)
 	return 0;
 }
 
-static void __init clean_path(char *path, mode_t mode)
+static void __init clean_path(char *path, umode_t mode)
 {
 	struct stat st;
 
@@ -374,7 +384,7 @@ static __initdata int (*actions[])(void) = {
 	[Reset]		= do_reset,
 };
 
-static int __init write_buffer(char *buf, unsigned len)
+static long __init write_buffer(char *buf, unsigned long len)
 {
 	count = len;
 	victim = buf;
@@ -384,11 +394,11 @@ static int __init write_buffer(char *buf, unsigned len)
 	return len - count;
 }
 
-static int __init flush_buffer(void *bufv, unsigned len)
+static long __init flush_buffer(void *bufv, unsigned long len)
 {
 	char *buf = (char *) bufv;
-	int written;
-	int origLen = len;
+	long written;
+	long origLen = len;
 	if (message)
 		return -1;
 	while ((written = write_buffer(buf, len)) < len && !message) {
@@ -407,13 +417,13 @@ static int __init flush_buffer(void *bufv, unsigned len)
 	return origLen;
 }
 
-static unsigned my_inptr;   /* index of next byte to be processed in inbuf */
+static unsigned long my_inptr; /* index of next byte to be processed in inbuf */
 
 #include <linux/decompress/generic.h>
 
-static char * __init unpack_to_rootfs(char *buf, unsigned len)
+static char * __init unpack_to_rootfs(char *buf, unsigned long len)
 {
-	int written;
+	long written;
 	decompress_fn decompress;
 	const char *compress_name;
 	static __initdata char msg_buf[64];
@@ -445,10 +455,12 @@ static char * __init unpack_to_rootfs(char *buf, unsigned len)
 		}
 		this_header = 0;
 		decompress = decompress_method(buf, len, &compress_name);
-		if (decompress)
-			decompress(buf, len, NULL, flush_buffer, NULL,
+		if (decompress) {
+			int res = decompress(buf, len, NULL, flush_buffer, NULL,
 				   &my_inptr, error);
-		else if (compress_name) {
+			if (res)
+				error("decompressor failed");
+		} else if (compress_name) {
 			if (!message) {
 				snprintf(msg_buf, sizeof msg_buf,
 					 "compression method %s not configured",
@@ -488,14 +500,14 @@ extern unsigned long __initramfs_size;
 
 static void __init free_initrd(void)
 {
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 	unsigned long crashk_start = (unsigned long)__va(crashk_res.start);
 	unsigned long crashk_end   = (unsigned long)__va(crashk_res.end);
 #endif
 	if (do_retain_initrd)
 		goto skip;
 
-#ifdef CONFIG_KEXEC
+#ifdef CONFIG_KEXEC_CORE
 	/*
 	 * If the initrd region is overlapped with crashkernel reserved region,
 	 * free only memory that is not part of crashkernel region.
@@ -525,7 +537,7 @@ static void __init clean_rootfs(void)
 	int fd;
 	void *buf;
 	struct linux_dirent64 *dirp;
-	int count;
+	int num;
 
 	fd = sys_open("/", O_RDONLY, 0);
 	WARN_ON(fd < 0);
@@ -539,9 +551,9 @@ static void __init clean_rootfs(void)
 	}
 
 	dirp = buf;
-	count = sys_getdents64(fd, dirp, BUF_SIZE);
-	while (count > 0) {
-		while (count > 0) {
+	num = sys_getdents64(fd, dirp, BUF_SIZE);
+	while (num > 0) {
+		while (num > 0) {
 			struct stat st;
 			int ret;
 
@@ -554,12 +566,12 @@ static void __init clean_rootfs(void)
 					sys_unlink(dirp->d_name);
 			}
 
-			count -= dirp->d_reclen;
+			num -= dirp->d_reclen;
 			dirp = (void *)dirp + dirp->d_reclen;
 		}
 		dirp = buf;
 		memset(buf, 0, BUF_SIZE);
-		count = sys_getdents64(fd, dirp, BUF_SIZE);
+		num = sys_getdents64(fd, dirp, BUF_SIZE);
 	}
 
 	sys_close(fd);
@@ -580,20 +592,22 @@ static int __init populate_rootfs(void)
 			initrd_end - initrd_start);
 		if (!err) {
 			free_initrd();
-			return 0;
+			goto done;
 		} else {
 			clean_rootfs();
 			unpack_to_rootfs(__initramfs_start, __initramfs_size);
 		}
 		printk(KERN_INFO "rootfs image is not initramfs (%s)"
 				"; looks like an initrd\n", err);
-		fd = sys_open("/initrd.image", O_WRONLY|O_CREAT, 0700);
+		fd = sys_open("/initrd.image",
+			      O_WRONLY|O_CREAT, 0700);
 		if (fd >= 0) {
 			sys_write(fd, (char *)initrd_start,
 					initrd_end - initrd_start);
 			sys_close(fd);
 			free_initrd();
 		}
+	done:
 #else
 		printk(KERN_INFO "Unpacking initramfs...\n");
 		err = unpack_to_rootfs((char *)initrd_start,
@@ -602,6 +616,11 @@ static int __init populate_rootfs(void)
 			printk(KERN_EMERG "Initramfs unpacking failed: %s\n", err);
 		free_initrd();
 #endif
+		/*
+		 * Try loading default modules from initramfs.  This gives
+		 * us a chance to load before device_initcalls.
+		 */
+		load_default_modules();
 	}
 	return 0;
 }

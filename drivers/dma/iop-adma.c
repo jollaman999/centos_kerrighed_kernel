@@ -32,8 +32,11 @@
 #include <linux/memory.h>
 #include <linux/ioport.h>
 #include <linux/raid/pq.h>
+#include <linux/slab.h>
 
 #include <mach/adma.h>
+
+#include "dmaengine.h"
 
 #define to_iop_adma_chan(chan) container_of(chan, struct iop_adma_chan, common)
 #define to_iop_adma_device(dev) \
@@ -149,6 +152,7 @@ iop_adma_run_tx_complete_actions(struct iop_adma_desc_slot *desc,
 		if (tx->callback)
 			tx->callback(tx->callback_param);
 
+		dma_descriptor_unmap(tx);
 		/* unmap dma addresses
 		 * (unmap_single vs unmap_page?)
 		 */
@@ -316,7 +320,7 @@ static void __iop_adma_slot_cleanup(struct iop_adma_chan *iop_chan)
 	}
 
 	if (cookie > 0) {
-		iop_chan->completed_cookie = cookie;
+		iop_chan->common.completed_cookie = cookie;
 		pr_debug("\tcompleted cookie %d\n", cookie);
 	}
 }
@@ -437,18 +441,6 @@ retry:
 	return NULL;
 }
 
-static dma_cookie_t
-iop_desc_assign_cookie(struct iop_adma_chan *iop_chan,
-	struct iop_adma_desc_slot *desc)
-{
-	dma_cookie_t cookie = iop_chan->common.cookie;
-	cookie++;
-	if (cookie < 0)
-		cookie = 1;
-	iop_chan->common.cookie = desc->async_tx.cookie = cookie;
-	return cookie;
-}
-
 static void iop_adma_check_threshold(struct iop_adma_chan *iop_chan)
 {
 	dev_dbg(iop_chan->device->common.dev, "pending: %d\n",
@@ -476,7 +468,7 @@ iop_adma_tx_submit(struct dma_async_tx_descriptor *tx)
 	slots_per_op = grp_start->slots_per_op;
 
 	spin_lock_bh(&iop_chan->lock);
-	cookie = iop_desc_assign_cookie(iop_chan, sw_desc);
+	cookie = dma_cookie_assign(tx);
 
 	old_chain_tail = list_entry(iop_chan->chain.prev,
 		struct iop_adma_desc_slot, chain_node);
@@ -618,7 +610,7 @@ iop_adma_prep_dma_memcpy(struct dma_chan *chan, dma_addr_t dma_dest,
 
 	if (unlikely(!len))
 		return NULL;
-	BUG_ON(unlikely(len > IOP_ADMA_MAX_BYTE_COUNT));
+	BUG_ON(len > IOP_ADMA_MAX_BYTE_COUNT);
 
 	dev_dbg(iop_chan->device->common.dev, "%s len: %u\n",
 		__func__, len);
@@ -651,7 +643,7 @@ iop_adma_prep_dma_memset(struct dma_chan *chan, dma_addr_t dma_dest,
 
 	if (unlikely(!len))
 		return NULL;
-	BUG_ON(unlikely(len > IOP_ADMA_MAX_BYTE_COUNT));
+	BUG_ON(len > IOP_ADMA_MAX_BYTE_COUNT);
 
 	dev_dbg(iop_chan->device->common.dev, "%s len: %u\n",
 		__func__, len);
@@ -685,7 +677,7 @@ iop_adma_prep_dma_xor(struct dma_chan *chan, dma_addr_t dma_dest,
 
 	if (unlikely(!len))
 		return NULL;
-	BUG_ON(unlikely(len > IOP_ADMA_XOR_MAX_BYTE_COUNT));
+	BUG_ON(len > IOP_ADMA_XOR_MAX_BYTE_COUNT);
 
 	dev_dbg(iop_chan->device->common.dev,
 		"%s src_cnt: %d len: %u flags: %lx\n",
@@ -893,43 +885,25 @@ static void iop_adma_free_chan_resources(struct dma_chan *chan)
 }
 
 /**
- * iop_adma_is_complete - poll the status of an ADMA transaction
+ * iop_adma_status - poll the status of an ADMA transaction
  * @chan: ADMA channel handle
  * @cookie: ADMA transaction identifier
+ * @txstate: a holder for the current state of the channel or NULL
  */
-static enum dma_status iop_adma_is_complete(struct dma_chan *chan,
+static enum dma_status iop_adma_status(struct dma_chan *chan,
 					dma_cookie_t cookie,
-					dma_cookie_t *done,
-					dma_cookie_t *used)
+					struct dma_tx_state *txstate)
 {
 	struct iop_adma_chan *iop_chan = to_iop_adma_chan(chan);
-	dma_cookie_t last_used;
-	dma_cookie_t last_complete;
-	enum dma_status ret;
+	int ret;
 
-	last_used = chan->cookie;
-	last_complete = iop_chan->completed_cookie;
-
-	if (done)
-		*done = last_complete;
-	if (used)
-		*used = last_used;
-
-	ret = dma_async_is_complete(cookie, last_complete, last_used);
+	ret = dma_cookie_status(chan, cookie, txstate);
 	if (ret == DMA_SUCCESS)
 		return ret;
 
 	iop_adma_slot_cleanup(iop_chan);
 
-	last_used = chan->cookie;
-	last_complete = iop_chan->completed_cookie;
-
-	if (done)
-		*done = last_complete;
-	if (used)
-		*used = last_used;
-
-	return dma_async_is_complete(cookie, last_complete, last_used);
+	return dma_cookie_status(chan, cookie, txstate);
 }
 
 static irqreturn_t iop_adma_eot_handler(int irq, void *data)
@@ -963,7 +937,7 @@ static irqreturn_t iop_adma_err_handler(int irq, void *data)
 	struct iop_adma_chan *chan = data;
 	unsigned long status = iop_chan_get_status(chan);
 
-	dev_printk(KERN_ERR, chan->device->common.dev,
+	dev_err(chan->device->common.dev,
 		"error ( %s%s%s%s%s%s%s)\n",
 		iop_is_err_int_parity(status, chan) ? "int_parity " : "",
 		iop_is_err_mcu_abort(status, chan) ? "mcu_abort " : "",
@@ -995,7 +969,7 @@ static void iop_adma_issue_pending(struct dma_chan *chan)
  */
 #define IOP_ADMA_TEST_SIZE 2000
 
-static int __devinit iop_adma_memcpy_self_test(struct iop_adma_device *device)
+static int iop_adma_memcpy_self_test(struct iop_adma_device *device)
 {
 	int i;
 	void *src, *dest;
@@ -1042,9 +1016,9 @@ static int __devinit iop_adma_memcpy_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(1);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) !=
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
 			DMA_SUCCESS) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+		dev_err(dma_chan->device->dev,
 			"Self-test copy timed out, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
@@ -1054,7 +1028,7 @@ static int __devinit iop_adma_memcpy_self_test(struct iop_adma_device *device)
 	dma_sync_single_for_cpu(&iop_chan->device->pdev->dev, dest_dma,
 		IOP_ADMA_TEST_SIZE, DMA_FROM_DEVICE);
 	if (memcmp(src, dest, IOP_ADMA_TEST_SIZE)) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+		dev_err(dma_chan->device->dev,
 			"Self-test copy failed compare, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
@@ -1069,7 +1043,7 @@ out:
 }
 
 #define IOP_ADMA_NUM_SRC_TEST 4 /* must be <= 15 */
-static int __devinit
+static int
 iop_adma_xor_val_self_test(struct iop_adma_device *device)
 {
 	int i, src_idx;
@@ -1142,9 +1116,9 @@ iop_adma_xor_val_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(8);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) !=
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
 		DMA_SUCCESS) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+		dev_err(dma_chan->device->dev,
 			"Self-test xor timed out, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
@@ -1156,7 +1130,7 @@ iop_adma_xor_val_self_test(struct iop_adma_device *device)
 	for (i = 0; i < (PAGE_SIZE / sizeof(u32)); i++) {
 		u32 *ptr = page_address(dest);
 		if (ptr[i] != cmp_word) {
-			dev_printk(KERN_ERR, dma_chan->device->dev,
+			dev_err(dma_chan->device->dev,
 				"Self-test xor failed compare, disabling\n");
 			err = -ENODEV;
 			goto free_resources;
@@ -1189,15 +1163,15 @@ iop_adma_xor_val_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(8);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) != DMA_SUCCESS) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+	if (iop_adma_status(dma_chan, cookie, NULL) != DMA_SUCCESS) {
+		dev_err(dma_chan->device->dev,
 			"Self-test zero sum timed out, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
 	}
 
 	if (zero_sum_result != 0) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+		dev_err(dma_chan->device->dev,
 			"Self-test zero sum failed compare, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
@@ -1213,8 +1187,8 @@ iop_adma_xor_val_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(8);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) != DMA_SUCCESS) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+	if (iop_adma_status(dma_chan, cookie, NULL) != DMA_SUCCESS) {
+		dev_err(dma_chan->device->dev,
 			"Self-test memset timed out, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
@@ -1223,7 +1197,7 @@ iop_adma_xor_val_self_test(struct iop_adma_device *device)
 	for (i = 0; i < PAGE_SIZE/sizeof(u32); i++) {
 		u32 *ptr = page_address(dest);
 		if (ptr[i]) {
-			dev_printk(KERN_ERR, dma_chan->device->dev,
+			dev_err(dma_chan->device->dev,
 				"Self-test memset failed compare, disabling\n");
 			err = -ENODEV;
 			goto free_resources;
@@ -1245,15 +1219,15 @@ iop_adma_xor_val_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(8);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) != DMA_SUCCESS) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+	if (iop_adma_status(dma_chan, cookie, NULL) != DMA_SUCCESS) {
+		dev_err(dma_chan->device->dev,
 			"Self-test non-zero sum timed out, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
 	}
 
 	if (zero_sum_result != 1) {
-		dev_printk(KERN_ERR, dma_chan->device->dev,
+		dev_err(dma_chan->device->dev,
 			"Self-test non-zero sum failed compare, disabling\n");
 		err = -ENODEV;
 		goto free_resources;
@@ -1269,8 +1243,8 @@ out:
 	return err;
 }
 
-#ifdef CONFIG_MD_RAID6_PQ
-static int __devinit
+#ifdef CONFIG_RAID6_PQ
+static int
 iop_adma_pq_zero_sum_self_test(struct iop_adma_device *device)
 {
 	/* combined sources, software pq results, and extra hw pq results */
@@ -1279,8 +1253,8 @@ iop_adma_pq_zero_sum_self_test(struct iop_adma_device *device)
 	struct page **pq_hw = &pq[IOP_ADMA_NUM_SRC_TEST+2];
 	/* address conversion buffers (dma_map / page_address) */
 	void *pq_sw[IOP_ADMA_NUM_SRC_TEST+2];
-	dma_addr_t pq_src[IOP_ADMA_NUM_SRC_TEST];
-	dma_addr_t pq_dest[2];
+	dma_addr_t pq_src[IOP_ADMA_NUM_SRC_TEST+2];
+	dma_addr_t *pq_dest = &pq_src[IOP_ADMA_NUM_SRC_TEST];
 
 	int i;
 	struct dma_async_tx_descriptor *tx;
@@ -1340,7 +1314,7 @@ iop_adma_pq_zero_sum_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(8);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) !=
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
 		DMA_SUCCESS) {
 		dev_err(dev, "Self-test pq timed out, disabling\n");
 		err = -ENODEV;
@@ -1377,7 +1351,7 @@ iop_adma_pq_zero_sum_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(8);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) !=
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
 		DMA_SUCCESS) {
 		dev_err(dev, "Self-test pq-zero-sum timed out, disabling\n");
 		err = -ENODEV;
@@ -1409,7 +1383,7 @@ iop_adma_pq_zero_sum_self_test(struct iop_adma_device *device)
 	iop_adma_issue_pending(dma_chan);
 	msleep(8);
 
-	if (iop_adma_is_complete(dma_chan, cookie, NULL, NULL) !=
+	if (iop_adma_status(dma_chan, cookie, NULL) !=
 		DMA_SUCCESS) {
 		dev_err(dev, "Self-test !pq-zero-sum timed out, disabling\n");
 		err = -ENODEV;
@@ -1433,7 +1407,7 @@ out:
 }
 #endif
 
-static int __devexit iop_adma_remove(struct platform_device *dev)
+static int iop_adma_remove(struct platform_device *dev)
 {
 	struct iop_adma_device *device = platform_get_drvdata(dev);
 	struct dma_chan *chan, *_chan;
@@ -1456,7 +1430,7 @@ static int __devexit iop_adma_remove(struct platform_device *dev)
 	return 0;
 }
 
-static int __devinit iop_adma_probe(struct platform_device *pdev)
+static int iop_adma_probe(struct platform_device *pdev)
 {
 	struct resource *res;
 	int ret = 0, i;
@@ -1470,7 +1444,7 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
 		return -ENODEV;
 
 	if (!devm_request_mem_region(&pdev->dev, res->start,
-				res->end - res->start, pdev->name))
+				resource_size(res), pdev->name))
 		return -EBUSY;
 
 	adev = kzalloc(sizeof(*adev), GFP_KERNEL);
@@ -1490,7 +1464,7 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
 		goto err_free_adev;
 	}
 
-	dev_dbg(&pdev->dev, "%s: allocted descriptor pool virt %p phys %p\n",
+	dev_dbg(&pdev->dev, "%s: allocated descriptor pool virt %p phys %p\n",
 		__func__, adev->dma_desc_pool_virt,
 		(void *) adev->dma_desc_pool);
 
@@ -1507,7 +1481,7 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
 	/* set base routines */
 	dma_dev->device_alloc_chan_resources = iop_adma_alloc_chan_resources;
 	dma_dev->device_free_chan_resources = iop_adma_free_chan_resources;
-	dma_dev->device_is_tx_complete = iop_adma_is_complete;
+	dma_dev->device_tx_status = iop_adma_status;
 	dma_dev->device_issue_pending = iop_adma_issue_pending;
 	dma_dev->dev = &pdev->dev;
 
@@ -1542,7 +1516,7 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
 	iop_chan->device = adev;
 
 	iop_chan->mmr_base = devm_ioremap(&pdev->dev, res->start,
-					res->end - res->start);
+					resource_size(res));
 	if (!iop_chan->mmr_base) {
 		ret = -ENOMEM;
 		goto err_free_iop_chan;
@@ -1573,6 +1547,7 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
 	INIT_LIST_HEAD(&iop_chan->chain);
 	INIT_LIST_HEAD(&iop_chan->all_slots);
 	iop_chan->common.device = dma_dev;
+	dma_cookie_init(&iop_chan->common);
 	list_add_tail(&iop_chan->common.device_node, &dma_dev->channels);
 
 	if (dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask)) {
@@ -1592,7 +1567,7 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
 
 	if (dma_has_cap(DMA_PQ, dma_dev->cap_mask) &&
 	    dma_has_cap(DMA_PQ_VAL, dma_dev->cap_mask)) {
-		#ifdef CONFIG_MD_RAID6_PQ
+		#ifdef CONFIG_RAID6_PQ
 		ret = iop_adma_pq_zero_sum_self_test(adev);
 		dev_dbg(&pdev->dev, "pq self test returned %d\n", ret);
 		#else
@@ -1605,15 +1580,14 @@ static int __devinit iop_adma_probe(struct platform_device *pdev)
 			goto err_free_iop_chan;
 	}
 
-	dev_printk(KERN_INFO, &pdev->dev, "Intel(R) IOP: "
-	  "( %s%s%s%s%s%s%s)\n",
-	  dma_has_cap(DMA_PQ, dma_dev->cap_mask) ? "pq " : "",
-	  dma_has_cap(DMA_PQ_VAL, dma_dev->cap_mask) ? "pq_val " : "",
-	  dma_has_cap(DMA_XOR, dma_dev->cap_mask) ? "xor " : "",
-	  dma_has_cap(DMA_XOR_VAL, dma_dev->cap_mask) ? "xor_val " : "",
-	  dma_has_cap(DMA_MEMSET, dma_dev->cap_mask)  ? "fill " : "",
-	  dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask) ? "cpy " : "",
-	  dma_has_cap(DMA_INTERRUPT, dma_dev->cap_mask) ? "intr " : "");
+	dev_info(&pdev->dev, "Intel(R) IOP: ( %s%s%s%s%s%s%s)\n",
+		 dma_has_cap(DMA_PQ, dma_dev->cap_mask) ? "pq " : "",
+		 dma_has_cap(DMA_PQ_VAL, dma_dev->cap_mask) ? "pq_val " : "",
+		 dma_has_cap(DMA_XOR, dma_dev->cap_mask) ? "xor " : "",
+		 dma_has_cap(DMA_XOR_VAL, dma_dev->cap_mask) ? "xor_val " : "",
+		 dma_has_cap(DMA_MEMSET, dma_dev->cap_mask)  ? "fill " : "",
+		 dma_has_cap(DMA_MEMCPY, dma_dev->cap_mask) ? "cpy " : "",
+		 dma_has_cap(DMA_INTERRUPT, dma_dev->cap_mask) ? "intr " : "");
 
 	dma_async_device_register(dma_dev);
 	goto out;
@@ -1650,16 +1624,12 @@ static void iop_chan_start_null_memcpy(struct iop_adma_chan *iop_chan)
 		iop_desc_set_dest_addr(grp_start, iop_chan, 0);
 		iop_desc_set_memcpy_src_addr(grp_start, 0);
 
-		cookie = iop_chan->common.cookie;
-		cookie++;
-		if (cookie <= 1)
-			cookie = 2;
+		cookie = dma_cookie_assign(&sw_desc->async_tx);
 
 		/* initialize the completed cookie to be less than
 		 * the most recently used cookie
 		 */
-		iop_chan->completed_cookie = cookie - 1;
-		iop_chan->common.cookie = sw_desc->async_tx.cookie = cookie;
+		iop_chan->common.completed_cookie = cookie - 1;
 
 		/* channel should not be busy */
 		BUG_ON(iop_chan_is_busy(iop_chan));
@@ -1681,8 +1651,8 @@ static void iop_chan_start_null_memcpy(struct iop_adma_chan *iop_chan)
 		/* run the descriptor */
 		iop_chan_enable(iop_chan);
 	} else
-		dev_printk(KERN_ERR, iop_chan->device->common.dev,
-			 "failed to allocate null descriptor\n");
+		dev_err(iop_chan->device->common.dev,
+			"failed to allocate null descriptor\n");
 	spin_unlock_bh(&iop_chan->lock);
 }
 
@@ -1707,16 +1677,12 @@ static void iop_chan_start_null_xor(struct iop_adma_chan *iop_chan)
 		iop_desc_set_xor_src_addr(grp_start, 0, 0);
 		iop_desc_set_xor_src_addr(grp_start, 1, 0);
 
-		cookie = iop_chan->common.cookie;
-		cookie++;
-		if (cookie <= 1)
-			cookie = 2;
+		cookie = dma_cookie_assign(&sw_desc->async_tx);
 
 		/* initialize the completed cookie to be less than
 		 * the most recently used cookie
 		 */
-		iop_chan->completed_cookie = cookie - 1;
-		iop_chan->common.cookie = sw_desc->async_tx.cookie = cookie;
+		iop_chan->common.completed_cookie = cookie - 1;
 
 		/* channel should not be busy */
 		BUG_ON(iop_chan_is_busy(iop_chan));
@@ -1738,35 +1704,23 @@ static void iop_chan_start_null_xor(struct iop_adma_chan *iop_chan)
 		/* run the descriptor */
 		iop_chan_enable(iop_chan);
 	} else
-		dev_printk(KERN_ERR, iop_chan->device->common.dev,
+		dev_err(iop_chan->device->common.dev,
 			"failed to allocate null descriptor\n");
 	spin_unlock_bh(&iop_chan->lock);
 }
 
-MODULE_ALIAS("platform:iop-adma");
-
 static struct platform_driver iop_adma_driver = {
 	.probe		= iop_adma_probe,
-	.remove		= __devexit_p(iop_adma_remove),
+	.remove		= iop_adma_remove,
 	.driver		= {
 		.owner	= THIS_MODULE,
 		.name	= "iop-adma",
 	},
 };
 
-static int __init iop_adma_init (void)
-{
-	return platform_driver_register(&iop_adma_driver);
-}
-
-static void __exit iop_adma_exit (void)
-{
-	platform_driver_unregister(&iop_adma_driver);
-	return;
-}
-module_exit(iop_adma_exit);
-module_init(iop_adma_init);
+module_platform_driver(iop_adma_driver);
 
 MODULE_AUTHOR("Intel Corporation");
 MODULE_DESCRIPTION("IOP ADMA Engine Driver");
 MODULE_LICENSE("GPL");
+MODULE_ALIAS("platform:iop-adma");

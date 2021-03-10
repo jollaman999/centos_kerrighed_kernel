@@ -28,7 +28,6 @@ extern int fix_aperture;
 #define AMD64_GARTAPERTUREBASE	0x94
 #define AMD64_GARTTABLEBASE	0x98
 #define AMD64_GARTCACHECTL	0x9c
-#define AMD64_GARTEN		(1<<0)
 
 #ifdef CONFIG_GART_IOMMU
 extern int gart_iommu_aperture;
@@ -38,7 +37,7 @@ extern int gart_iommu_aperture_disabled;
 extern void early_gart_iommu_check(void);
 extern int gart_iommu_init(void);
 extern void __init gart_parse_options(char *);
-extern void gart_iommu_hole_init(void);
+extern int gart_iommu_hole_init(void);
 
 #else
 #define gart_iommu_aperture            0
@@ -51,8 +50,9 @@ static inline void early_gart_iommu_check(void)
 static inline void gart_parse_options(char *options)
 {
 }
-static inline void gart_iommu_hole_init(void)
+static inline int gart_iommu_hole_init(void)
 {
+	return -ENODEV;
 }
 #endif
 

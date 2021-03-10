@@ -5,8 +5,8 @@
  *
  * Copyright (C) 2008 Nokia Corporation.
  *
- * Contact: Remi Denis-Courmont <remi.denis-courmont@nokia.com>
- * Original author: Sakari Ailus <sakari.ailus@nokia.com>
+ * Authors: Sakari Ailus <sakari.ailus@nokia.com>
+ *          Rémi Denis-Courmont
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -24,11 +24,13 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/socket.h>
 #include <asm/ioctls.h>
 #include <net/sock.h>
 
 #include <linux/phonet.h>
+#include <linux/export.h>
 #include <net/phonet/phonet.h>
 
 static int pn_backlog_rcv(struct sock *sk, struct sk_buff *skb);
@@ -51,6 +53,19 @@ static int pn_ioctl(struct sock *sk, int cmd, unsigned long arg)
 		answ = skb ? skb->len : 0;
 		release_sock(sk);
 		return put_user(answ, (int __user *)arg);
+
+	case SIOCPNADDRESOURCE:
+	case SIOCPNDELRESOURCE: {
+			u32 res;
+			if (get_user(res, (u32 __user *)arg))
+				return -EFAULT;
+			if (res >= 256)
+				return -EINVAL;
+			if (cmd == SIOCPNADDRESOURCE)
+				return pn_sock_bind_res(sk, res);
+			else
+				return pn_sock_unbind_res(sk, res);
+		}
 	}
 
 	return -ENOIOCTLCMD;
@@ -75,7 +90,8 @@ static int pn_sendmsg(struct kiocb *iocb, struct sock *sk,
 	struct sk_buff *skb;
 	int err;
 
-	if (msg->msg_flags & MSG_OOB)
+	if (msg->msg_flags & ~(MSG_DONTWAIT|MSG_EOR|MSG_NOSIGNAL|
+				MSG_CMSG_COMPAT))
 		return -EOPNOTSUPP;
 
 	if (msg->msg_name == NULL)
@@ -94,7 +110,7 @@ static int pn_sendmsg(struct kiocb *iocb, struct sock *sk,
 		return err;
 	skb_reserve(skb, MAX_PHONET_HEADER);
 
-	err = memcpy_fromiovec((void *)skb_put(skb, len), msg->msg_iov, len);
+	err = memcpy_from_msg((void *)skb_put(skb, len), msg, len);
 	if (err < 0) {
 		kfree_skb(skb);
 		return err;
@@ -119,7 +135,8 @@ static int pn_recvmsg(struct kiocb *iocb, struct sock *sk,
 	int rval = -EOPNOTSUPP;
 	int copylen;
 
-	if (flags & MSG_OOB)
+	if (flags & ~(MSG_PEEK|MSG_TRUNC|MSG_DONTWAIT|MSG_NOSIGNAL|
+			MSG_CMSG_COMPAT))
 		goto out_nofree;
 
 	skb = skb_recv_datagram(sk, flags, noblock, &rval);
@@ -158,11 +175,9 @@ out_nofree:
 static int pn_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 {
 	int err = sock_queue_rcv_skb(sk, skb);
-	if (err < 0) {
+
+	if (err < 0)
 		kfree_skb(skb);
-		if (err == -ENOMEM)
-			atomic_inc(&sk->sk_drops);
-	}
 	return err ? NET_RX_DROP : NET_RX_SUCCESS;
 }
 

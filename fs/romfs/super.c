@@ -147,7 +147,7 @@ static const struct address_space_operations romfs_aops = {
  */
 static int romfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 {
-	struct inode *i = filp->f_dentry->d_inode;
+	struct inode *i = file_inode(filp);
 	struct romfs_inode ri;
 	unsigned long offset, maxoff;
 	int j, ino, nextfh;
@@ -210,7 +210,7 @@ out:
  * look up an entry in a directory
  */
 static struct dentry *romfs_lookup(struct inode *dir, struct dentry *dentry,
-				   struct nameidata *nd)
+				   unsigned int flags)
 {
 	unsigned long offset, maxoff;
 	struct inode *inode;
@@ -282,6 +282,7 @@ error:
 static const struct file_operations romfs_dir_operations = {
 	.read		= generic_read_dir,
 	.readdir	= romfs_readdir,
+	.llseek		= default_llseek,
 };
 
 static const struct inode_operations romfs_dir_inode_operations = {
@@ -336,7 +337,7 @@ static struct inode *romfs_iget(struct super_block *sb, unsigned long pos)
 	inode->i_metasize = (ROMFH_SIZE + nlen + 1 + ROMFH_PAD) & ROMFH_MASK;
 	inode->i_dataoffset = pos + inode->i_metasize;
 
-	i->i_nlink = 1;		/* Hard to decide.. */
+	set_nlink(i, 1);		/* Hard to decide.. */
 	i->i_size = be32_to_cpu(ri.size);
 	i->i_mtime.tv_sec = i->i_atime.tv_sec = i->i_ctime.tv_sec = 0;
 	i->i_mtime.tv_nsec = i->i_atime.tv_nsec = i->i_ctime.tv_nsec = 0;
@@ -399,9 +400,15 @@ static struct inode *romfs_alloc_inode(struct super_block *sb)
 /*
  * return a spent inode to the slab cache
  */
+static void romfs_i_callback(struct rcu_head *head)
+{
+	struct inode *inode = container_of(head, struct inode, i_rcu);
+	kmem_cache_free(romfs_inode_cachep, ROMFS_I(inode));
+}
+
 static void romfs_destroy_inode(struct inode *inode)
 {
-	kmem_cache_free(romfs_inode_cachep, ROMFS_I(inode));
+	call_rcu(&inode->i_rcu, romfs_i_callback);
 }
 
 /*
@@ -531,39 +538,37 @@ static int romfs_fill_super(struct super_block *sb, void *data, int silent)
 	if (IS_ERR(root))
 		goto error;
 
-	sb->s_root = d_alloc_root(root);
+	sb->s_root = d_make_root(root);
 	if (!sb->s_root)
-		goto error_i;
+		goto error;
 
 	return 0;
 
-error_i:
-	iput(root);
 error:
 	return -EINVAL;
 error_rsb_inval:
 	ret = -EINVAL;
 error_rsb:
+	kfree(rsb);
 	return ret;
 }
 
 /*
  * get a superblock for mounting
  */
-static int romfs_get_sb(struct file_system_type *fs_type,
+static struct dentry *romfs_mount(struct file_system_type *fs_type,
 			int flags, const char *dev_name,
-			void *data, struct vfsmount *mnt)
+			void *data)
 {
-	int ret = -EINVAL;
+	struct dentry *ret = ERR_PTR(-EINVAL);
 
 #ifdef CONFIG_ROMFS_ON_MTD
-	ret = get_sb_mtd(fs_type, flags, dev_name, data, romfs_fill_super,
-			 mnt);
+	ret = mount_mtd(fs_type, flags, dev_name, data, romfs_fill_super);
 #endif
 #ifdef CONFIG_ROMFS_ON_BLOCK
-	if (ret == -EINVAL)
-		ret = get_sb_bdev(fs_type, flags, dev_name, data,
-				  romfs_fill_super, mnt);
+	if (ret == ERR_PTR(-EINVAL))
+		ret = mount_bdev(fs_type, flags, dev_name, data,
+				  romfs_fill_super);
 #endif
 	return ret;
 }
@@ -590,10 +595,11 @@ static void romfs_kill_sb(struct super_block *sb)
 static struct file_system_type romfs_fs_type = {
 	.owner		= THIS_MODULE,
 	.name		= "romfs",
-	.get_sb		= romfs_get_sb,
+	.mount		= romfs_mount,
 	.kill_sb	= romfs_kill_sb,
 	.fs_flags	= FS_REQUIRES_DEV,
 };
+MODULE_ALIAS_FS("romfs");
 
 /*
  * inode storage initialiser
@@ -617,8 +623,8 @@ static int __init init_romfs_fs(void)
 	romfs_inode_cachep =
 		kmem_cache_create("romfs_i",
 				  sizeof(struct romfs_inode_info), 0,
-				  SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD,
-				  romfs_i_init_once);
+				  SLAB_RECLAIM_ACCOUNT | SLAB_MEM_SPREAD |
+				  SLAB_ACCOUNT, romfs_i_init_once);
 
 	if (!romfs_inode_cachep) {
 		printk(KERN_ERR
@@ -643,6 +649,11 @@ error_register:
 static void __exit exit_romfs_fs(void)
 {
 	unregister_filesystem(&romfs_fs_type);
+	/*
+	 * Make sure all delayed rcu free inodes are flushed before we
+	 * destroy cache.
+	 */
+	rcu_barrier();
 	kmem_cache_destroy(romfs_inode_cachep);
 }
 

@@ -20,6 +20,8 @@
  *  bfad_im.c Linux driver IM module.
  */
 
+#include <linux/export.h>
+
 #include "bfad_drv.h"
 #include "bfad_im.h"
 #include "bfa_fcs.h"
@@ -30,8 +32,7 @@ DEFINE_IDR(bfad_im_port_index);
 struct scsi_transport_template *bfad_im_scsi_transport_template;
 struct scsi_transport_template *bfad_im_scsi_vport_transport_template;
 static void bfad_im_itnim_work_handler(struct work_struct *work);
-static int bfad_im_queuecommand(struct scsi_cmnd *cmnd,
-		void (*done) (struct scsi_cmnd *));
+static int bfad_im_queuecommand(struct Scsi_Host *h, struct scsi_cmnd *cmnd);
 static int bfad_im_slave_alloc(struct scsi_device *sdev);
 static void bfad_im_fc_rport_add(struct bfad_im_port_s  *im_port,
 				struct bfad_itnim_s *itnim);
@@ -182,6 +183,7 @@ bfad_im_info(struct Scsi_Host *shost)
 	snprintf(bfa_buf, sizeof(bfa_buf),
 		"QLogic BR-series FC/FCOE Adapter, hwpath: %s driver: %s",
 		bfad->pci_name, BFAD_DRIVER_VERSION);
+
 	return bfa_buf;
 }
 
@@ -205,7 +207,7 @@ bfad_im_abort_handler(struct scsi_cmnd *cmnd)
 	spin_lock_irqsave(&bfad->bfad_lock, flags);
 	hal_io = (struct bfa_ioim_s *) cmnd->host_scribble;
 	if (!hal_io) {
-		/* IO has been completed, retrun success */
+		/* IO has been completed, return success */
 		rc = SUCCESS;
 		goto out;
 	}
@@ -215,7 +217,8 @@ bfad_im_abort_handler(struct scsi_cmnd *cmnd)
 	}
 
 	bfa_trc(bfad, hal_io->iotag);
-	BFA_LOG(KERN_INFO, bfad, bfa_log_level, "scsi%d: abort cmnd %p iotag %x\n",
+	BFA_LOG(KERN_INFO, bfad, bfa_log_level,
+		"scsi%d: abort cmnd %p iotag %x\n",
 		im_port->shost->host_no, cmnd, hal_io->iotag);
 	(void) bfa_ioim_abort(hal_io);
 	spin_unlock_irqrestore(&bfad->bfad_lock, flags);
@@ -521,20 +524,13 @@ bfad_im_scsi_host_alloc(struct bfad_s *bfad, struct bfad_im_port_s *im_port,
 	int error = 1;
 
 	mutex_lock(&bfad_mutex);
-	if (!idr_pre_get(&bfad_im_port_index, GFP_KERNEL)) {
+	error = idr_alloc(&bfad_im_port_index, im_port, 0, 0, GFP_KERNEL);
+	if (error < 0) {
 		mutex_unlock(&bfad_mutex);
-		printk(KERN_WARNING "idr_pre_get failure\n");
+		printk(KERN_WARNING "idr_alloc failure\n");
 		goto out;
 	}
-
-	error = idr_get_new(&bfad_im_port_index, im_port,
-					 &im_port->idr_id);
-	if (error) {
-		mutex_unlock(&bfad_mutex);
-		printk(KERN_WARNING "idr_get_new failure\n");
-		goto out;
-	}
-
+	im_port->idr_id = error;
 	mutex_unlock(&bfad_mutex);
 
 	im_port->shost = bfad_scsi_host_alloc(im_port, bfad);
@@ -664,7 +660,7 @@ static void bfad_aen_im_notify_handler(struct work_struct *work)
 	struct bfad_s *bfad = im->bfad;
 	struct Scsi_Host *shost = bfad->pport.im_port->shost;
 	void *event_data;
-	unsigned long 	flags;
+	unsigned long flags;
 
 	while (!list_empty(&bfad->active_aen_q)) {
 		spin_lock_irqsave(&bfad->bfad_aen_spinlock, flags);
@@ -912,16 +908,72 @@ bfad_get_itnim(struct bfad_im_port_s *im_port, int id)
 }
 
 /*
+ * Function is invoked from the SCSI Host Template slave_alloc() entry point.
+ * Has the logic to query the LUN Mask database to check if this LUN needs to
+ * be made visible to the SCSI mid-layer or not.
+ *
+ * Returns BFA_STATUS_OK if this LUN needs to be added to the OS stack.
+ * Returns -ENXIO to notify SCSI mid-layer to not add this LUN to the OS stack.
+ */
+static int
+bfad_im_check_if_make_lun_visible(struct scsi_device *sdev,
+				  struct fc_rport *rport)
+{
+	struct bfad_itnim_data_s *itnim_data =
+				(struct bfad_itnim_data_s *) rport->dd_data;
+	struct bfa_s *bfa = itnim_data->itnim->bfa_itnim->bfa;
+	struct bfa_rport_s *bfa_rport = itnim_data->itnim->bfa_itnim->rport;
+	struct bfa_lun_mask_s *lun_list = bfa_get_lun_mask_list(bfa);
+	int i = 0, ret = -ENXIO;
+
+	for (i = 0; i < MAX_LUN_MASK_CFG; i++) {
+		if (lun_list[i].state == BFA_IOIM_LUN_MASK_ACTIVE &&
+		    scsilun_to_int(&lun_list[i].lun) == sdev->lun &&
+		    lun_list[i].rp_tag == bfa_rport->rport_tag &&
+		    lun_list[i].lp_tag == (u8)bfa_rport->rport_info.lp_tag) {
+			ret = BFA_STATUS_OK;
+			break;
+		}
+	}
+	return ret;
+}
+
+/*
  * Scsi_Host template entry slave_alloc
  */
 static int
 bfad_im_slave_alloc(struct scsi_device *sdev)
 {
 	struct fc_rport *rport = starget_to_rport(scsi_target(sdev));
+	struct bfad_itnim_data_s *itnim_data;
+	struct bfa_s *bfa;
 
 	if (!rport || fc_remote_port_chkready(rport))
 		return -ENXIO;
 
+	itnim_data = (struct bfad_itnim_data_s *) rport->dd_data;
+	bfa = itnim_data->itnim->bfa_itnim->bfa;
+
+	if (bfa_get_lun_mask_status(bfa) == BFA_LUNMASK_ENABLED) {
+		/*
+		 * We should not mask LUN 0 - since this will translate
+		 * to no LUN / TARGET for SCSI ml resulting no scan.
+		 */
+		if (sdev->lun == 0) {
+			sdev->sdev_bflags |= BLIST_NOREPORTLUN |
+					     BLIST_SPARSELUN;
+			goto done;
+		}
+
+		/*
+		 * Query LUN Mask configuration - to expose this LUN
+		 * to the SCSI mid-layer or to mask it.
+		 */
+		if (bfad_im_check_if_make_lun_visible(sdev, rport) !=
+							BFA_STATUS_OK)
+			return -ENXIO;
+	}
+done:
 	sdev->hostdata = rport->dd_data;
 
 	return 0;
@@ -986,7 +1038,7 @@ bfad_fc_host_init(struct bfad_im_port_s *im_port)
 	/* For fibre channel services type 0x20 */
 	fc_host_supported_fc4s(host)[7] = 1;
 
-	strncpy(symname, bfad->bfa_fcs.fabric.bport.port_cfg.sym_name.symname,
+	strlcpy(symname, bfad->bfa_fcs.fabric.bport.port_cfg.sym_name.symname,
 		BFA_SYMNAME_MAXLEN);
 	sprintf(fc_host_symbolic_name(host), "%s", symname);
 
@@ -1030,6 +1082,8 @@ bfad_im_fc_rport_add(struct bfad_im_port_s *im_port, struct bfad_itnim_s *itnim)
 	if ((fc_rport->scsi_target_id != -1)
 	    && (fc_rport->scsi_target_id < MAX_FCP_TARGET))
 		itnim->scsi_tgt_id = fc_rport->scsi_target_id;
+
+	itnim->channel = fc_rport->channel;
 
 	return;
 }
@@ -1138,7 +1192,7 @@ bfad_im_itnim_work_handler(struct work_struct *work)
  * Scsi_Host template entry, queue a SCSI command to the BFAD.
  */
 static int
-bfad_im_queuecommand(struct scsi_cmnd *cmnd, void (*done) (struct scsi_cmnd *))
+bfad_im_queuecommand_lck(struct scsi_cmnd *cmnd, void (*done) (struct scsi_cmnd *))
 {
 	struct bfad_im_port_s *im_port =
 		(struct bfad_im_port_s *) cmnd->device->host->hostdata[0];
@@ -1212,6 +1266,8 @@ out_fail_cmd:
 
 	return 0;
 }
+
+static DEF_SCSI_QCMD(bfad_im_queuecommand)
 
 void
 bfad_rport_online_wait(struct bfad_s *bfad)

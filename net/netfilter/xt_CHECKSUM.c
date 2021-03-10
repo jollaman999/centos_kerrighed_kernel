@@ -10,10 +10,8 @@
  * published by the Free Software Foundation.
 */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
-#include <linux/in.h>
 #include <linux/module.h>
 #include <linux/skbuff.h>
-#include <linux/netdevice.h>
 
 #include <linux/netfilter/x_tables.h>
 #include <linux/netfilter/xt_CHECKSUM.h>
@@ -25,7 +23,7 @@ MODULE_ALIAS("ipt_CHECKSUM");
 MODULE_ALIAS("ip6t_CHECKSUM");
 
 static unsigned int
-checksum_tg(struct sk_buff *skb, const struct xt_target_param *par)
+checksum_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	if (skb->ip_summed == CHECKSUM_PARTIAL)
 		skb_checksum_help(skb);
@@ -33,19 +31,19 @@ checksum_tg(struct sk_buff *skb, const struct xt_target_param *par)
 	return XT_CONTINUE;
 }
 
-static bool checksum_tg_check(const struct xt_tgchk_param *par)
+static int checksum_tg_check(const struct xt_tgchk_param *par)
 {
 	const struct xt_CHECKSUM_info *einfo = par->targinfo;
 
 	if (einfo->operation & ~XT_CHECKSUM_OP_FILL) {
 		pr_info("unsupported CHECKSUM operation %x\n", einfo->operation);
-		return false;
+		return -EINVAL;
 	}
 	if (!einfo->operation) {
 		pr_info("no CHECKSUM operation enabled\n");
-		return false;
+		return -EINVAL;
 	}
-	return true;
+	return 0;
 }
 
 static struct xt_target checksum_tg_reg __read_mostly = {

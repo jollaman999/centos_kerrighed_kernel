@@ -16,9 +16,7 @@
 #include <linux/nfs_fs.h>
 #include "internal.h"
 
-#ifdef RPC_DEBUG
-# define NFSDBG_FACILITY	NFSDBG_MOUNT
-#endif
+#define NFSDBG_FACILITY	NFSDBG_MOUNT
 
 /*
  * Defined by RFC 1094, section A.3; and RFC 1813, section 5.1.4
@@ -67,7 +65,7 @@ enum {
 	MOUNTPROC3_EXPORT	= 5,
 };
 
-static struct rpc_program	mnt_program;
+static const struct rpc_program mnt_program;
 
 /*
  * Defined by OpenGroup XNFS Version 3W, chapter 8
@@ -139,7 +137,10 @@ struct mnt_fhstatus {
  * nfs_mount - Obtain an NFS file handle for the given host and path
  * @info: pointer to mount request arguments
  *
- * Uses default timeout parameters specified by underlying transport.
+ * Uses default timeout parameters specified by underlying transport. On
+ * successful return, the auth_flavs list and auth_flav_len will be populated
+ * with the list from the server or a faked-up list if the server didn't
+ * provide one.
  */
 int nfs_mount(struct nfs_mount_request *info)
 {
@@ -153,7 +154,7 @@ int nfs_mount(struct nfs_mount_request *info)
 		.rpc_resp	= &result,
 	};
 	struct rpc_create_args args = {
-		.net		= &init_net,
+		.net		= info->net,
 		.protocol	= info->protocol,
 		.address	= info->sap,
 		.addrsize	= info->salen,
@@ -168,6 +169,9 @@ int nfs_mount(struct nfs_mount_request *info)
 	dprintk("NFS: sending MNT request for %s:%s\n",
 		(info->hostname ? info->hostname : "server"),
 			info->dirpath);
+
+	if (strlen(info->dirpath) > MNTPATHLEN)
+		return -ENAMETOOLONG;
 
 	if (info->noresvport)
 		args.flags |= RPC_CLNT_CREATE_NONPRIVPORT;
@@ -192,6 +196,15 @@ int nfs_mount(struct nfs_mount_request *info)
 	dprintk("NFS: MNT request succeeded\n");
 	status = 0;
 
+	/*
+	 * If the server didn't provide a flavor list, allow the
+	 * client to try any flavor.
+	 */
+	if (info->version != NFS_MNT3_VERSION || *info->auth_flav_len == 0) {
+		dprintk("NFS: Faking up auth_flavs list\n");
+		info->auth_flavs[0] = RPC_AUTH_NULL;
+		*info->auth_flav_len = 1;
+	}
 out:
 	return status;
 
@@ -225,7 +238,7 @@ void nfs_umount(const struct nfs_mount_request *info)
 		.to_retries = 2,
 	};
 	struct rpc_create_args args = {
-		.net		= &init_net,
+		.net		= info->net,
 		.protocol	= IPPROTO_UDP,
 		.address	= info->sap,
 		.addrsize	= info->salen,
@@ -236,19 +249,20 @@ void nfs_umount(const struct nfs_mount_request *info)
 		.authflavor	= RPC_AUTH_UNIX,
 		.flags		= RPC_CLNT_CREATE_NOPING,
 	};
-	struct mountres	result;
 	struct rpc_message msg	= {
 		.rpc_argp	= info->dirpath,
-		.rpc_resp	= &result,
 	};
 	struct rpc_clnt *clnt;
 	int status;
+
+	if (strlen(info->dirpath) > MNTPATHLEN)
+		return;
 
 	if (info->noresvport)
 		args.flags |= RPC_CLNT_CREATE_NONPRIVPORT;
 
 	clnt = rpc_create(&args);
-	if (unlikely(IS_ERR(clnt)))
+	if (IS_ERR(clnt))
 		goto out_clnt_err;
 
 	dprintk("NFS: sending UMNT request for %s:%s\n",
@@ -280,29 +294,19 @@ out_call_err:
  * XDR encode/decode functions for MOUNT
  */
 
-static int encode_mntdirpath(struct xdr_stream *xdr, const char *pathname)
+static void encode_mntdirpath(struct xdr_stream *xdr, const char *pathname)
 {
 	const u32 pathname_len = strlen(pathname);
 	__be32 *p;
 
-	if (unlikely(pathname_len > MNTPATHLEN))
-		return -EIO;
-
-	p = xdr_reserve_space(xdr, sizeof(u32) + pathname_len);
-	if (unlikely(p == NULL))
-		return -EIO;
+	p = xdr_reserve_space(xdr, 4 + pathname_len);
 	xdr_encode_opaque(p, pathname, pathname_len);
-
-	return 0;
 }
 
-static int mnt_enc_dirpath(struct rpc_rqst *req, __be32 *p,
-			   const char *dirpath)
+static void mnt_xdr_enc_dirpath(struct rpc_rqst *req, struct xdr_stream *xdr,
+				const char *dirpath)
 {
-	struct xdr_stream xdr;
-
-	xdr_init_encode(&xdr, &req->rq_snd_buf, p);
-	return encode_mntdirpath(&xdr, dirpath);
+	encode_mntdirpath(xdr, dirpath);
 }
 
 /*
@@ -320,10 +324,10 @@ static int decode_status(struct xdr_stream *xdr, struct mountres *res)
 	u32 status;
 	__be32 *p;
 
-	p = xdr_inline_decode(xdr, sizeof(status));
+	p = xdr_inline_decode(xdr, 4);
 	if (unlikely(p == NULL))
 		return -EIO;
-	status = ntohl(*p);
+	status = be32_to_cpup(p);
 
 	for (i = 0; i < ARRAY_SIZE(mnt_errtbl); i++) {
 		if (mnt_errtbl[i].status == status) {
@@ -351,18 +355,16 @@ static int decode_fhandle(struct xdr_stream *xdr, struct mountres *res)
 	return 0;
 }
 
-static int mnt_dec_mountres(struct rpc_rqst *req, __be32 *p,
-			    struct mountres *res)
+static int mnt_xdr_dec_mountres(struct rpc_rqst *req,
+				struct xdr_stream *xdr,
+				struct mountres *res)
 {
-	struct xdr_stream xdr;
 	int status;
 
-	xdr_init_decode(&xdr, &req->rq_rcv_buf, p);
-
-	status = decode_status(&xdr, res);
+	status = decode_status(xdr, res);
 	if (unlikely(status != 0 || res->errno != 0))
 		return status;
-	return decode_fhandle(&xdr, res);
+	return decode_fhandle(xdr, res);
 }
 
 static int decode_fhs_status(struct xdr_stream *xdr, struct mountres *res)
@@ -371,10 +373,10 @@ static int decode_fhs_status(struct xdr_stream *xdr, struct mountres *res)
 	u32 status;
 	__be32 *p;
 
-	p = xdr_inline_decode(xdr, sizeof(status));
+	p = xdr_inline_decode(xdr, 4);
 	if (unlikely(p == NULL))
 		return -EIO;
-	status = ntohl(*p);
+	status = be32_to_cpup(p);
 
 	for (i = 0; i < ARRAY_SIZE(mnt3_errtbl); i++) {
 		if (mnt3_errtbl[i].status == status) {
@@ -394,11 +396,11 @@ static int decode_fhandle3(struct xdr_stream *xdr, struct mountres *res)
 	u32 size;
 	__be32 *p;
 
-	p = xdr_inline_decode(xdr, sizeof(size));
+	p = xdr_inline_decode(xdr, 4);
 	if (unlikely(p == NULL))
 		return -EIO;
 
-	size = ntohl(*p++);
+	size = be32_to_cpup(p);
 	if (size > NFS3_FHSIZE || size == 0)
 		return -EIO;
 
@@ -421,15 +423,15 @@ static int decode_auth_flavors(struct xdr_stream *xdr, struct mountres *res)
 	if (*count == 0)
 		return 0;
 
-	p = xdr_inline_decode(xdr, sizeof(entries));
+	p = xdr_inline_decode(xdr, 4);
 	if (unlikely(p == NULL))
 		return -EIO;
-	entries = ntohl(*p);
+	entries = be32_to_cpup(p);
 	dprintk("NFS: received %u auth flavors\n", entries);
 	if (entries > NFS_MAX_SECFLAVORS)
 		entries = NFS_MAX_SECFLAVORS;
 
-	p = xdr_inline_decode(xdr, sizeof(u32) * entries);
+	p = xdr_inline_decode(xdr, 4 * entries);
 	if (unlikely(p == NULL))
 		return -EIO;
 
@@ -437,7 +439,7 @@ static int decode_auth_flavors(struct xdr_stream *xdr, struct mountres *res)
 		entries = *count;
 
 	for (i = 0; i < entries; i++) {
-		flavors[i] = ntohl(*p++);
+		flavors[i] = be32_to_cpup(p++);
 		dprintk("NFS:   auth flavor[%u]: %d\n", i, flavors[i]);
 	}
 	*count = i;
@@ -445,30 +447,28 @@ static int decode_auth_flavors(struct xdr_stream *xdr, struct mountres *res)
 	return 0;
 }
 
-static int mnt_dec_mountres3(struct rpc_rqst *req, __be32 *p,
-			     struct mountres *res)
+static int mnt_xdr_dec_mountres3(struct rpc_rqst *req,
+				 struct xdr_stream *xdr,
+				 struct mountres *res)
 {
-	struct xdr_stream xdr;
 	int status;
 
-	xdr_init_decode(&xdr, &req->rq_rcv_buf, p);
-
-	status = decode_fhs_status(&xdr, res);
+	status = decode_fhs_status(xdr, res);
 	if (unlikely(status != 0 || res->errno != 0))
 		return status;
-	status = decode_fhandle3(&xdr, res);
+	status = decode_fhandle3(xdr, res);
 	if (unlikely(status != 0)) {
 		res->errno = -EBADHANDLE;
 		return 0;
 	}
-	return decode_auth_flavors(&xdr, res);
+	return decode_auth_flavors(xdr, res);
 }
 
 static struct rpc_procinfo mnt_procedures[] = {
 	[MOUNTPROC_MNT] = {
 		.p_proc		= MOUNTPROC_MNT,
-		.p_encode	= (kxdrproc_t)mnt_enc_dirpath,
-		.p_decode	= (kxdrproc_t)mnt_dec_mountres,
+		.p_encode	= (kxdreproc_t)mnt_xdr_enc_dirpath,
+		.p_decode	= (kxdrdproc_t)mnt_xdr_dec_mountres,
 		.p_arglen	= MNT_enc_dirpath_sz,
 		.p_replen	= MNT_dec_mountres_sz,
 		.p_statidx	= MOUNTPROC_MNT,
@@ -476,7 +476,7 @@ static struct rpc_procinfo mnt_procedures[] = {
 	},
 	[MOUNTPROC_UMNT] = {
 		.p_proc		= MOUNTPROC_UMNT,
-		.p_encode	= (kxdrproc_t)mnt_enc_dirpath,
+		.p_encode	= (kxdreproc_t)mnt_xdr_enc_dirpath,
 		.p_arglen	= MNT_enc_dirpath_sz,
 		.p_statidx	= MOUNTPROC_UMNT,
 		.p_name		= "UMOUNT",
@@ -486,8 +486,8 @@ static struct rpc_procinfo mnt_procedures[] = {
 static struct rpc_procinfo mnt3_procedures[] = {
 	[MOUNTPROC3_MNT] = {
 		.p_proc		= MOUNTPROC3_MNT,
-		.p_encode	= (kxdrproc_t)mnt_enc_dirpath,
-		.p_decode	= (kxdrproc_t)mnt_dec_mountres3,
+		.p_encode	= (kxdreproc_t)mnt_xdr_enc_dirpath,
+		.p_decode	= (kxdrdproc_t)mnt_xdr_dec_mountres3,
 		.p_arglen	= MNT_enc_dirpath_sz,
 		.p_replen	= MNT_dec_mountres3_sz,
 		.p_statidx	= MOUNTPROC3_MNT,
@@ -495,7 +495,7 @@ static struct rpc_procinfo mnt3_procedures[] = {
 	},
 	[MOUNTPROC3_UMNT] = {
 		.p_proc		= MOUNTPROC3_UMNT,
-		.p_encode	= (kxdrproc_t)mnt_enc_dirpath,
+		.p_encode	= (kxdreproc_t)mnt_xdr_enc_dirpath,
 		.p_arglen	= MNT_enc_dirpath_sz,
 		.p_statidx	= MOUNTPROC3_UMNT,
 		.p_name		= "UMOUNT",
@@ -503,19 +503,19 @@ static struct rpc_procinfo mnt3_procedures[] = {
 };
 
 
-static struct rpc_version mnt_version1 = {
+static const struct rpc_version mnt_version1 = {
 	.number		= 1,
 	.nrprocs	= ARRAY_SIZE(mnt_procedures),
 	.procs		= mnt_procedures,
 };
 
-static struct rpc_version mnt_version3 = {
+static const struct rpc_version mnt_version3 = {
 	.number		= 3,
 	.nrprocs	= ARRAY_SIZE(mnt3_procedures),
 	.procs		= mnt3_procedures,
 };
 
-static struct rpc_version *mnt_version[] = {
+static const struct rpc_version *mnt_version[] = {
 	NULL,
 	&mnt_version1,
 	NULL,
@@ -524,7 +524,7 @@ static struct rpc_version *mnt_version[] = {
 
 static struct rpc_stat mnt_stats;
 
-static struct rpc_program mnt_program = {
+static const struct rpc_program mnt_program = {
 	.name		= "mount",
 	.number		= NFS_MNT_PROGRAM,
 	.nrvers		= ARRAY_SIZE(mnt_version),

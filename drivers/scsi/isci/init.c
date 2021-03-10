@@ -66,8 +66,8 @@
 #include "probe_roms.h"
 
 #define MAJ 1
-#define MIN 1
-#define BUILD 0-rh
+#define MIN 2
+#define BUILD 0
 #define DRV_VERSION __stringify(MAJ) "." __stringify(MIN) "." \
 	__stringify(BUILD)
 
@@ -222,7 +222,7 @@ static struct sas_domain_function_template isci_transport_ops  = {
  * @isci_host: This parameter specifies the lldd specific wrapper for the
  *    libsas sas_ha struct.
  *
- * This method returns an error code indicating sucess or failure. The user
+ * This method returns an error code indicating success or failure. The user
  * should check for possible memory allocation error return otherwise, a zero
  * indicates success.
  */
@@ -258,8 +258,6 @@ static int isci_register_sas_ha(struct isci_host *isci_host)
 	sas_ha->sas_port = sas_ports;
 	sas_ha->num_phys = SCI_MAX_PHYS;
 
-	sas_ha->lldd_queue_size = ISCI_CAN_QUEUE_VAL;
-	sas_ha->lldd_max_execute_num = 1;
 	sas_ha->strict_wide_ports = 1;
 
 	sas_register_ha(sas_ha);
@@ -274,15 +272,14 @@ static void isci_unregister(struct isci_host *isci_host)
 	if (!isci_host)
 		return;
 
+	shost = to_shost(isci_host);
 	sas_unregister_ha(&isci_host->sas_ha);
 
-	shost = to_shost(isci_host);
 	sas_remove_host(shost);
-	scsi_remove_host(shost);
 	scsi_host_put(shost);
 }
 
-static int __devinit isci_pci_init(struct pci_dev *pdev)
+static int isci_pci_init(struct pci_dev *pdev)
 {
 	int err, bar_num, bar_mask = 0;
 	void __iomem * const *iomap;
@@ -356,7 +353,7 @@ static int isci_setup_interrupts(struct pci_dev *pdev)
 	for (i = 0; i < num_msix; i++)
 		pci_info->msix_entries[i].entry = i;
 
-	err = pci_enable_msix(pdev, pci_info->msix_entries, num_msix);
+	err = pci_enable_msix_exact(pdev, pci_info->msix_entries, num_msix);
 	if (err)
 		goto intx;
 
@@ -598,6 +595,13 @@ static struct isci_host *isci_host_alloc(struct pci_dev *pdev, int id)
 	shost->max_lun = ~0;
 	shost->max_cmd_len = MAX_COMMAND_SIZE;
 
+	/* turn on DIF support */
+	scsi_host_set_prot(shost,
+			   SHOST_DIF_TYPE1_PROTECTION |
+			   SHOST_DIF_TYPE2_PROTECTION |
+			   SHOST_DIF_TYPE3_PROTECTION);
+	scsi_host_set_guard(shost, SHOST_DIX_GUARD_CRC);
+
 	err = scsi_add_host(shost, &pdev->dev);
 	if (err)
 		goto err_shost;
@@ -616,7 +620,7 @@ static struct isci_host *isci_host_alloc(struct pci_dev *pdev, int id)
 	return NULL;
 }
 
-static int __devinit isci_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+static int isci_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct isci_pci_info *pci_info;
 	int err, i;
@@ -633,7 +637,7 @@ static int __devinit isci_pci_probe(struct pci_dev *pdev, const struct pci_devic
 		return -ENOMEM;
 	pci_set_drvdata(pdev, pci_info);
 
-	if (efi_enabled)
+	if (efi_enabled(EFI_RUNTIME_SERVICES))
 		orom = isci_get_efi_var(pdev);
 
 	if (!orom)
@@ -644,7 +648,6 @@ static int __devinit isci_pci_probe(struct pci_dev *pdev, const struct pci_devic
 						orom->hdr.version)) {
 			dev_warn(&pdev->dev,
 				 "[%d]: invalid oem parameters detected, falling back to firmware\n", i);
-			devm_kfree(&pdev->dev, orom);
 			orom = NULL;
 			break;
 		}
@@ -686,13 +689,6 @@ static int __devinit isci_pci_probe(struct pci_dev *pdev, const struct pci_devic
 			goto err_host_alloc;
 		}
 		pci_info->hosts[i] = h;
-
-		/* turn on DIF support */
-		scsi_host_set_prot(to_shost(h),
-				   SHOST_DIF_TYPE1_PROTECTION |
-				   SHOST_DIF_TYPE2_PROTECTION |
-				   SHOST_DIF_TYPE3_PROTECTION);
-		scsi_host_set_guard(to_shost(h), SHOST_DIX_GUARD_CRC);
 	}
 
 	err = isci_setup_interrupts(pdev);
@@ -710,7 +706,7 @@ static int __devinit isci_pci_probe(struct pci_dev *pdev, const struct pci_devic
 	return err;
 }
 
-static void __devexit isci_pci_remove(struct pci_dev *pdev)
+static void isci_pci_remove(struct pci_dev *pdev)
 {
 	struct isci_host *ihost;
 	int i;
@@ -722,7 +718,7 @@ static void __devexit isci_pci_remove(struct pci_dev *pdev)
 	}
 }
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 static int isci_suspend(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
@@ -763,7 +759,7 @@ static int isci_resume(struct device *dev)
 		sas_prep_resume_ha(&ihost->sas_ha);
 
 		isci_host_init(ihost);
-		isci_host_start(to_shost(ihost));
+		isci_host_start(ihost->sas_ha.core.shost);
 		wait_for_start(ihost);
 
 		sas_resume_ha(&ihost->sas_ha);
@@ -771,18 +767,16 @@ static int isci_resume(struct device *dev)
 
 	return 0;
 }
+#endif
 
 static SIMPLE_DEV_PM_OPS(isci_pm_ops, isci_suspend, isci_resume);
-#endif
 
 static struct pci_driver isci_pci_driver = {
 	.name		= DRV_NAME,
 	.id_table	= isci_id_table,
 	.probe		= isci_pci_probe,
-	.remove		= __devexit_p(isci_pci_remove),
-#ifdef CONFIG_PM
+	.remove		= isci_pci_remove,
 	.driver.pm      = &isci_pm_ops,
-#endif
 };
 
 static __init int isci_init(void)

@@ -25,6 +25,7 @@
  */
 
 #include <linux/spinlock.h>
+#include <linux/gfp.h>
 #include "aic94xx.h"
 #include "aic94xx_sas.h"
 #include "aic94xx_hwi.h"
@@ -183,7 +184,7 @@ int asd_I_T_nexus_reset(struct domain_device *dev)
 	struct sas_phy *phy = sas_get_local_phy(dev);
 	/* Standard mandates link reset for ATA  (type 0) and
 	 * hard reset for SSP (type 1) */
-	int reset_type = (dev->dev_type == SATA_DEV ||
+	int reset_type = (dev->dev_type == SAS_SATA_DEV ||
 			  (dev->tproto & SAS_PROTOCOL_STP)) ? 0 : 1;
 
 	asd_clear_nexus_I_T(dev, NEXUS_PHASE_PRE);

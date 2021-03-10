@@ -170,20 +170,24 @@ static int fcoe_sysfs_fcf_add(struct fcoe_fcf *new)
 {
 	struct fcoe_ctlr *fip = new->fip;
 	struct fcoe_ctlr_device *ctlr_dev;
-	struct fcoe_fcf_device temp, *fcf_dev;
-	int rc = 0;
+	struct fcoe_fcf_device *temp, *fcf_dev;
+	int rc = -ENOMEM;
 
 	LIBFCOE_FIP_DBG(fip, "New FCF fab %16.16llx mac %pM\n",
 			new->fabric_name, new->fcf_mac);
 
-	temp.fabric_name = new->fabric_name;
-	temp.switch_name = new->switch_name;
-	temp.fc_map = new->fc_map;
-	temp.vfid = new->vfid;
-	memcpy(temp.mac, new->fcf_mac, ETH_ALEN);
-	temp.priority = new->pri;
-	temp.fka_period = new->fka_period;
-	temp.selected = 0; /* default to unselected */
+	temp = kzalloc(sizeof(*temp), GFP_KERNEL);
+	if (!temp)
+		goto out;
+
+	temp->fabric_name = new->fabric_name;
+	temp->switch_name = new->switch_name;
+	temp->fc_map = new->fc_map;
+	temp->vfid = new->vfid;
+	memcpy(temp->mac, new->fcf_mac, ETH_ALEN);
+	temp->priority = new->pri;
+	temp->fka_period = new->fka_period;
+	temp->selected = 0; /* default to unselected */
 
 	/*
 	 * If ctlr_dev doesn't exist then it means we're a libfcoe user
@@ -192,10 +196,11 @@ static int fcoe_sysfs_fcf_add(struct fcoe_fcf *new)
 	 * case we want to add the fcoe_fcf to the fcoe_ctlr list, but we
 	 * don't want to make sysfs changes.
 	 */
+
 	ctlr_dev = fcoe_ctlr_to_ctlr_dev(fip);
 	if (ctlr_dev) {
 		mutex_lock(&ctlr_dev->lock);
-		fcf_dev = fcoe_fcf_device_add(ctlr_dev, &temp);
+		fcf_dev = fcoe_fcf_device_add(ctlr_dev, temp);
 		if (unlikely(!fcf_dev)) {
 			rc = -ENOMEM;
 			mutex_unlock(&ctlr_dev->lock);
@@ -221,8 +226,10 @@ static int fcoe_sysfs_fcf_add(struct fcoe_fcf *new)
 
 	list_add(&new->list, &fip->fcfs);
 	fip->fcf_count++;
+	rc = 0;
 
 out:
+	kfree(temp);
 	return rc;
 }
 
@@ -332,7 +339,7 @@ static void fcoe_ctlr_announce(struct fcoe_ctlr *fip)
 	spin_unlock_bh(&fip->ctlr_lock);
 	sel = fip->sel_fcf;
 
-	if (sel && !compare_ether_addr(sel->fcf_mac, fip->dest_addr))
+	if (sel && ether_addr_equal(sel->fcf_mac, fip->dest_addr))
 		goto unlock;
 	if (!is_zero_ether_addr(fip->dest_addr)) {
 		printk(KERN_NOTICE "libfcoe: host%d: "
@@ -761,7 +768,7 @@ int fcoe_ctlr_els_send(struct fcoe_ctlr *fip, struct fc_lport *lport,
 		 * If non-FIP, we may have gotten an SID by accepting an FLOGI
 		 * from a point-to-point connection.  Switch to using
 		 * the source mac based on the SID.  The destination
-		 * MAC in this case would have been set by receving the
+		 * MAC in this case would have been set by receiving the
 		 * FLOGI.
 		 */
 		if (fip->state == FIP_ST_NON_FIP) {
@@ -1032,7 +1039,7 @@ static void fcoe_ctlr_recv_adv(struct fcoe_ctlr *fip, struct sk_buff *skb)
 		if (fcf->switch_name == new.switch_name &&
 		    fcf->fabric_name == new.fabric_name &&
 		    fcf->fc_map == new.fc_map &&
-		    compare_ether_addr(fcf->fcf_mac, new.fcf_mac) == 0) {
+		    ether_addr_equal(fcf->fcf_mac, new.fcf_mac)) {
 			found = 1;
 			break;
 		}
@@ -1373,7 +1380,7 @@ static void fcoe_ctlr_recv_clr_vlink(struct fcoe_ctlr *fip,
 			mp = (struct fip_mac_desc *)desc;
 			if (dlen < sizeof(*mp))
 				goto err;
-			if (compare_ether_addr(mp->fd_mac, fcf->fcf_mac))
+			if (!ether_addr_equal(mp->fd_mac, fcf->fcf_mac))
 				goto err;
 			desc_mask &= ~BIT(FIP_DT_MAC);
 			break;
@@ -1451,8 +1458,8 @@ static void fcoe_ctlr_recv_clr_vlink(struct fcoe_ctlr *fip,
 			 * 'port_id' is already validated, check MAC address and
 			 * wwpn
 			 */
-			if (compare_ether_addr(fip->get_src_addr(vn_port),
-						vp->fd_mac) != 0 ||
+			if (!ether_addr_equal(fip->get_src_addr(vn_port),
+					      vp->fd_mac) ||
 				get_unaligned_be64(&vp->fd_wwpn) !=
 							vn_port->wwpn)
 				continue;
@@ -1515,12 +1522,12 @@ static int fcoe_ctlr_recv_handler(struct fcoe_ctlr *fip, struct sk_buff *skb)
 		goto drop;
 	eh = eth_hdr(skb);
 	if (fip->mode == FIP_MODE_VN2VN) {
-		if (compare_ether_addr(eh->h_dest, fip->ctl_src_addr) &&
-		    compare_ether_addr(eh->h_dest, fcoe_all_vn2vn) &&
-		    compare_ether_addr(eh->h_dest, fcoe_all_p2p))
+		if (!ether_addr_equal(eh->h_dest, fip->ctl_src_addr) &&
+		    !ether_addr_equal(eh->h_dest, fcoe_all_vn2vn) &&
+		    !ether_addr_equal(eh->h_dest, fcoe_all_p2p))
 			goto drop;
-	} else if (compare_ether_addr(eh->h_dest, fip->ctl_src_addr) &&
-		   compare_ether_addr(eh->h_dest, fcoe_all_enode))
+	} else if (!ether_addr_equal(eh->h_dest, fip->ctl_src_addr) &&
+		   !ether_addr_equal(eh->h_dest, fcoe_all_enode))
 		goto drop;
 	fiph = (struct fip_header *)skb->data;
 	op = ntohs(fiph->fip_op);
@@ -1892,7 +1899,7 @@ int fcoe_ctlr_recv_flogi(struct fcoe_ctlr *fip, struct fc_lport *lport,
 		 * address_mode flag to use FC_OUI-based Ethernet DA.
 		 * Otherwise we use the FCoE gateway addr
 		 */
-		if (!compare_ether_addr(sa, (u8[6])FC_FCOE_FLOGI_MAC)) {
+		if (ether_addr_equal(sa, (u8[6])FC_FCOE_FLOGI_MAC)) {
 			fcoe_ctlr_map_dest(fip);
 		} else {
 			memcpy(fip->dest_addr, sa, ETH_ALEN);
@@ -2012,7 +2019,13 @@ static void fcoe_ctlr_vn_send(struct fcoe_ctlr *fip,
 	frame = (struct fip_frame *)skb->data;
 	memset(frame, 0, len);
 	memcpy(frame->eth.h_dest, dest, ETH_ALEN);
-	memcpy(frame->eth.h_source, fip->ctl_src_addr, ETH_ALEN);
+
+	if (sub == FIP_SC_VN_BEACON) {
+		hton24(frame->eth.h_source, FIP_VN_FC_MAP);
+		hton24(frame->eth.h_source + 3, fip->port_id);
+	} else {
+		memcpy(frame->eth.h_source, fip->ctl_src_addr, ETH_ALEN);
+	}
 	frame->eth.h_proto = htons(ETH_P_FIP);
 
 	frame->fip.fip_ver = FIP_VER_ENCAPS(FIP_VER);
@@ -2072,7 +2085,7 @@ static void fcoe_ctlr_vn_send(struct fcoe_ctlr *fip,
  * fcoe_ctlr_vn_rport_callback - Event handler for rport events.
  * @lport: The lport which is receiving the event
  * @rdata: remote port private data
- * @event: The event that occured
+ * @event: The event that occurred
  *
  * Locking Note:  The rport lock must not be held when calling this function.
  */
@@ -2122,15 +2135,13 @@ static void fcoe_ctlr_disc_stop_locked(struct fc_lport *lport)
 {
 	struct fc_rport_priv *rdata;
 
-	rcu_read_lock();
+	mutex_lock(&lport->disc.disc_mutex);
 	list_for_each_entry_rcu(rdata, &lport->disc.rports, peers) {
 		if (kref_get_unless_zero(&rdata->kref)) {
 			lport->tt.rport_logoff(rdata);
 			kref_put(&rdata->kref, lport->tt.rport_destroy);
 		}
 	}
-	rcu_read_unlock();
-	mutex_lock(&lport->disc.disc_mutex);
 	lport->disc.disc_callback = NULL;
 	mutex_unlock(&lport->disc.disc_mutex);
 }
@@ -2187,7 +2198,7 @@ static void fcoe_ctlr_vn_restart(struct fcoe_ctlr *fip)
 	 */
 	port_id = fip->port_id;
 	if (fip->probe_tries)
-		port_id = prandom32(&fip->rnd_state) & 0xffff;
+		port_id = prandom_u32_state(&fip->rnd_state) & 0xffff;
 	else if (!port_id)
 		port_id = fip->lp->wwpn & 0xffff;
 	if (!port_id || port_id == 0xffff)
@@ -2196,7 +2207,7 @@ static void fcoe_ctlr_vn_restart(struct fcoe_ctlr *fip)
 
 	if (fip->probe_tries < FIP_VN_RLIM_COUNT) {
 		fip->probe_tries++;
-		wait = random32() % FIP_VN_PROBE_WAIT;
+		wait = prandom_u32() % FIP_VN_PROBE_WAIT;
 	} else
 		wait = FIP_VN_RLIM_INT;
 	mod_timer(&fip->timer, jiffies + msecs_to_jiffies(wait));
@@ -2212,7 +2223,7 @@ static void fcoe_ctlr_vn_restart(struct fcoe_ctlr *fip)
 static void fcoe_ctlr_vn_start(struct fcoe_ctlr *fip)
 {
 	fip->probe_tries = 0;
-	prandom32_seed(&fip->rnd_state, fip->lp->wwpn);
+	prandom_seed_state(&fip->rnd_state, fip->lp->wwpn);
 	fcoe_ctlr_vn_restart(fip);
 }
 
@@ -2626,7 +2637,7 @@ static unsigned long fcoe_ctlr_vn_age(struct fcoe_ctlr *fip)
 	unsigned long deadline;
 
 	next_time = jiffies + msecs_to_jiffies(FIP_VN_BEACON_INT * 10);
-	rcu_read_lock();
+	mutex_lock(&lport->disc.disc_mutex);
 	list_for_each_entry_rcu(rdata, &lport->disc.rports, peers) {
 		if (!kref_get_unless_zero(&rdata->kref))
 			continue;
@@ -2647,7 +2658,7 @@ static unsigned long fcoe_ctlr_vn_age(struct fcoe_ctlr *fip)
 			next_time = deadline;
 		kref_put(&rdata->kref, lport->tt.rport_destroy);
 	}
-	rcu_read_unlock();
+	mutex_unlock(&lport->disc.disc_mutex);
 	return next_time;
 }
 
@@ -2770,8 +2781,6 @@ static void fcoe_ctlr_vn_disc(struct fcoe_ctlr *fip)
 	mutex_lock(&disc->disc_mutex);
 	callback = disc->pending ? disc->disc_callback : NULL;
 	disc->pending = 0;
-	mutex_unlock(&disc->disc_mutex);
-	rcu_read_lock();
 	list_for_each_entry_rcu(rdata, &disc->rports, peers) {
 		if (!kref_get_unless_zero(&rdata->kref))
 			continue;
@@ -2780,7 +2789,7 @@ static void fcoe_ctlr_vn_disc(struct fcoe_ctlr *fip)
 			lport->tt.rport_login(rdata);
 		kref_put(&rdata->kref, lport->tt.rport_destroy);
 	}
-	rcu_read_unlock();
+	mutex_unlock(&disc->disc_mutex);
 	if (callback)
 		callback(lport, DISC_EV_SUCCESS);
 }
@@ -2839,7 +2848,7 @@ static void fcoe_ctlr_vn_timeout(struct fcoe_ctlr *fip)
 					  fcoe_all_vn2vn, 0);
 			fip->port_ka_time = jiffies +
 				 msecs_to_jiffies(FIP_VN_BEACON_INT +
-					(random32() % FIP_VN_BEACON_FUZZ));
+					(prandom_u32() % FIP_VN_BEACON_FUZZ));
 		}
 		if (time_before(fip->port_ka_time, next_time))
 			next_time = fip->port_ka_time;
@@ -2871,8 +2880,8 @@ unlock:
  * disabled, so that should ensure that this routine is only called
  * when nothing is happening.
  */
-void fcoe_ctlr_mode_set(struct fc_lport *lport, struct fcoe_ctlr *fip,
-			enum fip_state fip_mode)
+static void fcoe_ctlr_mode_set(struct fc_lport *lport, struct fcoe_ctlr *fip,
+			       enum fip_state fip_mode)
 {
 	void *priv;
 

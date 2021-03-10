@@ -179,6 +179,7 @@ static void print_SCp(struct scsi_pointer *SCp, const char *prefix, const char *
 		SCp->buffers_residual, suffix);
 }
 
+#ifdef CHECK_STRUCTURE
 static void fas216_dumpinfo(FAS216_Info *info)
 {
 	static int used = 0;
@@ -223,7 +224,6 @@ static void fas216_dumpinfo(FAS216_Info *info)
 		info->internal_done, info->magic_end);
 }
 
-#ifdef CHECK_STRUCTURE
 static void __fas216_checkmagic(FAS216_Info *info, const char *func)
 {
 	int corruption = 0;
@@ -308,8 +308,7 @@ static void fas216_log_command(FAS216_Info *info, int level,
 	fas216_do_log(info, '0' + SCpnt->device->id, fmt, args);
 	va_end(args);
 
-	printk(" CDB: ");
-	__scsi_print_command(SCpnt->cmnd);
+	scsi_print_command(SCpnt);
 }
 
 static void
@@ -2078,14 +2077,12 @@ fas216_std_done(FAS216_Info *info, struct scsi_cmnd *SCpnt, unsigned int result)
 			break;
 
 		default:
-			printk(KERN_ERR "scsi%d.%c: incomplete data transfer "
-				"detected: res=%08X ptr=%p len=%X CDB: ",
-				info->host->host_no, '0' + SCpnt->device->id,
-				SCpnt->result, info->scsi.SCp.ptr,
-				info->scsi.SCp.this_residual);
-			__scsi_print_command(SCpnt->cmnd);
-			SCpnt->result &= ~(255 << 16);
-			SCpnt->result |= DID_BAD_TARGET << 16;
+			scmd_printk(KERN_ERR, SCpnt,
+				    "incomplete data transfer detected: res=%08X ptr=%p len=%X\n",
+				    SCpnt->result, info->scsi.SCp.ptr,
+				    info->scsi.SCp.this_residual);
+			scsi_print_command(SCpnt);
+			set_host_byte(SCpnt, DID_ERROR);
 			goto request_sense;
 		}
 	}
@@ -2119,7 +2116,7 @@ request_sense:
 	 * executed, unless a target connects to us.
 	 */
 	if (info->reqSCpnt)
-		printk(KERN_WARNING "scsi%d.%c: loosing request command\n",
+		printk(KERN_WARNING "scsi%d.%c: losing request command\n",
 			info->host->host_no, '0' + SCpnt->device->id);
 	info->reqSCpnt = SCpnt;
 }
@@ -2157,12 +2154,11 @@ static void fas216_done(FAS216_Info *info, unsigned int result)
 	 * to transfer, we should not have a valid pointer.
 	 */
 	if (info->scsi.SCp.ptr && info->scsi.SCp.this_residual == 0) {
-		printk("scsi%d.%c: zero bytes left to transfer, but "
-		       "buffer pointer still valid: ptr=%p len=%08x CDB: ",
-		       info->host->host_no, '0' + SCpnt->device->id,
-		       info->scsi.SCp.ptr, info->scsi.SCp.this_residual);
+		scmd_printk(KERN_INFO, SCpnt,
+			    "zero bytes left to transfer, but buffer pointer still valid: ptr=%p len=%08x\n",
+			    info->scsi.SCp.ptr, info->scsi.SCp.this_residual);
 		info->scsi.SCp.ptr = NULL;
-		__scsi_print_command(SCpnt->cmnd);
+		scsi_print_command(SCpnt);
 	}
 
 	/*
@@ -2176,7 +2172,7 @@ static void fas216_done(FAS216_Info *info, unsigned int result)
 	fn = (void (*)(FAS216_Info *, struct scsi_cmnd *, unsigned int))SCpnt->host_scribble;
 	fn(info, SCpnt, result);
 
-	if (info->scsi.irq != NO_IRQ) {
+	if (info->scsi.irq) {
 		spin_lock_irqsave(&info->host_lock, flags);
 		if (info->scsi.phase == PHASE_IDLE)
 			fas216_kick(info);
@@ -2198,7 +2194,7 @@ no_command:
  * Returns: 0 on success, else error.
  * Notes: io_request_lock is held, interrupts are disabled.
  */
-int fas216_queue_command(struct scsi_cmnd *SCpnt,
+static int fas216_queue_command_lck(struct scsi_cmnd *SCpnt,
 			 void (*done)(struct scsi_cmnd *))
 {
 	FAS216_Info *info = (FAS216_Info *)SCpnt->device->host->hostdata;
@@ -2240,6 +2236,8 @@ int fas216_queue_command(struct scsi_cmnd *SCpnt,
 	return result;
 }
 
+DEF_SCSI_QCMD(fas216_queue_command)
+
 /**
  * fas216_internal_done - trigger restart of a waiting thread in fas216_noqueue_command
  * @SCpnt: Command to wake
@@ -2263,7 +2261,7 @@ static void fas216_internal_done(struct scsi_cmnd *SCpnt)
  * Returns: scsi result code.
  * Notes: io_request_lock is held, interrupts are disabled.
  */
-int fas216_noqueue_command(struct scsi_cmnd *SCpnt,
+static int fas216_noqueue_command_lck(struct scsi_cmnd *SCpnt,
 			   void (*done)(struct scsi_cmnd *))
 {
 	FAS216_Info *info = (FAS216_Info *)SCpnt->device->host->hostdata;
@@ -2274,10 +2272,10 @@ int fas216_noqueue_command(struct scsi_cmnd *SCpnt,
 	 * We should only be using this if we don't have an interrupt.
 	 * Provide some "incentive" to use the queueing code.
 	 */
-	BUG_ON(info->scsi.irq != NO_IRQ);
+	BUG_ON(info->scsi.irq);
 
 	info->internal_done = 0;
-	fas216_queue_command(SCpnt, fas216_internal_done);
+	fas216_queue_command_lck(SCpnt, fas216_internal_done);
 
 	/*
 	 * This wastes time, since we can't return until the command is
@@ -2292,7 +2290,7 @@ int fas216_noqueue_command(struct scsi_cmnd *SCpnt,
 		 * If we don't have an IRQ, then we must poll the card for
 		 * it's interrupt, and use that to call this driver's
 		 * interrupt routine.  That way, we keep the command
-		 * progressing.  Maybe we can add some inteligence here
+		 * progressing.  Maybe we can add some intelligence here
 		 * and go to sleep if we know that the device is going
 		 * to be some time (eg, disconnected).
 		 */
@@ -2309,6 +2307,8 @@ int fas216_noqueue_command(struct scsi_cmnd *SCpnt,
 
 	return 0;
 }
+
+DEF_SCSI_QCMD(fas216_noqueue_command)
 
 /*
  * Error handler timeout function.  Indicate that we timed out,
@@ -2420,13 +2420,10 @@ int fas216_eh_abort(struct scsi_cmnd *SCpnt)
 
 	info->stats.aborts += 1;
 
-	printk(KERN_WARNING "scsi%d: abort command ", info->host->host_no);
-	__scsi_print_command(SCpnt->cmnd);
+	scmd_printk(KERN_WARNING, SCpnt, "abort command\n");
 
 	print_debug_list();
 	fas216_dumpstate(info);
-
-	printk(KERN_WARNING "scsi%d: abort %p ", info->host->host_no, SCpnt);
 
 	switch (fas216_find_command(info, SCpnt)) {
 	/*
@@ -2435,7 +2432,7 @@ int fas216_eh_abort(struct scsi_cmnd *SCpnt)
 	 * target, or the busylun bit is not set.
 	 */
 	case res_success:
-		printk("success\n");
+		scmd_printk(KERN_WARNING, SCpnt, "abort %p success\n", SCpnt);
 		result = SUCCESS;
 		break;
 
@@ -2445,14 +2442,13 @@ int fas216_eh_abort(struct scsi_cmnd *SCpnt)
 	 * if the bus is free.
 	 */
 	case res_hw_abort:
-		
 
 	/*
 	 * We are unable to abort the command for some reason.
 	 */
 	default:
 	case res_failed:
-		printk("failed\n");
+		scmd_printk(KERN_WARNING, SCpnt, "abort %p failed\n", SCpnt);
 		break;
 	}
 
@@ -2516,7 +2512,7 @@ int fas216_eh_device_reset(struct scsi_cmnd *SCpnt)
 		if (info->scsi.phase == PHASE_IDLE)
 			fas216_kick(info);
 
-		mod_timer(&info->eh_timer, 30 * HZ);
+		mod_timer(&info->eh_timer, jiffies + 30 * HZ);
 		spin_unlock_irqrestore(&info->host_lock, flags);
 
 		/*
@@ -2657,8 +2653,7 @@ int fas216_eh_host_reset(struct scsi_cmnd *SCpnt)
 
 	fas216_checkmagic(info);
 
-	printk("scsi%d.%c: %s: resetting host\n",
-		info->host->host_no, '0' + SCpnt->device->id, __func__);
+	fas216_log(info, LOG_ERROR, "resetting host");
 
 	/*
 	 * Reset the SCSI chip.
@@ -2954,9 +2949,9 @@ void fas216_release(struct Scsi_Host *host)
 	queue_free(&info->queues.issue);
 }
 
-int fas216_print_host(FAS216_Info *info, char *buffer)
+void fas216_print_host(FAS216_Info *info, struct seq_file *m)
 {
-	return sprintf(buffer,
+	seq_printf(m,
 			"\n"
 			"Chip    : %s\n"
 			" Address: 0x%p\n"
@@ -2966,11 +2961,9 @@ int fas216_print_host(FAS216_Info *info, char *buffer)
 			info->scsi.irq, info->scsi.dma);
 }
 
-int fas216_print_stats(FAS216_Info *info, char *buffer)
+void fas216_print_stats(FAS216_Info *info, struct seq_file *m)
 {
-	char *p = buffer;
-
-	p += sprintf(p, "\n"
+	seq_printf(m, "\n"
 			"Command Statistics:\n"
 			" Queued     : %u\n"
 			" Issued     : %u\n"
@@ -2987,38 +2980,33 @@ int fas216_print_stats(FAS216_Info *info, char *buffer)
 			info->stats.writes,	 info->stats.miscs,
 			info->stats.disconnects, info->stats.aborts,
 			info->stats.bus_resets,	 info->stats.host_resets);
-
-	return p - buffer;
 }
 
-int fas216_print_devices(FAS216_Info *info, char *buffer)
+void fas216_print_devices(FAS216_Info *info, struct seq_file *m)
 {
 	struct fas216_device *dev;
 	struct scsi_device *scd;
-	char *p = buffer;
 
-	p += sprintf(p, "Device/Lun TaggedQ       Parity   Sync\n");
+	seq_printf(m, "Device/Lun TaggedQ       Parity   Sync\n");
 
 	shost_for_each_device(scd, info->host) {
 		dev = &info->device[scd->id];
-		p += sprintf(p, "     %d/%d   ", scd->id, scd->lun);
+		seq_printf(m, "     %d/%d   ", scd->id, scd->lun);
 		if (scd->tagged_supported)
-			p += sprintf(p, "%3sabled(%3d) ",
+			seq_printf(m, "%3sabled(%3d) ",
 				     scd->simple_tags ? "en" : "dis",
 				     scd->current_tag);
 		else
-			p += sprintf(p, "unsupported   ");
+			seq_printf(m, "unsupported   ");
 
-		p += sprintf(p, "%3sabled ", dev->parity_enabled ? "en" : "dis");
+		seq_printf(m, "%3sabled ", dev->parity_enabled ? "en" : "dis");
 
 		if (dev->sof)
-			p += sprintf(p, "offset %d, %d ns\n",
+			seq_printf(m, "offset %d, %d ns\n",
 				     dev->sof, dev->period * 4);
 		else
-			p += sprintf(p, "async\n");
+			seq_printf(m, "async\n");
 	}
-
-	return p - buffer;
 }
 
 EXPORT_SYMBOL(fas216_init);

@@ -32,7 +32,6 @@
  *    Gareth Hughes <gareth@valinux.com>
  */
 
-#include <linux/nospec.h>
 #include <drm/drmP.h>
 #include <drm/mga_drm.h>
 #include "mga_drv.h"
@@ -877,15 +876,12 @@ static int mga_dma_vertex(struct drm_device *dev, void *data, struct drm_file *f
 	struct drm_buf *buf;
 	drm_mga_buf_priv_t *buf_priv;
 	drm_mga_vertex_t *vertex = data;
-	int idx;
 
 	LOCK_TEST_WITH_RETURN(dev, file_priv);
 
-	if (vertex->idx < 0 || vertex->idx >= dma->buf_count)
+	if (vertex->idx < 0 || vertex->idx > dma->buf_count)
 		return -EINVAL;
-	idx = array_index_nospec(vertex->idx, dma->buf_count);
-
-	buf = dma->buflist[idx];
+	buf = dma->buflist[vertex->idx];
 	buf_priv = buf->dev_private;
 
 	buf->used = vertex->used;
@@ -915,15 +911,13 @@ static int mga_dma_indices(struct drm_device *dev, void *data, struct drm_file *
 	struct drm_buf *buf;
 	drm_mga_buf_priv_t *buf_priv;
 	drm_mga_indices_t *indices = data;
-	int idx;
 
 	LOCK_TEST_WITH_RETURN(dev, file_priv);
 
-	if (indices->idx < 0 || indices->idx >= dma->buf_count)
+	if (indices->idx < 0 || indices->idx > dma->buf_count)
 		return -EINVAL;
-	idx = array_index_nospec(indices->idx, dma->buf_count);
 
-	buf = dma->buflist[idx];
+	buf = dma->buflist[indices->idx];
 	buf_priv = buf->dev_private;
 
 	buf_priv->discard = indices->discard;
@@ -952,7 +946,6 @@ static int mga_dma_iload(struct drm_device *dev, void *data, struct drm_file *fi
 	struct drm_buf *buf;
 	drm_mga_buf_priv_t *buf_priv;
 	drm_mga_iload_t *iload = data;
-	int idx;
 	DRM_DEBUG("\n");
 
 	LOCK_TEST_WITH_RETURN(dev, file_priv);
@@ -964,11 +957,10 @@ static int mga_dma_iload(struct drm_device *dev, void *data, struct drm_file *fi
 		return -EBUSY;
 	}
 #endif
-	if (iload->idx < 0 || iload->idx >= dma->buf_count)
+	if (iload->idx < 0 || iload->idx > dma->buf_count)
 		return -EINVAL;
-	idx = array_index_nospec(iload->idx, dma->buf_count);
 
-	buf = dma->buflist[idx];
+	buf = dma->buflist[iload->idx];
 	buf_priv = buf->dev_private;
 
 	if (mga_verify_iload(dev_priv, iload->dstorg, iload->length)) {
@@ -1013,7 +1005,7 @@ static int mga_dma_blit(struct drm_device *dev, void *data, struct drm_file *fil
 	return 0;
 }
 
-static int mga_getparam(struct drm_device *dev, void *data, struct drm_file *file_priv)
+int mga_getparam(struct drm_device *dev, void *data, struct drm_file *file_priv)
 {
 	drm_mga_private_t *dev_priv = dev->dev_private;
 	drm_mga_getparam_t *param = data;

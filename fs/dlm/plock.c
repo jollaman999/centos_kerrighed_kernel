@@ -11,6 +11,7 @@
 #include <linux/poll.h>
 #include <linux/dlm.h>
 #include <linux/dlm_plock.h>
+#include <linux/slab.h>
 
 #include "dlm_internal.h"
 #include "lockspace.h"
@@ -91,7 +92,7 @@ static void do_unlock_close(struct dlm_ls *ls, u64 number,
 	op->info.number		= number;
 	op->info.start		= 0;
 	op->info.end		= OFFSET_MAX;
-	if (fl->fl_lmops && fl->fl_lmops->fl_grant)
+	if (fl->fl_lmops && fl->fl_lmops->lm_grant)
 		op->info.owner	= (__u64) fl->fl_pid;
 	else
 		op->info.owner	= (__u64)(long) fl->fl_owner;
@@ -127,11 +128,11 @@ int dlm_posix_lock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	op->info.number		= number;
 	op->info.start		= fl->fl_start;
 	op->info.end		= fl->fl_end;
-	if (fl->fl_lmops && fl->fl_lmops->fl_grant) {
+	if (fl->fl_lmops && fl->fl_lmops->lm_grant) {
 		/* fl_owner is lockd which doesn't distinguish
 		   processes on the nfs client */
 		op->info.owner	= (__u64) fl->fl_pid;
-		xop->callback	= fl->fl_lmops->fl_grant;
+		xop->callback	= fl->fl_lmops->lm_grant;
 		locks_init_lock(&xop->flc);
 		locks_copy_lock(&xop->flc, fl);
 		xop->fl		= fl;
@@ -144,7 +145,7 @@ int dlm_posix_lock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	send_op(op);
 
 	if (xop->callback == NULL) {
-		rv = wait_event_killable(recv_wq, (op->done != 0));
+		rv = wait_event_interruptible(recv_wq, (op->done != 0));
 		if (rv == -ERESTARTSYS) {
 			log_debug(ls, "dlm_posix_lock: wait killed %llx",
 				  (unsigned long long)number);
@@ -171,7 +172,7 @@ int dlm_posix_lock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	rv = op->info.rv;
 
 	if (!rv) {
-		if (posix_lock_file_wait(file, fl) < 0)
+		if (locks_lock_file_wait(file, fl) < 0)
 			log_error(ls, "dlm_posix_lock: vfs lock error %llx",
 				  (unsigned long long)number);
 	}
@@ -183,7 +184,7 @@ out:
 }
 EXPORT_SYMBOL_GPL(dlm_posix_lock);
 
-/* Returns failure iff a succesful lock operation should be canceled */
+/* Returns failure iff a successful lock operation should be canceled */
 static int dlm_plock_callback(struct plock_op *op)
 {
 	struct file *file;
@@ -246,6 +247,7 @@ int dlm_posix_unlock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	struct dlm_ls *ls;
 	struct plock_op *op;
 	int rv;
+	unsigned char fl_flags = fl->fl_flags;
 
 	ls = dlm_find_lockspace_local(lockspace);
 	if (!ls)
@@ -257,9 +259,18 @@ int dlm_posix_unlock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 		goto out;
 	}
 
-	if (posix_lock_file_wait(file, fl) < 0)
-		log_error(ls, "dlm_posix_unlock: vfs unlock error %llx",
-			  (unsigned long long)number);
+	/* cause the vfs unlock to return ENOENT if lock is not found */
+	fl->fl_flags |= FL_EXISTS;
+
+	rv = locks_lock_file_wait(file, fl);
+	if (rv == -ENOENT) {
+		rv = 0;
+		goto out_free;
+	}
+	if (rv < 0) {
+		log_error(ls, "dlm_posix_unlock: vfs unlock error %d %llx",
+			  rv, (unsigned long long)number);
+	}
 
 	op->info.optype		= DLM_PLOCK_OP_UNLOCK;
 	op->info.pid		= fl->fl_pid;
@@ -267,7 +278,7 @@ int dlm_posix_unlock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	op->info.number		= number;
 	op->info.start		= fl->fl_start;
 	op->info.end		= fl->fl_end;
-	if (fl->fl_lmops && fl->fl_lmops->fl_grant)
+	if (fl->fl_lmops && fl->fl_lmops->lm_grant)
 		op->info.owner	= (__u64) fl->fl_pid;
 	else
 		op->info.owner	= (__u64)(long) fl->fl_owner;
@@ -295,9 +306,11 @@ int dlm_posix_unlock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	if (rv == -ENOENT)
 		rv = 0;
 
+out_free:
 	kfree(op);
 out:
 	dlm_put_lockspace(ls);
+	fl->fl_flags = fl_flags;
 	return rv;
 }
 EXPORT_SYMBOL_GPL(dlm_posix_unlock);
@@ -326,7 +339,7 @@ int dlm_posix_get(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	op->info.number		= number;
 	op->info.start		= fl->fl_start;
 	op->info.end		= fl->fl_end;
-	if (fl->fl_lmops && fl->fl_lmops->fl_grant)
+	if (fl->fl_lmops && fl->fl_lmops->lm_grant)
 		op->info.owner	= (__u64) fl->fl_pid;
 	else
 		op->info.owner	= (__u64)(long) fl->fl_owner;
@@ -354,7 +367,7 @@ int dlm_posix_get(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 		locks_init_lock(fl);
 		fl->fl_type = (op->info.ex) ? F_WRLCK : F_RDLCK;
 		fl->fl_flags = FL_POSIX;
-		fl->fl_pid = op->info.pid;
+		fl->fl_pid = -op->info.pid;
 		fl->fl_start = op->info.start;
 		fl->fl_end = op->info.end;
 		rv = 0;
@@ -468,7 +481,8 @@ static const struct file_operations dev_fops = {
 	.read    = dev_read,
 	.write   = dev_write,
 	.poll    = dev_poll,
-	.owner   = THIS_MODULE
+	.owner   = THIS_MODULE,
+	.llseek  = noop_llseek,
 };
 
 static struct miscdevice plock_dev_misc = {

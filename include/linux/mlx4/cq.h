@@ -34,7 +34,7 @@
 #define MLX4_CQ_H
 
 #include <linux/types.h>
-#include <linux/if_ether.h>
+#include <uapi/linux/if_ether.h>
 
 #include <linux/mlx4/device.h>
 #include <linux/mlx4/doorbell.h>
@@ -87,7 +87,13 @@ struct mlx4_ts_cqe {
 } __packed;
 
 enum {
-	MLX4_CQE_VLAN_PRESENT_MASK	= 1 << 29,
+	MLX4_CQE_L2_TUNNEL_IPOK		= 1 << 31,
+	MLX4_CQE_CVLAN_PRESENT_MASK	= 1 << 29,
+	MLX4_CQE_SVLAN_PRESENT_MASK	= 1 << 30,
+	MLX4_CQE_L2_TUNNEL		= 1 << 27,
+	MLX4_CQE_L2_TUNNEL_CSUM		= 1 << 26,
+	MLX4_CQE_L2_TUNNEL_IPV4		= 1 << 25,
+
 	MLX4_CQE_QPN_MASK		= 0xffffff,
 	MLX4_CQE_VID_MASK		= 0xfff,
 };
@@ -129,6 +135,9 @@ enum {
 	MLX4_CQE_SNAP                    = 1 << 1,
 	MLX4_CQE_BAD_FCS                 = 1 << 4,
 };
+
+#define MLX4_MAX_CQ_PERIOD (BIT(16) - 1)
+#define MLX4_MAX_CQ_COUNT (BIT(16) - 1)
 
 static inline void mlx4_cq_arm(struct mlx4_cq *cq, u32 cmd,
 			       void __iomem *uar_page,

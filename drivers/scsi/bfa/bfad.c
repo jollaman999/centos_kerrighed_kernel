@@ -64,9 +64,9 @@ int		max_rport_logins = BFA_FCS_MAX_RPORT_LOGINS;
 u32	bfi_image_cb_size, bfi_image_ct_size, bfi_image_ct2_size;
 u32	*bfi_image_cb, *bfi_image_ct, *bfi_image_ct2;
 
-#define BFAD_FW_FILE_CB		"cbfw-3.2.3.0.bin"
-#define BFAD_FW_FILE_CT		"ctfw-3.2.3.0.bin"
-#define BFAD_FW_FILE_CT2	"ct2fw-3.2.3.0.bin"
+#define BFAD_FW_FILE_CB		"cbfw-3.2.5.1.bin"
+#define BFAD_FW_FILE_CT		"ctfw-3.2.5.1.bin"
+#define BFAD_FW_FILE_CT2	"ct2fw-3.2.5.1.bin"
 
 static u32 *bfad_load_fwimg(struct pci_dev *pdev);
 static void bfad_free_fwimg(void);
@@ -673,6 +673,7 @@ bfad_vport_create(struct bfad_s *bfad, u16 vf_id,
 
 	spin_lock_irqsave(&bfad->bfad_lock, flags);
 	bfa_fcs_vport_start(&vport->fcs_vport);
+	list_add_tail(&vport->list_entry, &bfad->vport_list);
 	spin_unlock_irqrestore(&bfad->bfad_lock, flags);
 
 	return BFA_STATUS_OK;
@@ -778,49 +779,20 @@ bfad_pci_init(struct pci_dev *pdev, struct bfad_s *bfad)
 	bfad->pcidev = pdev;
 
 	/* Adjust PCIe Maximum Read Request Size */
-	if (pcie_max_read_reqsz > 0) {
-		int pcie_cap_reg;
-		u16 pcie_dev_ctl;
-		u16 mask = 0xffff;
-
-		switch (pcie_max_read_reqsz) {
-		case 128:
-			mask = 0x0;
-			break;
-		case 256:
-			mask = 0x1000;
-			break;
-		case 512:
-			mask = 0x2000;
-			break;
-		case 1024:
-			mask = 0x3000;
-			break;
-		case 2048:
-			mask = 0x4000;
-			break;
-		case 4096:
-			mask = 0x5000;
-			break;
-		default:
-			break;
-		}
-
-		pcie_cap_reg = pci_find_capability(pdev, PCI_CAP_ID_EXP);
-		if (mask != 0xffff && pcie_cap_reg) {
-			pcie_cap_reg += 0x08;
-			pci_read_config_word(pdev, pcie_cap_reg, &pcie_dev_ctl);
-			if ((pcie_dev_ctl & 0x7000) != mask) {
-				printk(KERN_WARNING "BFA[%s]: "
+	if (pci_is_pcie(pdev) && pcie_max_read_reqsz) {
+		if (pcie_max_read_reqsz >= 128 &&
+		    pcie_max_read_reqsz <= 4096 &&
+		    is_power_of_2(pcie_max_read_reqsz)) {
+			int max_rq = pcie_get_readrq(pdev);
+			printk(KERN_WARNING "BFA[%s]: "
 				"pcie_max_read_request_size is %d, "
-				"reset to %d\n", bfad->pci_name,
-				(1 << ((pcie_dev_ctl & 0x7000) >> 12)) << 7,
+				"reset to %d\n", bfad->pci_name, max_rq,
 				pcie_max_read_reqsz);
-
-				pcie_dev_ctl &= ~0x7000;
-				pci_write_config_word(pdev, pcie_cap_reg,
-						pcie_dev_ctl | mask);
-			}
+			pcie_set_readrq(pdev, pcie_max_read_reqsz);
+		} else {
+			printk(KERN_WARNING "BFA[%s]: invalid "
+			       "pcie_max_read_request_size %d ignored\n",
+			       bfad->pci_name, pcie_max_read_reqsz);
 		}
 	}
 
@@ -1277,7 +1249,7 @@ bfad_setup_intr(struct bfad_s *bfad)
 			 * interrupts into one vector, so even if we
 			 * can try to request less vectors, we don't
 			 * know how to associate interrupt events to
-			 *  vectors. Linux doesn't dupicate vectors
+			 *  vectors. Linux doesn't duplicate vectors
 			 * in the MSIX table for this case.
 			 */
 			if (error) {
@@ -1404,6 +1376,7 @@ bfad_pci_probe(struct pci_dev *pdev, const struct pci_device_id *pid)
 	bfad->ref_count = 0;
 	bfad->pport.bfad = bfad;
 	INIT_LIST_HEAD(&bfad->pbc_vport_list);
+	INIT_LIST_HEAD(&bfad->vport_list);
 
 	/* Setup the debugfs node for this bfad */
 	if (bfa_debugfs_enable)
@@ -1738,7 +1711,7 @@ static struct pci_driver bfad_pci_driver = {
 	.name = BFAD_DRIVER_NAME,
 	.id_table = bfad_id_table,
 	.probe = bfad_pci_probe,
-	.remove = __devexit_p(bfad_pci_remove),
+	.remove = bfad_pci_remove,
 	.err_handler = &bfad_err_handler,
 };
 

@@ -1,8 +1,7 @@
 /*
- *  arch/s390/lib/spinlock.c
  *    Out of line spinlock code.
  *
- *    Copyright (C) IBM Corp. 2004, 2006
+ *    Copyright IBM Corp. 2004, 2006
  *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com)
  */
 
@@ -10,6 +9,7 @@
 #include <linux/module.h>
 #include <linux/spinlock.h>
 #include <linux/init.h>
+#include <linux/smp.h>
 #include <asm/io.h>
 
 int spin_retry = 1000;
@@ -24,26 +24,11 @@ static int __init spin_retry_setup(char *str)
 }
 __setup("spin_retry=", spin_retry_setup);
 
-static inline void _raw_yield(void)
+void arch_spin_lock_wait(arch_spinlock_t *lp)
 {
-	if (MACHINE_HAS_DIAG44)
-		asm volatile("diag 0,0,0x44");
-}
-
-static inline void _raw_yield_cpu(int cpu)
-{
-	if (MACHINE_HAS_DIAG9C)
-		asm volatile("diag %0,0,0x9c"
-			     : : "d" (cpu_logical_map(cpu)));
-	else
-		_raw_yield();
-}
-
-void _raw_spin_lock_wait(raw_spinlock_t *lp)
-{
-	int count = spin_retry;
 	unsigned int cpu = SPINLOCK_LOCKVAL;
 	unsigned int owner;
+	int count;
 
 	while (1) {
 		owner = ACCESS_ONCE(lp->lock);
@@ -55,7 +40,7 @@ void _raw_spin_lock_wait(raw_spinlock_t *lp)
 		}
 		/* Check if the lock owner is running. */
 		if (!smp_vcpu_scheduled(~owner)) {
-			_raw_yield_cpu(~owner);
+			smp_yield_cpu(~owner);
 			continue;
 		}
 		/* Loop for a while on the lock value. */
@@ -69,17 +54,17 @@ void _raw_spin_lock_wait(raw_spinlock_t *lp)
 		 * For multiple layers of hypervisors, e.g. z/VM + LPAR
 		 * yield the CPU if the lock is still unavailable.
 		 */
-		if (MACHINE_IS_VM)
-			_raw_yield_cpu(~owner);
+		if (!MACHINE_IS_LPAR)
+			smp_yield_cpu(~owner);
 	}
 }
-EXPORT_SYMBOL(_raw_spin_lock_wait);
+EXPORT_SYMBOL(arch_spin_lock_wait);
 
-void _raw_spin_lock_wait_flags(raw_spinlock_t *lp, unsigned long flags)
+void arch_spin_lock_wait_flags(arch_spinlock_t *lp, unsigned long flags)
 {
-	int count = spin_retry;
 	unsigned int cpu = SPINLOCK_LOCKVAL;
 	unsigned int owner;
+	int count;
 
 	local_irq_restore(flags);
 	while (1) {
@@ -94,7 +79,7 @@ void _raw_spin_lock_wait_flags(raw_spinlock_t *lp, unsigned long flags)
 		}
 		/* Check if the lock owner is running. */
 		if (!smp_vcpu_scheduled(~owner)) {
-			_raw_yield_cpu(~owner);
+			smp_yield_cpu(~owner);
 			continue;
 		}
 		/* Loop for a while on the lock value. */
@@ -108,42 +93,42 @@ void _raw_spin_lock_wait_flags(raw_spinlock_t *lp, unsigned long flags)
 		 * For multiple layers of hypervisors, e.g. z/VM + LPAR
 		 * yield the CPU if the lock is still unavailable.
 		 */
-		if (MACHINE_IS_VM)
-			_raw_yield_cpu(~owner);
+		if (!MACHINE_IS_LPAR)
+			smp_yield_cpu(~owner);
 	}
 }
-EXPORT_SYMBOL(_raw_spin_lock_wait_flags);
+EXPORT_SYMBOL(arch_spin_lock_wait_flags);
 
-void _raw_spin_relax(raw_spinlock_t *lp)
+void arch_spin_relax(arch_spinlock_t *lp)
 {
 	unsigned int cpu = lp->lock;
 	if (cpu != 0) {
 		if (MACHINE_IS_VM || MACHINE_IS_KVM ||
 		    !smp_vcpu_scheduled(~cpu))
-			_raw_yield_cpu(~cpu);
+			smp_yield_cpu(~cpu);
 	}
 }
-EXPORT_SYMBOL(_raw_spin_relax);
+EXPORT_SYMBOL(arch_spin_relax);
 
-int _raw_spin_trylock_retry(raw_spinlock_t *lp)
+int arch_spin_trylock_retry(arch_spinlock_t *lp)
 {
 	int count;
 
 	for (count = spin_retry; count > 0; count--)
-		if (__raw_spin_trylock_once(lp))
+		if (arch_spin_trylock_once(lp))
 			return 1;
 	return 0;
 }
-EXPORT_SYMBOL(_raw_spin_trylock_retry);
+EXPORT_SYMBOL(arch_spin_trylock_retry);
 
-void _raw_read_lock_wait(raw_rwlock_t *rw)
+void _raw_read_lock_wait(arch_rwlock_t *rw)
 {
 	unsigned int old;
 	int count = spin_retry;
 
 	while (1) {
 		if (count-- <= 0) {
-			_raw_yield();
+			smp_yield();
 			count = spin_retry;
 		}
 		old = ACCESS_ONCE(rw->lock);
@@ -155,7 +140,7 @@ void _raw_read_lock_wait(raw_rwlock_t *rw)
 }
 EXPORT_SYMBOL(_raw_read_lock_wait);
 
-void _raw_read_lock_wait_flags(raw_rwlock_t *rw, unsigned long flags)
+void _raw_read_lock_wait_flags(arch_rwlock_t *rw, unsigned long flags)
 {
 	unsigned int old;
 	int count = spin_retry;
@@ -163,7 +148,7 @@ void _raw_read_lock_wait_flags(raw_rwlock_t *rw, unsigned long flags)
 	local_irq_restore(flags);
 	while (1) {
 		if (count-- <= 0) {
-			_raw_yield();
+			smp_yield();
 			count = spin_retry;
 		}
 		old = ACCESS_ONCE(rw->lock);
@@ -177,7 +162,7 @@ void _raw_read_lock_wait_flags(raw_rwlock_t *rw, unsigned long flags)
 }
 EXPORT_SYMBOL(_raw_read_lock_wait_flags);
 
-int _raw_read_trylock_retry(raw_rwlock_t *rw)
+int _raw_read_trylock_retry(arch_rwlock_t *rw)
 {
 	unsigned int old;
 	int count = spin_retry;
@@ -193,14 +178,14 @@ int _raw_read_trylock_retry(raw_rwlock_t *rw)
 }
 EXPORT_SYMBOL(_raw_read_trylock_retry);
 
-void _raw_write_lock_wait(raw_rwlock_t *rw)
+void _raw_write_lock_wait(arch_rwlock_t *rw)
 {
 	unsigned int old;
 	int count = spin_retry;
 
 	while (1) {
 		if (count-- <= 0) {
-			_raw_yield();
+			smp_yield();
 			count = spin_retry;
 		}
 		old = ACCESS_ONCE(rw->lock);
@@ -212,7 +197,7 @@ void _raw_write_lock_wait(raw_rwlock_t *rw)
 }
 EXPORT_SYMBOL(_raw_write_lock_wait);
 
-void _raw_write_lock_wait_flags(raw_rwlock_t *rw, unsigned long flags)
+void _raw_write_lock_wait_flags(arch_rwlock_t *rw, unsigned long flags)
 {
 	unsigned int old;
 	int count = spin_retry;
@@ -220,7 +205,7 @@ void _raw_write_lock_wait_flags(raw_rwlock_t *rw, unsigned long flags)
 	local_irq_restore(flags);
 	while (1) {
 		if (count-- <= 0) {
-			_raw_yield();
+			smp_yield();
 			count = spin_retry;
 		}
 		old = ACCESS_ONCE(rw->lock);
@@ -234,7 +219,7 @@ void _raw_write_lock_wait_flags(raw_rwlock_t *rw, unsigned long flags)
 }
 EXPORT_SYMBOL(_raw_write_lock_wait_flags);
 
-int _raw_write_trylock_retry(raw_rwlock_t *rw)
+int _raw_write_trylock_retry(arch_rwlock_t *rw)
 {
 	unsigned int old;
 	int count = spin_retry;

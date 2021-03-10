@@ -79,9 +79,6 @@ enum {
 	VMXNET3_CMD_RESERVED1,
 	VMXNET3_CMD_LOAD_PLUGIN,
 	VMXNET3_CMD_RESERVED2,
-	VMXNET3_CMD_RESERVED3,
-	VMXNET3_CMD_SET_COALESCE,
-	VMXNET3_CMD_REGISTER_MEMREGS,
 
 	VMXNET3_CMD_FIRST_GET = 0xF00D0000,
 	VMXNET3_CMD_GET_QUEUE_STATUS = VMXNET3_CMD_FIRST_GET,
@@ -94,8 +91,7 @@ enum {
 	VMXNET3_CMD_GET_DEV_EXTRA_INFO,
 	VMXNET3_CMD_GET_CONF_INTR,
 	VMXNET3_CMD_GET_RESERVED1,
-	VMXNET3_CMD_GET_TXDATA_DESC_SIZE,
-	VMXNET3_CMD_GET_COALESCE,
+	VMXNET3_CMD_GET_TXDATA_DESC_SIZE
 };
 
 /*
@@ -636,63 +632,6 @@ struct Vmxnet3_RxQueueDesc {
 	u8				      __pad[88]; /* 128 aligned */
 };
 
-struct Vmxnet3_SetPolling {
-	u8					enablePolling;
-};
-
-#define VMXNET3_COAL_STATIC_MAX_DEPTH		128
-#define VMXNET3_COAL_RBC_MIN_RATE		100
-#define VMXNET3_COAL_RBC_MAX_RATE		100000
-
-enum Vmxnet3_CoalesceMode {
-	VMXNET3_COALESCE_DISABLED   = 0,
-	VMXNET3_COALESCE_ADAPT      = 1,
-	VMXNET3_COALESCE_STATIC     = 2,
-	VMXNET3_COALESCE_RBC        = 3
-};
-
-struct Vmxnet3_CoalesceRbc {
-	u32					rbc_rate;
-};
-
-struct Vmxnet3_CoalesceStatic {
-	u32					tx_depth;
-	u32					tx_comp_depth;
-	u32					rx_depth;
-};
-
-struct Vmxnet3_CoalesceScheme {
-	enum Vmxnet3_CoalesceMode		coalMode;
-	union {
-		struct Vmxnet3_CoalesceRbc	coalRbc;
-		struct Vmxnet3_CoalesceStatic	coalStatic;
-	} coalPara;
-};
-
-struct Vmxnet3_MemoryRegion {
-	__le64					startPA;
-	__le32					length;
-	__le16					txQueueBits;
-	__le16					rxQueueBits;
-};
-
-#define MAX_MEMORY_REGION_PER_QUEUE 16
-#define MAX_MEMORY_REGION_PER_DEVICE 256
-
-struct Vmxnet3_MemRegs {
-	__le16					numRegs;
-	__le16					pad[3];
-	struct Vmxnet3_MemoryRegion		memRegs[1];
-};
-
-/* If the command data <= 16 bytes, use the shared memory directly.
- * otherwise, use variable length configuration descriptor.
- */
-union Vmxnet3_CmdInfo {
-	struct Vmxnet3_VariableLenConfDesc	varConf;
-	struct Vmxnet3_SetPolling		setPolling;
-	__le64					data[2];
-};
 
 struct Vmxnet3_DSDevRead {
 	/* read-only region for device, read by dev in response to a SET cmd */
@@ -711,14 +650,7 @@ struct Vmxnet3_DriverShared {
 	__le32				pad;
 	struct Vmxnet3_DSDevRead	devRead;
 	__le32				ecr;
-	__le32				reserved;
-	union {
-		__le32			reserved1[4];
-		union Vmxnet3_CmdInfo	cmdInfo; /* only valid in the context of
-						  * executing the relevant
-						  * command
-						  */
-	} cu;
+	__le32				reserved[5];
 };
 
 

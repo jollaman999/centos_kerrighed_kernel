@@ -115,7 +115,6 @@ do {											\
 	__kernel_frame0_ptr->gr29	= 0;						\
 } while(0)
 
-#define USE_ELF_CORE_DUMP
 #define CORE_DUMP_USE_REGSET
 #define ELF_FDPIC_CORE_EFLAGS	EF_FRV_FDPIC
 #define ELF_EXEC_PAGESIZE	16384
@@ -137,7 +136,5 @@ do {											\
    intent than poking at uname or /proc/cpuinfo.  */
 
 #define ELF_PLATFORM  (NULL)
-
-#define SET_PERSONALITY(ex) set_personality(PER_LINUX)
 
 #endif

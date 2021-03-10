@@ -1,6 +1,4 @@
 /*
- *  drivers/s390/net/qeth_l3_sys.c
- *
  *    Copyright IBM Corp. 2007
  *    Author(s): Utz Bacher <utz.bacher@de.ibm.com>,
  *		 Frank Pavlic <fpavlic@de.ibm.com>,
@@ -14,16 +12,6 @@
 
 #define QETH_DEVICE_ATTR(_id, _name, _mode, _show, _store) \
 struct device_attribute dev_attr_##_id = __ATTR(_name, _mode, _show, _store)
-
-static const char *qeth_l3_get_checksum_str(struct qeth_card *card)
-{
-	if (card->options.checksum_type == SW_CHECKSUMMING)
-		return "sw";
-	else if (card->options.checksum_type == HW_CHECKSUMMING)
-		return "hw";
-	else
-		return "no";
-}
 
 static ssize_t qeth_l3_dev_route_show(struct qeth_card *card,
 			struct qeth_routing_info *route, char *buf)
@@ -99,6 +87,8 @@ static ssize_t qeth_l3_dev_route_store(struct qeth_card *card,
 			rc = qeth_l3_setrouting_v6(card);
 	}
 out:
+	if (rc)
+		route->type = old_route_type;
 	mutex_unlock(&card->conf_mutex);
 	return rc ? rc : count;
 }
@@ -185,162 +175,6 @@ out:
 static DEVICE_ATTR(fake_broadcast, 0644, qeth_l3_dev_fake_broadcast_show,
 		   qeth_l3_dev_fake_broadcast_store);
 
-static ssize_t qeth_l3_dev_broadcast_mode_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-
-	if (!card)
-		return -EINVAL;
-
-	if (!((card->info.link_type == QETH_LINK_TYPE_HSTR) ||
-	      (card->info.link_type == QETH_LINK_TYPE_LANE_TR)))
-		return sprintf(buf, "n/a\n");
-
-	return sprintf(buf, "%s\n", (card->options.broadcast_mode ==
-				     QETH_TR_BROADCAST_ALLRINGS)?
-		       "all rings":"local");
-}
-
-static ssize_t qeth_l3_dev_broadcast_mode_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-	char *tmp;
-	int rc = 0;
-
-	if (!card)
-		return -EINVAL;
-
-	mutex_lock(&card->conf_mutex);
-	if ((card->state != CARD_STATE_DOWN) &&
-	    (card->state != CARD_STATE_RECOVER)) {
-		rc = -EPERM;
-		goto out;
-	}
-
-	if (!((card->info.link_type == QETH_LINK_TYPE_HSTR) ||
-	      (card->info.link_type == QETH_LINK_TYPE_LANE_TR))) {
-		rc = -EINVAL;
-		goto out;
-	}
-
-	tmp = strsep((char **) &buf, "\n");
-
-	if (!strcmp(tmp, "local"))
-		card->options.broadcast_mode = QETH_TR_BROADCAST_LOCAL;
-	else if (!strcmp(tmp, "all_rings"))
-		card->options.broadcast_mode = QETH_TR_BROADCAST_ALLRINGS;
-	else
-		rc = -EINVAL;
-out:
-	mutex_unlock(&card->conf_mutex);
-	return rc ? rc : count;
-}
-
-static DEVICE_ATTR(broadcast_mode, 0644, qeth_l3_dev_broadcast_mode_show,
-		   qeth_l3_dev_broadcast_mode_store);
-
-static ssize_t qeth_l3_dev_canonical_macaddr_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-
-	if (!card)
-		return -EINVAL;
-
-	if (!((card->info.link_type == QETH_LINK_TYPE_HSTR) ||
-	      (card->info.link_type == QETH_LINK_TYPE_LANE_TR)))
-		return sprintf(buf, "n/a\n");
-
-	return sprintf(buf, "%i\n", (card->options.macaddr_mode ==
-				     QETH_TR_MACADDR_CANONICAL)? 1:0);
-}
-
-static ssize_t qeth_l3_dev_canonical_macaddr_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-	char *tmp;
-	int i, rc = 0;
-
-	if (!card)
-		return -EINVAL;
-
-	mutex_lock(&card->conf_mutex);
-	if ((card->state != CARD_STATE_DOWN) &&
-	    (card->state != CARD_STATE_RECOVER)) {
-		rc = -EPERM;
-		goto out;
-	}
-
-	if (!((card->info.link_type == QETH_LINK_TYPE_HSTR) ||
-	      (card->info.link_type == QETH_LINK_TYPE_LANE_TR))) {
-		rc = -EINVAL;
-		goto out;
-	}
-
-	i = simple_strtoul(buf, &tmp, 16);
-	if ((i == 0) || (i == 1))
-		card->options.macaddr_mode = i?
-			QETH_TR_MACADDR_CANONICAL :
-			QETH_TR_MACADDR_NONCANONICAL;
-	else
-		rc = -EINVAL;
-out:
-	mutex_unlock(&card->conf_mutex);
-	return rc ? rc : count;
-}
-
-static DEVICE_ATTR(canonical_macaddr, 0644, qeth_l3_dev_canonical_macaddr_show,
-		   qeth_l3_dev_canonical_macaddr_store);
-
-static ssize_t qeth_l3_dev_checksum_show(struct device *dev,
-			struct device_attribute *attr, char *buf)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-
-	if (!card)
-		return -EINVAL;
-
-	return sprintf(buf, "%s checksumming\n",
-			qeth_l3_get_checksum_str(card));
-}
-
-static ssize_t qeth_l3_dev_checksum_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-	char *tmp;
-	int rc = 0;
-
-	if (!card)
-		return -EINVAL;
-
-	mutex_lock(&card->conf_mutex);
-	if ((card->state != CARD_STATE_DOWN) &&
-	    (card->state != CARD_STATE_RECOVER)) {
-		rc = -EPERM;
-		goto out;
-	}
-
-	tmp = strsep((char **) &buf, "\n");
-	if (!strcmp(tmp, "sw_checksumming"))
-		card->options.checksum_type = SW_CHECKSUMMING;
-	else if (!strcmp(tmp, "hw_checksumming"))
-		card->options.checksum_type = HW_CHECKSUMMING;
-	else if (!strcmp(tmp, "no_checksumming"))
-		card->options.checksum_type = NO_CHECKSUMMING;
-	else
-		rc = -EINVAL;
-out:
-	mutex_unlock(&card->conf_mutex);
-	return rc ? rc : count;
-}
-
-static DEVICE_ATTR(checksumming, 0644, qeth_l3_dev_checksum_show,
-		qeth_l3_dev_checksum_store);
-
 static ssize_t qeth_l3_dev_sniffer_show(struct device *dev,
 		struct device_attribute *attr, char *buf)
 {
@@ -391,10 +225,10 @@ static ssize_t qeth_l3_dev_sniffer_store(struct device *dev,
 					QETH_IN_BUF_COUNT_MAX)
 				qeth_realloc_buffer_pool(card,
 					QETH_IN_BUF_COUNT_MAX);
-			break;
 		} else
 			rc = -EPERM;
-	default:   /* fall through */
+		break;
+	default:
 		rc = -EINVAL;
 	}
 out:
@@ -404,52 +238,6 @@ out:
 
 static DEVICE_ATTR(sniffer, 0644, qeth_l3_dev_sniffer_show,
 		qeth_l3_dev_sniffer_store);
-
-static ssize_t qeth_l3_dev_large_send_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-
-	if (!card)
-		return -EINVAL;
-
-	switch (card->options.large_send) {
-	case QETH_LARGE_SEND_NO:
-		return sprintf(buf, "%s\n", "no");
-	case QETH_LARGE_SEND_TSO:
-		return sprintf(buf, "%s\n", "TSO");
-	default:
-		return sprintf(buf, "%s\n", "N/A");
-	}
-}
-
-static ssize_t qeth_l3_dev_large_send_store(struct device *dev,
-		struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct qeth_card *card = dev_get_drvdata(dev);
-	enum qeth_large_send_types type;
-	int rc = 0;
-	char *tmp;
-
-	if (!card)
-		return -EINVAL;
-	tmp = strsep((char **) &buf, "\n");
-	if (!strcmp(tmp, "no"))
-		type = QETH_LARGE_SEND_NO;
-	else if (!strcmp(tmp, "TSO"))
-		type = QETH_LARGE_SEND_TSO;
-	else
-		return -EINVAL;
-
-	mutex_lock(&card->conf_mutex);
-	if (card->options.large_send != type)
-		rc = qeth_l3_set_large_send(card, type);
-	mutex_unlock(&card->conf_mutex);
-	return rc ? rc : count;
-}
-
-static DEVICE_ATTR(large_send, 0644, qeth_l3_dev_large_send_show,
-		   qeth_l3_dev_large_send_store);
 
 
 static ssize_t qeth_l3_dev_hsuid_show(struct device *dev,
@@ -560,11 +348,7 @@ static struct attribute *qeth_l3_device_attrs[] = {
 	&dev_attr_route4.attr,
 	&dev_attr_route6.attr,
 	&dev_attr_fake_broadcast.attr,
-	&dev_attr_broadcast_mode.attr,
-	&dev_attr_canonical_macaddr.attr,
-	&dev_attr_checksumming.attr,
 	&dev_attr_sniffer.attr,
-	&dev_attr_large_send.attr,
 	&dev_attr_hsuid.attr,
 	NULL,
 };
@@ -588,6 +372,7 @@ static ssize_t qeth_l3_dev_ipato_enable_store(struct device *dev,
 		struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct qeth_card *card = dev_get_drvdata(dev);
+	struct qeth_ipaddr *tmpipa, *t;
 	char *tmp;
 	int rc = 0;
 
@@ -606,8 +391,21 @@ static ssize_t qeth_l3_dev_ipato_enable_store(struct device *dev,
 		card->ipato.enabled = (card->ipato.enabled)? 0 : 1;
 	} else if (!strcmp(tmp, "1")) {
 		card->ipato.enabled = 1;
+		list_for_each_entry_safe(tmpipa, t, card->ip_tbd_list, entry) {
+			if ((tmpipa->type == QETH_IP_TYPE_NORMAL) &&
+				qeth_l3_is_addr_covered_by_ipato(card, tmpipa))
+				tmpipa->set_flags |=
+					QETH_IPA_SETIP_TAKEOVER_FLAG;
+		}
+
 	} else if (!strcmp(tmp, "0")) {
 		card->ipato.enabled = 0;
+		list_for_each_entry_safe(tmpipa, t, card->ip_tbd_list, entry) {
+			if (tmpipa->set_flags &
+				QETH_IPA_SETIP_TAKEOVER_FLAG)
+				tmpipa->set_flags &=
+					~QETH_IPA_SETIP_TAKEOVER_FLAG;
+		}
 	} else
 		rc = -EINVAL;
 out:

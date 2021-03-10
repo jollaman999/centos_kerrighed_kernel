@@ -26,6 +26,7 @@
 #include <linux/notifier.h>
 #include <linux/numa.h>
 #include <linux/oprofile.h>
+#include <linux/slab.h>
 #include <linux/spinlock.h>
 #include "pr_util.h"
 
@@ -34,7 +35,7 @@
 static DEFINE_SPINLOCK(buffer_lock);
 static DEFINE_SPINLOCK(cache_lock);
 static int num_spu_nodes;
-int spu_prof_num_nodes;
+static int spu_prof_num_nodes;
 
 struct spu_buffer spu_buff[MAX_NUMNODES * SPUS_PER_NODE];
 struct delayed_work spu_work;
@@ -86,7 +87,7 @@ static void spu_buff_add(unsigned long int value, int spu)
 /* This function copies the per SPU buffers to the
  * OProfile kernel buffer.
  */
-void sync_spu_buff(void)
+static void sync_spu_buff(void)
 {
 	int spu;
 	unsigned long flags;
@@ -303,7 +304,7 @@ static inline unsigned long fast_get_dcookie(struct path *path)
 	return cookie;
 }
 
-/* Look up the dcookie for the task's first VM_EXECUTABLE mapping,
+/* Look up the dcookie for the task's mm->exe_file,
  * which corresponds loosely to "application name". Also, determine
  * the offset for the SPU ELF object.  If computed offset is
  * non-zero, it implies an embedded SPU object; otherwise, it's a
@@ -320,7 +321,6 @@ get_exec_dcookie_and_offset(struct spu *spu, unsigned int *offsetp,
 {
 	unsigned long app_cookie = 0;
 	unsigned int my_offset = 0;
-	struct file *app = NULL;
 	struct vm_area_struct *vma;
 	struct mm_struct *mm = spu->mm;
 
@@ -329,16 +329,10 @@ get_exec_dcookie_and_offset(struct spu *spu, unsigned int *offsetp,
 
 	down_read(&mm->mmap_sem);
 
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
-		if (!vma->vm_file)
-			continue;
-		if (!(vma->vm_flags & VM_EXECUTABLE))
-			continue;
-		app_cookie = fast_get_dcookie(&vma->vm_file->f_path);
+	if (mm->exe_file) {
+		app_cookie = fast_get_dcookie(&mm->exe_file->f_path);
 		pr_debug("got dcookie for %s\n",
-			 vma->vm_file->f_dentry->d_name.name);
-		app = vma->vm_file;
-		break;
+			 mm->exe_file->f_dentry->d_name.name);
 	}
 
 	for (vma = mm->mmap; vma; vma = vma->vm_next) {

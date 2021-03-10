@@ -28,7 +28,6 @@ struct path_selector {
 
 /* Information about a path selector type */
 struct path_selector_type {
-	uint64_t features;	/* 3rd party driver must initialize to zero */
 	char *name;
 	struct module *module;
 
@@ -51,13 +50,8 @@ struct path_selector_type {
 	/*
 	 * Chooses a path for this io, if no paths are available then
 	 * NULL will be returned.
-	 *
-	 * repeat_count is the number of times to use the path before
-	 * calling the function again.  0 means don't call it again unless
-	 * the path fails.
 	 */
 	struct dm_path *(*select_path) (struct path_selector *ps,
-					unsigned *repeat_count,
 					size_t nr_bytes);
 
 	/*

@@ -46,7 +46,6 @@ static unsigned long stack_maxrandom_size(void)
 	return max;
 }
 
-
 /*
  * Top of mmap area (just below the process stack).
  *
@@ -60,7 +59,7 @@ static int mmap_is_legacy(void)
 	if (current->personality & ADDR_COMPAT_LAYOUT)
 		return 1;
 
-	if (current->signal->rlim[RLIMIT_STACK].rlim_cur == RLIM_INFINITY)
+	if (rlimit(RLIMIT_STACK) == RLIM_INFINITY)
 		return 1;
 
 	return sysctl_legacy_va_layout;
@@ -70,21 +69,21 @@ unsigned long arch_mmap_rnd(void)
 {
 	unsigned long rnd;
 
-	/*
-	 *  8 bits of randomness in 32bit mmaps, 20 address space bits
-	 * 28 bits of randomness in 64bit mmaps, 40 address space bits
-	 */
 	if (mmap_is_ia32())
-		rnd = (unsigned long)get_random_int() % (1<<8);
+#ifdef CONFIG_COMPAT
+		rnd = get_random_long() & ((1UL << mmap_rnd_compat_bits) - 1);
+#else
+		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
+#endif
 	else
-		rnd = (unsigned long)get_random_int() % (1<<28);
+		rnd = get_random_long() & ((1UL << mmap_rnd_bits) - 1);
 
 	return rnd << PAGE_SHIFT;
 }
 
 static unsigned long mmap_base(unsigned long rnd)
 {
-	unsigned long gap = current->signal->rlim[RLIMIT_STACK].rlim_cur;
+	unsigned long gap = rlimit(RLIMIT_STACK);
 
 	if (gap < MIN_GAP)
 		gap = MIN_GAP;
@@ -92,20 +91,6 @@ static unsigned long mmap_base(unsigned long rnd)
 		gap = MAX_GAP;
 
 	return PAGE_ALIGN(TASK_SIZE - gap - rnd);
-}
-
-#define SHLIB_BASE             0x00110000
-
-/*
- * Bottom-up (legacy) layout on X86_32 did not support randomization, X86_64
- * does, but not when emulating X86_32
- */
-static unsigned long mmap_legacy_base(unsigned long rnd)
-{
-	if (mmap_is_ia32())
-		return TASK_UNMAPPED_BASE;
-	else
-		return TASK_UNMAPPED_BASE + rnd;
 }
 
 /*
@@ -116,23 +101,18 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
 {
 	unsigned long random_factor = 0UL;
 
-	mm->get_unmapped_exec_area = NULL;
-
 	if (current->flags & PF_RANDOMIZE)
 		random_factor = arch_mmap_rnd();
 
-	if (!(2 & exec_shield) && mmap_is_legacy()) {
-		mm->mmap_base = mmap_legacy_base(random_factor);
+	mm->mmap_legacy_base = TASK_UNMAPPED_BASE + random_factor;
+
+	if (mmap_is_legacy()) {
+		mm->mmap_base = mm->mmap_legacy_base;
 		mm->get_unmapped_area = arch_get_unmapped_area;
 		mm->unmap_area = arch_unmap_area;
 	} else {
 		mm->mmap_base = mmap_base(random_factor);
 		mm->get_unmapped_area = arch_get_unmapped_area_topdown;
-		if (!(current->personality & READ_IMPLIES_EXEC)
-		    && mmap_is_ia32()) {
-			mm->get_unmapped_exec_area = arch_get_unmapped_exec_area;
-			mm->shlib_base = SHLIB_BASE + arch_mmap_rnd();
-		}
 		mm->unmap_area = arch_unmap_area_topdown;
 	}
 }

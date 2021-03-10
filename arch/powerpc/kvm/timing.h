@@ -51,7 +51,7 @@ static inline void kvmppc_account_exit_stat(struct kvm_vcpu *vcpu, int type)
 
 	/* The BUILD_BUG_ON below breaks in funny ways, commented out
 	 * for now ... -BenH
-	BUILD_BUG_ON(__builtin_constant_p(type));
+	BUILD_BUG_ON(!__builtin_constant_p(type));
 	*/
 	switch (type) {
 	case EXT_INTR_EXITS:
@@ -92,6 +92,12 @@ static inline void kvmppc_account_exit_stat(struct kvm_vcpu *vcpu, int type)
 		break;
 	case SIGNAL_EXITS:
 		vcpu->stat.signal_exits++;
+		break;
+	case DBELL_EXITS:
+		vcpu->stat.dbell_exits++;
+		break;
+	case GDBELL_EXITS:
+		vcpu->stat.gdbell_exits++;
 		break;
 	}
 }

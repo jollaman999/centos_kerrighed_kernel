@@ -26,9 +26,13 @@
 #include <linux/init.h>
 #include <linux/sched.h>
 #include <linux/time.h>
+#include <linux/timex.h>
 #include <linux/spinlock.h>
 #include <linux/fs.h>
 #include <linux/pps_kernel.h>
+#include <linux/slab.h>
+
+#include "kc.h"
 
 /*
  * Local functions
@@ -98,7 +102,7 @@ struct pps_device *pps_register_source(struct pps_source_info *info,
 		goto pps_register_source_exit;
 	}
 
-	/* These initializations must be done before calling idr_get_new()
+	/* These initializations must be done before calling idr_alloc()
 	 * in order to avoid reces into pps_event().
 	 */
 	pps->params.api_version = PPS_API_VERS;
@@ -144,6 +148,7 @@ EXPORT_SYMBOL(pps_register_source);
 
 void pps_unregister_source(struct pps_device *pps)
 {
+	pps_kc_remove(pps);
 	pps_unregister_cdev(pps);
 
 	/* don't have to kfree(pps) here because it will be done on
@@ -164,7 +169,6 @@ EXPORT_SYMBOL(pps_unregister_source);
  * as:
  *	pps->info.echo(pps, event, data);
  */
-
 void pps_event(struct pps_device *pps, struct pps_event_time *ts, int event,
 		void *data)
 {
@@ -172,10 +176,8 @@ void pps_event(struct pps_device *pps, struct pps_event_time *ts, int event,
 	int captured = 0;
 	struct pps_ktime ts_real = { .sec = 0, .nsec = 0, .flags = 0 };
 
-	if ((event & (PPS_CAPTUREASSERT | PPS_CAPTURECLEAR)) == 0) {
-		dev_err(pps->dev, "unknown event (%x)\n", event);
-		return;
-	}
+	/* check event type */
+	BUG_ON((event & (PPS_CAPTUREASSERT | PPS_CAPTURECLEAR)) == 0);
 
 	dev_dbg(pps->dev, "PPS event at %ld.%09ld\n",
 			ts->ts_real.tv_sec, ts->ts_real.tv_nsec);
@@ -218,6 +220,8 @@ void pps_event(struct pps_device *pps, struct pps_event_time *ts, int event,
 
 		captured = ~0;
 	}
+
+	pps_kc_event(pps, ts, event);
 
 	/* Wake up if captured something */
 	if (captured) {

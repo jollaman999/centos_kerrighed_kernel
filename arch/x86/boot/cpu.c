@@ -55,7 +55,7 @@ int validate_cpu(void)
 
 		msg_strs = (const unsigned char *)x86_cap_strs;
 
-		for (i = 0; i < RHNCAPINTS; i++) {
+		for (i = 0; i < NCAPINTS; i++) {
 			u32 e = err_flags[i];
 
 			for (j = 0; j < 32; j++) {
@@ -78,6 +78,8 @@ int validate_cpu(void)
 			}
 		}
 		putchar('\n');
+		return -1;
+	} else if (check_knl_erratum()) {
 		return -1;
 	} else {
 		return 0;

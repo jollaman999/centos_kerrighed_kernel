@@ -206,14 +206,16 @@ static inline void i8253_cascade_ns_to_timer_2div(int i8253_osc_base,
 	}
 
 	*nanosec = div1 * div2 * i8253_osc_base;
-	*d1 = div1 & 0xffff;	/*  masking is done since counter maps zero to 0x10000 */
+	/*  masking is done since counter maps zero to 0x10000 */
+	*d1 = div1 & 0xffff;
 	*d2 = div2 & 0xffff;
 	return;
 }
 
 #ifndef CMDTEST
 /* i8254_load programs 8254 counter chip.  It should also work for the 8253.
- * base_address is the lowest io address for the chip (the address of counter 0).
+ * base_address is the lowest io address
+ * for the chip (the address of counter 0).
  * counter_number is the counter you want to load (0,1 or 2)
  * count is the number to load into the counter.
  *
@@ -260,8 +262,10 @@ static inline int i8254_load(unsigned long base_address, unsigned int regshift,
 	return 0;
 }
 
-static inline int i8254_mm_load(void *base_address, unsigned int regshift,
-				unsigned int counter_number, unsigned int count,
+static inline int i8254_mm_load(void __iomem *base_address,
+				unsigned int regshift,
+				unsigned int counter_number,
+				unsigned int count,
 				unsigned int mode)
 {
 	unsigned int byte;
@@ -309,7 +313,8 @@ static inline int i8254_read(unsigned long base_address, unsigned int regshift,
 	return ret;
 }
 
-static inline int i8254_mm_read(void *base_address, unsigned int regshift,
+static inline int i8254_mm_read(void __iomem *base_address,
+				unsigned int regshift,
 				unsigned int counter_number)
 {
 	unsigned int byte;
@@ -346,7 +351,7 @@ static inline void i8254_write(unsigned long base_address,
 	outb(byte, base_address + (counter_number << regshift));
 }
 
-static inline void i8254_mm_write(void *base_address,
+static inline void i8254_mm_write(void __iomem *base_address,
 				  unsigned int regshift,
 				  unsigned int counter_number,
 				  unsigned int count)
@@ -388,7 +393,7 @@ static inline int i8254_set_mode(unsigned long base_address,
 	return 0;
 }
 
-static inline int i8254_mm_set_mode(void *base_address,
+static inline int i8254_mm_set_mode(void __iomem *base_address,
 				    unsigned int regshift,
 				    unsigned int counter_number,
 				    unsigned int mode)
@@ -417,7 +422,7 @@ static inline int i8254_status(unsigned long base_address,
 	return inb(base_address + (counter_number << regshift));
 }
 
-static inline int i8254_mm_status(void *base_address,
+static inline int i8254_mm_status(void __iomem *base_address,
 				  unsigned int regshift,
 				  unsigned int counter_number)
 {

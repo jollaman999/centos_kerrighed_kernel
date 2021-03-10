@@ -33,6 +33,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/init.h>
+#include <linux/slab.h>
 
 #include <net/irda/irda.h>
 #include <net/irda/irmod.h>
@@ -116,7 +117,7 @@ struct ircomm_cb *ircomm_open(notify_t *notify, __u8 service_type, int line)
 
 	IRDA_ASSERT(ircomm != NULL, return NULL;);
 
-	self = kzalloc(sizeof(struct ircomm_cb), GFP_ATOMIC);
+	self = kzalloc(sizeof(struct ircomm_cb), GFP_KERNEL);
 	if (self == NULL)
 		return NULL;
 
@@ -243,13 +244,7 @@ EXPORT_SYMBOL(ircomm_connect_request);
 void ircomm_connect_indication(struct ircomm_cb *self, struct sk_buff *skb,
 			       struct ircomm_info *info)
 {
-	int clen = 0;
-
 	IRDA_DEBUG(2, "%s()\n", __func__ );
-
-	/* Check if the packet contains data on the control channel */
-	if (skb->len > 0)
-		clen = skb->data[0];
 
 	/*
 	 * If there are any data hiding in the control channel, we must

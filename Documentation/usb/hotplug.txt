@@ -10,7 +10,7 @@ immediately usable.  That means the system must do many things, including:
 
     - Bind a driver to that device.  Bus frameworks do that using a
       device driver's probe() routine.
-    
+
     - Tell other subsystems to configure the new device.  Print
       queues may need to be enabled, networks brought up, disk
       partitions mounted, and so on.  In some cases these will
@@ -33,9 +33,9 @@ you get the best hotplugging when you configure a highly modular system.
 
 KERNEL HOTPLUG HELPER (/sbin/hotplug)
 
-When you compile with CONFIG_HOTPLUG, you get a new kernel parameter:
-/proc/sys/kernel/hotplug, which normally holds the pathname "/sbin/hotplug".
-That parameter names a program which the kernel may invoke at various times.
+There is a kernel parameter: /proc/sys/kernel/hotplug, which normally
+holds the pathname "/sbin/hotplug".  That parameter names a program
+which the kernel may invoke at various times.
 
 The /sbin/hotplug program can be invoked by any subsystem as part of its
 reaction to a configuration change, from a thread in that subsystem.
@@ -58,7 +58,7 @@ USB POLICY AGENT
 
 The USB subsystem currently invokes /sbin/hotplug when USB devices
 are added or removed from system.  The invocation is done by the kernel
-hub daemon thread [khubd], or else as part of root hub initialization
+hub workqueue [hub_wq], or else as part of root hub initialization
 (done by init, modprobe, kapmd, etc).  Its single command line parameter
 is the string "usb", and it passes these environment variables:
 
@@ -84,7 +84,7 @@ USB MODUTILS SUPPORT
 Current versions of module-init-tools will create a "modules.usbmap" file
 which contains the entries from each driver's MODULE_DEVICE_TABLE.  Such
 files can be used by various user mode policy agents to make sure all the
-right driver modules get loaded, either at boot time or later. 
+right driver modules get loaded, either at boot time or later.
 
 See <linux/usb.h> for full information about such table entries; or look
 at existing drivers.  Each table entry describes one or more criteria to

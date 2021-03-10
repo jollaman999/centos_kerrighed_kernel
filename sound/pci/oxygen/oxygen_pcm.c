@@ -42,7 +42,8 @@ static const struct snd_pcm_hardware oxygen_stereo_hardware = {
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_PAUSE |
-		SNDRV_PCM_INFO_SYNC_START,
+		SNDRV_PCM_INFO_SYNC_START |
+		SNDRV_PCM_INFO_NO_PERIOD_WAKEUP,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE |
 		   SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = SNDRV_PCM_RATE_32000 |
@@ -69,7 +70,8 @@ static const struct snd_pcm_hardware oxygen_multichannel_hardware = {
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_PAUSE |
-		SNDRV_PCM_INFO_SYNC_START,
+		SNDRV_PCM_INFO_SYNC_START |
+		SNDRV_PCM_INFO_NO_PERIOD_WAKEUP,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE |
 		   SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = SNDRV_PCM_RATE_32000 |
@@ -96,7 +98,8 @@ static const struct snd_pcm_hardware oxygen_ac97_hardware = {
 		SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_PAUSE |
-		SNDRV_PCM_INFO_SYNC_START,
+		SNDRV_PCM_INFO_SYNC_START |
+		SNDRV_PCM_INFO_NO_PERIOD_WAKEUP,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
 	.rates = SNDRV_PCM_RATE_48000,
 	.rate_min = 48000,
@@ -562,7 +565,10 @@ static int oxygen_prepare(struct snd_pcm_substream *substream)
 	oxygen_set_bits8(chip, OXYGEN_DMA_FLUSH, channel_mask);
 	oxygen_clear_bits8(chip, OXYGEN_DMA_FLUSH, channel_mask);
 
-	chip->interrupt_mask |= channel_mask;
+	if (substream->runtime->no_period_wakeup)
+		chip->interrupt_mask &= ~channel_mask;
+	else
+		chip->interrupt_mask |= channel_mask;
 	oxygen_write16(chip, OXYGEN_INTERRUPT_MASK, chip->interrupt_mask);
 	spin_unlock_irq(&chip->reg_lock);
 	return 0;
@@ -625,7 +631,7 @@ static snd_pcm_uframes_t oxygen_pointer(struct snd_pcm_substream *substream)
 	return bytes_to_frames(runtime, curr_addr - (u32)runtime->dma_addr);
 }
 
-static struct snd_pcm_ops oxygen_rec_a_ops = {
+static const struct snd_pcm_ops oxygen_rec_a_ops = {
 	.open      = oxygen_rec_a_open,
 	.close     = oxygen_close,
 	.ioctl     = snd_pcm_lib_ioctl,
@@ -636,7 +642,7 @@ static struct snd_pcm_ops oxygen_rec_a_ops = {
 	.pointer   = oxygen_pointer,
 };
 
-static struct snd_pcm_ops oxygen_rec_b_ops = {
+static const struct snd_pcm_ops oxygen_rec_b_ops = {
 	.open      = oxygen_rec_b_open,
 	.close     = oxygen_close,
 	.ioctl     = snd_pcm_lib_ioctl,
@@ -647,7 +653,7 @@ static struct snd_pcm_ops oxygen_rec_b_ops = {
 	.pointer   = oxygen_pointer,
 };
 
-static struct snd_pcm_ops oxygen_rec_c_ops = {
+static const struct snd_pcm_ops oxygen_rec_c_ops = {
 	.open      = oxygen_rec_c_open,
 	.close     = oxygen_close,
 	.ioctl     = snd_pcm_lib_ioctl,
@@ -658,7 +664,7 @@ static struct snd_pcm_ops oxygen_rec_c_ops = {
 	.pointer   = oxygen_pointer,
 };
 
-static struct snd_pcm_ops oxygen_spdif_ops = {
+static const struct snd_pcm_ops oxygen_spdif_ops = {
 	.open      = oxygen_spdif_open,
 	.close     = oxygen_close,
 	.ioctl     = snd_pcm_lib_ioctl,
@@ -669,7 +675,7 @@ static struct snd_pcm_ops oxygen_spdif_ops = {
 	.pointer   = oxygen_pointer,
 };
 
-static struct snd_pcm_ops oxygen_multich_ops = {
+static const struct snd_pcm_ops oxygen_multich_ops = {
 	.open      = oxygen_multich_open,
 	.close     = oxygen_close,
 	.ioctl     = snd_pcm_lib_ioctl,
@@ -680,7 +686,7 @@ static struct snd_pcm_ops oxygen_multich_ops = {
 	.pointer   = oxygen_pointer,
 };
 
-static struct snd_pcm_ops oxygen_ac97_ops = {
+static const struct snd_pcm_ops oxygen_ac97_ops = {
 	.open      = oxygen_ac97_open,
 	.close     = oxygen_close,
 	.ioctl     = snd_pcm_lib_ioctl,

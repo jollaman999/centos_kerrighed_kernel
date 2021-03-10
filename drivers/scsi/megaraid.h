@@ -13,7 +13,7 @@
  */
 
 /*
- * Comand coalescing - This feature allows the driver to be able to combine
+ * Command coalescing - This feature allows the driver to be able to combine
  * two or more commands and issue as one command in order to boost I/O
  * performance. Useful if the nature of the I/O is sequential. It is not very
  * useful for random natured I/Os.
@@ -45,44 +45,9 @@
 
 #define MAX_DEV_TYPE	32
 
-#ifndef PCI_VENDOR_ID_LSI_LOGIC
-#define PCI_VENDOR_ID_LSI_LOGIC		0x1000
-#endif
-
-#ifndef PCI_VENDOR_ID_AMI
-#define PCI_VENDOR_ID_AMI		0x101E
-#endif
-
-#ifndef PCI_VENDOR_ID_DELL
-#define PCI_VENDOR_ID_DELL		0x1028
-#endif
-
-#ifndef PCI_VENDOR_ID_INTEL
-#define PCI_VENDOR_ID_INTEL		0x8086
-#endif
-
-#ifndef PCI_DEVICE_ID_AMI_MEGARAID
-#define PCI_DEVICE_ID_AMI_MEGARAID	0x9010
-#endif
-
-#ifndef PCI_DEVICE_ID_AMI_MEGARAID2
-#define PCI_DEVICE_ID_AMI_MEGARAID2	0x9060
-#endif
-
-#ifndef PCI_DEVICE_ID_AMI_MEGARAID3
-#define PCI_DEVICE_ID_AMI_MEGARAID3	0x1960
-#endif
-
 #define PCI_DEVICE_ID_DISCOVERY		0x000E
 #define PCI_DEVICE_ID_PERC4_DI		0x000F
 #define PCI_DEVICE_ID_PERC4_QC_VERDE	0x0407
-
-/* Sub-System Vendor IDs */
-#define	AMI_SUBSYS_VID			0x101E
-#define DELL_SUBSYS_VID			0x1028
-#define	HP_SUBSYS_VID			0x103C
-#define LSI_SUBSYS_VID			0x1000
-#define INTEL_SUBSYS_VID		0x8086
 
 #define HBA_SIGNATURE	      		0x3344
 #define HBA_SIGNATURE_471	  	0xCCCC
@@ -381,7 +346,7 @@ typedef struct {
 	u8	battery_status;	/*
 				 * BIT 0: battery module missing
 				 * BIT 1: VBAD
-				 * BIT 2: temprature high
+				 * BIT 2: temperature high
 				 * BIT 3: battery pack missing
 				 * BIT 4,5:
 				 *   00 - charge complete
@@ -532,9 +497,9 @@ struct uioctl_t {
 
 /*
  * struct mcontroller is used to pass information about the controllers in the
- * system. Its upto the application how to use the information. We are passing
+ * system. Its up to the application how to use the information. We are passing
  * as much info about the cards as possible and useful. Before issuing the
- * call to find information about the cards, the applicaiton needs to issue a
+ * call to find information about the cards, the application needs to issue a
  * ioctl first to find out the number of controllers in the system.
  */
 #define MAX_CONTROLLERS 32
@@ -804,7 +769,7 @@ typedef struct {
 	unsigned long		base;
 	void __iomem		*mmio_base;
 
-	/* mbox64 with mbox not aligned on 16-byte boundry */
+	/* mbox64 with mbox not aligned on 16-byte boundary */
 	mbox64_t	*una_mbox64;
 	dma_addr_t	una_mbox64_dma;
 
@@ -888,10 +853,10 @@ typedef struct {
 
 	u8	sglen;	/* f/w supported scatter-gather list length */
 
-	unsigned char int_cdb[MAX_COMMAND_SIZE];
 	scb_t			int_scb;
 	struct mutex		int_mtx;	/* To synchronize the internal
 						commands */
+	int			int_status;	/* status of internal cmd */
 	struct completion	int_waitq;	/* wait queue for internal
 						 cmds */
 
@@ -987,7 +952,7 @@ static int mega_query_adapter(adapter_t *);
 static int issue_scb(adapter_t *, scb_t *);
 static int mega_setup_mailbox(adapter_t *);
 
-static int megaraid_queue (Scsi_Cmnd *, void (*)(Scsi_Cmnd *));
+static int megaraid_queue (struct Scsi_Host *, struct scsi_cmnd *);
 static scb_t * mega_build_cmd(adapter_t *, Scsi_Cmnd *, int *);
 static void __mega_runpendq(adapter_t *);
 static int issue_scb_block(adapter_t *, u_char *);
@@ -1013,8 +978,7 @@ static void mega_8_to_40ld (mraid_inquiry *inquiry,
 		mega_inquiry3 *enquiry3, mega_product_info *);
 
 static int megadev_open (struct inode *, struct file *);
-static int megadev_ioctl (struct inode *, struct file *, unsigned int,
-		unsigned long);
+static int megadev_ioctl (struct file *, unsigned int, unsigned long);
 static int mega_m_to_n(void __user *, nitioctl_t *);
 static int mega_n_to_m(void __user *, megacmd_t *);
 
@@ -1023,24 +987,7 @@ static int mega_init_scb (adapter_t *);
 static int mega_is_bios_enabled (adapter_t *);
 
 #ifdef CONFIG_PROC_FS
-static int mega_print_inquiry(char *, char *);
 static void mega_create_proc_entry(int, struct proc_dir_entry *);
-static int proc_read_config(char *, char **, off_t, int, int *, void *);
-static int proc_read_stat(char *, char **, off_t, int, int *, void *);
-static int proc_read_mbox(char *, char **, off_t, int, int *, void *);
-static int proc_rebuild_rate(char *, char **, off_t, int, int *, void *);
-static int proc_battery(char *, char **, off_t, int, int *, void *);
-static int proc_pdrv_ch0(char *, char **, off_t, int, int *, void *);
-static int proc_pdrv_ch1(char *, char **, off_t, int, int *, void *);
-static int proc_pdrv_ch2(char *, char **, off_t, int, int *, void *);
-static int proc_pdrv_ch3(char *, char **, off_t, int, int *, void *);
-static int proc_pdrv(adapter_t *, char *, int);
-static int proc_rdrv_10(char *, char **, off_t, int, int *, void *);
-static int proc_rdrv_20(char *, char **, off_t, int, int *, void *);
-static int proc_rdrv_30(char *, char **, off_t, int, int *, void *);
-static int proc_rdrv_40(char *, char **, off_t, int, int *, void *);
-static int proc_rdrv(adapter_t *, char *, int, int);
-
 static int mega_adapinq(adapter_t *, dma_addr_t);
 static int mega_internal_dev_inquiry(adapter_t *, u8, u8, dma_addr_t);
 #endif
@@ -1057,7 +1004,6 @@ static int mega_del_logdrv(adapter_t *, int);
 static int mega_do_del_logdrv(adapter_t *, int);
 static void mega_get_max_sgl(adapter_t *);
 static int mega_internal_command(adapter_t *, megacmd_t *, mega_passthru *);
-static void mega_internal_done(Scsi_Cmnd *);
 static int mega_support_cluster(adapter_t *);
 #endif
 

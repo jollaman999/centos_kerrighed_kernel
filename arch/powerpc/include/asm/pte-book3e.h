@@ -12,6 +12,7 @@
 #define _PAGE_PRESENT	0x000001 /* software: pte contains a translation */
 #define _PAGE_FILE	0x000002 /* (!present only) software: pte holds file offset */
 #define _PAGE_SW1	0x000002
+#define _PAGE_BIT_SWAP_TYPE	2
 #define _PAGE_BAP_SR	0x000004
 #define _PAGE_BAP_UR	0x000008
 #define _PAGE_BAP_SW	0x000010
@@ -71,6 +72,9 @@
 #define _PAGE_PSIZE	_PAGE_PSIZE_4K
 #define	PTE_RPN_SHIFT	(24)
 #endif
+
+#define PTE_WIMGE_SHIFT (19)
+#define PTE_BAP_SHIFT	(2)
 
 /* On 32-bit, we never clear the top part of the PTE */
 #ifdef CONFIG_PPC32

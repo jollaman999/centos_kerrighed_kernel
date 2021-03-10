@@ -21,7 +21,6 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/module.h>
-#include <linux/smp_lock.h>
 
 #include <asm/io.h>
 #include <asm/reboot.h>
@@ -38,7 +37,7 @@ MODULE_PARM_DESC(major, "Major device number");
 
 static void (*old_machine_restart)(char *command);
 static void __iomem *tb0219_base;
-static spinlock_t tb0219_lock;
+static DEFINE_SPINLOCK(tb0219_lock);
 
 #define tb0219_read(offset)		readw(tb0219_base + (offset))
 #define tb0219_write(offset, value)	writew((value), tb0219_base + (offset))
@@ -165,7 +164,7 @@ static ssize_t tanbac_tb0219_read(struct file *file, char __user *buf, size_t le
 	unsigned int minor;
 	char value;
 
-	minor = iminor(file->f_path.dentry->d_inode);
+	minor = iminor(file_inode(file));
 	switch (minor) {
 	case 0:
 		value = get_led();
@@ -201,7 +200,7 @@ static ssize_t tanbac_tb0219_write(struct file *file, const char __user *data,
 	int retval = 0;
 	char c;
 
-	minor = iminor(file->f_path.dentry->d_inode);
+	minor = iminor(file_inode(file));
 	switch (minor) {
 	case 0:
 		type = TYPE_LED;
@@ -237,7 +236,6 @@ static int tanbac_tb0219_open(struct inode *inode, struct file *file)
 {
 	unsigned int minor;
 
-	cycle_kernel_lock();
 	minor = iminor(inode);
 	switch (minor) {
 	case 0:
@@ -263,6 +261,7 @@ static const struct file_operations tb0219_fops = {
 	.write		= tanbac_tb0219_write,
 	.open		= tanbac_tb0219_open,
 	.release	= tanbac_tb0219_release,
+	.llseek		= no_llseek,
 };
 
 static void tb0219_restart(char *command)
@@ -285,7 +284,7 @@ static void tb0219_pci_irq_init(void)
 	vr41xx_set_irq_level(TB0219_PCI_SLOT3_PIN, IRQ_LEVEL_LOW);
 }
 
-static int __devinit tb0219_probe(struct platform_device *dev)
+static int tb0219_probe(struct platform_device *dev)
 {
 	int retval;
 
@@ -306,8 +305,6 @@ static int __devinit tb0219_probe(struct platform_device *dev)
 		return retval;
 	}
 
-	spin_lock_init(&tb0219_lock);
-
 	old_machine_restart = _machine_restart;
 	_machine_restart = tb0219_restart;
 
@@ -321,7 +318,7 @@ static int __devinit tb0219_probe(struct platform_device *dev)
 	return 0;
 }
 
-static int __devexit tb0219_remove(struct platform_device *dev)
+static int tb0219_remove(struct platform_device *dev)
 {
 	_machine_restart = old_machine_restart;
 
@@ -337,7 +334,7 @@ static struct platform_device *tb0219_platform_device;
 
 static struct platform_driver tb0219_device_driver = {
 	.probe		= tb0219_probe,
-	.remove		= __devexit_p(tb0219_remove),
+	.remove		= tb0219_remove,
 	.driver		= {
 		.name	= "TB0219",
 		.owner	= THIS_MODULE,

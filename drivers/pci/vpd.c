@@ -6,6 +6,7 @@
  */
 
 #include <linux/pci.h>
+#include <linux/export.h>
 
 int pci_vpd_find_tag(const u8 *buf, unsigned int off, unsigned int len, u8 rdt)
 {
@@ -53,7 +54,7 @@ int pci_vpd_find_info_keyword(const u8 *buf, unsigned int off,
 			return i;
 
 		i += PCI_VPD_INFO_FLD_HDR_SIZE +
-		pci_vpd_info_field_size(&buf[i]);
+		     pci_vpd_info_field_size(&buf[i]);
 	}
 
 	return -ENOENT;

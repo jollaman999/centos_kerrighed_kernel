@@ -35,7 +35,7 @@
 	printk(level "%s %d-%04x: " fmt, name, i2c_adapter_id(adapter), addr , ## arg)
 
 #define v4l_client_printk(level, client, fmt, arg...)			    \
-	v4l_printk(level, (client)->driver->driver.name, (client)->adapter, \
+	v4l_printk(level, (client)->dev.driver->name, (client)->adapter, \
 		   (client)->addr, fmt , ## arg)
 
 #define v4l_err(client, fmt, arg...) \
@@ -77,21 +77,6 @@
 		if (debug >= (level))					\
 			v4l2_printk(KERN_DEBUG, dev, fmt , ## arg); 	\
 	} while (0)
-
-/* ------------------------------------------------------------------------- */
-
-/* Priority helper functions */
-
-struct v4l2_prio_state {
-	atomic_t prios[4];
-};
-void v4l2_prio_init(struct v4l2_prio_state *global);
-int v4l2_prio_change(struct v4l2_prio_state *global, enum v4l2_priority *local,
-		     enum v4l2_priority new);
-void v4l2_prio_open(struct v4l2_prio_state *global, enum v4l2_priority *local);
-void v4l2_prio_close(struct v4l2_prio_state *global, enum v4l2_priority local);
-enum v4l2_priority v4l2_prio_max(struct v4l2_prio_state *global);
-int v4l2_prio_check(struct v4l2_prio_state *global, enum v4l2_priority local);
 
 /* ------------------------------------------------------------------------- */
 
@@ -138,20 +123,9 @@ struct v4l2_subdev_ops;
 
 /* Load an i2c module and return an initialized v4l2_subdev struct.
    The client_type argument is the name of the chip that's on the adapter. */
-struct v4l2_subdev *v4l2_i2c_new_subdev_cfg(struct v4l2_device *v4l2_dev,
+struct v4l2_subdev *v4l2_i2c_new_subdev(struct v4l2_device *v4l2_dev,
 		struct i2c_adapter *adapter, const char *client_type,
-		int irq, void *platform_data,
 		u8 addr, const unsigned short *probe_addrs);
-
-/* Load an i2c module and return an initialized v4l2_subdev struct.
-   The client_type argument is the name of the chip that's on the adapter. */
-static inline struct v4l2_subdev *v4l2_i2c_new_subdev(struct v4l2_device *v4l2_dev,
-		struct i2c_adapter *adapter, const char *client_type,
-		u8 addr, const unsigned short *probe_addrs)
-{
-	return v4l2_i2c_new_subdev_cfg(v4l2_dev, adapter, client_type, 0, NULL,
-				       addr, probe_addrs);
-}
 
 struct i2c_board_info;
 
@@ -159,7 +133,7 @@ struct v4l2_subdev *v4l2_i2c_new_subdev_board(struct v4l2_device *v4l2_dev,
 		struct i2c_adapter *adapter, struct i2c_board_info *info,
 		const unsigned short *probe_addrs);
 
-/* Initialize an v4l2_subdev with data from an i2c_client struct */
+/* Initialize a v4l2_subdev with data from an i2c_client struct */
 void v4l2_i2c_subdev_init(struct v4l2_subdev *sd, struct i2c_client *client,
 		const struct v4l2_subdev_ops *ops);
 /* Return i2c client address of v4l2_subdev. */
@@ -192,7 +166,7 @@ struct spi_device;
 struct v4l2_subdev *v4l2_spi_new_subdev(struct v4l2_device *v4l2_dev,
 		struct spi_master *master, struct spi_board_info *info);
 
-/* Initialize an v4l2_subdev with data from an spi_device struct */
+/* Initialize a v4l2_subdev with data from an spi_device struct */
 void v4l2_spi_subdev_init(struct v4l2_subdev *sd, struct spi_device *spi,
 		const struct v4l2_subdev_ops *ops);
 #endif
@@ -227,7 +201,6 @@ void v4l_bound_align_image(unsigned int *w, unsigned int wmin,
 			   unsigned int *h, unsigned int hmin,
 			   unsigned int hmax, unsigned int halign,
 			   unsigned int salign);
-int v4l_fill_dv_preset_info(u32 preset, struct v4l2_dv_enum_preset *info);
 
 struct v4l2_discrete_probe {
 	const struct v4l2_frmsize_discrete	*sizes;
@@ -237,5 +210,20 @@ struct v4l2_discrete_probe {
 const struct v4l2_frmsize_discrete *v4l2_find_nearest_format(
 		const struct v4l2_discrete_probe *probe,
 		s32 width, s32 height);
+
+bool v4l_match_dv_timings(const struct v4l2_dv_timings *t1,
+			  const struct v4l2_dv_timings *t2,
+			  unsigned pclock_delta);
+
+bool v4l2_detect_cvt(unsigned frame_height, unsigned hfreq, unsigned vsync,
+		u32 polarities, struct v4l2_dv_timings *fmt);
+
+bool v4l2_detect_gtf(unsigned frame_height, unsigned hfreq, unsigned vsync,
+		u32 polarities, struct v4l2_fract aspect,
+		struct v4l2_dv_timings *fmt);
+
+struct v4l2_fract v4l2_calc_aspect_ratio(u8 hor_landscape, u8 vert_portrait);
+
+void v4l2_get_timestamp(struct timeval *tv);
 
 #endif /* V4L2_COMMON_H_ */

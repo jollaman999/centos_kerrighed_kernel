@@ -1,80 +1,82 @@
 /*
- * Copyright IBM Corp. 2008,2009
+ * Copyright IBM Corp. 2008, 2009
  *
  *   Author(s): Heiko Carstens <heiko.carstens@de.ibm.com>,
  *
  */
 
+#include <linux/linkage.h>
 #include <asm/asm-offsets.h>
+#include <asm/ftrace.h>
 #include <asm/nospec-insn.h>
+#include <asm/ptrace.h>
 
+	GEN_BR_THUNK %r1
 	GEN_BR_THUNK %r14
 
-	.globl ftrace_stub
-ftrace_stub:
+	.section .kprobes.text, "ax"
+
+ENTRY(ftrace_stub)
 	BR_EX	%r14
 
-	.globl _mcount
-_mcount:
-#ifdef CONFIG_DYNAMIC_FTRACE
+#define STACK_FRAME_SIZE  (STACK_FRAME_OVERHEAD + __PT_SIZE)
+#define STACK_PTREGS	  (STACK_FRAME_OVERHEAD)
+#define STACK_PTREGS_GPRS (STACK_PTREGS + __PT_GPRS)
+#define STACK_PTREGS_PSW  (STACK_PTREGS + __PT_PSW)
+
+ENTRY(_mcount)
 	BR_EX	%r14
 
-	.data
-	.globl	ftrace_dyn_func
-ftrace_dyn_func:
-	.quad	ftrace_stub
-	.previous
-
-	.globl ftrace_caller
-ftrace_caller:
-#endif
-	larl	%r1,function_trace_stop
-	icm	%r1,0xf,0(%r1)
-	jnz	ftrace_exit
-	stmg	%r2,%r5,32(%r15)
-	stg	%r14,112(%r15)
+ENTRY(ftrace_caller)
+	.globl	ftrace_regs_caller
+	.set	ftrace_regs_caller,ftrace_caller
 	lgr	%r1,%r15
-	aghi	%r15,-160
+	aghi	%r15,-STACK_FRAME_SIZE
 	stg	%r1,__SF_BACKCHAIN(%r15)
-	lgr	%r2,%r14
-	lg	%r3,168(%r15)
-#ifdef CONFIG_DYNAMIC_FTRACE
-	larl	%r14,ftrace_dyn_func
+	stg	%r1,(STACK_PTREGS_GPRS+15*8)(%r15)
+	stg	%r0,(STACK_PTREGS_PSW+8)(%r15)
+	stmg	%r2,%r14,(STACK_PTREGS_GPRS+2*8)(%r15)
+#ifdef CONFIG_HAVE_MARCH_Z196_FEATURES
+	aghik	%r2,%r0,-MCOUNT_INSN_SIZE
+	lgrl	%r4,function_trace_op
+	lgrl	%r1,ftrace_trace_function
 #else
-	larl	%r14,ftrace_trace_function
+	lgr	%r2,%r0
+	aghi	%r2,-MCOUNT_INSN_SIZE
+	larl	%r4,function_trace_op
+	lg	%r4,0(%r4)
+	larl	%r1,ftrace_trace_function
+	lg	%r1,0(%r1)
 #endif
-	lg	%r1,0(%r14)
+	lgr	%r3,%r14
+	la	%r5,STACK_PTREGS(%r15)
 	BASR_EX	%r14,%r1
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
-#ifdef CONFIG_DYNAMIC_FTRACE
-	.globl	ftrace_graph_caller
-ftrace_graph_caller:
-	# This unconditional branch gets runtime patched. Change only if
-	# you know what you are doing. See ftrace_enable_graph_caller().
-	j	0f
-#endif
-	lg	%r2,272(%r15)
-	lg	%r3,168(%r15)
+# The j instruction gets runtime patched to a nop instruction.
+# See ftrace_enable_ftrace_graph_caller. The patched instruction is:
+#	j	.+4
+ENTRY(ftrace_graph_caller)
+	j	ftrace_graph_caller_end
+	lg	%r2,(STACK_PTREGS_GPRS+14*8)(%r15)
+	lg	%r3,(STACK_PTREGS_PSW+8)(%r15)
 	brasl	%r14,prepare_ftrace_return
-	stg	%r2,168(%r15)
-0:
+	stg	%r2,(STACK_PTREGS_GPRS+14*8)(%r15)
+ftrace_graph_caller_end:
+	.globl	ftrace_graph_caller_end
 #endif
-	aghi	%r15,160
-	lmg	%r2,%r5,32(%r15)
-	lg	%r14,112(%r15)
-ftrace_exit:
-	BR_EX	%r14
+	lg	%r1,(STACK_PTREGS_PSW+8)(%r15)
+	lmg	%r2,%r15,(STACK_PTREGS_GPRS+2*8)(%r15)
+	BR_EX	%r1
 
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER
 
-	.globl	return_to_handler
-return_to_handler:
+ENTRY(return_to_handler)
 	stmg	%r2,%r5,32(%r15)
 	lgr	%r1,%r15
-	aghi	%r15,-160
+	aghi	%r15,-STACK_FRAME_OVERHEAD
 	stg	%r1,__SF_BACKCHAIN(%r15)
 	brasl	%r14,ftrace_return_to_handler
-	aghi	%r15,160
+	aghi	%r15,STACK_FRAME_OVERHEAD
 	lgr	%r14,%r2
 	lmg	%r2,%r5,32(%r15)
 	BR_EX	%r14

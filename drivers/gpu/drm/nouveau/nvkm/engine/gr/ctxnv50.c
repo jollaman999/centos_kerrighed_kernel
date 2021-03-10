@@ -1,5 +1,5 @@
 /*
- * Copyright 2009 Marcin Kocielnicki
+ * Copyright 2009 Marcin Kościelnicki
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -106,6 +106,7 @@
 #define CP_SEEK_2      0x00c800ff
 
 #include "ctxnv40.h"
+#include "nv50.h"
 
 #include <subdev/fb.h>
 

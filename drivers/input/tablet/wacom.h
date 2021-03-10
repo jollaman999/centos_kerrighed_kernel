@@ -85,9 +85,10 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/mod_devicetable.h>
 #include <linux/init.h>
 #include <linux/usb/input.h>
-#include <linux/input/mt.h>
+#include <linux/power_supply.h>
 #include <asm/unaligned.h>
 
 /*
@@ -103,82 +104,38 @@ MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE(DRIVER_LICENSE);
 
 #define USB_VENDOR_ID_WACOM	0x056a
+#define USB_VENDOR_ID_LENOVO	0x17ef
 
 struct wacom {
 	dma_addr_t data_dma;
-	struct input_dev *dev;
 	struct usb_device *usbdev;
 	struct usb_interface *intf;
 	struct urb *irq;
-	struct wacom_wac *wacom_wac;
+	struct wacom_wac wacom_wac;
 	struct mutex lock;
 	struct work_struct work;
-	unsigned int open:1;
+	bool open;
 	char phys[32];
 	struct wacom_led {
-		u8 select[5]; /* status led selector (0..3) */
+		u8 select[2]; /* status led selector (0..3) */
 		u8 llv;       /* status led brightness no button (1..127) */
 		u8 hlv;       /* status led brightness button pressed (1..127) */
 		u8 img_lum;   /* OLED matrix display brightness */
 	} led;
-	struct kobject *remote_dir;
-	struct attribute_group remote_group[5];
+	struct power_supply *battery;
+	struct power_supply_desc battery_desc;
 };
 
-struct wacom_combo {
-	struct wacom *wacom;
-	struct urb *urb;
-};
-
-static inline void wacom_schedule_work(struct wacom_combo *wcombo)
+static inline void wacom_schedule_work(struct wacom_wac *wacom_wac)
 {
-	schedule_work(&wcombo->wacom->work);
+	struct wacom *wacom = container_of(wacom_wac, struct wacom, wacom_wac);
+	schedule_work(&wacom->work);
 }
 
 extern const struct usb_device_id wacom_ids[];
 
-extern int wacom_wac_irq(struct wacom_wac * wacom_wac, void * wcombo);
-extern void wacom_report_abs(void *wcombo, unsigned int abs_type, int abs_data);
-extern void wacom_report_rel(void *wcombo, unsigned int rel_type, int rel_data);
-extern void wacom_report_key(void *wcombo, unsigned int key_type, int key_data);
-extern void wacom_input_event(void *wcombo, unsigned int type, unsigned int code, int value);
-extern void wacom_mt_slot(void *wcombo, int slot);
-extern void wacom_mt_report_slot_state(void *wcombo, unsigned int tool_type, bool active);
-extern void wacom_mt_report_pointer_emulation(void *wcombo, bool value);
-extern void wacom_input_sync(void *wcombo);
-extern int wacom_init_input_dev(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern int wacom_mt_get_slot_by_key(void *wcombo, int key);
-extern void input_dev_g4(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_g(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_24hd(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_c22hd(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_c21ux2(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_i3s(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_i3(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_i(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern int input_dev_i4s(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_i4(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_pl(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_pt(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_tpc(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_24hdt(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern int input_dev_tpc2fg(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_mo(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_bee(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_cintiq(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_bamboo_pt(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_ipro(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_ipros(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_cintiq27qhd(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_cintiq27qhdt(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void input_dev_remote(struct input_dev *input_dev, struct wacom_wac *wacom_wac);
-extern void wacom_set_led_status(void *wcombo, int idx, int status);
-extern __u16 wacom_le16_to_cpu(unsigned char *data);
-extern __u16 wacom_be16_to_cpu(unsigned char *data);
-extern struct wacom_features *get_wacom_feature(const struct usb_device_id *id);
-extern const struct usb_device_id *get_device_table(void);
-int wacom_remote_create_attr_group(void *wcombo, __u32 serial, int index);
-void wacom_remote_destroy_attr_group(void *wcombo, __u32 serial);
-int wacom_wac_finger_count_touches(void *wcombo);
-
+void wacom_wac_irq(struct wacom_wac *wacom_wac, size_t len);
+void wacom_setup_device_quirks(struct wacom_features *features);
+int wacom_setup_input_capabilities(struct input_dev *input_dev,
+				   struct wacom_wac *wacom_wac);
 #endif

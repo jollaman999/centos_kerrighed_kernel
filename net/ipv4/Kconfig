@@ -46,7 +46,7 @@ config IP_ADVANCED_ROUTER
 	  rp_filter on use:
 
 	  echo 1 > /proc/sys/net/ipv4/conf/<device>/rp_filter
-	   and
+	   or
 	  echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter
 
 	  Note that some distributions enable it in startup scripts.
@@ -55,45 +55,9 @@ config IP_ADVANCED_ROUTER
 
 	  If unsure, say N here.
 
-choice
-	prompt "Choose IP: FIB lookup algorithm (choose FIB_HASH if unsure)"
-	depends on IP_ADVANCED_ROUTER
-	default ASK_IP_FIB_HASH
-
-config ASK_IP_FIB_HASH
-	bool "FIB_HASH"
-	---help---
-	  Current FIB is very proven and good enough for most users.
-
-config IP_FIB_TRIE
-	bool "FIB_TRIE"
-	---help---
-	  Use new experimental LC-trie as FIB lookup algorithm.
-	  This improves lookup performance if you have a large
-	  number of routes.
-
-	  LC-trie is a longest matching prefix lookup algorithm which
-	  performs better than FIB_HASH for large routing tables.
-	  But, it consumes more memory and is more complex.
-
-	  LC-trie is described in:
-
-	  IP-address lookup using LC-tries. Stefan Nilsson and Gunnar Karlsson
-	  IEEE Journal on Selected Areas in Communications, 17(6):1083-1092,
-	  June 1999
-
-	  An experimental study of compression methods for dynamic tries
-	  Stefan Nilsson and Matti Tikkanen. Algorithmica, 33(1):19-33, 2002.
-	  http://www.nada.kth.se/~snilsson/public/papers/dyntrie2/
-
-endchoice
-
-config IP_FIB_HASH
-	def_bool ASK_IP_FIB_HASH || !IP_ADVANCED_ROUTER
-
 config IP_FIB_TRIE_STATS
 	bool "FIB TRIE statistics"
-	depends on IP_FIB_TRIE
+	depends on IP_ADVANCED_ROUTER
 	---help---
 	  Keep track of statistics on structure of FIB TRIE table.
 	  Useful for testing and measuring TRIE performance.
@@ -139,6 +103,9 @@ config IP_ROUTE_VERBOSE
 	  attack or a misconfigured system somewhere. The information is
 	  handled by the klogd daemon which is responsible for kernel messages
 	  ("man klogd").
+
+config IP_ROUTE_CLASSID
+	bool
 
 config IP_PNP
 	bool "IP: kernel level autoconfiguration"
@@ -196,11 +163,10 @@ config IP_PNP_RARP
 	  operating on your network. Read
 	  <file:Documentation/filesystems/nfs/nfsroot.txt> for details.
 
-# not yet ready..
-#   bool '    IP: ARP support' CONFIG_IP_PNP_ARP
 config NET_IPIP
 	tristate "IP: tunneling"
 	select INET_TUNNEL
+	select NET_IP_TUNNEL
 	---help---
 	  Tunneling means encapsulating data of one protocol type within
 	  another protocol and sending it over a channel that understands the
@@ -223,11 +189,12 @@ config NET_IPGRE_DEMUX
 
 config NET_IP_TUNNEL
 	tristate
+	select DST_CACHE
 	default n
 
 config NET_IPGRE
 	tristate "IP: GRE tunnels over IP"
-	depends on NET_IPGRE_DEMUX
+	depends on (IPV6 || IPV6=n) && NET_IPGRE_DEMUX
 	select NET_IP_TUNNEL
 	help
 	  Tunneling means encapsulating data of one protocol type within
@@ -264,7 +231,7 @@ config IP_MROUTE
 
 config IP_MROUTE_MULTIPLE_TABLES
 	bool "IP: multicast policy routing"
-	depends on IP_ADVANCED_ROUTER
+	depends on IP_MROUTE && IP_ADVANCED_ROUTER
 	select FIB_RULES
 	help
 	  Normally, a multicast router runs a userspace daemon and decides
@@ -298,24 +265,8 @@ config IP_PIMSM_V2
 	  gated-5). This routing protocol is not used widely, so say N unless
 	  you want to play with it.
 
-config ARPD
-	bool "IP: ARP daemon support"
-	---help---
-	  The kernel maintains an internal cache which maps IP addresses to
-	  hardware addresses on the local network, so that Ethernet/Token Ring/
-	  etc. frames are sent to the proper address on the physical networking
-	  layer. Normally, kernel uses the ARP protocol to resolve these
-	  mappings.
-
-	  Saying Y here adds support to have an user space daemon to do this
-	  resolution instead. This is useful for implementing an alternate
-	  address resolution protocol (e.g. NHRP on mGRE tunnels) and also for
-	  testing purposes.
-
-	  If unsure, say N.
-
 config SYN_COOKIES
-	bool "IP: TCP syncookie support (disabled per default)"
+	bool "IP: TCP syncookie support"
 	---help---
 	  Normal TCP/IP networking is open to an attack known as "SYN
 	  flooding". This denial-of-service attack prevents legitimate remote
@@ -340,19 +291,55 @@ config SYN_COOKIES
 	  server is really overloaded. If this happens frequently better turn
 	  them off.
 
-	  If you say Y here, note that SYN cookies aren't enabled by default;
-	  you can enable them by saying Y to "/proc file system support" and
+	  If you say Y here, you can disable SYN cookies at run time by
+	  saying Y to "/proc file system support" and
 	  "Sysctl support" below and executing the command
 
-	  echo 1 >/proc/sys/net/ipv4/tcp_syncookies
+	  echo 0 > /proc/sys/net/ipv4/tcp_syncookies
 
-	  at boot time after the /proc file system has been mounted.
+	  after the /proc file system has been mounted.
 
 	  If unsure, say N.
 
+config NET_IPVTI
+	tristate "Virtual (secure) IP: tunneling"
+	select INET_TUNNEL
+	select NET_IP_TUNNEL
+	depends on INET_XFRM_MODE_TUNNEL
+	---help---
+	  Tunneling means encapsulating data of one protocol type within
+	  another protocol and sending it over a channel that understands the
+	  encapsulating protocol. This can be used with xfrm mode tunnel to give
+	  the notion of a secure tunnel for IPSEC and then use routing protocol
+	  on top.
+
+config NET_UDP_TUNNEL
+	tristate
+	select NET_IP_TUNNEL
+	default n
+
+config NET_FOU
+	tristate "IP: Foo (IP protocols) over UDP"
+	select XFRM
+	select NET_UDP_TUNNEL
+	---help---
+	  Foo over UDP allows any IP protocol to be directly encapsulated
+	  over UDP include tunnels (IPIP, GRE, SIT). By encapsulating in UDP
+	  network mechanisms and optimizations for UDP (such as ECMP
+	  and RSS) can be leveraged to provide better service.
+
+config NET_FOU_IP_TUNNELS
+	bool "IP: FOU encapsulation of IP tunnels"
+	depends on NET_IPIP || NET_IPGRE || IPV6_SIT
+	select NET_FOU
+	---help---
+	  Allow configuration of FOU or GUE encapsulation for IP tunnels.
+	  When this option is enabled IP tunnels can be configured to use
+	  FOU or GUE encapsulation.
+
 config INET_AH
 	tristate "IP: AH transformation"
-	select XFRM
+	select XFRM_ALGO
 	select CRYPTO
 	select CRYPTO_HMAC
 	select CRYPTO_MD5
@@ -364,7 +351,7 @@ config INET_AH
 
 config INET_ESP
 	tristate "IP: ESP transformation"
-	select XFRM
+	select XFRM_ALGO
 	select CRYPTO
 	select CRYPTO_AUTHENC
 	select CRYPTO_HMAC
@@ -424,7 +411,7 @@ config INET_XFRM_MODE_BEET
 	  If unsure, say Y.
 
 config INET_LRO
-	bool "Large Receive Offload (ipv4/tcp)"
+	tristate "Large Receive Offload (ipv4/tcp)"
 	default y
 	---help---
 	  Support for Large Receive Offload (ipv4/tcp).
@@ -437,13 +424,23 @@ config INET_DIAG
 	---help---
 	  Support for INET (TCP, DCCP, etc) socket monitoring interface used by
 	  native Linux tools such as ss. ss is included in iproute2, currently
-	  downloadable at <http://linux-net.osdl.org/index.php/Iproute2>.
+	  downloadable at:
+	  
+	    http://www.linuxfoundation.org/collaborate/workgroups/networking/iproute2
 
 	  If unsure, say Y.
 
 config INET_TCP_DIAG
 	depends on INET_DIAG
 	def_tristate INET_DIAG
+
+config INET_UDP_DIAG
+	tristate "UDP: socket monitoring interface"
+	depends on INET_DIAG && (IPV6 || IPV6=n)
+	default n
+	---help---
+	  Support for UDP socket monitoring interface used by the ss tool.
+	  If unsure, say Y.
 
 menuconfig TCP_CONG_ADVANCED
 	bool "TCP: advanced congestion control"
@@ -507,7 +504,6 @@ config TCP_CONG_HTCP
 
 config TCP_CONG_HSTCP
 	tristate "High Speed TCP"
-	depends on EXPERIMENTAL
 	default n
 	---help---
 	Sally Floyd's High Speed TCP (RFC 3649) congestion control.
@@ -518,7 +514,6 @@ config TCP_CONG_HSTCP
 
 config TCP_CONG_HYBLA
 	tristate "TCP-Hybla congestion control algorithm"
-	depends on EXPERIMENTAL
 	default n
 	---help---
 	TCP-Hybla is a sender-side only change that eliminates penalization of
@@ -528,7 +523,6 @@ config TCP_CONG_HYBLA
 
 config TCP_CONG_VEGAS
 	tristate "TCP Vegas"
-	depends on EXPERIMENTAL
 	default n
 	---help---
 	TCP Vegas is a sender-side only change to TCP that anticipates
@@ -539,7 +533,6 @@ config TCP_CONG_VEGAS
 
 config TCP_CONG_SCALABLE
 	tristate "Scalable TCP"
-	depends on EXPERIMENTAL
 	default n
 	---help---
 	Scalable TCP is a sender-side only change to TCP which uses a
@@ -549,7 +542,6 @@ config TCP_CONG_SCALABLE
 
 config TCP_CONG_LP
 	tristate "TCP Low Priority"
-	depends on EXPERIMENTAL
 	default n
 	---help---
 	TCP Low Priority (TCP-LP), a distributed algorithm whose goal is
@@ -559,7 +551,6 @@ config TCP_CONG_LP
 
 config TCP_CONG_VENO
 	tristate "TCP Veno"
-	depends on EXPERIMENTAL
 	default n
 	---help---
 	TCP Veno is a sender-side only enhancement of TCP to obtain better
@@ -567,11 +558,10 @@ config TCP_CONG_VENO
 	distinguishing to circumvent the difficult judgment of the packet loss
 	type. TCP Veno cuts down less congestion window in response to random
 	loss packets.
-	See http://www.ntu.edu.sg/home5/ZHOU0022/papers/CPFu03a.pdf
+	See <http://ieeexplore.ieee.org/xpl/freeabs_all.jsp?arnumber=1177186> 
 
 config TCP_CONG_YEAH
 	tristate "YeAH TCP"
-	depends on EXPERIMENTAL
 	select TCP_CONG_VEGAS
 	default n
 	---help---
@@ -586,7 +576,6 @@ config TCP_CONG_YEAH
 
 config TCP_CONG_ILLINOIS
 	tristate "TCP Illinois"
-	depends on EXPERIMENTAL
 	default n
 	---help---
 	TCP-Illinois is a sender-side modification of TCP Reno for
@@ -596,6 +585,27 @@ config TCP_CONG_ILLINOIS
 
 	For further details see:
 	  http://www.ews.uiuc.edu/~shaoliu/tcpillinois/index.html
+
+config TCP_CONG_DCTCP
+	tristate "DataCenter TCP (DCTCP)"
+	default n
+	---help---
+	DCTCP leverages Explicit Congestion Notification (ECN) in the network to
+	provide multi-bit feedback to the end hosts. It is designed to provide:
+
+	- High burst tolerance (incast due to partition/aggregate),
+	- Low latency (short flows, queries),
+	- High throughput (continuous data updates, large file transfers) with
+	  commodity, shallow-buffered switches.
+
+	All switches in the data center network running DCTCP must support
+	ECN marking and be configured for marking when reaching defined switch
+	buffer thresholds. The default ECN marking threshold heuristic for
+	DCTCP on switches is 20 packets (30KB) at 1Gbps, and 65 packets
+	(~100KB) at 10Gbps, but might need further careful tweaking.
+
+	For further details see:
+	  http://simula.stanford.edu/~alizade/Site/DCTCP_files/dctcp-final.pdf
 
 choice
 	prompt "Default TCP congestion control"
@@ -613,15 +623,23 @@ choice
 	config DEFAULT_HTCP
 		bool "Htcp" if TCP_CONG_HTCP=y
 
+	config DEFAULT_HYBLA
+		bool "Hybla" if TCP_CONG_HYBLA=y
+
 	config DEFAULT_VEGAS
 		bool "Vegas" if TCP_CONG_VEGAS=y
+
+	config DEFAULT_VENO
+		bool "Veno" if TCP_CONG_VENO=y
 
 	config DEFAULT_WESTWOOD
 		bool "Westwood" if TCP_CONG_WESTWOOD=y
 
+	config DEFAULT_DCTCP
+		bool "DCTCP" if TCP_CONG_DCTCP=y
+
 	config DEFAULT_RENO
 		bool "Reno"
-
 endchoice
 
 endif
@@ -636,14 +654,16 @@ config DEFAULT_TCP_CONG
 	default "bic" if DEFAULT_BIC
 	default "cubic" if DEFAULT_CUBIC
 	default "htcp" if DEFAULT_HTCP
+	default "hybla" if DEFAULT_HYBLA
 	default "vegas" if DEFAULT_VEGAS
 	default "westwood" if DEFAULT_WESTWOOD
+	default "veno" if DEFAULT_VENO
 	default "reno" if DEFAULT_RENO
+	default "dctcp" if DEFAULT_DCTCP
 	default "cubic"
 
 config TCP_MD5SIG
-	bool "TCP: MD5 Signature Option support (RFC2385) (EXPERIMENTAL)"
-	depends on EXPERIMENTAL
+	bool "TCP: MD5 Signature Option support (RFC2385)"
 	select CRYPTO
 	select CRYPTO_MD5
 	---help---
@@ -652,4 +672,3 @@ config TCP_MD5SIG
 	  on the Internet.
 
 	  If unsure, say N.
-

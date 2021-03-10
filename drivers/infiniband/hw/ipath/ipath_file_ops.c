@@ -35,11 +35,13 @@
 #include <linux/poll.h>
 #include <linux/cdev.h>
 #include <linux/swap.h>
+#include <linux/export.h>
 #include <linux/vmalloc.h>
+#include <linux/slab.h>
 #include <linux/highmem.h>
 #include <linux/io.h>
+#include <linux/aio.h>
 #include <linux/jiffies.h>
-#include <linux/smp_lock.h>
 #include <linux/cpu.h>
 #include <asm/pgtable.h>
 
@@ -65,7 +67,8 @@ static const struct file_operations ipath_file_ops = {
 	.open = ipath_open,
 	.release = ipath_close,
 	.poll = ipath_poll,
-	.mmap = ipath_mmap
+	.mmap = ipath_mmap,
+	.llseek = noop_llseek,
 };
 
 /*
@@ -912,15 +915,15 @@ static int ipath_create_user_egr(struct ipath_portdata *pd)
 	chunk = pd->port_rcvegrbuf_chunks;
 	egrperchunk = pd->port_rcvegrbufs_perchunk;
 	size = pd->port_rcvegrbuf_size;
-	pd->port_rcvegrbuf = kmalloc(chunk * sizeof(pd->port_rcvegrbuf[0]),
-				     GFP_KERNEL);
+	pd->port_rcvegrbuf = kmalloc_array(chunk, sizeof(pd->port_rcvegrbuf[0]),
+					   GFP_KERNEL);
 	if (!pd->port_rcvegrbuf) {
 		ret = -ENOMEM;
 		goto bail;
 	}
 	pd->port_rcvegrbuf_phys =
-		kmalloc(chunk * sizeof(pd->port_rcvegrbuf_phys[0]),
-			GFP_KERNEL);
+		kmalloc_array(chunk, sizeof(pd->port_rcvegrbuf_phys[0]),
+			      GFP_KERNEL);
 	if (!pd->port_rcvegrbuf_phys) {
 		ret = -ENOMEM;
 		goto bail_rcvegrbuf;
@@ -1225,7 +1228,7 @@ static int mmap_kvaddr(struct vm_area_struct *vma, u64 pgaddr,
 
 	vma->vm_pgoff = (unsigned long) addr >> PAGE_SHIFT;
 	vma->vm_ops = &ipath_file_vm_ops;
-	vma->vm_flags |= VM_RESERVED | VM_DONTEXPAND;
+	vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
 	ret = 1;
 
 bail:
@@ -1864,9 +1867,9 @@ static int ipath_assign_port(struct file *fp,
 		goto done_chk_sdma;
 	}
 
-	i_minor = iminor(fp->f_path.dentry->d_inode) - IPATH_USER_MINOR_BASE;
+	i_minor = iminor(file_inode(fp)) - IPATH_USER_MINOR_BASE;
 	ipath_cdbg(VERBOSE, "open on dev %lx (minor %d)\n",
-		   (long)fp->f_path.dentry->d_inode->i_rdev, i_minor);
+		   (long)file_inode(fp)->i_rdev, i_minor);
 
 	if (i_minor)
 		ret = find_free_port(i_minor - 1, fp, uinfo);
@@ -2041,7 +2044,6 @@ static void unlock_expected_tids(struct ipath_portdata *pd)
 
 static int ipath_close(struct inode *in, struct file *fp)
 {
-	int ret = 0;
 	struct ipath_filedata *fd;
 	struct ipath_portdata *pd;
 	struct ipath_devdata *dd;
@@ -2153,7 +2155,7 @@ static int ipath_close(struct inode *in, struct file *fp)
 
 bail:
 	kfree(fd);
-	return ret;
+	return 0;
 }
 
 static int ipath_port_info(struct ipath_portdata *pd, u16 subport,

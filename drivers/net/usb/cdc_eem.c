@@ -14,12 +14,10 @@
  * GNU General Public License for more details.
  *
  * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
 #include <linux/module.h>
-#include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ctype.h>
@@ -30,6 +28,8 @@
 #include <linux/crc32.h>
 #include <linux/usb/cdc.h>
 #include <linux/usb/usbnet.h>
+#include <linux/gfp.h>
+#include <linux/if_vlan.h>
 
 
 /*
@@ -73,7 +73,7 @@ static void eem_linkcmd(struct usbnet *dev, struct sk_buff *skb)
 		usb_free_urb(urb);
 fail:
 		dev_kfree_skb(skb);
-		devwarn(dev, "link cmd failure\n");
+		netdev_warn(dev->net, "link cmd failure\n");
 		return;
 	}
 }
@@ -83,15 +83,13 @@ static int eem_bind(struct usbnet *dev, struct usb_interface *intf)
 	int status = 0;
 
 	status = usbnet_get_endpoints(dev, intf);
-	if (status < 0) {
-		usb_set_intfdata(intf, NULL);
-		usb_driver_release_interface(driver_of(intf), intf);
+	if (status < 0)
 		return status;
-	}
 
 	/* no jumbogram (16K) support for now */
 
-	dev->net->hard_header_len += EEM_HEAD + ETH_FCS_LEN;
+	dev->net->hard_header_len += EEM_HEAD + ETH_FCS_LEN + VLAN_HLEN;
+	dev->hard_mtu = dev->net->mtu + dev->net->hard_header_len;
 
 	return 0;
 }
@@ -121,8 +119,8 @@ static struct sk_buff *eem_tx_fixup(struct usbnet *dev, struct sk_buff *skb,
 		int	headroom = skb_headroom(skb);
 		int	tailroom = skb_tailroom(skb);
 
-		if ((tailroom >= ETH_FCS_LEN + padlen)
-				&& (headroom >= EEM_HEAD))
+		if ((tailroom >= ETH_FCS_LEN + padlen) &&
+		    (headroom >= EEM_HEAD))
 			goto done;
 
 		if ((headroom + tailroom)
@@ -189,7 +187,7 @@ static int eem_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 
 		/*
 		 * EEM packet header format:
-		 * b0..14:	EEM type dependant (Data or Command)
+		 * b0..14:	EEM type dependent (Data or Command)
 		 * b15:		bmType
 		 */
 		header = get_unaligned_le16(skb->data);
@@ -212,7 +210,8 @@ static int eem_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			 * b15:		1 (EEM command)
 			 */
 			if (header & BIT(14)) {
-				devdbg(dev, "reserved command %04x\n", header);
+				netdev_dbg(dev->net, "reserved command %04x\n",
+					   header);
 				continue;
 			}
 
@@ -241,8 +240,12 @@ static int eem_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			 *  - suspend: peripheral ready to suspend
 			 *  - response: suggest N millisec polling
 			 *  - response complete: suggest N sec polling
+			 *
+			 * Suspend is reported and maybe heeded.
 			 */
 			case 2:		/* Suspend hint */
+				usbnet_device_suggests_idle(dev);
+				continue;
 			case 3:		/* Response hint */
 			case 4:		/* Response complete hint */
 				continue;
@@ -255,8 +258,9 @@ static int eem_rx_fixup(struct usbnet *dev, struct sk_buff *skb)
 			case 1:		/* Echo response */
 			case 5:		/* Tickle */
 			default:	/* reserved */
-				devwarn(dev, "unexpected link command %d\n",
-						bmEEMCmd);
+				netdev_warn(dev->net,
+					    "unexpected link command %d\n",
+					    bmEEMCmd);
 				continue;
 			}
 
@@ -367,18 +371,7 @@ static struct usb_driver eem_driver = {
 	.disable_hub_initiated_lpm = 1,
 };
 
-
-static int __init eem_init(void)
-{
-	return usb_register(&eem_driver);
-}
-module_init(eem_init);
-
-static void __exit eem_exit(void)
-{
-	usb_deregister(&eem_driver);
-}
-module_exit(eem_exit);
+module_usb_driver(eem_driver);
 
 MODULE_AUTHOR("Omar Laazimani <omar.oberthur@gmail.com>");
 MODULE_DESCRIPTION("USB CDC EEM");

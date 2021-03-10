@@ -21,6 +21,8 @@
 #include <linux/interrupt.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 #include <sound/ac97_codec.h>
 #include <sound/asoundef.h>
 #include <sound/core.h>
@@ -194,7 +196,6 @@ static void oxygen_gpio_changed(struct work_struct *work)
 		chip->model.gpio_changed(chip);
 }
 
-#ifdef CONFIG_PROC_FS
 static void oxygen_proc_read(struct snd_info_entry *entry,
 			     struct snd_info_buffer *buffer)
 {
@@ -243,14 +244,8 @@ static void oxygen_proc_read(struct snd_info_entry *entry,
 
 static void oxygen_proc_init(struct oxygen *chip)
 {
-	struct snd_info_entry *entry;
-
-	if (!snd_card_proc_new(chip->card, "oxygen", &entry))
-		snd_info_set_text_ops(entry, chip, oxygen_proc_read);
+	snd_card_ro_proc_new(chip->card, "oxygen", chip, oxygen_proc_read);
 }
-#else
-#define oxygen_proc_init(chip)
-#endif
 
 static const struct pci_device_id *
 oxygen_search_pci_id(struct oxygen *chip, const struct pci_device_id ids[])
@@ -375,7 +370,7 @@ static void oxygen_init(struct oxygen *chip)
 	for (i = 0; i < 8; ++i)
 		chip->dac_volume[i] = chip->model.dac_volume_min;
 	chip->dac_mute = 1;
-	chip->spdif_playback_enable = 1;
+	chip->spdif_playback_enable = 0;
 	chip->spdif_bits = OXYGEN_SPDIF_C | OXYGEN_SPDIF_ORIGINAL |
 		(IEC958_AES1_CON_PCM_CODER << OXYGEN_SPDIF_CATEGORY_SHIFT);
 	chip->spdif_pcm_bits = chip->spdif_bits;
@@ -589,7 +584,8 @@ static void oxygen_card_free(struct snd_card *card)
 	oxygen_shutdown(chip);
 	if (chip->irq >= 0)
 		free_irq(chip->irq, chip);
-	flush_scheduled_work();
+	flush_work(&chip->spdif_input_bits_work);
+	flush_work(&chip->gpio_work);
 	chip->model.cleanup(chip);
 	kfree(chip->model_data);
 	mutex_destroy(&chip->mutex);
@@ -671,7 +667,7 @@ int oxygen_pci_probe(struct pci_dev *pci, int index, char *id,
 	chip->model.init(chip);
 
 	err = request_irq(pci->irq, oxygen_interrupt, IRQF_SHARED,
-			  DRIVER, chip);
+			  KBUILD_MODNAME, chip);
 	if (err < 0) {
 		dev_err(card->dev, "cannot grab interrupt %d\n", pci->irq);
 		goto err_card;
@@ -694,15 +690,15 @@ int oxygen_pci_probe(struct pci_dev *pci, int index, char *id,
 		goto err_card;
 
 	if (chip->model.device_config & (MIDI_OUTPUT | MIDI_INPUT)) {
-		unsigned int info_flags = MPU401_INFO_INTEGRATED;
+		unsigned int info_flags =
+				MPU401_INFO_INTEGRATED | MPU401_INFO_IRQ_HOOK;
 		if (chip->model.device_config & MIDI_OUTPUT)
 			info_flags |= MPU401_INFO_OUTPUT;
 		if (chip->model.device_config & MIDI_INPUT)
 			info_flags |= MPU401_INFO_INPUT;
 		err = snd_mpu401_uart_new(card, 0, MPU401_HW_CMIPCI,
 					  chip->addr + OXYGEN_MPU401,
-					  info_flags, 0, 0,
-					  &chip->midi);
+					  info_flags, -1, &chip->midi);
 		if (err < 0)
 			goto err_card;
 	}
@@ -737,11 +733,10 @@ EXPORT_SYMBOL(oxygen_pci_probe);
 void oxygen_pci_remove(struct pci_dev *pci)
 {
 	snd_card_free(pci_get_drvdata(pci));
-	pci_set_drvdata(pci, NULL);
 }
 EXPORT_SYMBOL(oxygen_pci_remove);
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 static int oxygen_pci_suspend(struct device *dev)
 {
 	struct snd_card *card = dev_get_drvdata(dev);
@@ -764,7 +759,8 @@ static int oxygen_pci_suspend(struct device *dev)
 	spin_unlock_irq(&chip->reg_lock);
 
 	synchronize_irq(chip->irq);
-	flush_scheduled_work();
+	flush_work(&chip->spdif_input_bits_work);
+	flush_work(&chip->gpio_work);
 	chip->interrupt_mask = saved_interrupt_mask;
 	return 0;
 }
@@ -822,7 +818,7 @@ static int oxygen_pci_resume(struct device *dev)
 
 SIMPLE_DEV_PM_OPS(oxygen_pci_pm, oxygen_pci_suspend, oxygen_pci_resume);
 EXPORT_SYMBOL(oxygen_pci_pm);
-#endif /* CONFIG_PM */
+#endif /* CONFIG_PM_SLEEP */
 
 void oxygen_pci_shutdown(struct pci_dev *pci)
 {

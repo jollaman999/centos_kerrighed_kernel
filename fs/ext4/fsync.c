@@ -35,6 +35,45 @@
 #include <trace/events/ext4.h>
 
 /*
+ * If we're not journaling and this is a just-created file, we have to
+ * sync our parent directory (if it was freshly created) since
+ * otherwise it will only be written by writeback, leaving a huge
+ * window during which a crash may lose the file.  This may apply for
+ * the parent directory's parent as well, and so on recursively, if
+ * they are also freshly created.
+ */
+static int ext4_sync_parent(struct inode *inode)
+{
+	struct dentry *dentry = NULL;
+	struct inode *next;
+	int ret = 0;
+
+	if (!ext4_test_inode_state(inode, EXT4_STATE_NEWENTRY))
+		return 0;
+	inode = igrab(inode);
+	while (ext4_test_inode_state(inode, EXT4_STATE_NEWENTRY)) {
+		ext4_clear_inode_state(inode, EXT4_STATE_NEWENTRY);
+		dentry = d_find_any_alias(inode);
+		if (!dentry)
+			break;
+		next = igrab(dentry->d_parent->d_inode);
+		dput(dentry);
+		if (!next)
+			break;
+		iput(inode);
+		inode = next;
+		ret = sync_mapping_buffers(inode->i_mapping);
+		if (ret)
+			break;
+		ret = sync_inode_metadata(inode, 1);
+		if (ret)
+			break;
+	}
+	iput(inode);
+	return ret;
+}
+
+/*
  * akpm: A new design for ext4_sync_file().
  *
  * This is only called from sys_fsync(), sys_fdatasync() and sys_msync().
@@ -44,32 +83,39 @@
  *
  * What we do is just kick off a commit and wait on it.  This will snapshot the
  * inode to disk.
- *
- * i_mutex lock is held when entering and exiting this function
  */
 
-int ext4_sync_file(struct file *file, struct dentry *dentry, int datasync)
+int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 {
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = file->f_mapping->host;
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
-	int ret;
+	int ret = 0, err;
 	tid_t commit_tid;
 	bool needs_barrier = false;
 
 	J_ASSERT(ext4_journal_current_handle() == NULL);
 
-	trace_ext4_sync_file(file, dentry, datasync);
+	trace_ext4_sync_file_enter(file, datasync);
 
-	if (inode->i_sb->s_flags & MS_RDONLY)
-		return 0;
+	if (inode->i_sb->s_flags & MS_RDONLY) {
+		/* Make sure that we read updated s_mount_flags value */
+		smp_rmb();
+		if (EXT4_SB(inode->i_sb)->s_mount_flags & EXT4_MF_FS_ABORTED)
+			ret = -EROFS;
+		goto out;
+	}
 
-	ret = ext4_flush_unwritten_io(inode);
-	if (ret < 0)
+	if (!journal) {
+		ret = generic_file_fsync(file, start, end, datasync);
+		if (!ret && !hlist_empty(&inode->i_dentry))
+			ret = ext4_sync_parent(inode);
+		goto out;
+	}
+
+	ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+	if (ret)
 		return ret;
-
-	if (!journal)
-		return simple_fsync(file, dentry, datasync);
 
 	/*
 	 * data=writeback,ordered:
@@ -85,15 +131,22 @@ int ext4_sync_file(struct file *file, struct dentry *dentry, int datasync)
 	 *  (they were dirtied by commit).  But that's OK - the blocks are
 	 *  safe in-journal, which is all fsync() needs to ensure.
 	 */
-	if (ext4_should_journal_data(inode))
-		return ext4_force_commit(inode->i_sb);
+	if (ext4_should_journal_data(inode)) {
+		ret = ext4_force_commit(inode->i_sb);
+		goto out;
+	}
 
 	commit_tid = datasync ? ei->i_datasync_tid : ei->i_sync_tid;
 	if (journal->j_flags & JBD2_BARRIER &&
 	    !jbd2_trans_will_send_data_barrier(journal, commit_tid))
 		needs_barrier = true;
 	ret = jbd2_complete_transaction(journal, commit_tid);
-	if (needs_barrier)
-		blkdev_issue_flush(inode->i_sb->s_bdev, NULL);
+	if (needs_barrier) {
+		err = blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
+		if (!ret)
+			ret = err;
+	}
+out:
+	trace_ext4_sync_file_exit(inode, ret);
 	return ret;
 }

@@ -48,43 +48,6 @@ int psb_gem_get_aperture(struct drm_device *dev, void *data,
 }
 
 /**
- *	psb_gem_dumb_map_gtt	-	buffer mapping for dumb interface
- *	@file: our drm client file
- *	@dev: drm device
- *	@handle: GEM handle to the object (from dumb_create)
- *
- *	Do the necessary setup to allow the mapping of the frame buffer
- *	into user memory. We don't have to do much here at the moment.
- */
-int psb_gem_dumb_map_gtt(struct drm_file *file, struct drm_device *dev,
-			 uint32_t handle, uint64_t *offset)
-{
-	int ret = 0;
-	struct drm_gem_object *obj;
-
-	mutex_lock(&dev->struct_mutex);
-
-	/* GEM does all our handle to object mapping */
-	obj = drm_gem_object_lookup(dev, file, handle);
-	if (obj == NULL) {
-		ret = -ENOENT;
-		goto unlock;
-	}
-	/* What validation is needed here ? */
-
-	/* Make it mmapable */
-	ret = drm_gem_create_mmap_offset(obj);
-	if (ret)
-		goto out;
-	*offset = drm_vma_node_offset_addr(&obj->vma_node);
-out:
-	drm_gem_object_unreference(obj);
-unlock:
-	mutex_unlock(&dev->struct_mutex);
-	return ret;
-}
-
-/**
  *	psb_gem_create		-	create a mappable object
  *	@file: the DRM file of the client
  *	@dev: our device
@@ -130,7 +93,7 @@ int psb_gem_create(struct drm_file *file, struct drm_device *dev, u64 size,
 		return ret;
 	}
 	/* We have the initial and handle reference but need only one now */
-	drm_gem_object_unreference(&r->gem);
+	drm_gem_object_put_unlocked(&r->gem);
 	*handlep = handle;
 	return 0;
 }
@@ -189,7 +152,7 @@ int psb_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 
 	/* Make sure we don't parallel update on a fault, nor move or remove
 	   something from beneath our feet */
-	mutex_lock(&dev->struct_mutex);
+	mutex_lock(&dev_priv->mmap_mutex);
 
 	/* For now the mmap pins the object and it stays pinned. As things
 	   stand that will do us no harm */
@@ -215,7 +178,7 @@ int psb_gem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	ret = vm_insert_pfn(vma, (unsigned long)vmf->virtual_address, pfn);
 
 fail:
-	mutex_unlock(&dev->struct_mutex);
+	mutex_unlock(&dev_priv->mmap_mutex);
 	switch (ret) {
 	case 0:
 	case -ERESTARTSYS:

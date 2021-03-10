@@ -62,14 +62,22 @@ int crypto_authenc_extractkeys(struct crypto_authenc_keys *keys, const u8 *key,
 		return -EINVAL;
 	if (rta->rta_type != CRYPTO_AUTHENC_KEYA_PARAM)
 		return -EINVAL;
-	if (RTA_PAYLOAD(rta) < sizeof(*param))
+
+	/*
+	 * RTA_OK() didn't align the rtattr's payload when validating that it
+	 * fits in the buffer.  Yet, the keys should start on the next 4-byte
+	 * aligned boundary.  To avoid confusion, require that the rtattr
+	 * payload be exactly the param struct, which has a 4-byte aligned size.
+	 */
+	if (RTA_PAYLOAD(rta) != sizeof(*param))
 		return -EINVAL;
+	BUILD_BUG_ON(sizeof(*param) % RTA_ALIGNTO);
 
 	param = RTA_DATA(rta);
 	keys->enckeylen = be32_to_cpu(param->enckeylen);
 
-	key += RTA_ALIGN(rta->rta_len);
-	keylen -= RTA_ALIGN(rta->rta_len);
+	key += rta->rta_len;
+	keylen -= rta->rta_len;
 
 	if (keylen < keys->enckeylen)
 		return -EINVAL;
@@ -179,6 +187,7 @@ static void authenc_verify_ahash_update_done(struct crypto_async_request *areq,
 	struct crypto_authenc_ctx *ctx = crypto_aead_ctx(authenc);
 	struct authenc_request_ctx *areq_ctx = aead_request_ctx(req);
 	struct ahash_request *ahreq = (void *)(areq_ctx->tail + ctx->reqoff);
+	unsigned int cryptlen = req->cryptlen;
 
 	if (err)
 		goto out;
@@ -194,11 +203,12 @@ static void authenc_verify_ahash_update_done(struct crypto_async_request *areq,
 		goto out;
 
 	authsize = crypto_aead_authsize(authenc);
+	cryptlen -= authsize;
 	ihash = ahreq->result + authsize;
 	scatterwalk_map_and_copy(ihash, areq_ctx->sg, areq_ctx->cryptlen,
 				 authsize, 0);
 
-	err = memcmp(ihash, ahreq->result, authsize) ? -EBADMSG: 0;
+	err = crypto_memneq(ihash, ahreq->result, authsize) ? -EBADMSG : 0;
 	if (err)
 		goto out;
 
@@ -207,7 +217,7 @@ static void authenc_verify_ahash_update_done(struct crypto_async_request *areq,
 	ablkcipher_request_set_callback(abreq, aead_request_flags(req),
 					req->base.complete, req->base.data);
 	ablkcipher_request_set_crypt(abreq, req->src, req->dst,
-				     req->cryptlen, req->iv);
+				     cryptlen, req->iv);
 
 	err = crypto_ablkcipher_decrypt(abreq);
 
@@ -226,16 +236,18 @@ static void authenc_verify_ahash_done(struct crypto_async_request *areq,
 	struct crypto_authenc_ctx *ctx = crypto_aead_ctx(authenc);
 	struct authenc_request_ctx *areq_ctx = aead_request_ctx(req);
 	struct ahash_request *ahreq = (void *)(areq_ctx->tail + ctx->reqoff);
+	unsigned int cryptlen = req->cryptlen;
 
 	if (err)
 		goto out;
 
 	authsize = crypto_aead_authsize(authenc);
+	cryptlen -= authsize;
 	ihash = ahreq->result + authsize;
 	scatterwalk_map_and_copy(ihash, areq_ctx->sg, areq_ctx->cryptlen,
 				 authsize, 0);
 
-	err = memcmp(ihash, ahreq->result, authsize) ? -EBADMSG: 0;
+	err = crypto_memneq(ihash, ahreq->result, authsize) ? -EBADMSG : 0;
 	if (err)
 		goto out;
 
@@ -244,7 +256,7 @@ static void authenc_verify_ahash_done(struct crypto_async_request *areq,
 	ablkcipher_request_set_callback(abreq, aead_request_flags(req),
 					req->base.complete, req->base.data);
 	ablkcipher_request_set_crypt(abreq, req->src, req->dst,
-				     req->cryptlen, req->iv);
+				     cryptlen, req->iv);
 
 	err = crypto_ablkcipher_decrypt(abreq);
 
@@ -344,7 +356,7 @@ static int crypto_authenc_genicv(struct aead_request *req, u8 *iv,
 		cryptlen += ivsize;
 	}
 
-	if (sg_is_last(assoc)) {
+	if (req->assoclen && sg_is_last(assoc)) {
 		authenc_ahash_fn = crypto_authenc_ahash;
 		sg_init_table(asg, 2);
 		sg_set_page(asg, sg_page(assoc), assoc->length, assoc->offset);
@@ -376,9 +388,10 @@ static void crypto_authenc_encrypt_done(struct crypto_async_request *req,
 	if (!err) {
 		struct crypto_aead *authenc = crypto_aead_reqtfm(areq);
 		struct crypto_authenc_ctx *ctx = crypto_aead_ctx(authenc);
-		struct ablkcipher_request *abreq = aead_request_ctx(areq);
-		u8 *iv = (u8 *)(abreq + 1) +
-			 crypto_ablkcipher_reqsize(ctx->enc);
+		struct authenc_request_ctx *areq_ctx = aead_request_ctx(areq);
+		struct ablkcipher_request *abreq = (void *)(areq_ctx->tail
+							    + ctx->reqoff);
+		u8 *iv = (u8 *)abreq - crypto_ablkcipher_ivsize(ctx->enc);
 
 		err = crypto_authenc_genicv(areq, iv, 0);
 	}
@@ -390,11 +403,13 @@ static int crypto_authenc_encrypt(struct aead_request *req)
 {
 	struct crypto_aead *authenc = crypto_aead_reqtfm(req);
 	struct crypto_authenc_ctx *ctx = crypto_aead_ctx(authenc);
-	struct ablkcipher_request *abreq = aead_request_ctx(req);
+	struct authenc_request_ctx *areq_ctx = aead_request_ctx(req);
 	struct crypto_ablkcipher *enc = ctx->enc;
 	struct scatterlist *dst = req->dst;
 	unsigned int cryptlen = req->cryptlen;
-	u8 *iv = (u8 *)(abreq + 1) + crypto_ablkcipher_reqsize(enc);
+	struct ablkcipher_request *abreq = (void *)(areq_ctx->tail
+						    + ctx->reqoff);
+	u8 *iv = (u8 *)abreq - crypto_ablkcipher_ivsize(enc);
 	int err;
 
 	ablkcipher_request_set_tfm(abreq, enc);
@@ -458,7 +473,7 @@ static int crypto_authenc_verify(struct aead_request *req,
 	unsigned int authsize;
 
 	areq_ctx->complete = authenc_verify_ahash_done;
-	areq_ctx->complete = authenc_verify_ahash_update_done;
+	areq_ctx->update_complete = authenc_verify_ahash_update_done;
 
 	ohash = authenc_ahash_fn(req, CRYPTO_TFM_REQ_MAY_SLEEP);
 	if (IS_ERR(ohash))
@@ -468,7 +483,7 @@ static int crypto_authenc_verify(struct aead_request *req,
 	ihash = ohash + authsize;
 	scatterwalk_map_and_copy(ihash, areq_ctx->sg, areq_ctx->cryptlen,
 				 authsize, 0);
-	return memcmp(ihash, ohash, authsize) ? -EBADMSG: 0;
+	return crypto_memneq(ihash, ohash, authsize) ? -EBADMSG : 0;
 }
 
 static int crypto_authenc_iverify(struct aead_request *req, u8 *iv,
@@ -496,7 +511,7 @@ static int crypto_authenc_iverify(struct aead_request *req, u8 *iv,
 		cryptlen += ivsize;
 	}
 
-	if (sg_is_last(assoc)) {
+	if (req->assoclen && sg_is_last(assoc)) {
 		authenc_ahash_fn = crypto_authenc_ahash;
 		sg_init_table(asg, 2);
 		sg_set_page(asg, sg_page(assoc), assoc->length, assoc->offset);
@@ -550,10 +565,6 @@ static int crypto_authenc_init_tfm(struct crypto_tfm *tfm)
 	if (IS_ERR(auth))
 		return PTR_ERR(auth);
 
-	ctx->reqoff = ALIGN(2 * crypto_ahash_digestsize(auth) +
-			    crypto_ahash_alignmask(auth),
-			    crypto_ahash_alignmask(auth) + 1);
-
 	enc = crypto_spawn_skcipher(&ictx->enc);
 	err = PTR_ERR(enc);
 	if (IS_ERR(enc))
@@ -561,14 +572,19 @@ static int crypto_authenc_init_tfm(struct crypto_tfm *tfm)
 
 	ctx->auth = auth;
 	ctx->enc = enc;
-	
-	tfm->crt_aead.reqsize = max_t(unsigned int,
-				crypto_ahash_reqsize(auth) + ctx->reqoff +
-				sizeof(struct authenc_request_ctx) +
-				sizeof(struct ahash_request), 
+
+	ctx->reqoff = ALIGN(2 * crypto_ahash_digestsize(auth) +
+			    crypto_ahash_alignmask(auth),
+			    crypto_ahash_alignmask(auth) + 1) +
+		      crypto_ablkcipher_ivsize(enc);
+
+	tfm->crt_aead.reqsize = sizeof(struct authenc_request_ctx) +
+				ctx->reqoff +
+				max_t(unsigned int,
+				crypto_ahash_reqsize(auth) +
+				sizeof(struct ahash_request),
 				sizeof(struct skcipher_givcrypt_request) +
-				crypto_ablkcipher_reqsize(enc) +
-				crypto_ablkcipher_ivsize(enc));
+				crypto_ablkcipher_reqsize(enc));
 
 	return 0;
 
@@ -597,9 +613,8 @@ static struct crypto_instance *crypto_authenc_alloc(struct rtattr **tb)
 	int err;
 
 	algt = crypto_get_attr_type(tb);
-	err = PTR_ERR(algt);
 	if (IS_ERR(algt))
-		return ERR_PTR(err);
+		return ERR_CAST(algt);
 
 	if ((algt->type ^ CRYPTO_ALG_TYPE_AEAD) & algt->mask)
 		return ERR_PTR(-EINVAL);
@@ -607,7 +622,7 @@ static struct crypto_instance *crypto_authenc_alloc(struct rtattr **tb)
 	auth = ahash_attr_alg(tb[1], CRYPTO_ALG_TYPE_HASH,
 			       CRYPTO_ALG_TYPE_AHASH_MASK);
 	if (IS_ERR(auth))
-		return ERR_PTR(PTR_ERR(auth));
+		return ERR_CAST(auth);
 
 	auth_base = &auth->base;
 
@@ -714,3 +729,4 @@ module_exit(crypto_authenc_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Simple AEAD wrapper for IPsec");
+MODULE_ALIAS_CRYPTO("authenc");

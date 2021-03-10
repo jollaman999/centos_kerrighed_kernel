@@ -1,8 +1,6 @@
 /*
- *  include/asm-s390/timex.h
- *
  *  S390 version
- *    Copyright (C) 1999 IBM Deutschland Entwicklung GmbH, IBM Corporation
+ *    Copyright IBM Corp. 1999
  *
  *  Derived from "include/asm-i386/timex.h"
  *    Copyright (C) 1992, Linus Torvalds
@@ -11,43 +9,47 @@
 #ifndef _ASM_S390_TIMEX_H
 #define _ASM_S390_TIMEX_H
 
+#include <asm/lowcore.h>
+
 /* The value of the TOD clock for 1.1.1970. */
 #define TOD_UNIX_EPOCH 0x7d91048bca000000ULL
 
 /* Inline functions for clock register access. */
-static inline int set_clock(__u64 time)
+static inline int set_tod_clock(__u64 time)
 {
 	int cc;
 
 	asm volatile(
-		"   sck   0(%2)\n"
+		"   sck   %1\n"
 		"   ipm   %0\n"
 		"   srl   %0,28\n"
-		: "=d" (cc) : "m" (time), "a" (&time) : "cc");
+		: "=d" (cc) : "Q" (time) : "cc");
 	return cc;
 }
 
-static inline int store_clock(__u64 *time)
+static inline int store_tod_clock(__u64 *time)
 {
 	int cc;
 
 	asm volatile(
-		"   stck  0(%2)\n"
+		"   stck  %1\n"
 		"   ipm   %0\n"
 		"   srl   %0,28\n"
-		: "=d" (cc), "=m" (*time) : "a" (time) : "cc");
+		: "=d" (cc), "=Q" (*time) : : "cc");
 	return cc;
 }
 
 static inline void set_clock_comparator(__u64 time)
 {
-	asm volatile("sckc 0(%1)" : : "m" (time), "a" (&time));
+	asm volatile("sckc %0" : : "Q" (time));
 }
 
 static inline void store_clock_comparator(__u64 *time)
 {
-	asm volatile("stckc 0(%1)" : "=m" (*time) : "a" (time));
+	asm volatile("stckc %0" : "=Q" (*time));
 }
+
+void clock_comparator_work(void);
 
 void __init ptff_init(void);
 
@@ -79,60 +81,80 @@ static inline int ptff_query(unsigned int nr)
 	return (*ptr & (0x80 >> (nr & 7))) != 0;
 }
 
-static inline int ptff(void *ptff_block, size_t len, unsigned int func)
-{
-	typedef struct { char _[len]; } addrtype;
-	register unsigned int reg0 asm("0") = func;
-	register unsigned long reg1 asm("1") = (unsigned long) ptff_block;
-	int rc;
+/*
+ * ptff - Perform timing facility function
+ * @ptff_block: Pointer to ptff parameter block
+ * @len: Length of parameter block
+ * @func: Function code
+ * Returns: Condition code (0 on success)
+ */
+#define ptff(ptff_block, len, func)					\
+({									\
+	struct addrtype { char _[len]; };				\
+	register unsigned int reg0 asm("0") = func;			\
+	register unsigned long reg1 asm("1") = (unsigned long) (ptff_block);\
+	int rc;								\
+									\
+	asm volatile(							\
+		"	.word	0x0104\n"				\
+		"	ipm	%0\n"					\
+		"	srl	%0,28\n"				\
+		: "=d" (rc), "+m" (*(struct addrtype *) reg1)		\
+		: "d" (reg0), "d" (reg1) : "cc");			\
+	rc;								\
+})
 
-	asm volatile(
-		"	.word	0x0104\n"
-		"	ipm	%0\n"
-		"	srl	%0,28\n"
-		: "=d" (rc), "+m" (*(addrtype *) ptff_block)
-		: "d" (reg0), "d" (reg1) : "cc");
-	return rc;
+static inline unsigned long long local_tick_disable(void)
+{
+	unsigned long long old;
+
+	old = S390_lowcore.clock_comparator;
+	S390_lowcore.clock_comparator = -1ULL;
+	set_clock_comparator(S390_lowcore.clock_comparator);
+	return old;
 }
 
-#define CLOCK_TICK_RATE	1193180 /* Underlying HZ */
+static inline void local_tick_enable(unsigned long long comp)
+{
+	S390_lowcore.clock_comparator = comp;
+	set_clock_comparator(S390_lowcore.clock_comparator);
+}
+
+#define CLOCK_TICK_RATE		1193180 /* Underlying HZ */
+#define STORE_CLOCK_EXT_SIZE	16	/* stcke writes 16 bytes */
 
 typedef unsigned long long cycles_t;
 
-static inline unsigned long long get_clock (void)
+static inline void get_tod_clock_ext(char *clk)
 {
+	typedef struct { char _[STORE_CLOCK_EXT_SIZE]; } addrtype;
+
+	asm volatile("stcke %0" : "=Q" (*(addrtype *) clk) : : "cc");
+}
+
+static inline unsigned long long get_tod_clock(void)
+{
+	unsigned char clk[STORE_CLOCK_EXT_SIZE];
+
+	get_tod_clock_ext(clk);
+	return *((unsigned long long *)&clk[1]);
+}
+
+static inline unsigned long long get_tod_clock_fast(void)
+{
+#ifdef CONFIG_HAVE_MARCH_Z9_109_FEATURES
 	unsigned long long clk;
 
-#if __GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 2)
-	asm volatile("stck %0" : "=Q" (clk) : : "cc");
-#else /* __GNUC__ */
-	asm volatile("stck 0(%1)" : "=m" (clk) : "a" (&clk) : "cc");
-#endif /* __GNUC__ */
+	asm volatile("stckf %0" : "=Q" (clk) : : "cc");
 	return clk;
-}
-
-static inline void get_clock_ext(char *clk)
-{
-	asm volatile("stcke %0" : "=Q" (*clk) : : "cc");
-}
-
-static inline unsigned long long get_clock_xt(void)
-{
-	unsigned char clk[16];
-
-#if __GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 2)
-	asm volatile("stcke %0" : "=Q" (clk) : : "cc");
-#else /* __GNUC__ */
-	asm volatile("stcke 0(%1)" : "=m" (clk)
-				   : "a" (clk) : "cc");
-#endif /* __GNUC__ */
-
-	return *((unsigned long long *)&clk[1]);
+#else
+	return get_tod_clock();
+#endif
 }
 
 static inline cycles_t get_cycles(void)
 {
-	return (cycles_t) get_clock() >> 2;
+	return (cycles_t) get_tod_clock() >> 2;
 }
 
 int get_sync_clock(unsigned long long *clock);
@@ -158,9 +180,9 @@ extern u64 sched_clock_base_cc;
  * function, otherwise the returned value is not guaranteed to
  * be monotonic.
  */
-static inline unsigned long long get_clock_monotonic(void)
+static inline unsigned long long get_tod_clock_monotonic(void)
 {
-	return get_clock_xt() - sched_clock_base_cc;
+	return get_tod_clock() - sched_clock_base_cc;
 }
 
 /**

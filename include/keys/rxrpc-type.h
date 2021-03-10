@@ -51,7 +51,7 @@ struct krb5_principal {
 struct krb5_tagged_data {
 	/* for tag value, see /usr/include/krb5/krb5.h
 	 * - KRB5_AUTHDATA_* for auth data
-	 * - 
+	 * -
 	 */
 	s32		tag;
 	u32		data_len;
@@ -99,7 +99,6 @@ struct rxrpc_key_token {
  * structure of raw payloads passed to add_key() or instantiate key
  */
 struct rxrpc_key_data_v1 {
-	u32		kif_version;		/* 1 */
 	u16		security_index;
 	u16		ticket_length;
 	u32		expiry;			/* time_t */

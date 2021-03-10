@@ -17,18 +17,17 @@ struct seq_file;
 /*
  * This is internal.  Do not use it.
  */
-extern void (*init_arch_irq)(void);
-extern void init_FIQ(void);
-extern int show_fiq_list(struct seq_file *, void *);
+extern void init_FIQ(int);
+extern int show_fiq_list(struct seq_file *, int);
 
 /*
  * This is for easy migration, but should be changed in the source
  */
 #define do_bad_IRQ(irq,desc)				\
 do {							\
-	spin_lock(&desc->lock);				\
+	raw_spin_lock(&desc->lock);			\
 	handle_bad_irq(irq, desc);			\
-	spin_unlock(&desc->lock);			\
+	raw_spin_unlock(&desc->lock);			\
 } while(0)
 
 #endif

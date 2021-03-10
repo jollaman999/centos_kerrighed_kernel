@@ -2,6 +2,7 @@
 #include <linux/pci.h>
 #include <linux/module.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 #include <linux/ioport.h>
 #include <linux/wait.h>
 
@@ -12,7 +13,7 @@
  * configuration space.
  */
 
-DEFINE_SPINLOCK(pci_lock);
+DEFINE_RAW_SPINLOCK(pci_lock);
 
 /*
  *  Wrappers for all PCI configuration access functions.  They just check
@@ -24,7 +25,7 @@ DEFINE_SPINLOCK(pci_lock);
 #define PCI_word_BAD (pos & 1)
 #define PCI_dword_BAD (pos & 3)
 
-#define PCI_OP_READ(size,type,len) \
+#define PCI_OP_READ(size, type, len) \
 int pci_bus_read_config_##size \
 	(struct pci_bus *bus, unsigned int devfn, int pos, type *value)	\
 {									\
@@ -32,23 +33,23 @@ int pci_bus_read_config_##size \
 	unsigned long flags;						\
 	u32 data = 0;							\
 	if (PCI_##size##_BAD) return PCIBIOS_BAD_REGISTER_NUMBER;	\
-	spin_lock_irqsave(&pci_lock, flags);				\
+	raw_spin_lock_irqsave(&pci_lock, flags);			\
 	res = bus->ops->read(bus, devfn, pos, len, &data);		\
 	*value = (type)data;						\
-	spin_unlock_irqrestore(&pci_lock, flags);			\
+	raw_spin_unlock_irqrestore(&pci_lock, flags);		\
 	return res;							\
 }
 
-#define PCI_OP_WRITE(size,type,len) \
+#define PCI_OP_WRITE(size, type, len) \
 int pci_bus_write_config_##size \
 	(struct pci_bus *bus, unsigned int devfn, int pos, type value)	\
 {									\
 	int res;							\
 	unsigned long flags;						\
 	if (PCI_##size##_BAD) return PCIBIOS_BAD_REGISTER_NUMBER;	\
-	spin_lock_irqsave(&pci_lock, flags);				\
+	raw_spin_lock_irqsave(&pci_lock, flags);			\
 	res = bus->ops->write(bus, devfn, pos, len, value);		\
-	spin_unlock_irqrestore(&pci_lock, flags);			\
+	raw_spin_unlock_irqrestore(&pci_lock, flags);		\
 	return res;							\
 }
 
@@ -78,10 +79,10 @@ struct pci_ops *pci_bus_set_ops(struct pci_bus *bus, struct pci_ops *ops)
 	struct pci_ops *old_ops;
 	unsigned long flags;
 
-	spin_lock_irqsave(&pci_lock, flags);
+	raw_spin_lock_irqsave(&pci_lock, flags);
 	old_ops = bus->ops;
 	bus->ops = ops;
-	spin_unlock_irqrestore(&pci_lock, flags);
+	raw_spin_unlock_irqrestore(&pci_lock, flags);
 	return old_ops;
 }
 EXPORT_SYMBOL(pci_bus_set_ops);
@@ -103,52 +104,50 @@ static noinline void pci_wait_cfg(struct pci_dev *dev)
 	__add_wait_queue(&pci_cfg_wait, &wait);
 	do {
 		set_current_state(TASK_UNINTERRUPTIBLE);
-		spin_unlock_irq(&pci_lock);
+		raw_spin_unlock_irq(&pci_lock);
 		schedule();
-		spin_lock_irq(&pci_lock);
-	} while (dev->block_ucfg_access);
+		raw_spin_lock_irq(&pci_lock);
+	} while (dev->block_cfg_access);
 	__remove_wait_queue(&pci_cfg_wait, &wait);
 }
 
 /* Returns 0 on success, negative values indicate error. */
-#define PCI_USER_READ_CONFIG(size,type)					\
+#define PCI_USER_READ_CONFIG(size, type)					\
 int pci_user_read_config_##size						\
 	(struct pci_dev *dev, int pos, type *val)			\
 {									\
-	int ret = 0;							\
+	int ret = PCIBIOS_SUCCESSFUL;					\
 	u32 data = -1;							\
 	if (PCI_##size##_BAD)						\
 		return -EINVAL;						\
-	spin_lock_irq(&pci_lock);					\
-	if (unlikely(dev->block_ucfg_access))				\
+	raw_spin_lock_irq(&pci_lock);				\
+	if (unlikely(dev->block_cfg_access))				\
 		pci_wait_cfg(dev);					\
 	ret = dev->bus->ops->read(dev->bus, dev->devfn,			\
 					pos, sizeof(type), &data);	\
-	spin_unlock_irq(&pci_lock);					\
+	raw_spin_unlock_irq(&pci_lock);				\
 	*val = (type)data;						\
-	if (ret > 0)							\
-		ret = -EINVAL;						\
-	return ret;							\
-}
+	return pcibios_err_to_errno(ret);				\
+}									\
+EXPORT_SYMBOL_GPL(pci_user_read_config_##size);
 
 /* Returns 0 on success, negative values indicate error. */
-#define PCI_USER_WRITE_CONFIG(size,type)				\
+#define PCI_USER_WRITE_CONFIG(size, type)				\
 int pci_user_write_config_##size					\
 	(struct pci_dev *dev, int pos, type val)			\
 {									\
-	int ret = -EIO;							\
+	int ret = PCIBIOS_SUCCESSFUL;					\
 	if (PCI_##size##_BAD)						\
 		return -EINVAL;						\
-	spin_lock_irq(&pci_lock);					\
-	if (unlikely(dev->block_ucfg_access))				\
+	raw_spin_lock_irq(&pci_lock);				\
+	if (unlikely(dev->block_cfg_access))				\
 		pci_wait_cfg(dev);					\
 	ret = dev->bus->ops->write(dev->bus, dev->devfn,		\
 					pos, sizeof(type), val);	\
-	spin_unlock_irq(&pci_lock);					\
-	if (ret > 0)							\
-		ret = -EINVAL;						\
-	return ret;							\
-}
+	raw_spin_unlock_irq(&pci_lock);				\
+	return pcibios_err_to_errno(ret);				\
+}									\
+EXPORT_SYMBOL_GPL(pci_user_write_config_##size);
 
 PCI_USER_READ_CONFIG(byte, u8)
 PCI_USER_READ_CONFIG(word, u16)
@@ -269,7 +268,7 @@ static size_t pci_vpd_size(struct pci_dev *dev, size_t old_size)
 static int pci_vpd_wait(struct pci_dev *dev)
 {
 	struct pci_vpd *vpd = dev->vpd;
-	unsigned long timeout = jiffies + msecs_to_jiffies(50);
+	unsigned long timeout = jiffies + msecs_to_jiffies(125);
 	unsigned long max_sleep = 16;
 	u16 status;
 	int ret;
@@ -526,10 +525,10 @@ void pci_vpd_release(struct pci_dev *dev)
 }
 
 /**
- * pci_cfg_access_lock - Block userspace PCI config reads/writes
+ * pci_cfg_access_lock - Lock PCI config reads/writes
  * @dev:	pci device struct
  *
- * When access is blocked, any userspace reads or writes to config 
+ * When access is locked, any userspace reads or writes to config
  * space and concurrent lock requests will sleep until access is
  * allowed via pci_cfg_access_unlocked again.
  */
@@ -537,33 +536,33 @@ void pci_cfg_access_lock(struct pci_dev *dev)
 {
 	might_sleep();
 
-	spin_lock_irq(&pci_lock);
-	if (dev->block_ucfg_access)
-	    pci_wait_cfg(dev);
-	dev->block_ucfg_access = 1;
-	spin_unlock_irq(&pci_lock);
+	raw_spin_lock_irq(&pci_lock);
+	if (dev->block_cfg_access)
+		pci_wait_cfg(dev);
+	dev->block_cfg_access = 1;
+	raw_spin_unlock_irq(&pci_lock);
 }
 EXPORT_SYMBOL_GPL(pci_cfg_access_lock);
 
 /**
  * pci_cfg_access_trylock - try to lock PCI config reads/writes
- * @dev:       pci device struct
+ * @dev:	pci device struct
  *
  * Same as pci_cfg_access_lock, but will return 0 if access is
  * already locked, 1 otherwise. This function can be used from
  * atomic contexts.
  */
 bool pci_cfg_access_trylock(struct pci_dev *dev)
- {
+{
 	unsigned long flags;
 	bool locked = true;
 
-	spin_lock_irqsave(&pci_lock, flags);
-	if (dev->block_ucfg_access)
+	raw_spin_lock_irqsave(&pci_lock, flags);
+	if (dev->block_cfg_access)
 		locked = false;
 	else
-		dev->block_ucfg_access = 1;
-	spin_unlock_irqrestore(&pci_lock, flags);
+		dev->block_cfg_access = 1;
+	raw_spin_unlock_irqrestore(&pci_lock, flags);
 
 	return locked;
 }
@@ -579,49 +578,17 @@ void pci_cfg_access_unlock(struct pci_dev *dev)
 {
 	unsigned long flags;
 
-	spin_lock_irqsave(&pci_lock, flags);
+	raw_spin_lock_irqsave(&pci_lock, flags);
 
 	/* This indicates a problem in the caller, but we don't need
 	 * to kill them, unlike a double-block above. */
-	WARN_ON(!dev->block_ucfg_access);
+	WARN_ON(!dev->block_cfg_access);
 
-	dev->block_ucfg_access = 0;
+	dev->block_cfg_access = 0;
 	wake_up_all(&pci_cfg_wait);
-	spin_unlock_irqrestore(&pci_lock, flags);
+	raw_spin_unlock_irqrestore(&pci_lock, flags);
 }
 EXPORT_SYMBOL_GPL(pci_cfg_access_unlock);
-
-/**
- * pci_block_user_cfg_access -- kabi wrapper to pci_cfg_access_lock
- * @dev:	pci device struct
- *
- */
-void pci_block_user_cfg_access(struct pci_dev *dev)
-{
-	return pci_cfg_access_lock(dev);
-}
-EXPORT_SYMBOL_GPL(pci_block_user_cfg_access);
-
-/**
- * pci_unblock_user_cfg_access -- kabi wrapper to pci_cfg_access_unlock
- * @dev:	pci device struct
- *
- */
-void pci_unblock_user_cfg_access(struct pci_dev *dev)
-{
-	return pci_cfg_access_unlock(dev);
-}
-EXPORT_SYMBOL_GPL(pci_unblock_user_cfg_access);
-
-/**
- * pcie_caps_reg - get the PCIe Capabilities Register
- * @dev: PCI device
- */
-u16 pcie_caps_reg(const struct pci_dev *dev)
-{
-	return ((struct pci_dev_rh1 *)dev->rh_reserved1)->pcie_flags_reg;
-}
-EXPORT_SYMBOL(pcie_caps_reg);
 
 /**
  * pci_pcie_type - get the PCIe device/port type
@@ -629,17 +596,53 @@ EXPORT_SYMBOL(pcie_caps_reg);
  */
 int pci_pcie_type(const struct pci_dev *dev)
 {
-	return (((struct pci_dev_rh1 *)dev->rh_reserved1)->pcie_flags_reg &
-		PCI_EXP_FLAGS_TYPE) >> 4;
+	return (pcie_caps_reg(dev) & PCI_EXP_FLAGS_TYPE) >> 4;
 }
 EXPORT_SYMBOL_GPL(pci_pcie_type);
+
+/**
+ * pci_pcie_cap - get the saved PCIe capability offset
+ * @dev: PCI device
+ *
+ * PCIe capability offset is calculated at PCI device initialization
+ * time and saved in the data structure. This function returns saved
+ * PCIe capability offset. Using this instead of pci_find_capability()
+ * reduces unnecessary search in the PCI configuration space. If you
+ * need to calculate PCIe capability offset from raw device for some
+ * reasons, please use pci_find_capability() instead.
+ */
+int pci_pcie_cap(struct pci_dev *dev)
+{
+	return dev->pcie_cap;
+}
+EXPORT_SYMBOL_GPL(pci_pcie_cap);
+
+/**
+ * pci_is_pcie - check if the PCI device is PCI Express capable
+ * @dev: PCI device
+ *
+ * Returns: true if the PCI device is PCI Express capable, false otherwise.
+ */
+bool pci_is_pcie(struct pci_dev *dev)
+{
+	return pci_pcie_cap(dev);
+}
+EXPORT_SYMBOL_GPL(pci_is_pcie);
 
 static inline int pcie_cap_version(const struct pci_dev *dev)
 {
 	return pcie_caps_reg(dev) & PCI_EXP_FLAGS_VERS;
 }
 
-static inline bool pcie_cap_has_lnkctl(const struct pci_dev *dev)
+static bool pcie_downstream_port(const struct pci_dev *dev)
+{
+	int type = pci_pcie_type(dev);
+
+	return type == PCI_EXP_TYPE_ROOT_PORT ||
+	       type == PCI_EXP_TYPE_DOWNSTREAM;
+}
+
+bool pcie_cap_has_lnkctl(const struct pci_dev *dev)
 {
 	int type = pci_pcie_type(dev);
 
@@ -654,10 +657,7 @@ static inline bool pcie_cap_has_lnkctl(const struct pci_dev *dev)
 
 static inline bool pcie_cap_has_sltctl(const struct pci_dev *dev)
 {
-	int type = pci_pcie_type(dev);
-
-	return (type == PCI_EXP_TYPE_ROOT_PORT ||
-		type == PCI_EXP_TYPE_DOWNSTREAM) &&
+	return pcie_downstream_port(dev) &&
 	       pcie_caps_reg(dev) & PCI_EXP_FLAGS_SLOT;
 }
 
@@ -736,10 +736,9 @@ int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
 	 * State bit in the Slot Status register of Downstream Ports,
 	 * which must be hardwired to 1b.  (PCIe Base Spec 3.0, sec 7.8)
 	 */
-	if (pci_is_pcie(dev) && pos == PCI_EXP_SLTSTA &&
-		 pci_pcie_type(dev) == PCI_EXP_TYPE_DOWNSTREAM) {
+	if (pci_is_pcie(dev) && pcie_downstream_port(dev) &&
+	    pos == PCI_EXP_SLTSTA)
 		*val = PCI_EXP_SLTSTA_PDS;
-	}
 
 	return 0;
 }
@@ -765,10 +764,9 @@ int pcie_capability_read_dword(struct pci_dev *dev, int pos, u32 *val)
 		return ret;
 	}
 
-	if (pci_is_pcie(dev) && pos == PCI_EXP_SLTCTL &&
-		 pci_pcie_type(dev) == PCI_EXP_TYPE_DOWNSTREAM) {
+	if (pci_is_pcie(dev) && pcie_downstream_port(dev) &&
+	    pos == PCI_EXP_SLTSTA)
 		*val = PCI_EXP_SLTSTA_PDS;
-	}
 
 	return 0;
 }
@@ -797,6 +795,18 @@ int pcie_capability_write_dword(struct pci_dev *dev, int pos, u32 val)
 	return pci_write_config_dword(dev, pci_pcie_cap(dev) + pos, val);
 }
 EXPORT_SYMBOL(pcie_capability_write_dword);
+
+int pcie_capability_set_word(struct pci_dev *dev, int pos, u16 set)
+{
+	return pcie_capability_clear_and_set_word(dev, pos, 0, set);
+}
+EXPORT_SYMBOL(pcie_capability_set_word);
+
+int pcie_capability_clear_word(struct pci_dev *dev, int pos, u16 clear)
+{
+	return pcie_capability_clear_and_set_word(dev, pos, clear, 0);
+}
+EXPORT_SYMBOL(pcie_capability_clear_word);
 
 int pcie_capability_clear_and_set_word(struct pci_dev *dev, int pos,
 				       u16 clear, u16 set)

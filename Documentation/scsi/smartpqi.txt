@@ -38,8 +38,8 @@ smartpqi specific entries in /sys
   The version attribute is read-only and will return the driver version
   and the controller firmware version.
   For example:
-              driver: 0.9.13-370
-              firmware: 0.01-522
+	driver: 0.9.13-370
+	firmware: 0.01-522
 
   smartpqi sas device attributes
   ------------------------------

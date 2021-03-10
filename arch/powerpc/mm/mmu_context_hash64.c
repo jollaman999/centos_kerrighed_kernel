@@ -18,31 +18,29 @@
 #include <linux/mm.h>
 #include <linux/spinlock.h>
 #include <linux/idr.h>
+#include <linux/export.h>
+#include <linux/gfp.h>
+#include <linux/slab.h>
 
 #include <asm/mmu_context.h>
+#include <asm/pgalloc.h>
+
+#include "icswx.h"
 
 static DEFINE_SPINLOCK(mmu_context_lock);
-static DEFINE_IDR(mmu_context_idr);
+static DEFINE_IDA(mmu_context_ida);
 
-/*
- * The proto-VSID space has 2^35 - 1 segments available for user mappings.
- * Each segment contains 2^28 bytes.  Each context maps 2^44 bytes,
- * so we can support 2^19-1 contexts (19 == 35 + 28 - 44).
- */
-#define NO_CONTEXT	0
-#define MAX_CONTEXT	((1UL << 19) - 1)
-
-int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+int __init_new_context(void)
 {
 	int index;
 	int err;
 
 again:
-	if (!idr_pre_get(&mmu_context_idr, GFP_KERNEL))
+	if (!ida_pre_get(&mmu_context_ida, GFP_KERNEL))
 		return -ENOMEM;
 
 	spin_lock(&mmu_context_lock);
-	err = idr_get_new_above(&mmu_context_idr, NULL, 1, &index);
+	err = ida_get_new_above(&mmu_context_ida, 1, &index);
 	spin_unlock(&mmu_context_lock);
 
 	if (err == -EAGAIN)
@@ -50,12 +48,24 @@ again:
 	else if (err)
 		return err;
 
-	if (index > MAX_CONTEXT) {
+	if (index > MAX_USER_CONTEXT) {
 		spin_lock(&mmu_context_lock);
-		idr_remove(&mmu_context_idr, index);
+		ida_remove(&mmu_context_ida, index);
 		spin_unlock(&mmu_context_lock);
 		return -ENOMEM;
 	}
+
+	return index;
+}
+EXPORT_SYMBOL_GPL(__init_new_context);
+
+int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
+{
+	int index;
+
+	index = __init_new_context();
+	if (index < 0)
+		return index;
 
 	/* The old code would re-promote on fork, we don't do that
 	 * when using slices as it could cause problem promoting slices
@@ -63,16 +73,77 @@ again:
 	 */
 	if (slice_mm_new_context(mm))
 		slice_set_user_psize(mm, mmu_virtual_psize);
+	subpage_prot_init_new_context(mm);
 	mm->context.id = index;
+#ifdef CONFIG_PPC_ICSWX
+	mm->context.cop_lockp = kmalloc(sizeof(spinlock_t), GFP_KERNEL);
+	if (!mm->context.cop_lockp) {
+		__destroy_context(index);
+		subpage_prot_free(mm);
+		mm->context.id = MMU_NO_CONTEXT;
+		return -ENOMEM;
+	}
+	spin_lock_init(mm->context.cop_lockp);
+#endif /* CONFIG_PPC_ICSWX */
 
+#ifdef CONFIG_PPC_64K_PAGES
+	mm->context.pte_frag = NULL;
+#endif
+#ifdef CONFIG_SPAPR_TCE_IOMMU
+	mm_iommu_init(mm);
+#endif
 	return 0;
 }
 
-void destroy_context(struct mm_struct *mm)
+void __destroy_context(int context_id)
 {
 	spin_lock(&mmu_context_lock);
-	idr_remove(&mmu_context_idr, mm->context.id);
+	ida_remove(&mmu_context_ida, context_id);
 	spin_unlock(&mmu_context_lock);
+}
+EXPORT_SYMBOL_GPL(__destroy_context);
 
-	mm->context.id = NO_CONTEXT;
+#ifdef CONFIG_PPC_64K_PAGES
+static void destroy_pagetable_page(struct mm_struct *mm)
+{
+	int count;
+	void *pte_frag;
+	struct page *page;
+
+	pte_frag = mm->context.pte_frag;
+	if (!pte_frag)
+		return;
+
+	page = virt_to_page(pte_frag);
+	/* drop all the pending references */
+	count = ((unsigned long)pte_frag & ~PAGE_MASK) >> PTE_FRAG_SIZE_SHIFT;
+	/* We allow PTE_FRAG_NR fragments from a PTE page */
+	if (page_ref_sub_and_test(page, PTE_FRAG_NR - count)) {
+		pgtable_page_dtor(page);
+		free_hot_cold_page(page, 0);
+	}
+}
+
+#else
+static inline void destroy_pagetable_page(struct mm_struct *mm)
+{
+	return;
+}
+#endif
+
+void destroy_context(struct mm_struct *mm)
+{
+#ifdef CONFIG_SPAPR_TCE_IOMMU
+	WARN_ON_ONCE(!list_empty(&mm->iommu_group_mem_list));
+#endif
+#ifdef CONFIG_PPC_ICSWX
+	drop_cop(mm->context.acop, mm);
+	kfree(mm->context.cop_lockp);
+	mm->context.cop_lockp = NULL;
+#endif /* CONFIG_PPC_ICSWX */
+
+	destroy_pagetable_page(mm);
+	__destroy_context(mm->context.id);
+	subpage_prot_free(mm);
+	mm->context.id = MMU_NO_CONTEXT;
 }

@@ -2,11 +2,14 @@
 # I2C subsystem configuration
 #
 
-menuconfig I2C
+menu "I2C support"
+
+config I2C
 	tristate "I2C support"
-	depends on HAS_IOMEM
+	select RT_MUTEXES
+	select IRQ_DOMAIN if !S390
 	---help---
-	  I2C (pronounce: I-square-C) is a slow serial bus protocol used in
+	  I2C (pronounce: I-squared-C) is a slow serial bus protocol used in
 	  many micro controller applications and developed by Philips.  SMBus,
 	  or System Management Bus is a subset of the I2C protocol.  More
 	  information is contained in the directory <file:Documentation/i2c/>,
@@ -20,6 +23,17 @@ menuconfig I2C
 
 	  This I2C support can also be built as a module.  If so, the module
 	  will be called i2c-core.
+
+config I2C_ACPI
+	bool "I2C ACPI support"
+	depends on ACPI
+	default y
+	help
+	  Say Y here if you want to enable ACPI I2C support. This includes support
+	  for automatic enumeration of I2C slave devices and support for ACPI I2C
+	  Operation Regions. Operation Regions allow firmware (BIOS) code to
+	  access I2C slave devices, such as smart batteries through an I2C host
+	  controller driver.
 
 if I2C
 
@@ -46,6 +60,19 @@ config I2C_CHARDEV
 	  This support is also available as a module.  If so, the module 
 	  will be called i2c-dev.
 
+config I2C_MUX
+	tristate "I2C bus multiplexing support"
+	depends on HAS_IOMEM
+	help
+	  Say Y here if you want the I2C core to support the ability to
+	  handle multiplexed I2C bus topologies, by presenting each
+	  multiplexed segment as a I2C adapter.
+
+	  This support is also available as a module.  If so, the module
+	  will be called i2c-mux.
+
+source drivers/i2c/muxes/Kconfig
+
 config I2C_HELPER_AUTO
 	bool "Autoselect pertinent helper modules"
 	default y
@@ -60,9 +87,32 @@ config I2C_HELPER_AUTO
 
 	  In doubt, say Y.
 
+config I2C_SMBUS
+	tristate "SMBus-specific protocols" if !I2C_HELPER_AUTO
+	depends on GENERIC_HARDIRQS
+	help
+	  Say Y here if you want support for SMBus extensions to the I2C
+	  specification. At the moment, the only supported extension is
+	  the SMBus alert protocol.
+
+	  This support is also available as a module.  If so, the module
+	  will be called i2c-smbus.
+
 source drivers/i2c/algos/Kconfig
 source drivers/i2c/busses/Kconfig
-source drivers/i2c/chips/Kconfig
+
+config I2C_STUB
+	tristate "I2C/SMBus Test Stub"
+	depends on m
+	default 'n'
+	help
+	  This module may be useful to developers of SMBus client drivers,
+	  especially for certain kinds of sensor chips.
+
+	  If you do build this module, be sure to read the notes and warnings
+	  in <file:Documentation/i2c/i2c-stub>.
+
+	  If you don't know what to do here, definitely say N.
 
 config I2C_DEBUG_CORE
 	bool "I2C Core debugging messages"
@@ -81,18 +131,13 @@ config I2C_DEBUG_ALGO
 
 config I2C_DEBUG_BUS
 	bool "I2C Bus debugging messages"
+	depends on HAS_IOMEM
 	help
 	  Say Y here if you want the I2C bus drivers to produce a bunch of
 	  debug messages to the system log.  Select this if you are having
 	  a problem with I2C support and want to see more of what is going
 	  on.
 
-config I2C_DEBUG_CHIP
-	bool "I2C Chip debugging messages"
-	help
-	  Say Y here if you want the I2C chip drivers to produce a bunch of
-	  debug messages to the system log.  Select this if you are having
-	  a problem with I2C support and want to see more of what is going
-	  on.
-
 endif # I2C
+
+endmenu

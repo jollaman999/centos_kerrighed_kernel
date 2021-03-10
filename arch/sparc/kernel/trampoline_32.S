@@ -15,8 +15,8 @@
 #include <asm/contregs.h>
 #include <asm/thread_info.h>
 
-	.globl sun4m_cpu_startup, __smp4m_processor_id
-	.globl sun4d_cpu_startup, __smp4d_processor_id
+	.globl sun4m_cpu_startup
+	.globl sun4d_cpu_startup
 
 	__CPUINIT
 	.align 4
@@ -79,32 +79,17 @@ cpu3_startup:
 	 nop
 
 	/* Start this processor. */
-	call	smp4m_callin
+	call	smp_callin
 	 nop
 
-	b,a	smp_do_cpu_idle
+	b,a	smp_panic
 
 	.text
 	.align	4
 
-smp_do_cpu_idle:
-	call	cpu_idle
-	 mov	0, %o0
-
+smp_panic:
 	call	cpu_panic
 	 nop
-
-__smp4m_processor_id:
-	rd	%tbr, %g2
-	srl	%g2, 12, %g2
-	and	%g2, 3, %g2
-	retl
-	 mov	%g1, %o7
-
-__smp4d_processor_id:
-	lda	[%g0] ASI_M_VIKING_TMP1, %g2
-	retl
-	 mov	%g1, %o7
 
 /* CPUID in bootbus can be found at PA 0xff0140000 */
 #define SUN4D_BOOTBUS_CPUID	0xf0140000
@@ -156,7 +141,64 @@ sun4d_cpu_startup:
 	 nop
 
 	/* Start this processor. */
-	call	smp4d_callin
+	call	smp_callin
 	 nop
 
-	b,a	smp_do_cpu_idle
+	b,a	smp_panic
+
+	__CPUINIT
+	.align	4
+        .global leon_smp_cpu_startup, smp_penguin_ctable
+
+leon_smp_cpu_startup:
+
+        set smp_penguin_ctable,%g1
+        ld [%g1+4],%g1
+        srl %g1,4,%g1
+        set 0x00000100,%g5 /* SRMMU_CTXTBL_PTR */
+	sta %g1, [%g5] ASI_LEON_MMUREGS
+
+	/* Set up a sane %psr -- PIL<0xf> S<0x1> PS<0x1> CWP<0x0> */
+	set	(PSR_PIL | PSR_S | PSR_PS), %g1
+	wr	%g1, 0x0, %psr		! traps off though
+	WRITE_PAUSE
+
+	/* Our %wim is one behind CWP */
+	mov	2, %g1
+	wr	%g1, 0x0, %wim
+	WRITE_PAUSE
+
+	/* Set tbr - we use just one trap table. */
+	set	trapbase, %g1
+	wr	%g1, 0x0, %tbr
+	WRITE_PAUSE
+
+	/* Get our CPU id */
+        rd     %asr17,%g3
+
+	/* Give ourselves a stack and curptr. */
+	set	current_set, %g5
+	srl	%g3, 28, %g4
+	sll	%g4, 2, %g4
+	ld	[%g5 + %g4], %g6
+
+	sethi	%hi(THREAD_SIZE - STACKFRAME_SZ), %sp
+	or	%sp, %lo(THREAD_SIZE - STACKFRAME_SZ), %sp
+	add	%g6, %sp, %sp
+
+	/* Turn on traps (PSR_ET). */
+	rd	%psr, %g1
+	wr	%g1, PSR_ET, %psr	! traps on
+	WRITE_PAUSE
+
+	/* Init our caches, etc. */
+	set	poke_srmmu, %g5
+	ld	[%g5], %g5
+	call	%g5
+	 nop
+
+	/* Start this processor. */
+	call	smp_callin
+	 nop
+
+	b,a	smp_panic

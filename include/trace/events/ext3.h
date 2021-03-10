@@ -24,8 +24,8 @@ TRACE_EVENT(ext3_free_inode,
 		__entry->dev	= inode->i_sb->s_dev;
 		__entry->ino	= inode->i_ino;
 		__entry->mode	= inode->i_mode;
-		__entry->uid	= inode->i_uid;
-		__entry->gid	= inode->i_gid;
+		__entry->uid	= i_uid_read(inode);
+		__entry->gid	= i_gid_read(inode);
 		__entry->blocks	= inode->i_blocks;
 	),
 
@@ -83,7 +83,7 @@ TRACE_EVENT(ext3_allocate_inode,
 		  (unsigned long) __entry->dir, __entry->mode)
 );
 
-TRACE_EVENT(ext3_delete_inode,
+TRACE_EVENT(ext3_evict_inode,
 	TP_PROTO(struct inode *inode),
 
 	TP_ARGS(inode),
@@ -103,6 +103,28 @@ TRACE_EVENT(ext3_delete_inode,
 	TP_printk("dev %d,%d ino %lu nlink %d",
 		  MAJOR(__entry->dev), MINOR(__entry->dev),
 		  (unsigned long) __entry->ino, __entry->nlink)
+);
+
+TRACE_EVENT(ext3_drop_inode,
+	TP_PROTO(struct inode *inode, int drop),
+
+	TP_ARGS(inode, drop),
+
+	TP_STRUCT__entry(
+		__field(	dev_t,	dev			)
+		__field(	ino_t,	ino			)
+		__field(	int,	drop			)
+	),
+
+	TP_fast_assign(
+		__entry->dev	= inode->i_sb->s_dev;
+		__entry->ino	= inode->i_ino;
+		__entry->drop	= drop;
+	),
+
+	TP_printk("dev %d,%d ino %lu drop %d",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  (unsigned long) __entry->ino, __entry->drop)
 );
 
 TRACE_EVENT(ext3_mark_inode_dirty,

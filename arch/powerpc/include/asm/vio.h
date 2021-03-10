@@ -15,7 +15,6 @@
 #define _ASM_POWERPC_VIO_H
 #ifdef __KERNEL__
 
-#include <linux/init.h>
 #include <linux/errno.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
@@ -43,6 +42,8 @@
  * VIO CMO minimum entitlement for all devices and spare entitlement
  */
 #define VIO_CMO_MIN_ENT 1562624
+
+extern struct bus_type vio_bus_type;
 
 struct iommu_table;
 
@@ -113,6 +114,7 @@ struct vio_dev {
 };
 
 struct vio_driver {
+	const char *name;
 	const struct vio_device_id *id_table;
 	int (*probe)(struct vio_dev *dev, const struct vio_device_id *id);
 	int (*remove)(struct vio_dev *dev);
@@ -120,16 +122,23 @@ struct vio_driver {
 	 * be loaded in a CMO environment if it uses DMA.
 	 */
 	unsigned long (*get_desired_dma)(struct vio_dev *dev);
+	const struct dev_pm_ops *pm;
 	struct device_driver driver;
 };
 
-extern int vio_register_driver(struct vio_driver *drv);
+extern int __vio_register_driver(struct vio_driver *drv, struct module *owner,
+				 const char *mod_name);
+/*
+ * vio_register_driver must be a macro so that KBUILD_MODNAME can be expanded
+ */
+#define vio_register_driver(driver)		\
+	__vio_register_driver(driver, THIS_MODULE, KBUILD_MODNAME)
 extern void vio_unregister_driver(struct vio_driver *drv);
 
 extern int vio_cmo_entitlement_update(size_t);
 extern void vio_cmo_set_dev_desired(struct vio_dev *viodev, size_t desired);
 
-extern void __devinit vio_unregister_device(struct vio_dev *dev);
+extern void vio_unregister_device(struct vio_dev *dev);
 
 extern int vio_h_cop_sync(struct vio_dev *vdev, struct vio_pfo_op *op);
 

@@ -37,7 +37,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <scsi/scsi_host.h>
@@ -149,7 +148,7 @@ static int ninja32_init_one(struct pci_dev *dev, const struct pci_device_id *id)
 
 	ninja32_program(base);
 	/* FIXME: Should we disable them at remove ? */
-	return ata_host_activate(host, dev->irq, ata_sff_interrupt,
+	return ata_host_activate(host, dev->irq, ata_bmdma_interrupt,
 				 IRQF_SHARED, &ninja32_sht);
 }
 
@@ -165,7 +164,7 @@ static int ninja32_reinit_one(struct pci_dev *pdev)
 		return rc;
 	ninja32_program(host->iomap[0]);
 	ata_host_resume(host);
-	return 0;			
+	return 0;
 }
 #endif
 
@@ -190,21 +189,10 @@ static struct pci_driver ninja32_pci_driver = {
 #endif
 };
 
-static int __init ninja32_init(void)
-{
-	return pci_register_driver(&ninja32_pci_driver);
-}
-
-static void __exit ninja32_exit(void)
-{
-	pci_unregister_driver(&ninja32_pci_driver);
-}
+module_pci_driver(ninja32_pci_driver);
 
 MODULE_AUTHOR("Alan Cox");
 MODULE_DESCRIPTION("low-level driver for Ninja32 ATA");
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, ninja32);
 MODULE_VERSION(DRV_VERSION);
-
-module_init(ninja32_init);
-module_exit(ninja32_exit);

@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /*
    Mauro Carvalho Chehab <mchehab@infradead.org>
@@ -33,7 +34,7 @@ static struct rc_map_table pixelview_new[] = {
 	{ 0x3e, KEY_0 },
 
 	{ 0x1c, KEY_AGAIN },		/* LOOP	*/
-	{ 0x3f, KEY_MEDIA },		/* Source */
+	{ 0x3f, KEY_VIDEO },		/* Source */
 	{ 0x1f, KEY_LAST },		/* +100 */
 	{ 0x1b, KEY_MUTE },
 

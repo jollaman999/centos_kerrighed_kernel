@@ -38,7 +38,7 @@ static long compat_keyctl_instantiate_key_iov(
 
 	ret = compat_rw_copy_check_uvector(WRITE, _payload_iov, ioc,
 					   ARRAY_SIZE(iovstack),
-					   iovstack, &iov, 1);
+					   iovstack, &iov);
 	if (ret < 0)
 		goto err;
 	if (ret == 0)
@@ -137,6 +137,9 @@ asmlinkage long compat_sys_keyctl(u32 option,
 
 	case KEYCTL_INVALIDATE:
 		return keyctl_invalidate_key(arg2);
+
+	case KEYCTL_GET_PERSISTENT:
+		return keyctl_get_persistent(arg2, arg3);
 
 	default:
 		return -EOPNOTSUPP;

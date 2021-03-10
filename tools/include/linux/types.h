@@ -7,6 +7,7 @@
 
 #define __SANE_USERSPACE_TYPES__	/* For PPC64, to get LL64 types */
 #include <asm/types.h>
+#include <asm/posix_types.h>
 
 struct page;
 struct kmem_cache;
@@ -60,8 +61,24 @@ typedef __u32 __bitwise __be32;
 typedef __u64 __bitwise __le64;
 typedef __u64 __bitwise __be64;
 
+typedef struct {
+	int counter;
+} atomic_t;
+
+#ifndef __aligned_u64
+# define __aligned_u64 __u64 __attribute__((aligned(8)))
+#endif
+
 struct list_head {
 	struct list_head *next, *prev;
+};
+
+struct hlist_head {
+	struct hlist_node *first;
+};
+
+struct hlist_node {
+	struct hlist_node *next, **pprev;
 };
 
 #endif /* _TOOLS_LINUX_TYPES_H_ */

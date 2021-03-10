@@ -35,10 +35,8 @@ nlm_fopen(struct svc_rqst *rqstp, struct nfs_fh *f, struct file **filp)
 	memcpy((char*)&fh.fh_handle.fh_base, f->data, f->size);
 	fh.fh_export = NULL;
 
-	exp_readlock();
 	nfserr = nfsd_open(rqstp, &fh, S_IFREG, NFSD_MAY_LOCK, filp);
 	fh_put(&fh);
-	exp_readunlock();
  	/* We return nlm error codes as nlm doesn't know
 	 * about nfsd, but nfsd does know about nlm..
 	 */
@@ -60,7 +58,7 @@ nlm_fclose(struct file *filp)
 	fput(filp);
 }
 
-static struct nlmsvc_binding	nfsd_nlm_ops = {
+static const struct nlmsvc_binding nfsd_nlm_ops = {
 	.fopen		= nlm_fopen,		/* open file for locking */
 	.fclose		= nlm_fclose,		/* close file */
 };

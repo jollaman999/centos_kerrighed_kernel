@@ -124,8 +124,8 @@ static long cp_oldabi_stat64(struct kstat *stat,
 	tmp.__st_ino = stat->ino;
 	tmp.st_mode = stat->mode;
 	tmp.st_nlink = stat->nlink;
-	tmp.st_uid = stat->uid;
-	tmp.st_gid = stat->gid;
+	tmp.st_uid = from_kuid_munged(current_user_ns(), stat->uid);
+	tmp.st_gid = from_kgid_munged(current_user_ns(), stat->gid);
 	tmp.st_rdev = huge_encode_dev(stat->rdev);
 	tmp.st_size = stat->size;
 	tmp.st_blocks = stat->blocks;
@@ -141,7 +141,7 @@ static long cp_oldabi_stat64(struct kstat *stat,
 	return copy_to_user(statbuf,&tmp,sizeof(tmp)) ? -EFAULT : 0;
 }
 
-asmlinkage long sys_oabi_stat64(char __user * filename,
+asmlinkage long sys_oabi_stat64(const char __user * filename,
 				struct oldabi_stat64 __user * statbuf)
 {
 	struct kstat stat;
@@ -151,7 +151,7 @@ asmlinkage long sys_oabi_stat64(char __user * filename,
 	return error;
 }
 
-asmlinkage long sys_oabi_lstat64(char __user * filename,
+asmlinkage long sys_oabi_lstat64(const char __user * filename,
 				 struct oldabi_stat64 __user * statbuf)
 {
 	struct kstat stat;
@@ -172,7 +172,7 @@ asmlinkage long sys_oabi_fstat64(unsigned long fd,
 }
 
 asmlinkage long sys_oabi_fstatat64(int dfd,
-				   char __user *filename,
+				   const char __user *filename,
 				   struct oldabi_stat64  __user *statbuf,
 				   int flag)
 {
@@ -193,52 +193,56 @@ struct oabi_flock64 {
 	pid_t	l_pid;
 } __attribute__ ((packed,aligned(4)));
 
+static long do_locks(unsigned int fd, unsigned int cmd,
+				 unsigned long arg)
+{
+	struct flock64 kernel;
+	struct oabi_flock64 user;
+	mm_segment_t fs;
+	long ret;
+
+	if (copy_from_user(&user, (struct oabi_flock64 __user *)arg,
+			   sizeof(user)))
+		return -EFAULT;
+	kernel.l_type	= user.l_type;
+	kernel.l_whence	= user.l_whence;
+	kernel.l_start	= user.l_start;
+	kernel.l_len	= user.l_len;
+	kernel.l_pid	= user.l_pid;
+
+	fs = get_fs();
+	set_fs(KERNEL_DS);
+	ret = sys_fcntl64(fd, cmd, (unsigned long)&kernel);
+	set_fs(fs);
+
+	if (!ret && (cmd == F_GETLK64 || cmd == F_OFD_GETLK)) {
+		user.l_type	= kernel.l_type;
+		user.l_whence	= kernel.l_whence;
+		user.l_start	= kernel.l_start;
+		user.l_len	= kernel.l_len;
+		user.l_pid	= kernel.l_pid;
+		if (copy_to_user((struct oabi_flock64 __user *)arg,
+				 &user, sizeof(user)))
+			ret = -EFAULT;
+	}
+	return ret;
+}
+
 asmlinkage long sys_oabi_fcntl64(unsigned int fd, unsigned int cmd,
 				 unsigned long arg)
 {
-	struct oabi_flock64 user;
-	struct flock64 kernel;
-	mm_segment_t fs = USER_DS; /* initialized to kill a warning */
-	unsigned long local_arg = arg;
-	int ret;
-
 	switch (cmd) {
+	case F_OFD_GETLK:
+	case F_OFD_SETLK:
+	case F_OFD_SETLKW:
 	case F_GETLK64:
 	case F_SETLK64:
 	case F_SETLKW64:
-		if (copy_from_user(&user, (struct oabi_flock64 __user *)arg,
-				   sizeof(user)))
-			return -EFAULT;
-		kernel.l_type	= user.l_type;
-		kernel.l_whence	= user.l_whence;
-		kernel.l_start	= user.l_start;
-		kernel.l_len	= user.l_len;
-		kernel.l_pid	= user.l_pid;
-		local_arg = (unsigned long)&kernel;
-		fs = get_fs();
-		set_fs(KERNEL_DS);
+		return do_locks(fd, cmd, arg);
+
+	default:
+		return sys_fcntl64(fd, cmd, arg);
 	}
-
-	ret = sys_fcntl64(fd, cmd, local_arg);
-
-	switch (cmd) {
-	case F_GETLK64:
-		if (!ret) {
-			user.l_type	= kernel.l_type;
-			user.l_whence	= kernel.l_whence;
-			user.l_start	= kernel.l_start;
-			user.l_len	= kernel.l_len;
-			user.l_pid	= kernel.l_pid;
-			if (copy_to_user((struct oabi_flock64 __user *)arg,
-					 &user, sizeof(user)))
-				ret = -EFAULT;
-		}
-	case F_SETLK64:
-	case F_SETLKW64:
-		set_fs(fs);
-	}
-
-	return ret;
 }
 
 struct oabi_epoll_event {
@@ -311,7 +315,7 @@ asmlinkage long sys_oabi_semtimedop(int semid,
 	long err;
 	int i;
 
-	if (nsops < 1)
+	if (nsops < 1 || nsops > SEMOPM)
 		return -EINVAL;
 	sops = kmalloc(sizeof(*sops) * nsops, GFP_KERNEL);
 	if (!sops)
@@ -345,9 +349,6 @@ asmlinkage long sys_oabi_semop(int semid, struct oabi_sembuf __user *tsops,
 {
 	return sys_oabi_semtimedop(semid, tsops, nsops, NULL);
 }
-
-extern asmlinkage int sys_ipc(uint call, int first, int second, int third,
-			      void __user *ptr, long fifth);
 
 asmlinkage int sys_oabi_ipc(uint call, int first, int second, int third,
 			    void __user *ptr, long fifth)

@@ -24,6 +24,8 @@
 #include "seq_oss_midi.h"
 #include "../seq_lock.h"
 #include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/nospec.h>
 
 /*
@@ -69,11 +71,11 @@ struct seq_oss_synth {
 static int max_synth_devs;
 static struct seq_oss_synth *synth_devs[SNDRV_SEQ_OSS_MAX_SYNTH_DEVS];
 static struct seq_oss_synth midi_synth_dev = {
-	-1, /* seq_device */
-	SYNTH_TYPE_MIDI, /* synth_type */
-	0, /* synth_subtype */
-	16, /* nr_voices */
-	"MIDI", /* name */
+	.seq_device = -1,
+	.synth_type = SYNTH_TYPE_MIDI,
+	.synth_subtype = 0,
+	.nr_voices = 16,
+	.name = "MIDI",
 };
 
 static DEFINE_SPINLOCK(register_lock);
@@ -97,17 +99,17 @@ snd_seq_oss_synth_init(void)
  * registration of the synth device
  */
 int
-snd_seq_oss_synth_register(struct snd_seq_device *dev)
+snd_seq_oss_synth_probe(struct device *_dev)
 {
+	struct snd_seq_device *dev = to_seq_dev(_dev);
 	int i;
 	struct seq_oss_synth *rec;
 	struct snd_seq_oss_reg *reg = SNDRV_SEQ_DEVICE_ARGPTR(dev);
 	unsigned long flags;
 
-	if ((rec = kzalloc(sizeof(*rec), GFP_KERNEL)) == NULL) {
-		pr_err("ALSA: seq_oss: can't malloc synth info\n");
+	rec = kzalloc(sizeof(*rec), GFP_KERNEL);
+	if (!rec)
 		return -ENOMEM;
-	}
 	rec->seq_device = -1;
 	rec->synth_type = reg->type;
 	rec->synth_subtype = reg->subtype;
@@ -148,8 +150,9 @@ snd_seq_oss_synth_register(struct snd_seq_device *dev)
 
 
 int
-snd_seq_oss_synth_unregister(struct snd_seq_device *dev)
+snd_seq_oss_synth_remove(struct device *_dev)
 {
+	struct snd_seq_device *dev = to_seq_dev(_dev);
 	int index;
 	struct seq_oss_synth *rec = dev->driver_data;
 	unsigned long flags;
@@ -194,7 +197,6 @@ get_sdev(int dev)
 	unsigned long flags;
 
 	spin_lock_irqsave(&register_lock, flags);
-	dev = array_index_nospec(dev, SNDRV_SEQ_OSS_MAX_SYNTH_DEVS);
 	rec = synth_devs[dev];
 	if (rec)
 		snd_use_lock_use(&rec->use_lock);
@@ -247,7 +249,6 @@ snd_seq_oss_synth_setup(struct seq_oss_devinfo *dp)
 		if (info->nr_voices > 0) {
 			info->ch = kcalloc(info->nr_voices, sizeof(struct seq_oss_chinfo), GFP_KERNEL);
 			if (!info->ch) {
-				pr_err("ALSA: seq_oss: Cannot malloc voices\n");
 				rec->oper.close(&info->arg);
 				module_put(rec->oper.owner);
 				snd_use_lock_free(&rec->use_lock);
@@ -308,7 +309,7 @@ snd_seq_oss_synth_cleanup(struct seq_oss_devinfo *dp)
 	struct seq_oss_synth *rec;
 	struct seq_oss_synthinfo *info;
 
-	if (snd_BUG_ON(dp->max_synthdev >= SNDRV_SEQ_OSS_MAX_SYNTH_DEVS))
+	if (snd_BUG_ON(dp->max_synthdev > SNDRV_SEQ_OSS_MAX_SYNTH_DEVS))
 		return;
 	for (i = 0; i < dp->max_synthdev; i++) {
 		info = &dp->synths[i];
@@ -616,14 +617,14 @@ int
 snd_seq_oss_synth_make_info(struct seq_oss_devinfo *dp, int dev, struct synth_info *inf)
 {
 	struct seq_oss_synth *rec;
+	struct seq_oss_synthinfo *info = get_synthinfo_nospec(dp, dev);
 
-	if (dev < 0 || dev >= dp->max_synthdev)
+	if (!info)
 		return -ENXIO;
-	dev = array_index_nospec(dev, dp->max_synthdev);
 
-	if (dp->synths[dev].is_midi) {
+	if (info->is_midi) {
 		struct midi_info minf;
-		snd_seq_oss_midi_make_info(dp, dp->synths[dev].midi_mapped, &minf);
+		snd_seq_oss_midi_make_info(dp, info->midi_mapped, &minf);
 		inf->synth_type = SYNTH_TYPE_MIDI;
 		inf->synth_subtype = 0;
 		inf->nr_voices = 16;
@@ -643,7 +644,7 @@ snd_seq_oss_synth_make_info(struct seq_oss_devinfo *dp, int dev, struct synth_in
 }
 
 
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 /*
  * proc interface
  */
@@ -671,4 +672,4 @@ snd_seq_oss_synth_info_read(struct snd_info_buffer *buf)
 		snd_use_lock_free(&rec->use_lock);
 	}
 }
-#endif /* CONFIG_PROC_FS */
+#endif /* CONFIG_SND_PROC_FS */

@@ -1,10 +1,43 @@
 #ifndef _ASM_X86_IO_H
 #define _ASM_X86_IO_H
 
+/*
+ * This file contains the definitions for the x86 IO instructions
+ * inb/inw/inl/outb/outw/outl and the "string versions" of the same
+ * (insb/insw/insl/outsb/outsw/outsl). You can also use "pausing"
+ * versions of the single-IO instructions (inb_p/inw_p/..).
+ *
+ * This file is not meant to be obfuscating: it's just complicated
+ * to (a) handle it all in a way that makes gcc able to optimize it
+ * as well as possible and (b) trying to avoid writing the same thing
+ * over and over again with slight variations and possibly making a
+ * mistake somewhere.
+ */
+
+/*
+ * Thanks to James van Artsdalen for a better timing-fix than
+ * the two short jumps: using outb's to a nonexistent port seems
+ * to guarantee better timings even on fast machines.
+ *
+ * On the other hand, I'd like to be sure of a non-existent port:
+ * I feel a bit unsafe about using 0x80 (should be safe, though)
+ *
+ *		Linus
+ */
+
+ /*
+  *  Bit simplified and optimized by Jan Hubicka
+  *  Support of BIGMEM added by Gerhard Wichert, Siemens AG, July 1999.
+  *
+  *  isa_memset_io, isa_memcpy_fromio, isa_memcpy_toio added,
+  *  isa_read[wl] and isa_write[wl] fixed
+  *  - Arnaldo Carvalho de Melo <acme@conectiva.com.br>
+  */
+
 #define ARCH_HAS_IOREMAP_WC
 
+#include <linux/string.h>
 #include <linux/compiler.h>
-#include <asm-generic/int-ll64.h>
 #include <asm/page.h>
 
 #define build_mmio_read(name, size, type, reg, barrier) \
@@ -40,6 +73,9 @@ build_mmio_write(__writel, "l", unsigned int, "r", )
 #define __raw_readw __readw
 #define __raw_readl __readl
 
+#define writeb_relaxed(v, a) __writeb(v, a)
+#define writew_relaxed(v, a) __writew(v, a)
+#define writel_relaxed(v, a) __writel(v, a)
 #define __raw_writeb __writeb
 #define __raw_writew __writew
 #define __raw_writel __writel
@@ -51,28 +87,8 @@ build_mmio_write(__writel, "l", unsigned int, "r", )
 build_mmio_read(readq, "q", unsigned long, "=r", :"memory")
 build_mmio_write(writeq, "q", unsigned long, "r", :"memory")
 
-#else
-
-static inline __u64 readq(const volatile void __iomem *addr)
-{
-	const volatile u32 __iomem *p = addr;
-	u32 low, high;
-
-	low = readl(p);
-	high = readl(p + 1);
-
-	return low + ((u64)high << 32);
-}
-
-static inline void writeq(__u64 val, volatile void __iomem *addr)
-{
-	writel(val, addr);
-	writel(val >> 32, addr+4);
-}
-
-#endif
-
 #define readq_relaxed(a)	readq(a)
+#define writeq_relaxed(v, a)	writeq(v, a)
 
 #define __raw_readq(a)		readq(a)
 #define __raw_writeq(val, addr)	writeq(val, addr)
@@ -80,6 +96,8 @@ static inline void writeq(__u64 val, volatile void __iomem *addr)
 /* Let people know that we have them */
 #define readq			readq
 #define writeq			writeq
+
+#endif
 
 /**
  *	virt_to_phys	-	map virtual addresses to physical
@@ -161,6 +179,7 @@ extern void __iomem *ioremap_nocache(resource_size_t offset, unsigned long size)
 extern void __iomem *ioremap_cache(resource_size_t offset, unsigned long size);
 extern void __iomem *ioremap_prot(resource_size_t offset, unsigned long size,
 				unsigned long prot_val);
+extern void __iomem *ioremap_encrypted(resource_size_t phys_addr, unsigned long size);
 
 /*
  * The default ioremap() behavior is non-cached:
@@ -174,17 +193,168 @@ extern void iounmap(volatile void __iomem *addr);
 
 extern void set_iounmap_nonlazy(void);
 
-#ifdef CONFIG_X86_32
-# include "io_32.h"
+#ifdef __KERNEL__
+
+#include <asm-generic/iomap.h>
+
+#include <linux/vmalloc.h>
+
+/*
+ * Convert a virtual cached pointer to an uncached pointer
+ */
+#define xlate_dev_kmem_ptr(p)	p
+
+static inline void
+memset_io(volatile void __iomem *addr, unsigned char val, size_t count)
+{
+	memset((void __force *)addr, val, count);
+}
+
+static inline void
+memcpy_fromio(void *dst, const volatile void __iomem *src, size_t count)
+{
+	memcpy(dst, (const void __force *)src, count);
+}
+
+static inline void
+memcpy_toio(volatile void __iomem *dst, const void *src, size_t count)
+{
+	memcpy((void __force *)dst, src, count);
+}
+
+/*
+ * ISA space is 'always mapped' on a typical x86 system, no need to
+ * explicitly ioremap() it. The fact that the ISA IO space is mapped
+ * to PAGE_OFFSET is pure coincidence - it does not mean ISA values
+ * are physical addresses. The following constant pointer can be
+ * used as the IO-area pointer (it can be iounmapped as well, so the
+ * analogy with PCI is quite large):
+ */
+#define __ISA_IO_base ((char __iomem *)(PAGE_OFFSET))
+
+/*
+ *	Cache management
+ *
+ *	This needed for two cases
+ *	1. Out of order aware processors
+ *	2. Accidentally out of order processors (PPro errata #51)
+ */
+
+static inline void flush_write_buffers(void)
+{
+#if defined(CONFIG_X86_PPRO_FENCE)
+	asm volatile("lock; addl $0,0(%%esp)": : :"memory");
+#endif
+}
+
+#endif /* __KERNEL__ */
+
+extern void native_io_delay(void);
+
+extern int io_delay_type;
+extern void io_delay_init(void);
+
+#if defined(CONFIG_PARAVIRT)
+#include <asm/paravirt.h>
 #else
-# include "io_64.h"
+
+static inline void slow_down_io(void)
+{
+	native_io_delay();
+#ifdef REALLY_SLOW_IO
+	native_io_delay();
+	native_io_delay();
+	native_io_delay();
+#endif
+}
+
 #endif
 
-extern void *xlate_dev_mem_ptr(unsigned long phys);
-extern void unxlate_dev_mem_ptr(unsigned long phys, void *addr);
+#ifdef CONFIG_AMD_MEM_ENCRYPT
+#include <linux/jump_label.h>
+
+extern struct static_key sev_enable_key;
+
+static inline bool sev_key_active(void)
+{
+	return static_key_false(&sev_enable_key);
+}
+
+#else /* !CONFIG_AMD_MEM_ENCRYPT */
+
+static inline bool sev_key_active(void) { return false; }
+
+#endif /* CONFIG_AMD_MEM_ENCRYPT */
+
+#define BUILDIO(bwl, bw, type)						\
+static inline void out##bwl(unsigned type value, int port)		\
+{									\
+	asm volatile("out" #bwl " %" #bw "0, %w1"			\
+		     : : "a"(value), "Nd"(port));			\
+}									\
+									\
+static inline unsigned type in##bwl(int port)				\
+{									\
+	unsigned type value;						\
+	asm volatile("in" #bwl " %w1, %" #bw "0"			\
+		     : "=a"(value) : "Nd"(port));			\
+	return value;							\
+}									\
+									\
+static inline void out##bwl##_p(unsigned type value, int port)		\
+{									\
+	out##bwl(value, port);						\
+	slow_down_io();							\
+}									\
+									\
+static inline unsigned type in##bwl##_p(int port)			\
+{									\
+	unsigned type value = in##bwl(port);				\
+	slow_down_io();							\
+	return value;							\
+}									\
+									\
+static inline void outs##bwl(int port, const void *addr, unsigned long count) \
+{									\
+	if (sev_key_active()) {						\
+		unsigned type *value = (unsigned type *)addr;		\
+		while (count) {						\
+			out##bwl(*value, port);				\
+			value++;					\
+			count--;					\
+		}							\
+	} else {							\
+		asm volatile("rep; outs" #bwl				\
+			     : "+S"(addr), "+c"(count)			\
+			     : "d"(port) : "memory");			\
+	}								\
+}									\
+									\
+static inline void ins##bwl(int port, void *addr, unsigned long count)	\
+{									\
+	if (sev_key_active()) {						\
+		unsigned type *value = (unsigned type *)addr;		\
+		while (count) {						\
+			*value = in##bwl(port);				\
+			value++;					\
+			count--;					\
+		}							\
+	} else {							\
+		asm volatile("rep; ins" #bwl				\
+			     : "+D"(addr), "+c"(count)			\
+			     : "d"(port) : "memory");			\
+	}								\
+}
+
+BUILDIO(b, b, char)
+BUILDIO(w, w, short)
+BUILDIO(l, , int)
+
+extern void *xlate_dev_mem_ptr(phys_addr_t phys);
+extern void unxlate_dev_mem_ptr(phys_addr_t phys, void *addr);
 
 extern int ioremap_change_attr(unsigned long vaddr, unsigned long size,
-				unsigned long prot_val);
+				enum page_cache_mode pcm);
 extern void __iomem *ioremap_wc(resource_size_t offset, unsigned long size);
 
 /*
@@ -196,9 +366,24 @@ extern void early_ioremap_init(void);
 extern void early_ioremap_reset(void);
 extern void __iomem *early_ioremap(resource_size_t phys_addr,
 				   unsigned long size);
-extern void __iomem *early_memremap(resource_size_t phys_addr,
+extern void *early_memremap(resource_size_t phys_addr,
 				    unsigned long size);
 extern void early_iounmap(void __iomem *addr, unsigned long size);
+extern void early_memunmap(void *addr, unsigned long size);
+extern void fixup_early_ioremap(void);
+extern bool is_early_ioremap_ptep(pte_t *ptep);
+
+#ifdef CONFIG_XEN
+#include <xen/xen.h>
+struct bio_vec;
+
+extern bool xen_biovec_phys_mergeable(const struct bio_vec *vec1,
+				      const struct bio_vec *vec2);
+
+#define BIOVEC_PHYS_MERGEABLE(vec1, vec2)				\
+	(__BIOVEC_PHYS_MERGEABLE(vec1, vec2) &&				\
+	 (!xen_domain() || xen_biovec_phys_mergeable(vec1, vec2)))
+#endif	/* CONFIG_XEN */
 
 #define IO_SPACE_LIMIT 0xffff
 
@@ -207,6 +392,20 @@ extern int __must_check arch_phys_wc_add(unsigned long base,
 					 unsigned long size);
 extern void arch_phys_wc_del(int handle);
 #define arch_phys_wc_add arch_phys_wc_add
+#endif
+
+extern bool arch_memremap_can_ram_remap(resource_size_t offset,
+					unsigned long size,
+					unsigned long flags);
+#define arch_memremap_can_ram_remap arch_memremap_can_ram_remap
+
+extern bool phys_mem_access_encrypted(unsigned long phys_addr,
+				      unsigned long size);
+
+#ifdef CONFIG_X86_PAT
+extern int arch_io_reserve_memtype_wc(resource_size_t start, resource_size_t size);
+extern void arch_io_free_memtype_wc(resource_size_t start, resource_size_t size);
+#define arch_io_reserve_memtype_wc arch_io_reserve_memtype_wc
 #endif
 
 #endif /* _ASM_X86_IO_H */

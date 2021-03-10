@@ -4,7 +4,9 @@
 conmakehash
 kallsyms
 pnmtologo
-bin2c
 unifdef
-binoffset
 ihex2fw
+recordmcount
+docproc
+sortextable
+asn1_compiler

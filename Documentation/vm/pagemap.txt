@@ -15,8 +15,10 @@ There are three components to pagemap:
     * Bits 0-54  page frame number (PFN) if present
     * Bits 0-4   swap type if swapped
     * Bits 5-54  swap offset if swapped
-    * Bits 55-60 page shift (page size = 1<<page shift)
-    * Bit  61    reserved for future use
+    * Bit  55    pte is soft-dirty (see Documentation/vm/soft-dirty.txt)
+    * Bit  56    page exclusively mapped
+    * Bits 57-60 zero
+    * Bit  61    page is file-page or shared-anon
     * Bit  62    page swapped
     * Bit  63    page present
 
@@ -60,6 +62,8 @@ There are three components to pagemap:
     19. HWPOISON
     20. NOPAGE
     21. KSM
+    22. THP
+    25. IDLE
 
 Short descriptions to the page flags:
 
@@ -96,6 +100,15 @@ Short descriptions to the page flags:
 
 21. KSM
     identical memory pages dynamically shared between one or more processes
+
+22. THP
+    contiguous pages which construct transparent hugepages
+
+25. IDLE
+    page has not been accessed since it was marked idle (see
+    Documentation/vm/idle_page_tracking.txt). Note that this flag may be
+    stale in case the page was accessed via a PTE. To make sure the flag
+    is up-to-date one has to read /sys/kernel/mm/page_idle/bitmap first.
 
     [IO related page flags]
  1. ERROR     IO error occurred

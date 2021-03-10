@@ -1,8 +1,10 @@
-#include <linux/sysdev.h>
+#include <linux/device.h>
 #include <asm/mce.h>
 
 enum severity_level {
 	MCE_NO_SEVERITY,
+	MCE_DEFERRED_SEVERITY,
+	MCE_UCNA_SEVERITY = MCE_DEFERRED_SEVERITY,
 	MCE_KEEP_SEVERITY,
 	MCE_SOME_SEVERITY,
 	MCE_AO_SEVERITY,
@@ -11,6 +13,8 @@ enum severity_level {
 	MCE_PANIC_SEVERITY,
 };
 
+extern struct blocking_notifier_head x86_mce_decoder_chain;
+
 #define ATTR_LEN		16
 #define INITIAL_CHECK_INTERVAL	5 * 60 /* 5 minutes */
 
@@ -18,14 +22,23 @@ enum severity_level {
 struct mce_bank {
 	u64			ctl;			/* subevents to enable */
 	unsigned char init;				/* initialise bank? */
-	struct sysdev_attribute attr;			/* sysdev attribute */
+	struct device_attribute attr;			/* device attribute */
 	char			attrname[ATTR_LEN];	/* attribute name */
 };
 
-int mce_severity(struct mce *a, int tolerant, char **msg);
-struct dentry *mce_get_debugfs_dir(void);
+struct mce_evt_llist {
+	struct llist_node llnode;
+	struct mce mce;
+};
 
-extern int mce_ser;
+void mce_gen_pool_process(void);
+bool mce_gen_pool_empty(void);
+int mce_gen_pool_add(struct mce *mce);
+int mce_gen_pool_init(void);
+struct llist_node *mce_gen_pool_prepare_records(void);
+
+extern int (*mce_severity)(struct mce *a, int tolerant, char **msg, bool is_excp);
+struct dentry *mce_get_debugfs_dir(void);
 
 extern struct mce_bank *mce_banks;
 extern mce_banks_t mce_banks_ce_disabled;
@@ -67,3 +80,19 @@ static inline int apei_clear_mce(u64 record_id)
 	return -EINVAL;
 }
 #endif
+
+void mce_inject_log(struct mce *m);
+
+/*
+ * We consider records to be equivalent if bank+status+addr+misc all match.
+ * This is only used when the system is going down because of a fatal error
+ * to avoid cluttering the console log with essentially repeated information.
+ * In normal processing all errors seen are logged.
+ */
+static inline bool mce_cmp(struct mce *m1, struct mce *m2)
+{
+	return m1->bank != m2->bank ||
+		m1->status != m2->status ||
+		m1->addr != m2->addr ||
+		m1->misc != m2->misc;
+}

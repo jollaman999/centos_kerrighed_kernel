@@ -1,5 +1,5 @@
 /*
- * Driver for HP iLO/iLO2 management processor.
+ * Driver for the HP iLO management processor.
  *
  * Copyright (C) 2008 Hewlett-Packard Development Company, L.P.
  *	David Altobelli <david.altobelli@hpe.com>
@@ -25,12 +25,20 @@
 #include <linux/io.h>
 #include <linux/wait.h>
 #include <linux/poll.h>
+#include <linux/slab.h>
 #include "hpilo.h"
 
 static struct class *ilo_class;
 static unsigned int ilo_major;
 static unsigned int max_ccb = 16;
 static char ilo_hwdev[MAX_ILO_DEV];
+static const struct pci_device_id ilo_blacklist[] = {
+	/* auxiliary iLO */
+	{PCI_DEVICE_SUB(PCI_VENDOR_ID_HP, 0x3307, PCI_VENDOR_ID_HP, 0x1979)},
+	/* CL */
+	{PCI_DEVICE_SUB(PCI_VENDOR_ID_HP, 0x3307, PCI_VENDOR_ID_HP_3PAR, 0x0289)},
+	{}
+};
 
 static inline int get_entry_id(int entry)
 {
@@ -640,6 +648,7 @@ static const struct file_operations ilo_fops = {
 	.poll		= ilo_poll,
 	.open 		= ilo_open,
 	.release 	= ilo_close,
+	.llseek		= noop_llseek,
 };
 
 static irqreturn_t ilo_isr(int irq, void *data)
@@ -684,11 +693,10 @@ static void ilo_unmap_device(struct pci_dev *pdev, struct ilo_hwinfo *hw)
 	pci_iounmap(pdev, hw->mmio_vaddr);
 }
 
-static int __devinit ilo_map_device(struct pci_dev *pdev, struct ilo_hwinfo *hw)
+static int ilo_map_device(struct pci_dev *pdev, struct ilo_hwinfo *hw)
 {
 	int bar;
 	unsigned long off;
-	unsigned long sz;
 
 	/* map the memory mapped i/o registers */
 	hw->mmio_vaddr = pci_iomap(pdev, 1, 0);
@@ -702,13 +710,11 @@ static int __devinit ilo_map_device(struct pci_dev *pdev, struct ilo_hwinfo *hw)
 		bar = 5;
 		/* Last 8k is reserved for CCBs */
 		off = pci_resource_len(pdev, bar) - 0x2000;
-		sz = 0;
 	} else {
 		bar = 2;
 		off = 0;
-		sz = max_ccb * ILOHW_CCB_SZ;
 	}
-	hw->ram_vaddr = pci_iomap(pdev, bar, sz) + off;
+	hw->ram_vaddr = pci_iomap_range(pdev, bar, off, max_ccb * ILOHW_CCB_SZ);
 	if (hw->ram_vaddr == NULL) {
 		dev_err(&pdev->dev, "Error mapping shared mem\n");
 		goto mmio_free;
@@ -761,15 +767,16 @@ static void ilo_remove(struct pci_dev *pdev)
 	ilo_hwdev[(minor / max_ccb)] = 0;
 }
 
-static int __devinit ilo_probe(struct pci_dev *pdev,
+static int ilo_probe(struct pci_dev *pdev,
 			       const struct pci_device_id *ent)
 {
 	int devnum, minor, start, error = 0;
 	struct ilo_hwinfo *ilo_hw;
 
-	/* Ignore subsystem_device = 0x1979 (set by BIOS)  */
-	if (pdev->subsystem_device == 0x1979)
-		return 0;
+	if (pci_match_id(ilo_blacklist, pdev)) {
+		dev_dbg(&pdev->dev, "Not supported on this device\n");
+		return -ENODEV;
+	}
 
 	if (max_ccb > MAX_CCB)
 		max_ccb = MAX_CCB;
@@ -869,7 +876,7 @@ static struct pci_driver ilo_driver = {
 	.name 	  = ILO_NAME,
 	.id_table = ilo_devices,
 	.probe 	  = ilo_probe,
-	.remove   = __devexit_p(ilo_remove),
+	.remove   = ilo_remove,
 };
 
 static int __init ilo_init(void)
@@ -916,7 +923,7 @@ MODULE_AUTHOR("David Altobelli <david.altobelli@hpe.com>");
 MODULE_LICENSE("GPL v2");
 
 module_param(max_ccb, uint, 0444);
-MODULE_PARM_DESC(max_ccb, "Maximum number of HP iLO channels to attach (16)");
+MODULE_PARM_DESC(max_ccb, "Maximum number of HP iLO channels to attach (8-24)(default=16)");
 
 module_init(ilo_init);
 module_exit(ilo_exit);

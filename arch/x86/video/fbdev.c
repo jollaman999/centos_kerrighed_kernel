@@ -8,6 +8,7 @@
  */
 #include <linux/fb.h>
 #include <linux/pci.h>
+#include <linux/module.h>
 #include <linux/vgaarb.h>
 
 int fb_is_primary_device(struct fb_info *info)
@@ -31,6 +32,7 @@ int fb_is_primary_device(struct fb_info *info)
 	}
 
 	res = &pci_dev->resource[PCI_ROM_RESOURCE];
+
 	if (res && res->flags & IORESOURCE_ROM_SHADOW)
 		return 1;
 

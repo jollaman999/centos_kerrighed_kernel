@@ -25,14 +25,12 @@
 #include <linux/spinlock.h>
 #include <linux/rwsem.h>
 #include <linux/init.h>
-#include <linux/smp_lock.h>
 #include <linux/mutex.h>
+#include <linux/jiffies.h>
 
 #include <asm/hardware/dec21285.h>
 #include <asm/io.h>
-#include <asm/leds.h>
 #include <asm/mach-types.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 
 /*****************************************************************************/
@@ -40,6 +38,7 @@
 
 #define	NWFLASH_VERSION "6.4"
 
+static DEFINE_MUTEX(flash_mutex);
 static void kick_open(void);
 static int get_flash_id(void);
 static int erase_block(int nBlock);
@@ -50,7 +49,7 @@ static int write_block(unsigned long p, const char __user *buf, int count);
 #define KFLASH_ID	0x89A6		//Intel flash
 #define KFLASH_ID4	0xB0D4		//Intel flash 4Meg
 
-static int flashdebug;		//if set - we will display progress msgs
+static bool flashdebug;		//if set - we will display progress msgs
 
 static int gbWriteEnable;
 static int gbWriteBase64Enable;
@@ -93,8 +92,9 @@ static int get_flash_id(void)
 	return c2;
 }
 
-static int flash_ioctl(struct inode *inodep, struct file *filep, unsigned int cmd, unsigned long arg)
+static long flash_ioctl(struct file *filep, unsigned int cmd, unsigned long arg)
 {
+	mutex_lock(&flash_mutex);
 	switch (cmd) {
 	case CMD_WRITE_DISABLE:
 		gbWriteBase64Enable = 0;
@@ -112,8 +112,10 @@ static int flash_ioctl(struct inode *inodep, struct file *filep, unsigned int cm
 	default:
 		gbWriteBase64Enable = 0;
 		gbWriteEnable = 0;
+		mutex_unlock(&flash_mutex);
 		return -EINVAL;
 	}
+	mutex_unlock(&flash_mutex);
 	return 0;
 }
 
@@ -175,9 +177,6 @@ static ssize_t flash_write(struct file *file, const char __user *buf,
 		return -ERESTARTSYS;
 
 	written = 0;
-
-	leds_event(led_claim);
-	leds_event(led_green_on);
 
 	nBlock = (int) p >> 16;	//block # of 64K bytes
 
@@ -255,11 +254,6 @@ static ssize_t flash_write(struct file *file, const char __user *buf,
 			printk(KERN_DEBUG "flash_write: written 0x%X bytes OK.\n", written);
 	}
 
-	/*
-	 * restore reg on exit
-	 */
-	leds_event(led_release);
-
 	mutex_unlock(&nwflash_mutex);
 
 	return written;
@@ -278,42 +272,13 @@ static loff_t flash_llseek(struct file *file, loff_t offset, int orig)
 {
 	loff_t ret;
 
-	lock_kernel();
+	mutex_lock(&flash_mutex);
 	if (flashdebug)
 		printk(KERN_DEBUG "flash_llseek: offset=0x%X, orig=0x%X.\n",
 		       (unsigned int) offset, orig);
 
-	switch (orig) {
-	case 0:
-		if (offset < 0) {
-			ret = -EINVAL;
-			break;
-		}
-
-		if ((unsigned int) offset > gbFlashSize) {
-			ret = -EINVAL;
-			break;
-		}
-
-		file->f_pos = (unsigned int) offset;
-		ret = file->f_pos;
-		break;
-	case 1:
-		if ((file->f_pos + offset) > gbFlashSize) {
-			ret = -EINVAL;
-			break;
-		}
-		if ((file->f_pos + offset) < 0) {
-			ret = -EINVAL;
-			break;
-		}
-		file->f_pos += offset;
-		ret = file->f_pos;
-		break;
-	default:
-		ret = -EINVAL;
-	}
-	unlock_kernel();
+	ret = no_seek_end_llseek_size(file, offset, orig, gbFlashSize);
+	mutex_unlock(&flash_mutex);
 	return ret;
 }
 
@@ -329,11 +294,6 @@ static int erase_block(int nBlock)
 	volatile unsigned char *pWritePtr;
 	unsigned long timeout;
 	int temp, temp1;
-
-	/*
-	 * orange LED == erase
-	 */
-	leds_event(led_amber_on);
 
 	/*
 	 * reset footbridge to the correct offset 0 (...0..3)
@@ -443,12 +403,6 @@ static int write_block(unsigned long p, const char __user *buf, int count)
 	unsigned long timeout;
 	unsigned long timeout1;
 
-	/*
-	 * red LED == write
-	 */
-	leds_event(led_amber_off);
-	leds_event(led_red_on);
-
 	pWritePtr = (unsigned char *) ((unsigned int) (FLASH_BASE + p));
 
 	/*
@@ -555,17 +509,9 @@ static int write_block(unsigned long p, const char __user *buf, int count)
 					       pWritePtr - FLASH_BASE);
 
 				/*
-				 * no LED == waiting
-				 */
-				leds_event(led_amber_off);
-				/*
 				 * wait couple ms
 				 */
 				msleep(10);
-				/*
-				 * red LED == write
-				 */
-				leds_event(led_red_on);
 
 				goto WriteRetry;
 			} else {
@@ -579,12 +525,6 @@ static int write_block(unsigned long p, const char __user *buf, int count)
 			}
 		}
 	}
-
-	/*
-	 * green LED == read/verify
-	 */
-	leds_event(led_amber_off);
-	leds_event(led_green_on);
 
 	msleep(10);
 
@@ -614,9 +554,9 @@ static void kick_open(void)
 	 * we want to write a bit pattern XXX1 to Xilinx to enable
 	 * the write gate, which will be open for about the next 2ms.
 	 */
-	spin_lock_irqsave(&nw_gpio_lock, flags);
+	raw_spin_lock_irqsave(&nw_gpio_lock, flags);
 	nw_cpld_modify(CPLD_FLASH_WR_ENABLE, CPLD_FLASH_WR_ENABLE);
-	spin_unlock_irqrestore(&nw_gpio_lock, flags);
+	raw_spin_unlock_irqrestore(&nw_gpio_lock, flags);
 
 	/*
 	 * let the ISA bus to catch on...
@@ -630,7 +570,7 @@ static const struct file_operations flash_fops =
 	.llseek		= flash_llseek,
 	.read		= flash_read,
 	.write		= flash_write,
-	.ioctl		= flash_ioctl,
+	.unlocked_ioctl	= flash_ioctl,
 };
 
 static struct miscdevice flash_miscdev =

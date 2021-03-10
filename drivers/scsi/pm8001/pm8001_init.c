@@ -427,7 +427,7 @@ static int pm8001_ioremap(struct pm8001_hba_info *pm8001_ha)
 				pm8001_printk("PCI: bar %d, logicalBar %d ",
 				bar, logicalBar));
 			PM8001_INIT_DBG(pm8001_ha, pm8001_printk(
-				"base addr %llx virt_addr %llx len=%d\n",
+				"base addr %llx virt_addr=%llx len=%d\n",
 				(u64)pm8001_ha->io_mem[logicalBar].membase,
 				(u64)(unsigned long)
 				pm8001_ha->io_mem[logicalBar].memvirtaddr,
@@ -479,8 +479,7 @@ static struct pm8001_hba_info *pm8001_pci_alloc(struct pci_dev *pdev,
 
 #ifdef PM8001_USE_TASKLET
 	/* Tasklet for non msi-x interrupt handler */
-	if (!pci_find_capability(pdev, PCI_CAP_ID_MSIX) ||
-			(pm8001_ha->chip_id == chip_8001))
+	if ((!pdev->msix_cap) || (pm8001_ha->chip_id == chip_8001))
 		tasklet_init(&pm8001_ha->tasklet[0], pm8001_tasklet,
 			(unsigned long)&(pm8001_ha->irq_vector[0]));
 	else
@@ -600,8 +599,6 @@ static void  pm8001_post_sas_ha_init(struct Scsi_Host *shost,
 	sha->lldd_module = THIS_MODULE;
 	sha->sas_addr = &pm8001_ha->sas_addr[0];
 	sha->num_phys = chip_info->n_phy;
-	sha->lldd_max_execute_num = 1;
-	sha->lldd_queue_size = PM8001_CAN_QUEUE;
 	sha->core.shost = shost;
 }
 
@@ -795,7 +792,7 @@ static u32 pm8001_request_irq(struct pm8001_hba_info *pm8001_ha)
 	pdev = pm8001_ha->pdev;
 
 #ifdef PM8001_USE_MSIX
-	if (pci_find_capability(pdev, PCI_CAP_ID_MSIX))
+	if (pdev->msix_cap)
 		return pm8001_setup_msix(pm8001_ha);
 	else {
 		PM8001_INIT_DBG(pm8001_ha,
@@ -940,10 +937,10 @@ static void pm8001_pci_remove(struct pci_dev *pdev)
 	struct pm8001_hba_info *pm8001_ha;
 	int i, j;
 	pm8001_ha = sha->lldd_ha;
+	pci_set_drvdata(pdev, NULL);
 	sas_unregister_ha(sha);
 	sas_remove_host(pm8001_ha->shost);
 	list_del(&pm8001_ha->list);
-	scsi_remove_host(pm8001_ha->shost);
 	PM8001_CHIP_DISP->interrupt_disable(pm8001_ha, 0xFF);
 	PM8001_CHIP_DISP->chip_soft_rst(pm8001_ha);
 
@@ -959,8 +956,7 @@ static void pm8001_pci_remove(struct pci_dev *pdev)
 #endif
 #ifdef PM8001_USE_TASKLET
 	/* For non-msix and msix interrupts */
-	if (!pci_find_capability(pdev, PCI_CAP_ID_MSIX) ||
-			(pm8001_ha->chip_id == chip_8001))
+	if ((!pdev->msix_cap) || (pm8001_ha->chip_id == chip_8001))
 		tasklet_kill(&pm8001_ha->tasklet[0]);
 	else
 		for (j = 0; j < PM8001_MAX_MSIX_VEC; j++)
@@ -985,15 +981,14 @@ static int pm8001_pci_suspend(struct pci_dev *pdev, pm_message_t state)
 {
 	struct sas_ha_struct *sha = pci_get_drvdata(pdev);
 	struct pm8001_hba_info *pm8001_ha;
-	int i, j, pos;
+	int  i, j;
 	u32 device_state;
 	pm8001_ha = sha->lldd_ha;
 	sas_suspend_ha(sha);
 	flush_workqueue(pm8001_wq);
 	scsi_block_requests(pm8001_ha->shost);
-	pos = pci_find_capability(pdev, PCI_CAP_ID_PM);
-	if (pos == 0) {
-		printk(KERN_ERR " PCI PM not supported\n");
+	if (!pdev->pm_cap) {
+		dev_err(&pdev->dev, " PCI PM not supported\n");
 		return -ENODEV;
 	}
 	PM8001_CHIP_DISP->interrupt_disable(pm8001_ha, 0xFF);
@@ -1010,8 +1005,7 @@ static int pm8001_pci_suspend(struct pci_dev *pdev, pm_message_t state)
 #endif
 #ifdef PM8001_USE_TASKLET
 	/* For non-msix and msix interrupts */
-	if (!pci_find_capability(pdev, PCI_CAP_ID_MSIX) ||
-			(pm8001_ha->chip_id == chip_8001))
+	if ((!pdev->msix_cap) || (pm8001_ha->chip_id == chip_8001))
 		tasklet_kill(&pm8001_ha->tasklet[0]);
 	else
 		for (j = 0; j < PM8001_MAX_MSIX_VEC; j++)
@@ -1080,8 +1074,7 @@ static int pm8001_pci_resume(struct pci_dev *pdev)
 		goto err_out_disable;
 #ifdef PM8001_USE_TASKLET
 	/*  Tasklet for non msi-x interrupt handler */
-	if (!pci_find_capability(pdev, PCI_CAP_ID_MSIX) ||
-			(pm8001_ha->chip_id == chip_8001))
+	if ((!pdev->msix_cap) || (pm8001_ha->chip_id == chip_8001))
 		tasklet_init(&pm8001_ha->tasklet[0], pm8001_tasklet,
 			(unsigned long)&(pm8001_ha->irq_vector[0]));
 	else
@@ -1189,7 +1182,7 @@ static int __init pm8001_init(void)
 {
 	int rc = -ENOMEM;
 
-	pm8001_wq = create_workqueue("pm80xx");
+	pm8001_wq = alloc_workqueue("pm80xx", 0, 0);
 	if (!pm8001_wq)
 		goto err;
 
@@ -1223,6 +1216,7 @@ module_exit(pm8001_exit);
 MODULE_AUTHOR("Jack Wang <jack_wang@usish.com>");
 MODULE_AUTHOR("Anand Kumar Santhanam <AnandKumar.Santhanam@pmcs.com>");
 MODULE_AUTHOR("Sangeetha Gnanasekaran <Sangeetha.Gnanasekaran@pmcs.com>");
+MODULE_AUTHOR("Nikith Ganigarakoppal <Nikith.Ganigarakoppal@pmcs.com>");
 MODULE_DESCRIPTION(
 		"PMC-Sierra PM8001/8081/8088/8089/8074/8076/8077 "
 		"SAS/SATA controller driver");

@@ -1,19 +1,17 @@
 /*
  * This only handles 32bit MTRR on 32bit hosts. This is strictly wrong
- * because MTRRs can span upto 40 bits (36bits on most modern x86)
+ * because MTRRs can span up to 40 bits (36bits on most modern x86)
  */
 #define DEBUG
 
 #include <linux/module.h>
 #include <linux/init.h>
-#include <linux/slab.h>
 #include <linux/io.h>
 #include <linux/mm.h>
 
 #include <asm/processor-flags.h>
 #include <asm/cpufeature.h>
 #include <asm/tlbflush.h>
-#include <asm/system.h>
 #include <asm/mtrr.h>
 #include <asm/msr.h>
 #include <asm/pat.h>
@@ -77,108 +75,239 @@ static u64 get_mtrr_size(u64 mask)
 	return size;
 }
 
-
 /*
- * Returns the effective MTRR type for the region
- * Error returns:
- * - 0xFE - when the range is "not entirely covered" by _any_ var range MTRR
- * - 0xFF - when MTRR is not enabled
+ * Check and return the effective type for MTRR-MTRR type overlap.
+ * Returns 1 if the effective type is UNCACHEABLE, else returns 0
  */
-u8 mtrr_type_lookup(u64 start, u64 end)
+static int check_type_overlap(u8 *prev, u8 *curr)
 {
-	int i;
-	u8 prev_match, curr_match;
-
-	if (!mtrr_state_set)
-		return 0xFF;
-
-	if (!mtrr_state.enabled)
-		return 0xFF;
-
-	/* Make end inclusive end, instead of exclusive */
-	end--;
-
-	/* Look in fixed ranges. Just return the type as per start */
-	if (mtrr_state.have_fixed && (start < 0x100000)) {
-		int idx;
-
-		if (start < 0x80000) {
-			idx = 0;
-			idx += (start >> 16);
-			return mtrr_state.fixed_ranges[idx];
-		} else if (start < 0xC0000) {
-			idx = 1 * 8;
-			idx += ((start - 0x80000) >> 14);
-			return mtrr_state.fixed_ranges[idx];
-		} else if (start < 0x1000000) {
-			idx = 3 * 8;
-			idx += ((start - 0xC0000) >> 12);
-			return mtrr_state.fixed_ranges[idx];
-		}
+	if (*prev == MTRR_TYPE_UNCACHABLE || *curr == MTRR_TYPE_UNCACHABLE) {
+		*prev = MTRR_TYPE_UNCACHABLE;
+		*curr = MTRR_TYPE_UNCACHABLE;
+		return 1;
 	}
 
-	/*
-	 * Look in variable ranges
-	 * Look of multiple ranges matching this address and pick type
-	 * as per MTRR precedence
-	 */
-	if (!(mtrr_state.enabled & 2))
-		return mtrr_state.def_type;
+	if ((*prev == MTRR_TYPE_WRBACK && *curr == MTRR_TYPE_WRTHROUGH) ||
+	    (*prev == MTRR_TYPE_WRTHROUGH && *curr == MTRR_TYPE_WRBACK)) {
+		*prev = MTRR_TYPE_WRTHROUGH;
+		*curr = MTRR_TYPE_WRTHROUGH;
+	}
 
-	prev_match = 0xFF;
+	if (*prev != *curr) {
+		*prev = MTRR_TYPE_UNCACHABLE;
+		*curr = MTRR_TYPE_UNCACHABLE;
+		return 1;
+	}
+
+	return 0;
+}
+
+/**
+ * mtrr_type_lookup_fixed - look up memory type in MTRR fixed entries
+ *
+ * Return the MTRR fixed memory type of 'start'.
+ *
+ * MTRR fixed entries are divided into the following ways:
+ *  0x00000 - 0x7FFFF : This range is divided into eight 64KB sub-ranges
+ *  0x80000 - 0xBFFFF : This range is divided into sixteen 16KB sub-ranges
+ *  0xC0000 - 0xFFFFF : This range is divided into sixty-four 4KB sub-ranges
+ *
+ * Return Values:
+ * MTRR_TYPE_(type)  - Matched memory type
+ * MTRR_TYPE_INVALID - Unmatched
+ */
+static u8 mtrr_type_lookup_fixed(u64 start, u64 end)
+{
+	int idx;
+
+	if (start >= 0x100000)
+		return MTRR_TYPE_INVALID;
+
+	/* 0x0 - 0x7FFFF */
+	if (start < 0x80000) {
+		idx = 0;
+		idx += (start >> 16);
+		return mtrr_state.fixed_ranges[idx];
+	/* 0x80000 - 0xBFFFF */
+	} else if (start < 0xC0000) {
+		idx = 1 * 8;
+		idx += ((start - 0x80000) >> 14);
+		return mtrr_state.fixed_ranges[idx];
+	}
+
+	/* 0xC0000 - 0xFFFFF */
+	idx = 3 * 8;
+	idx += ((start - 0xC0000) >> 12);
+	return mtrr_state.fixed_ranges[idx];
+}
+
+/**
+ * mtrr_type_lookup_variable - look up memory type in MTRR variable entries
+ *
+ * Return Value:
+ * MTRR_TYPE_(type) - Matched memory type or default memory type (unmatched)
+ *
+ * Output Arguments:
+ * repeat - Set to 1 when [start:end] spanned across MTRR range and type
+ *	    returned corresponds only to [start:*partial_end].  Caller has
+ *	    to lookup again for [*partial_end:end].
+ *
+ * uniform - Set to 1 when an MTRR covers the region uniformly, i.e. the
+ *	     region is fully covered by a single MTRR entry or the default
+ *	     type.
+ */
+static u8 mtrr_type_lookup_variable(u64 start, u64 end, u64 *partial_end,
+				    int *repeat, u8 *uniform)
+{
+	int i;
+	u64 base, mask;
+	u8 prev_match, curr_match;
+
+	*repeat = 0;
+	*uniform = 1;
+
+	/* Make end inclusive instead of exclusive */
+	end--;
+
+	prev_match = MTRR_TYPE_INVALID;
 	for (i = 0; i < num_var_ranges; ++i) {
-		u64 mtrr_start, mtrr_end, mask;
+		unsigned short start_state, end_state, inclusive;
 
 		if (!(mtrr_state.var_ranges[i].mask_lo & (1 << 11)))
 			continue;
 
+		base = (((u64)mtrr_state.var_ranges[i].base_hi) << 32) +
+		       (mtrr_state.var_ranges[i].base_lo & PAGE_MASK);
 		mask = (((u64)mtrr_state.var_ranges[i].mask_hi) << 32) +
 		       (mtrr_state.var_ranges[i].mask_lo & PAGE_MASK);
-		mtrr_start = (((u64)mtrr_state.var_ranges[i].base_hi) << 32) +
-			     (mtrr_state.var_ranges[i].base_lo & PAGE_MASK);
-		mtrr_end = mtrr_start + get_mtrr_size(mask);
 
-		/*
-		 * Handle the case where the range overlap several mtrr, for
-		 * which we will consider all mtrr two by two and use the
-		 * lowest common denominator (uncache being lower, then write
-		 * through then write back).
-		 */
-		if (end < mtrr_start || start > mtrr_end)
+		start_state = ((start & mask) == (base & mask));
+		end_state = ((end & mask) == (base & mask));
+		inclusive = ((start < base) && (end > base));
+
+		if ((start_state != end_state) || inclusive) {
+			/*
+			 * We have start:end spanning across an MTRR.
+			 * We split the region into either
+			 *
+			 * - start_state:1
+			 * (start:mtrr_end)(mtrr_end:end)
+			 * - end_state:1
+			 * (start:mtrr_start)(mtrr_start:end)
+			 * - inclusive:1
+			 * (start:mtrr_start)(mtrr_start:mtrr_end)(mtrr_end:end)
+			 *
+			 * depending on kind of overlap.
+			 *
+			 * Return the type of the first region and a pointer
+			 * to the start of next region so that caller will be
+			 * advised to lookup again after having adjusted start
+			 * and end.
+			 *
+			 * Note: This way we handle overlaps with multiple
+			 * entries and the default type properly.
+			 */
+			if (start_state)
+				*partial_end = base + get_mtrr_size(mask);
+			else
+				*partial_end = base;
+
+			if (unlikely(*partial_end <= start)) {
+				WARN_ON(1);
+				*partial_end = start + PAGE_SIZE;
+			}
+
+			end = *partial_end - 1; /* end is inclusive */
+			*repeat = 1;
+			*uniform = 0;
+		}
+
+		if ((start & mask) != (base & mask))
 			continue;
 
 		curr_match = mtrr_state.var_ranges[i].base_lo & 0xff;
-		if (prev_match == 0xFF) {
+		if (prev_match == MTRR_TYPE_INVALID) {
 			prev_match = curr_match;
 			continue;
 		}
 
-		if (prev_match == MTRR_TYPE_UNCACHABLE ||
-		    curr_match == MTRR_TYPE_UNCACHABLE) {
-			return MTRR_TYPE_UNCACHABLE;
-		}
-
-		if ((prev_match == MTRR_TYPE_WRBACK &&
-		     curr_match == MTRR_TYPE_WRTHROUGH) ||
-		    (prev_match == MTRR_TYPE_WRTHROUGH &&
-		     curr_match == MTRR_TYPE_WRBACK)) {
-			prev_match = MTRR_TYPE_WRTHROUGH;
-			curr_match = MTRR_TYPE_WRTHROUGH;
-		}
-
-		if (prev_match != curr_match)
-			return MTRR_TYPE_UNCACHABLE;
+		*uniform = 0;
+		if (check_type_overlap(&prev_match, &curr_match))
+			return curr_match;
 	}
 
-	if (mtrr_tom2) {
-		if (start >= (1ULL<<32) && (end < mtrr_tom2))
-			return MTRR_TYPE_WRBACK;
-	}
-
-	if (prev_match != 0xFF)
+	if (prev_match != MTRR_TYPE_INVALID)
 		return prev_match;
 
 	return mtrr_state.def_type;
+}
+
+/**
+ * mtrr_type_lookup - look up memory type in MTRR
+ *
+ * Return Values:
+ * MTRR_TYPE_(type)  - The effective MTRR type for the region
+ * MTRR_TYPE_INVALID - MTRR is disabled
+ *
+ * Output Argument:
+ * uniform - Set to 1 when an MTRR covers the region uniformly, i.e. the
+ *	     region is fully covered by a single MTRR entry or the default
+ *	     type.
+ */
+u8 mtrr_type_lookup(u64 start, u64 end, u8 *uniform)
+{
+	u8 type, prev_type, is_uniform = 1, dummy;
+	int repeat;
+	u64 partial_end;
+
+	if (!mtrr_state_set)
+		return MTRR_TYPE_INVALID;
+
+	if (!(mtrr_state.enabled & MTRR_STATE_MTRR_ENABLED))
+		return MTRR_TYPE_INVALID;
+
+	/*
+	 * Look up the fixed ranges first, which take priority over
+	 * the variable ranges.
+	 */
+	if ((start < 0x100000) &&
+	    (mtrr_state.have_fixed) &&
+	    (mtrr_state.enabled & MTRR_STATE_MTRR_FIXED_ENABLED)) {
+		is_uniform = 0;
+		type = mtrr_type_lookup_fixed(start, end);
+		goto out;
+	}
+
+	/*
+	 * Look up the variable ranges.  Look of multiple ranges matching
+	 * this address and pick type as per MTRR precedence.
+	 */
+	type = mtrr_type_lookup_variable(start, end, &partial_end,
+					 &repeat, &is_uniform);
+
+	/*
+	 * Common path is with repeat = 0.
+	 * However, we can have cases where [start:end] spans across some
+	 * MTRR ranges and/or the default type.  Do repeated lookups for
+	 * that case here.
+	 */
+	while (repeat) {
+		prev_type = type;
+		start = partial_end;
+		is_uniform = 0;
+		type = mtrr_type_lookup_variable(start, end, &partial_end,
+						 &repeat, &dummy);
+
+		if (check_type_overlap(&prev_type, &type))
+			goto out;
+	}
+
+	if (mtrr_tom2 && (start >= (1ULL<<32)) && (end < mtrr_tom2))
+		type = MTRR_TYPE_WRBACK;
+
+out:
+	*uniform = is_uniform;
+	return type;
 }
 
 /* Get the MSR pair relating to a var range */
@@ -279,7 +408,9 @@ static void __init print_mtrr_state(void)
 		 mtrr_attrib_to_str(mtrr_state.def_type));
 	if (mtrr_state.have_fixed) {
 		pr_debug("MTRR fixed ranges %sabled:\n",
-			 mtrr_state.enabled & 1 ? "en" : "dis");
+			((mtrr_state.enabled & MTRR_STATE_MTRR_ENABLED) &&
+			 (mtrr_state.enabled & MTRR_STATE_MTRR_FIXED_ENABLED)) ?
+			 "en" : "dis");
 		print_fixed(0x00000, 0x10000, mtrr_state.fixed_ranges + 0);
 		for (i = 0; i < 2; ++i)
 			print_fixed(0x80000 + i * 0x20000, 0x04000,
@@ -292,12 +423,8 @@ static void __init print_mtrr_state(void)
 		print_fixed_last();
 	}
 	pr_debug("MTRR variable ranges %sabled:\n",
-		 mtrr_state.enabled & 2 ? "en" : "dis");
-	if (size_or_mask & 0xffffffffUL)
-		high_width = ffs(size_or_mask & 0xffffffffUL) - 1;
-	else
-		high_width = ffs(size_or_mask>>32) + 32 - 1;
-	high_width = (high_width - (32 - PAGE_SHIFT) + 3) / 4;
+		 mtrr_state.enabled & MTRR_STATE_MTRR_ENABLED ? "en" : "dis");
+	high_width = (__ffs64(size_or_mask) - (32 - PAGE_SHIFT) + 3) / 4;
 
 	for (i = 0; i < num_var_ranges; ++i) {
 		if (mtrr_state.var_ranges[i].mask_lo & (1 << 11))
@@ -449,13 +576,12 @@ static void generic_get_mtrr(unsigned int reg, unsigned long *base,
 	u32 mask_lo, mask_hi, base_lo, base_hi;
 	unsigned int hi;
 	u64 tmp, mask;
-	int cpu;
 
 	/*
 	 * get_mtrr doesn't need to update mtrr_state, also it could be called
 	 * from any cpu, so try to print it out directly.
 	 */
-	cpu = get_cpu();
+	get_cpu();
 
 	rdmsr(MTRRphysMask_MSR(reg), mask_lo, mask_hi);
 
@@ -480,7 +606,7 @@ static void generic_get_mtrr(unsigned int reg, unsigned long *base,
 
 		if (tmp != mask) {
 			printk(KERN_WARNING "mtrr: your BIOS has configured an incorrect mask, fixing it.\n");
-			add_taint(TAINT_FIRMWARE_WORKAROUND);
+			add_taint(TAINT_FIRMWARE_WORKAROUND, LOCKDEP_STILL_OK);
 			mask = tmp;
 		}
 	}
@@ -586,7 +712,7 @@ static unsigned long set_mtrr_state(void)
 
 
 static unsigned long cr4;
-static DEFINE_SPINLOCK(set_atomicity_lock);
+static DEFINE_RAW_SPINLOCK(set_atomicity_lock);
 
 /*
  * Since we are disabling the cache don't allow any interrupts,
@@ -606,7 +732,7 @@ static void prepare_set(void) __acquires(set_atomicity_lock)
 	 * changes to the way the kernel boots
 	 */
 
-	spin_lock(&set_atomicity_lock);
+	raw_spin_lock(&set_atomicity_lock);
 
 	/* Enter the no-fill (CD=1, NW=0) cache mode and flush caches. */
 	cr0 = read_cr0() | X86_CR0_CD;
@@ -627,6 +753,7 @@ static void prepare_set(void) __acquires(set_atomicity_lock)
 
 	/* Disable MTRRs, and set the default type to uncached */
 	mtrr_wrmsr(MSR_MTRRdefType, deftype_lo & ~0xcff, deftype_hi);
+	wbinvd();
 }
 
 static void post_set(void) __releases(set_atomicity_lock)
@@ -643,7 +770,7 @@ static void post_set(void) __releases(set_atomicity_lock)
 	/* Restore value of CR4 */
 	if (cpu_has_pge)
 		write_cr4(cr4);
-	spin_unlock(&set_atomicity_lock);
+	raw_spin_unlock(&set_atomicity_lock);
 }
 
 static void generic_set_all(void)
@@ -768,7 +895,7 @@ int positive_have_wrcomb(void)
 /*
  * Generic structure...
  */
-struct mtrr_ops generic_mtrr_ops = {
+const struct mtrr_ops generic_mtrr_ops = {
 	.use_intel_if		= 1,
 	.set_all		= generic_set_all,
 	.get			= generic_get_mtrr,

@@ -17,9 +17,6 @@
 #include <linux/pci.h>
 #include <linux/io.h>
 
-#if 1 /* in RHEL */
-#include <pcmcia/cs_types.h>
-#endif
 #include <pcmcia/cistpl.h>
 #include <pcmcia/ds.h>
 

@@ -675,7 +675,7 @@ bnx2i_find_ep_in_ofld_list(struct bnx2i_hba *hba, u32 iscsi_cid)
 {
 	struct list_head *list;
 	struct list_head *tmp;
-	struct bnx2i_endpoint *ep;
+	struct bnx2i_endpoint *ep = NULL;
 
 	read_lock_bh(&hba->ep_rdwr_lock);
 	list_for_each_safe(list, tmp, &hba->ep_ofld_list) {
@@ -703,7 +703,7 @@ bnx2i_find_ep_in_destroy_list(struct bnx2i_hba *hba, u32 iscsi_cid)
 {
 	struct list_head *list;
 	struct list_head *tmp;
-	struct bnx2i_endpoint *ep;
+	struct bnx2i_endpoint *ep = NULL;
 
 	read_lock_bh(&hba->ep_rdwr_lock);
 	list_for_each_safe(list, tmp, &hba->ep_destroy_list) {
@@ -1227,7 +1227,7 @@ static int bnx2i_task_xmit(struct iscsi_task *task)
 	struct bnx2i_conn *bnx2i_conn = conn->dd_data;
 	struct scsi_cmnd *sc = task->sc;
 	struct bnx2i_cmd *cmd = task->dd_data;
-	struct iscsi_cmd *hdr = (struct iscsi_cmd *) task->hdr;
+	struct iscsi_scsi_req *hdr = (struct iscsi_scsi_req *)task->hdr;
 
 	if (atomic_read(&bnx2i_conn->ep->num_active_cmds) + 1  >
 	    hba->max_sqes)
@@ -1907,7 +1907,8 @@ static struct iscsi_endpoint *bnx2i_ep_connect(struct Scsi_Host *shost,
 
 	bnx2i_ep_active_list_add(hba, bnx2i_ep);
 
-	if (bnx2i_map_ep_dbell_regs(bnx2i_ep))
+	rc = bnx2i_map_ep_dbell_regs(bnx2i_ep);
+	if (rc)
 		goto del_active_ep;
 
 	mutex_unlock(&hba->net_dev_lock);
@@ -2191,7 +2192,7 @@ static int bnx2i_nl_set_path(struct Scsi_Host *shost, struct iscsi_path *params)
 	return 0;
 }
 
-static mode_t bnx2i_attr_is_visible(int param_type, int param)
+static umode_t bnx2i_attr_is_visible(int param_type, int param)
 {
 	switch (param_type) {
 	case ISCSI_HOST_PARAM:

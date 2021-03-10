@@ -25,15 +25,18 @@
 
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/types.h>
 #include <linux/hardirq.h>
 #include <linux/acpi.h>
+#include <linux/dmi.h>
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
 #include <linux/dynamic_debug.h>
 
 #include "internal.h"
+#include "sleep.h"
 
 #define _COMPONENT		ACPI_BUS_COMPONENT
 ACPI_MODULE_NAME("utils");
@@ -110,12 +113,12 @@ acpi_extract_package(union acpi_object *package,
 		case ACPI_TYPE_INTEGER:
 			switch (format_string[i]) {
 			case 'N':
-				size_required += sizeof(acpi_integer);
-				tail_offset += sizeof(acpi_integer);
+				size_required += sizeof(u64);
+				tail_offset += sizeof(u64);
 				break;
 			case 'S':
 				size_required +=
-				    sizeof(char *) + sizeof(acpi_integer) +
+				    sizeof(char *) + sizeof(u64) +
 				    sizeof(char);
 				tail_offset += sizeof(char *);
 				break;
@@ -149,6 +152,21 @@ acpi_extract_package(union acpi_object *package,
 				printk(KERN_WARNING PREFIX "Invalid package element"
 					      " [%d] got string/buffer,"
 					      " expecing [%c]\n",
+					      i, format_string[i]);
+				return AE_BAD_DATA;
+				break;
+			}
+			break;
+		case ACPI_TYPE_LOCAL_REFERENCE:
+			switch (format_string[i]) {
+			case 'R':
+				size_required += sizeof(void *);
+				tail_offset += sizeof(void *);
+				break;
+			default:
+				printk(KERN_WARNING PREFIX "Invalid package element"
+					      " [%d] got reference,"
+					      " expecting [%c]\n",
 					      i, format_string[i]);
 				return AE_BAD_DATA;
 				break;
@@ -196,17 +214,17 @@ acpi_extract_package(union acpi_object *package,
 		case ACPI_TYPE_INTEGER:
 			switch (format_string[i]) {
 			case 'N':
-				*((acpi_integer *) head) =
+				*((u64 *) head) =
 				    element->integer.value;
-				head += sizeof(acpi_integer);
+				head += sizeof(u64);
 				break;
 			case 'S':
 				pointer = (u8 **) head;
 				*pointer = tail;
-				*((acpi_integer *) tail) =
+				*((u64 *) tail) =
 				    element->integer.value;
-				head += sizeof(acpi_integer *);
-				tail += sizeof(acpi_integer);
+				head += sizeof(u64 *);
+				tail += sizeof(u64);
 				/* NULL terminate string */
 				*tail = (char)0;
 				tail += sizeof(char);
@@ -244,7 +262,18 @@ acpi_extract_package(union acpi_object *package,
 				break;
 			}
 			break;
-
+		case ACPI_TYPE_LOCAL_REFERENCE:
+			switch (format_string[i]) {
+			case 'R':
+				*(void **)head =
+				    (void *)element->reference.handle;
+				head += sizeof(void *);
+				break;
+			default:
+				/* Should never get here */
+				break;
+			}
+			break;
 		case ACPI_TYPE_PACKAGE:
 			/* TBD: handle nested packages... */
 		default:
@@ -291,51 +320,6 @@ acpi_evaluate_integer(acpi_handle handle,
 }
 
 EXPORT_SYMBOL(acpi_evaluate_integer);
-
-#if 0
-acpi_status
-acpi_evaluate_string(acpi_handle handle,
-		     acpi_string pathname,
-		     acpi_object_list * arguments, acpi_string * data)
-{
-	acpi_status status = AE_OK;
-	acpi_object *element = NULL;
-	acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-
-
-	if (!data)
-		return AE_BAD_PARAMETER;
-
-	status = acpi_evaluate_object(handle, pathname, arguments, &buffer);
-	if (ACPI_FAILURE(status)) {
-		acpi_util_eval_error(handle, pathname, status);
-		return status;
-	}
-
-	element = (acpi_object *) buffer.pointer;
-
-	if ((element->type != ACPI_TYPE_STRING)
-	    || (element->type != ACPI_TYPE_BUFFER)
-	    || !element->string.length) {
-		acpi_util_eval_error(handle, pathname, AE_BAD_DATA);
-		return AE_BAD_DATA;
-	}
-
-	*data = kzalloc(element->string.length + 1, GFP_KERNEL);
-	if (!data) {
-		printk(KERN_ERR PREFIX "Memory allocation\n");
-		return -ENOMEM;
-	}
-
-	memcpy(*data, element->string.pointer, element->string.length);
-
-	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Return value [%s]\n", *data));
-
-	kfree(buffer.pointer);
-
-	return AE_OK;
-}
-#endif
 
 acpi_status
 acpi_evaluate_reference(acpi_handle handle,
@@ -430,8 +414,41 @@ acpi_evaluate_reference(acpi_handle handle,
 
 EXPORT_SYMBOL(acpi_evaluate_reference);
 
+acpi_status
+acpi_get_physical_device_location(acpi_handle handle, struct acpi_pld_info **pld)
+{
+	acpi_status status;
+	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
+	union acpi_object *output;
+
+	status = acpi_evaluate_object(handle, "_PLD", NULL, &buffer);
+
+	if (ACPI_FAILURE(status))
+		return status;
+
+	output = buffer.pointer;
+
+	if (!output || output->type != ACPI_TYPE_PACKAGE
+	    || !output->package.count
+	    || output->package.elements[0].type != ACPI_TYPE_BUFFER
+	    || output->package.elements[0].buffer.length < ACPI_PLD_REV1_BUFFER_SIZE) {
+		status = AE_TYPE;
+		goto out;
+	}
+
+	status = acpi_decode_pld_buffer(
+			output->package.elements[0].buffer.pointer,
+			output->package.elements[0].buffer.length,
+			pld);
+
+out:
+	kfree(buffer.pointer);
+	return status;
+}
+EXPORT_SYMBOL(acpi_get_physical_device_location);
+
 /**
- * acpi_evaluate_hotplug_ost: Evaluate _OST for hotplug operations
+ * acpi_evaluate_ost: Evaluate _OST for hotplug operations
  * @handle: ACPI device handle
  * @source_event: source event code
  * @status_code: status code
@@ -442,17 +459,15 @@ EXPORT_SYMBOL(acpi_evaluate_reference);
  * When the platform does not support _OST, this function has no effect.
  */
 acpi_status
-acpi_evaluate_hotplug_ost(acpi_handle handle, u32 source_event,
-		u32 status_code, struct acpi_buffer *status_buf)
+acpi_evaluate_ost(acpi_handle handle, u32 source_event, u32 status_code,
+		  struct acpi_buffer *status_buf)
 {
-#ifdef ACPI_HOTPLUG_OST
 	union acpi_object params[3] = {
 		{.type = ACPI_TYPE_INTEGER,},
 		{.type = ACPI_TYPE_INTEGER,},
 		{.type = ACPI_TYPE_BUFFER,}
 	};
 	struct acpi_object_list arg_list = {3, params};
-	acpi_status status;
 
 	params[0].integer.value = source_event;
 	params[1].integer.value = status_code;
@@ -464,13 +479,9 @@ acpi_evaluate_hotplug_ost(acpi_handle handle, u32 source_event,
 		params[2].buffer.length = 0;
 	}
 
-	status = acpi_evaluate_object(handle, "_OST", &arg_list, NULL);
-	return status;
-#else
-	return AE_OK;
-#endif
+	return acpi_evaluate_object(handle, "_OST", &arg_list, NULL);
 }
-EXPORT_SYMBOL(acpi_evaluate_hotplug_ost);
+EXPORT_SYMBOL(acpi_evaluate_ost);
 
 /**
  * acpi_handle_path: Return the object path of handle
@@ -562,6 +573,61 @@ bool acpi_has_method(acpi_handle handle, char *name)
 }
 EXPORT_SYMBOL(acpi_has_method);
 
+acpi_status acpi_execute_simple_method(acpi_handle handle, char *method,
+				       u64 arg)
+{
+	union acpi_object obj = { .type = ACPI_TYPE_INTEGER };
+	struct acpi_object_list arg_list = { .count = 1, .pointer = &obj, };
+
+	obj.integer.value = arg;
+
+	return acpi_evaluate_object(handle, method, &arg_list, NULL);
+}
+EXPORT_SYMBOL(acpi_execute_simple_method);
+
+/**
+ * acpi_evaluate_ej0: Evaluate _EJ0 method for hotplug operations
+ * @handle: ACPI device handle
+ *
+ * Evaluate device's _EJ0 method for hotplug operations.
+ */
+acpi_status acpi_evaluate_ej0(acpi_handle handle)
+{
+	acpi_status status;
+
+	status = acpi_execute_simple_method(handle, "_EJ0", 1);
+	if (status == AE_NOT_FOUND)
+		acpi_handle_warn(handle, "No _EJ0 support for device\n");
+	else if (ACPI_FAILURE(status))
+		acpi_handle_warn(handle, "Eject failed (0x%x)\n", status);
+
+	return status;
+}
+
+/**
+ * acpi_evaluate_lck: Evaluate _LCK method to lock/unlock device
+ * @handle: ACPI device handle
+ * @lock: lock device if non-zero, otherwise unlock device
+ *
+ * Evaluate device's _LCK method if present to lock/unlock device
+ */
+acpi_status acpi_evaluate_lck(acpi_handle handle, int lock)
+{
+	acpi_status status;
+
+	status = acpi_execute_simple_method(handle, "_LCK", !!lock);
+	if (ACPI_FAILURE(status) && status != AE_NOT_FOUND) {
+		if (lock)
+			acpi_handle_warn(handle,
+				"Locking device failed (0x%x)\n", status);
+		else
+			acpi_handle_warn(handle,
+				"Unlocking device failed (0x%x)\n", status);
+	}
+
+	return status;
+}
+
 /**
  * acpi_evaluate_dsm - evaluate device's _DSM method
  * @handle: ACPI device handle
@@ -577,7 +643,7 @@ EXPORT_SYMBOL(acpi_has_method);
  * some old BIOSes do expect a buffer or an integer etc.
  */
 union acpi_object *
-acpi_evaluate_dsm(acpi_handle handle, const u8 *uuid, int rev, int func,
+acpi_evaluate_dsm(acpi_handle handle, const u8 *uuid, u64 rev, u64 func,
 		  union acpi_object *argv4)
 {
 	acpi_status ret;
@@ -627,7 +693,7 @@ EXPORT_SYMBOL(acpi_evaluate_dsm);
  * functions. Currently only support 64 functions at maximum, should be
  * enough for now.
  */
-bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, int rev, u64 funcs)
+bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, u64 rev, u64 funcs)
 {
 	int i;
 	u64 mask = 0;
@@ -649,6 +715,16 @@ bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, int rev, u64 funcs)
 	ACPI_FREE(obj);
 
 	/*
+	 * RHEL7: If this is a Cisco system and a mask of 0x80 is returned
+	 * then set the value to 0x81 so the Bit 0 check passes.
+	 */
+	if ((mask == 0x80) &&
+	    dmi_match(DMI_BIOS_VENDOR, "Cisco Systems, Inc.")) {
+		acpi_handle_warn(handle, FW_WARN "Cisco Systems, Inc.: _DSM mask returns 0x80 but should return 0x81.  Please contact Cisco Systems, Inc. for a BIOS upgrade.\n");
+		mask = 0x81;
+	}
+
+	/*
 	 * Bit 0 indicates whether there's support for any functions other than
 	 * function 0 for the specified UUID and revision.
 	 */
@@ -658,3 +734,33 @@ bool acpi_check_dsm(acpi_handle handle, const u8 *uuid, int rev, u64 funcs)
 	return false;
 }
 EXPORT_SYMBOL(acpi_check_dsm);
+
+/**
+ * acpi_dev_found - Detect presence of a given ACPI device in the namespace.
+ * @hid: Hardware ID of the device.
+ *
+ * Return %true if the device was present at the moment of invocation.
+ * Note that if the device is pluggable, it may since have disappeared.
+ *
+ * For this function to work, acpi_bus_scan() must have been executed
+ * which happens in the subsys_initcall() subsection. Hence, do not
+ * call from a subsys_initcall() or earlier (use acpi_get_devices()
+ * instead). Calling from module_init() is fine (which is synonymous
+ * with device_initcall()).
+ */
+bool acpi_dev_found(const char *hid)
+{
+	struct acpi_device_bus_id *acpi_device_bus_id;
+	bool found = false;
+
+	mutex_lock(&acpi_device_lock);
+	list_for_each_entry(acpi_device_bus_id, &acpi_bus_id_list, node)
+		if (!strcmp(acpi_device_bus_id->bus_id, hid)) {
+			found = true;
+			break;
+		}
+	mutex_unlock(&acpi_device_lock);
+
+	return found;
+}
+EXPORT_SYMBOL(acpi_dev_found);

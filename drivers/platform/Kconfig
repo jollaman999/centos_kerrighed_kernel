@@ -1,5 +1,7 @@
-# drivers/platform/Kconfig
-
 if X86
 source "drivers/platform/x86/Kconfig"
 endif
+if GOLDFISH
+source "drivers/platform/goldfish/Kconfig"
+endif
+

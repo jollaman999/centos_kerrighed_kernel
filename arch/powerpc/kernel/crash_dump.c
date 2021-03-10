@@ -13,7 +13,7 @@
 
 #include <linux/crash_dump.h>
 #include <linux/bootmem.h>
-#include <linux/lmb.h>
+#include <linux/memblock.h>
 #include <asm/code-patching.h>
 #include <asm/kdump.h>
 #include <asm/prom.h>
@@ -28,14 +28,10 @@
 #define DBG(fmt...)
 #endif
 
-/* Stores the physical address of elf header of crash image. */
-unsigned long long elfcorehdr_addr = ELFCORE_ADDR_MAX;
-EXPORT_SYMBOL(elfcorehdr_addr);
-
-#ifndef CONFIG_RELOCATABLE
+#ifndef CONFIG_NONSTATIC_KERNEL
 void __init reserve_kdump_trampoline(void)
 {
-	lmb_reserve(0, KDUMP_RESERVE_LIMIT);
+	memblock_reserve(0, KDUMP_RESERVE_LIMIT);
 }
 
 static void __init create_trampoline(unsigned long addr)
@@ -71,31 +67,7 @@ void __init setup_kdump_trampoline(void)
 
 	DBG(" <- setup_kdump_trampoline()\n");
 }
-#endif /* CONFIG_RELOCATABLE */
-
-/*
- * Note: elfcorehdr_addr is not just limited to vmcore. It is also used by
- * is_kdump_kernel() to determine if we are booting after a panic. Hence
- * ifdef it under CONFIG_CRASH_DUMP and not CONFIG_PROC_VMCORE.
- */
-static int __init parse_elfcorehdr(char *p)
-{
-	if (p)
-		elfcorehdr_addr = memparse(p, &p);
-
-	return 1;
-}
-__setup("elfcorehdr=", parse_elfcorehdr);
-
-static int __init parse_savemaxmem(char *p)
-{
-	if (p)
-		saved_max_pfn = (memparse(p, &p) >> PAGE_SHIFT) - 1;
-
-	return 1;
-}
-__setup("savemaxmem=", parse_savemaxmem);
-
+#endif /* CONFIG_NONSTATIC_KERNEL */
 
 static size_t copy_oldmem_vaddr(void *vaddr, char *buf, size_t csize,
                                unsigned long offset, int userbuf)
@@ -131,10 +103,10 @@ ssize_t copy_oldmem_page(unsigned long pfn, char *buf,
 	if (!csize)
 		return 0;
 
-	csize = min(csize, PAGE_SIZE);
+	csize = min_t(size_t, csize, PAGE_SIZE);
 	paddr = pfn << PAGE_SHIFT;
 
-	if (lmb_is_region_memory(paddr, csize)) {
+	if (memblock_is_region_memory(paddr, csize)) {
 		vaddr = __va(paddr);
 		csize = copy_oldmem_vaddr(vaddr, buf, csize, offset, userbuf);
 	} else {
@@ -154,15 +126,15 @@ ssize_t copy_oldmem_page(unsigned long pfn, char *buf,
 void crash_free_reserved_phys_range(unsigned long begin, unsigned long end)
 {
 	unsigned long addr;
-	const u32 *basep, *sizep;
+	const __be32 *basep, *sizep;
 	unsigned int rtas_start = 0, rtas_end = 0;
 
 	basep = of_get_property(rtas.dev, "linux,rtas-base", NULL);
 	sizep = of_get_property(rtas.dev, "rtas-size", NULL);
 
 	if (basep && sizep) {
-		rtas_start = *basep;
-		rtas_end = *basep + *sizep;
+		rtas_start = be32_to_cpup(basep);
+		rtas_end = rtas_start + be32_to_cpup(sizep);
 	}
 
 	for (addr = begin; addr < end; addr += PAGE_SIZE) {
@@ -170,10 +142,7 @@ void crash_free_reserved_phys_range(unsigned long begin, unsigned long end)
 		if (addr <= rtas_end && ((addr + PAGE_SIZE) > rtas_start))
 			continue;
 
-		ClearPageReserved(pfn_to_page(addr >> PAGE_SHIFT));
-		init_page_count(pfn_to_page(addr >> PAGE_SHIFT));
-		free_page((unsigned long)__va(addr));
-		totalram_pages++;
+		free_reserved_page(pfn_to_page(addr >> PAGE_SHIFT));
 	}
 }
 #endif

@@ -17,13 +17,13 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/fs.h>
+#include <linux/preempt.h>
 #include <linux/smp.h>
 #include <linux/notifier.h>
 #include <linux/kdebug.h>
 #include <linux/cpu.h>
 #include <linux/sched.h>
 #include <linux/gfp.h>
-#include <linux/nospec.h>
 #include <asm/mce.h>
 #include <asm/apic.h>
 #include <asm/nmi.h>
@@ -33,7 +33,7 @@ static void inject_mce(struct mce *m)
 {
 	struct mce *i = &per_cpu(injectm, m->extcpu);
 
-	/* Make sure noone reads partially written injectm */
+	/* Make sure no one reads partially written injectm */
 	i->finished = 0;
 	mb();
 	m->finished = 0;
@@ -78,27 +78,33 @@ static void raise_exception(struct mce *m, struct pt_regs *pregs)
 }
 
 static cpumask_var_t mce_inject_cpumask;
+static DEFINE_MUTEX(mce_inject_mutex);
 
-static int mce_raise_notify(struct notifier_block *self,
-			    unsigned long val, void *data)
+static int mce_raise_notify(unsigned int cmd, struct pt_regs *regs)
 {
-	struct die_args *args = (struct die_args *)data;
 	int cpu = smp_processor_id();
 	struct mce *m = &__get_cpu_var(injectm);
-	if (val != DIE_NMI_IPI || !cpumask_test_cpu(cpu, mce_inject_cpumask))
-		return NOTIFY_DONE;
+	if (!cpumask_test_cpu(cpu, mce_inject_cpumask))
+		return NMI_DONE;
 	cpumask_clear_cpu(cpu, mce_inject_cpumask);
 	if (m->inject_flags & MCJ_EXCEPTION)
-		raise_exception(m, args->regs);
+		raise_exception(m, regs);
 	else if (m->status)
 		raise_poll(m);
-	return NOTIFY_STOP;
+	return NMI_HANDLED;
 }
 
-static struct notifier_block mce_raise_nb = {
-	.notifier_call = mce_raise_notify,
-	.priority = NMI_LOCAL_NORMAL_PRIOR,
-};
+static void mce_irq_ipi(void *info)
+{
+	int cpu = smp_processor_id();
+	struct mce *m = &__get_cpu_var(injectm);
+
+	if (cpumask_test_cpu(cpu, mce_inject_cpumask) &&
+			m->inject_flags & MCJ_EXCEPTION) {
+		cpumask_clear_cpu(cpu, mce_inject_cpumask);
+		raise_exception(m, NULL);
+	}
+}
 
 /* Inject mce on current CPU */
 static int raise_local(void)
@@ -147,9 +153,10 @@ static void raise_mce(struct mce *m)
 		return;
 
 #ifdef CONFIG_X86_LOCAL_APIC
-	if (m->inject_flags & MCJ_NMI_BROADCAST) {
+	if (m->inject_flags & (MCJ_IRQ_BROADCAST | MCJ_NMI_BROADCAST)) {
 		unsigned long start;
 		int cpu;
+
 		get_online_cpus();
 		cpumask_copy(mce_inject_cpumask, cpu_online_mask);
 		cpumask_clear_cpu(get_cpu(), mce_inject_cpumask);
@@ -159,13 +166,25 @@ static void raise_mce(struct mce *m)
 			    MCJ_CTX(mcpu->inject_flags) != MCJ_CTX_RANDOM)
 				cpumask_clear_cpu(cpu, mce_inject_cpumask);
 		}
-		if (!cpumask_empty(mce_inject_cpumask))
-			apic->send_IPI_mask(mce_inject_cpumask, NMI_VECTOR);
+		if (!cpumask_empty(mce_inject_cpumask)) {
+			if (m->inject_flags & MCJ_IRQ_BROADCAST) {
+				/*
+				 * don't wait because mce_irq_ipi is necessary
+				 * to be sync with following raise_local
+				 */
+				preempt_disable();
+				smp_call_function_many(mce_inject_cpumask,
+					mce_irq_ipi, NULL, 0);
+				preempt_enable();
+			} else if (m->inject_flags & MCJ_NMI_BROADCAST)
+				apic->send_IPI_mask(mce_inject_cpumask,
+						NMI_VECTOR);
+		}
 		start = jiffies;
 		while (!cpumask_empty(mce_inject_cpumask)) {
 			if (!time_before(jiffies, start + 2*HZ)) {
 				printk(KERN_ERR
-				"Timeout waiting for mce inject NMI %lx\n",
+				"Timeout waiting for mce inject %lx\n",
 					*cpumask_bits(mce_inject_cpumask));
 				break;
 			}
@@ -176,7 +195,11 @@ static void raise_mce(struct mce *m)
 		put_online_cpus();
 	} else
 #endif
+	{
+		preempt_disable();
 		raise_local();
+		preempt_enable();
+	}
 }
 
 /* Error injection interface */
@@ -184,7 +207,6 @@ static ssize_t mce_write(struct file *filp, const char __user *ubuf,
 			 size_t usize, loff_t *off)
 {
 	struct mce m;
-	unsigned int num_possible_cpus = num_possible_cpus();
 
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
@@ -200,16 +222,18 @@ static ssize_t mce_write(struct file *filp, const char __user *ubuf,
 	if (copy_from_user(&m, ubuf, usize))
 		return -EFAULT;
 
-	if (m.extcpu >= num_possible_cpus || !cpu_online(m.extcpu))
+	if (m.extcpu >= num_possible_cpus() || !cpu_online(m.extcpu))
 		return -EINVAL;
-	m.extcpu = array_index_nospec(m.extcpu, num_possible_cpus);
 
 	/*
 	 * Need to give user space some time to set everything up,
 	 * so do it a jiffie or two later everywhere.
 	 */
 	schedule_timeout(2);
+
+	mutex_lock(&mce_inject_mutex);
 	raise_mce(&m);
+	mutex_unlock(&mce_inject_mutex);
 	return usize;
 }
 
@@ -218,8 +242,9 @@ static int inject_init(void)
 	if (!alloc_cpumask_var(&mce_inject_cpumask, GFP_KERNEL))
 		return -ENOMEM;
 	printk(KERN_INFO "Machine check injector initialized\n");
-	mce_chrdev_ops.write = mce_write;
-	register_die_notifier(&mce_raise_nb);
+	register_mce_write_callback(mce_write);
+	register_nmi_handler(NMI_LOCAL, mce_raise_notify, 0,
+				"mce_notify");
 	return 0;
 }
 

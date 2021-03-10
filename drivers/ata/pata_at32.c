@@ -18,6 +18,7 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
+#include <linux/slab.h>
 #include <scsi/scsi_host.h>
 #include <linux/ata.h>
 #include <linux/libata.h>
@@ -193,7 +194,7 @@ static int __init pata_at32_init_one(struct device *dev,
 	/* Setup ATA bindings */
 	ap->ops	     = &at32_port_ops;
 	ap->pio_mask = PIO_MASK;
-	ap->flags   |= ATA_FLAG_MMIO | ATA_FLAG_SLAVE_POSS;
+	ap->flags   |= ATA_FLAG_SLAVE_POSS;
 
 	/*
 	 * Since all 8-bit taskfile transfers has to go on the lower
@@ -270,7 +271,7 @@ static int __init pata_at32_probe(struct platform_device *pdev)
 
 	struct device		 *dev = &pdev->dev;
 	struct at32_ide_info	 *info;
-	struct ide_platform_data *board = pdev->dev.platform_data;
+	struct ide_platform_data *board = dev_get_platdata(&pdev->dev);
 	struct resource		 *res;
 
 	int irq;
@@ -392,18 +393,7 @@ static struct platform_driver pata_at32_driver = {
 	},
 };
 
-static int __init pata_at32_init(void)
-{
-	return platform_driver_probe(&pata_at32_driver, pata_at32_probe);
-}
-
-static void __exit pata_at32_exit(void)
-{
-	platform_driver_unregister(&pata_at32_driver);
-}
-
-module_init(pata_at32_init);
-module_exit(pata_at32_exit);
+module_platform_driver_probe(pata_at32_driver, pata_at32_probe);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("AVR32 SMC/CFC PATA Driver");

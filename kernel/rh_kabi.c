@@ -11,47 +11,26 @@
  */
 #include <linux/kernel.h>
 #include <linux/module.h>
-#include <linux/proc_fs.h>
+#include <linux/netfilter.h>
 
-#ifdef CONFIG_X86
-#include <asm/alternative.h>
-#endif
-
-struct rh_kabi_structs_6_2 {
+struct rh_kabi_structs_7_0 {
 	int pad; /* avoid an empty struct */
-#ifdef CONFIG_X86
-	struct alt_instr *alt_instr;
-#endif
 };
 
-struct rh_kabi_structs_6_3 {
-	int pad; /* avoid an empty struct */
-#ifdef CONFIG_PARAVIRT
-	struct paravirt_patch_template *paravirt_patch_template;
-#endif
+struct rh_kabi_structs_7_2 {
+	struct nf_hook_state *nf_hook_state;
 };
 
-struct rh_kabi_structs_6_6 {
-	struct proc_inode *proc_inode;
-};
-
-void rh_kabi_6_2(struct rh_kabi_structs_6_2 *rh_kabi_structs_6_2)
+void rh_kabi_7_0(struct rh_kabi_structs_7_0 *rh_kabi_structs_7_0)
 {
 	/* No one should ever call this function */
 	panic("Problem exists between keyboard and your seat.");
 }
-EXPORT_SYMBOL_GPL(rh_kabi_6_2);
+EXPORT_SYMBOL_GPL(rh_kabi_7_0);
 
-void rh_kabi_6_3(struct rh_kabi_structs_6_3 *rh_kabi_structs_6_3)
+void rh_kabi_7_2(struct rh_kabi_structs_7_2 *rh_kabi_structs_7_2)
 {
-	/* No need to duplicate the string above :) */
-	rh_kabi_6_2(NULL);
+	/* No need to duplicate the string above */
+	rh_kabi_7_0(NULL);
 }
-EXPORT_SYMBOL_GPL(rh_kabi_6_3);
-
-void rh_kabi_6_6(struct rh_kabi_structs_6_6 *rh_kabi_structs_6_6)
-{
-	/* No need to duplicate the string above :) */
-	rh_kabi_6_2(NULL);
-}
-EXPORT_SYMBOL_GPL(rh_kabi_6_6);
+EXPORT_SYMBOL_GPL(rh_kabi_7_2);

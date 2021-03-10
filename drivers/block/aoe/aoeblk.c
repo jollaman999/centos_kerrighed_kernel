@@ -4,17 +4,23 @@
  * block device routines
  */
 
+#include <linux/kernel.h>
 #include <linux/hdreg.h>
 #include <linux/blkdev.h>
 #include <linux/backing-dev.h>
 #include <linux/fs.h>
 #include <linux/ioctl.h>
+#include <linux/slab.h>
+#include <linux/ratelimit.h>
 #include <linux/genhd.h>
 #include <linux/netdevice.h>
+#include <linux/mutex.h>
+#include <linux/export.h>
 #include <linux/moduleparam.h>
 #include <scsi/sg.h>
 #include "aoe.h"
 
+static DEFINE_MUTEX(aoeblk_mutex);
 static struct kmem_cache *buf_pool_cache;
 
 /* GPFS needs a larger value than the default. */
@@ -120,20 +126,14 @@ static struct attribute *aoe_attrs[] = {
 	NULL,
 };
 
-static const struct attribute_group attr_group = {
+static const struct attribute_group aoe_attr_group = {
 	.attrs = aoe_attrs,
 };
 
-static int
-aoedisk_add_sysfs(struct aoedev *d)
-{
-	return sysfs_create_group(&disk_to_dev(d->gd)->kobj, &attr_group);
-}
-void
-aoedisk_rm_sysfs(struct aoedev *d)
-{
-	sysfs_remove_group(&disk_to_dev(d->gd)->kobj, &attr_group);
-}
+static const struct attribute_group *aoe_attr_groups[] = {
+	&aoe_attr_group,
+	NULL,
+};
 
 static int
 aoeblk_open(struct block_device *bdev, fmode_t mode)
@@ -150,17 +150,20 @@ aoeblk_open(struct block_device *bdev, fmode_t mode)
 	if (!(d->flags & DEVFL_UP) || d->flags & DEVFL_TKILL)
 		return -ENODEV;
 
+	mutex_lock(&aoeblk_mutex);
 	spin_lock_irqsave(&d->lock, flags);
 	if (d->flags & DEVFL_UP && !(d->flags & DEVFL_TKILL)) {
 		d->nopen++;
 		spin_unlock_irqrestore(&d->lock, flags);
+		mutex_unlock(&aoeblk_mutex);
 		return 0;
 	}
 	spin_unlock_irqrestore(&d->lock, flags);
+	mutex_unlock(&aoeblk_mutex);
 	return -ENODEV;
 }
 
-static int
+static void
 aoeblk_release(struct gendisk *disk, fmode_t mode)
 {
 	struct aoedev *d = disk->private_data;
@@ -171,11 +174,9 @@ aoeblk_release(struct gendisk *disk, fmode_t mode)
 	if (--d->nopen == 0) {
 		spin_unlock_irqrestore(&d->lock, flags);
 		aoecmd_cfg(d->aoemajor, d->aoeminor);
-		return 0;
+		return;
 	}
 	spin_unlock_irqrestore(&d->lock, flags);
-
-	return 0;
 }
 
 static void
@@ -186,7 +187,7 @@ aoeblk_request(struct request_queue *q)
 
 	d = q->queuedata;
 	if ((d->flags & DEVFL_UP) == 0) {
-		printk(KERN_INFO "aoe: device %ld.%d is not up\n",
+		pr_info_ratelimited("aoe: device %ld.%d is not up\n",
 			d->aoemajor, d->aoeminor);
 		while ((rq = blk_peek_request(q))) {
 			blk_start_request(rq);
@@ -195,8 +196,6 @@ aoeblk_request(struct request_queue *q)
 		return;
 	}
 	aoecmd_work(d);
-
-	return;
 }
 
 static int
@@ -323,8 +322,7 @@ aoeblk_gdalloc(void *vp)
 
 	spin_unlock_irqrestore(&d->lock, flags);
 
-	add_disk(gd);
-	aoedisk_add_sysfs(d);
+	add_disk_with_attributes(gd, aoe_attr_groups);
 
 	spin_lock_irqsave(&d->lock, flags);
 	WARN_ON(!(d->flags & DEVFL_GD_NOW));

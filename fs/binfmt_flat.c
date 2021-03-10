@@ -15,7 +15,7 @@
  *	JAN/99 -- coded full program relocation (gerg@snapgear.com)
  */
 
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
@@ -37,7 +37,6 @@
 #include <linux/syscalls.h>
 
 #include <asm/byteorder.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <asm/unaligned.h>
 #include <asm/cacheflush.h>
@@ -56,16 +55,19 @@
 #endif
 
 /*
- * User data (stack, data section and bss) needs to be aligned
- * for the same reasons as SLAB memory is, and to the same amount.
- * Avoid duplicating architecture specific code by using the same
- * macro as with SLAB allocation:
+ * User data (data section and bss) needs to be aligned.
+ * We pick 0x20 here because it is the max value elf2flt has always
+ * used in producing FLAT files, and because it seems to be large
+ * enough to make all the gcc alignment related tests happy.
  */
-#ifdef ARCH_SLAB_MINALIGN
-#define FLAT_DATA_ALIGN	(ARCH_SLAB_MINALIGN)
-#else
-#define FLAT_DATA_ALIGN	(sizeof(void *))
-#endif
+#define FLAT_DATA_ALIGN	(0x20)
+
+/*
+ * User data (stack) also needs to be aligned.
+ * Here we can be a bit looser than the data sections since this
+ * needs to only meet arch ABI requirements.
+ */
+#define FLAT_STACK_ALIGN	max_t(unsigned long, sizeof(void *), ARCH_SLAB_MINALIGN)
 
 #define RELOC_FAILED 0xff00ff01		/* Relocation incorrect somewhere */
 #define UNLOADED_LIB 0x7ff000ff		/* Placeholder for unused library */
@@ -86,7 +88,7 @@ struct lib_info {
 static int load_flat_shared_library(int id, struct lib_info *p);
 #endif
 
-static int load_flat_binary(struct linux_binprm *, struct pt_regs * regs);
+static int load_flat_binary(struct linux_binprm *);
 static int flat_core_dump(struct coredump_params *cprm);
 
 static struct linux_binfmt flat_format = {
@@ -105,7 +107,7 @@ static struct linux_binfmt flat_format = {
 static int flat_core_dump(struct coredump_params *cprm)
 {
 	printk("Process %s:%d received signr %d and should have core dumped\n",
-			current->comm, current->pid, (int) cprm->signr);
+			current->comm, current->pid, (int) cprm->siginfo->si_signo);
 	return(1);
 }
 
@@ -129,7 +131,7 @@ static unsigned long create_flat_tables(
 
 	sp = (unsigned long *)p;
 	sp -= (envc + argc + 2) + 1 + (flat_argvp_envp_on_stack() ? 2 : 0);
-	sp = (unsigned long *) ((unsigned long)sp & -FLAT_DATA_ALIGN);
+	sp = (unsigned long *) ((unsigned long)sp & -FLAT_STACK_ALIGN);
 	argv = sp + 1 + (flat_argvp_envp_on_stack() ? 2 : 0);
 	envp = argv + (argc + 1);
 
@@ -205,11 +207,12 @@ static int decompress_exec(
 
 	/* Read in first chunk of data and parse gzip header. */
 	fpos = offset;
-	ret = bprm->file->f_op->read(bprm->file, buf, LBUFSIZE, &fpos);
+	ret = kernel_read(bprm->file, offset, buf, LBUFSIZE);
 
 	strm.next_in = buf;
 	strm.avail_in = ret;
 	strm.total_in = 0;
+	fpos += ret;
 
 	retval = -ENOEXEC;
 
@@ -275,7 +278,7 @@ static int decompress_exec(
 	}
 
 	while ((ret = zlib_inflate(&strm, Z_NO_FLUSH)) == Z_OK) {
-		ret = bprm->file->f_op->read(bprm->file, buf, LBUFSIZE, &fpos);
+		ret = kernel_read(bprm->file, fpos, buf, LBUFSIZE);
 		if (ret <= 0)
 			break;
 		len -= ret;
@@ -283,6 +286,7 @@ static int decompress_exec(
 		strm.next_in = buf;
 		strm.avail_in = ret;
 		strm.total_in = 0;
+		fpos += ret;
 	}
 
 	if (ret < 0) {
@@ -355,7 +359,7 @@ calc_reloc(unsigned long r, struct lib_info *p, int curid, int internalp)
 
 	if (!flat_reloc_valid(r, start_brk - start_data + text_len)) {
 		printk("BINFMT_FLAT: reloc outside program 0x%x (0 - 0x%x/0x%x)",
-		       (int) r,(int)(start_brk-start_code),(int)text_len);
+		       (int) r,(int)(start_brk-start_data+text_len),(int)text_len);
 		goto failed;
 	}
 
@@ -426,6 +430,7 @@ static int load_flat_file(struct linux_binprm * bprm,
 	unsigned long textpos = 0, datapos = 0, result;
 	unsigned long realdatastart = 0;
 	unsigned long text_len, data_len, bss_len, stack_len, flags;
+	unsigned long full_data;
 	unsigned long len, memp = 0;
 	unsigned long memp_size, extra, rlim;
 	unsigned long *reloc = 0, *rp;
@@ -436,7 +441,7 @@ static int load_flat_file(struct linux_binprm * bprm,
 	int ret;
 
 	hdr = ((struct flat_hdr *) bprm->buf);		/* exec-header */
-	inode = bprm->file->f_path.dentry->d_inode;
+	inode = file_inode(bprm->file);
 
 	text_len  = ntohl(hdr->data_start);
 	data_len  = ntohl(hdr->data_end) - ntohl(hdr->data_start);
@@ -449,6 +454,7 @@ static int load_flat_file(struct linux_binprm * bprm,
 	relocs    = ntohl(hdr->reloc_count);
 	flags     = ntohl(hdr->flags);
 	rev       = ntohl(hdr->rev);
+	full_data = data_len + relocs * sizeof(unsigned long);
 
 	if (strncmp(hdr->magic, "bFLT", 4)) {
 		/*
@@ -501,7 +507,7 @@ static int load_flat_file(struct linux_binprm * bprm,
 	 * size limits imposed on them by creating programs with large
 	 * arrays in the data or bss.
 	 */
-	rlim = current->signal->rlim[RLIMIT_DATA].rlim_cur;
+	rlim = rlimit(RLIMIT_DATA);
 	if (rlim >= RLIM_INFINITY)
 		rlim = ~0;
 	if (data_len + bss_len > rlim) {
@@ -540,10 +546,8 @@ static int load_flat_file(struct linux_binprm * bprm,
 		 */
 		DBG_FLT("BINFMT_FLAT: ROM mapping of file (we hope)\n");
 
-		down_write(&current->mm->mmap_sem);
-		textpos = do_mmap(bprm->file, 0, text_len, PROT_READ|PROT_EXEC,
+		textpos = vm_mmap(bprm->file, 0, text_len, PROT_READ|PROT_EXEC,
 				  MAP_PRIVATE|MAP_EXECUTABLE, 0);
-		up_write(&current->mm->mmap_sem);
 		if (!textpos || IS_ERR_VALUE(textpos)) {
 			if (!textpos)
 				textpos = (unsigned long) -ENOMEM;
@@ -554,17 +558,15 @@ static int load_flat_file(struct linux_binprm * bprm,
 
 		len = data_len + extra + MAX_SHARED_LIBS * sizeof(unsigned long);
 		len = PAGE_ALIGN(len);
-		down_write(&current->mm->mmap_sem);
-		realdatastart = do_mmap(0, 0, len,
+		realdatastart = vm_mmap(0, 0, len,
 			PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE, 0);
-		up_write(&current->mm->mmap_sem);
 
 		if (realdatastart == 0 || IS_ERR_VALUE(realdatastart)) {
 			if (!realdatastart)
 				realdatastart = (unsigned long) -ENOMEM;
 			printk("Unable to allocate RAM for process data, errno %d\n",
 					(int)-realdatastart);
-			do_munmap(current->mm, textpos, text_len);
+			vm_munmap(textpos, text_len);
 			ret = realdatastart;
 			goto err;
 		}
@@ -579,17 +581,17 @@ static int load_flat_file(struct linux_binprm * bprm,
 #ifdef CONFIG_BINFMT_ZFLAT
 		if (flags & FLAT_FLAG_GZDATA) {
 			result = decompress_exec(bprm, fpos, (char *) datapos, 
-						 data_len + (relocs * sizeof(unsigned long)), 0);
+						 full_data, 0);
 		} else
 #endif
 		{
-			result = bprm->file->f_op->read(bprm->file, (char *) datapos,
-					data_len + (relocs * sizeof(unsigned long)), &fpos);
+			result = read_code(bprm->file, datapos, fpos,
+					full_data);
 		}
 		if (IS_ERR_VALUE(result)) {
 			printk("Unable to read data+bss, errno %d\n", (int)-result);
-			do_munmap(current->mm, textpos, text_len);
-			do_munmap(current->mm, realdatastart, data_len + extra);
+			vm_munmap(textpos, text_len);
+			vm_munmap(realdatastart, len);
 			ret = result;
 			goto err;
 		}
@@ -601,10 +603,8 @@ static int load_flat_file(struct linux_binprm * bprm,
 
 		len = text_len + data_len + extra + MAX_SHARED_LIBS * sizeof(unsigned long);
 		len = PAGE_ALIGN(len);
-		down_write(&current->mm->mmap_sem);
-		textpos = do_mmap(0, 0, len,
+		textpos = vm_mmap(0, 0, len,
 			PROT_READ | PROT_EXEC | PROT_WRITE, MAP_PRIVATE, 0);
-		up_write(&current->mm->mmap_sem);
 
 		if (!textpos || IS_ERR_VALUE(textpos)) {
 			if (!textpos)
@@ -631,34 +631,29 @@ static int load_flat_file(struct linux_binprm * bprm,
 		if (flags & FLAT_FLAG_GZIP) {
 			result = decompress_exec(bprm, sizeof (struct flat_hdr),
 					 (((char *) textpos) + sizeof (struct flat_hdr)),
-					 (text_len + data_len + (relocs * sizeof(unsigned long))
+					 (text_len + full_data
 						  - sizeof (struct flat_hdr)),
 					 0);
 			memmove((void *) datapos, (void *) realdatastart,
-					data_len + (relocs * sizeof(unsigned long)));
+					full_data);
 		} else if (flags & FLAT_FLAG_GZDATA) {
-			fpos = 0;
-			result = bprm->file->f_op->read(bprm->file,
-					(char *) textpos, text_len, &fpos);
+			result = read_code(bprm->file, textpos, 0, text_len);
 			if (!IS_ERR_VALUE(result))
 				result = decompress_exec(bprm, text_len, (char *) datapos,
-						 data_len + (relocs * sizeof(unsigned long)), 0);
+						 full_data, 0);
 		}
 		else
 #endif
 		{
-			fpos = 0;
-			result = bprm->file->f_op->read(bprm->file,
-					(char *) textpos, text_len, &fpos);
-			if (!IS_ERR_VALUE(result)) {
-				fpos = ntohl(hdr->data_start);
-				result = bprm->file->f_op->read(bprm->file, (char *) datapos,
-					data_len + (relocs * sizeof(unsigned long)), &fpos);
-			}
+			result = read_code(bprm->file, textpos, 0, text_len);
+			if (!IS_ERR_VALUE(result))
+				result = read_code(bprm->file, datapos,
+						   ntohl(hdr->data_start),
+						   full_data);
 		}
 		if (IS_ERR_VALUE(result)) {
 			printk("Unable to read code+data+bss, errno %d\n",(int)-result);
-			do_munmap(current->mm, textpos, text_len + data_len + extra +
+			vm_munmap(textpos, text_len + data_len + extra +
 				MAX_SHARED_LIBS * sizeof(unsigned long));
 			ret = result;
 			goto err;
@@ -714,7 +709,7 @@ static int load_flat_file(struct linux_binprm * bprm,
 	 * help simplify all this mumbo jumbo
 	 *
 	 * We've got two different sections of relocation entries.
-	 * The first is the GOT which resides at the begining of the data segment
+	 * The first is the GOT which resides at the beginning of the data segment
 	 * and is terminated with a -1.  This one can be relocated in place.
 	 * The second is the extra relocation entries tacked after the image's
 	 * data segment. These require a little more processing as the entry is
@@ -817,6 +812,8 @@ static int load_flat_shared_library(int id, struct lib_info *libs)
 	int res;
 	char buf[16];
 
+	memset(&bprm, 0, sizeof(bprm));
+
 	/* Create the file name */
 	sprintf(buf, "/lib/lib%d.so", id);
 
@@ -831,6 +828,12 @@ static int load_flat_shared_library(int id, struct lib_info *libs)
 	res = -ENOMEM;
 	if (!bprm.cred)
 		goto out;
+
+	/* We don't really care about recalculating credentials at this point
+	 * as we're past the point of no return and are dealing with shared
+	 * libraries.
+	 */
+	bprm.cred_prepared = 1;
 
 	res = prepare_binprm(&bprm);
 
@@ -854,9 +857,10 @@ out:
  * libraries.  There is no binary dependent code anywhere else.
  */
 
-static int load_flat_binary(struct linux_binprm * bprm, struct pt_regs * regs)
+static int load_flat_binary(struct linux_binprm * bprm)
 {
 	struct lib_info libinfo;
+	struct pt_regs *regs = current_pt_regs();
 	unsigned long p = bprm->p;
 	unsigned long stack_len;
 	unsigned long start_addr;
@@ -876,7 +880,7 @@ static int load_flat_binary(struct linux_binprm * bprm, struct pt_regs * regs)
 	stack_len = TOP_OF_ARGS - bprm->p;             /* the strings */
 	stack_len += (bprm->argc + 1) * sizeof(char *); /* the argv array */
 	stack_len += (bprm->envc + 1) * sizeof(char *); /* the envp array */
-	stack_len += FLAT_DATA_ALIGN - 1;  /* reserve for upcoming alignment */
+	stack_len += FLAT_STACK_ALIGN - 1;  /* reserve for upcoming alignment */
 	
 	res = load_flat_file(bprm, &libinfo, 0, &stack_len);
 	if (IS_ERR_VALUE(res))
@@ -891,7 +895,6 @@ static int load_flat_binary(struct linux_binprm * bprm, struct pt_regs * regs)
 						libinfo.lib_list[j].start_data:UNLOADED_LIB;
 
 	install_exec_creds(bprm);
- 	current->flags &= ~PF_FORKNOEXEC;
 
 	set_binfmt(&flat_format);
 
@@ -939,7 +942,8 @@ static int load_flat_binary(struct linux_binprm * bprm, struct pt_regs * regs)
 
 static int __init init_flat_binfmt(void)
 {
-	return register_binfmt(&flat_format);
+	register_binfmt(&flat_format);
+	return 0;
 }
 
 /****************************************************************************/

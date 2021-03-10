@@ -30,6 +30,7 @@
 #include <linux/fs.h>
 #include <linux/oprofile.h>
 #include <linux/sched.h>
+#include <linux/gfp.h>
 
 #include "oprofile_stats.h"
 #include "event_buffer.h"
@@ -140,14 +141,19 @@ static struct notifier_block module_load_nb = {
 	.notifier_call = module_load_notify,
 };
 
+static void free_all_tasks(void)
+{
+	/* make sure we don't leak task structs */
+	process_task_mortuary();
+	process_task_mortuary();
+}
+
 int sync_start(void)
 {
 	int err;
 
 	if (!zalloc_cpumask_var(&marked_cpus, GFP_KERNEL))
 		return -ENOMEM;
-
-	mutex_lock(&buffer_mutex);
 
 	err = task_handoff_register(&task_free_nb);
 	if (err)
@@ -165,7 +171,6 @@ int sync_start(void)
 	start_cpu_work();
 
 out:
-	mutex_unlock(&buffer_mutex);
 	return err;
 out4:
 	profile_event_unregister(PROFILE_MUNMAP, &munmap_nb);
@@ -173,6 +178,7 @@ out3:
 	profile_event_unregister(PROFILE_TASK_EXIT, &task_exit_nb);
 out2:
 	task_handoff_unregister(&task_free_nb);
+	free_all_tasks();
 out1:
 	free_cpumask_var(marked_cpus);
 	goto out;
@@ -181,20 +187,16 @@ out1:
 
 void sync_stop(void)
 {
-	/* flush buffers */
-	mutex_lock(&buffer_mutex);
 	end_cpu_work();
 	unregister_module_notifier(&module_load_nb);
 	profile_event_unregister(PROFILE_MUNMAP, &munmap_nb);
 	profile_event_unregister(PROFILE_TASK_EXIT, &task_exit_nb);
 	task_handoff_unregister(&task_free_nb);
-	mutex_unlock(&buffer_mutex);
-	flush_scheduled_work();
+	barrier();			/* do all of the above first */
 
-	/* make sure we don't leak task structs */
-	process_task_mortuary();
-	process_task_mortuary();
+	flush_cpu_work();
 
+	free_all_tasks();
 	free_cpumask_var(marked_cpus);
 }
 
@@ -214,7 +216,7 @@ static inline unsigned long fast_get_dcookie(struct path *path)
 }
 
 
-/* Look up the dcookie for the task's first VM_EXECUTABLE mapping,
+/* Look up the dcookie for the task's mm->exe_file,
  * which corresponds loosely to "application name". This is
  * not strictly necessary but allows oprofile to associate
  * shared-library samples with particular applications
@@ -222,21 +224,10 @@ static inline unsigned long fast_get_dcookie(struct path *path)
 static unsigned long get_exec_dcookie(struct mm_struct *mm)
 {
 	unsigned long cookie = NO_COOKIE;
-	struct vm_area_struct *vma;
 
-	if (!mm)
-		goto out;
+	if (mm && mm->exe_file)
+		cookie = fast_get_dcookie(&mm->exe_file->f_path);
 
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
-		if (!vma->vm_file)
-			continue;
-		if (!(vma->vm_flags & VM_EXECUTABLE))
-			continue;
-		cookie = fast_get_dcookie(&vma->vm_file->f_path);
-		break;
-	}
-
-out:
 	return cookie;
 }
 

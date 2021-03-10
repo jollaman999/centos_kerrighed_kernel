@@ -1,22 +1,65 @@
-#include <linux/init.h>
+#include <linux/export.h>
 #include <linux/bitops.h>
+#include <linux/elf.h>
 #include <linux/mm.h>
 
 #include <linux/io.h>
+#include <linux/sched.h>
 #include <linux/random.h>
+#include <linux/topology.h>
 #include <asm/processor.h>
 #include <asm/apic.h>
+#include <asm/cacheinfo.h>
 #include <asm/cpu.h>
 #include <asm/nospec-branch.h>
 #include <asm/pci-direct.h>
 
 #ifdef CONFIG_X86_64
-# include <asm/numa_64.h>
 # include <asm/mmconfig.h>
 # include <asm/cacheflush.h>
 #endif
 
 #include "cpu.h"
+
+/*
+ * nodes_per_socket: Stores the number of nodes per socket.
+ * Refer to Fam15h Models 00-0fh BKDG - CPUID Fn8000_001E_ECX
+ * Node Identifiers[10:8]
+ */
+static u32 nodes_per_socket = 1;
+
+static inline int rdmsrl_amd_safe(unsigned msr, unsigned long long *p)
+{
+	u32 gprs[8] = { 0 };
+	int err;
+
+	WARN_ONCE((boot_cpu_data.x86 != 0xf),
+		  "%s should only be used on K8!\n", __func__);
+
+	gprs[1] = msr;
+	gprs[7] = 0x9c5a203a;
+
+	err = rdmsr_safe_regs(gprs);
+
+	*p = gprs[0] | ((u64)gprs[2] << 32);
+
+	return err;
+}
+
+static inline int wrmsrl_amd_safe(unsigned msr, unsigned long long val)
+{
+	u32 gprs[8] = { 0 };
+
+	WARN_ONCE((boot_cpu_data.x86 != 0xf),
+		  "%s should only be used on K8!\n", __func__);
+
+	gprs[0] = (u32)val;
+	gprs[1] = msr;
+	gprs[2] = val >> 32;
+	gprs[7] = 0x9c5a203a;
+
+	return wrmsr_safe_regs(gprs);
+}
 
 #ifdef CONFIG_X86_32
 /*
@@ -25,7 +68,8 @@
  *	contact AMD for precise details and a CPU swap.
  *
  *	See	http://www.multimania.com/poulot/k6bug.html
- *		http://www.amd.com/K6/k6docs/revgd.html
+ *	and	section 2.6.2 of "AMD-K6 Processor Revision Guide - Model 6"
+ *		(Publication # 21266  Issue Date: August 1998)
  *
  *	The following test is erm.. interesting. AMD neglected to up
  *	the chip setting when fixing the bug but they also tweaked some
@@ -35,7 +79,7 @@
 extern void vide(void);
 __asm__(".align 4\nvide: ret");
 
-static void __cpuinit init_amd_k5(struct cpuinfo_x86 *c)
+static void init_amd_k5(struct cpuinfo_x86 *c)
 {
 /*
  * General Systems BIOSen alias the cpu frequency registers
@@ -53,7 +97,7 @@ static void __cpuinit init_amd_k5(struct cpuinfo_x86 *c)
 }
 
 
-static void __cpuinit init_amd_k6(struct cpuinfo_x86 *c)
+static void init_amd_k6(struct cpuinfo_x86 *c)
 {
 	u32 l, h;
 	int mbytes = num_physpages >> (20-PAGE_SHIFT);
@@ -71,7 +115,7 @@ static void __cpuinit init_amd_k6(struct cpuinfo_x86 *c)
 		const int K6_BUG_LOOP = 1000000;
 		int n;
 		void (*f_vide)(void);
-		unsigned long d, d2;
+		u64 d, d2;
 
 		printk(KERN_INFO "AMD K6 stepping B detected - ");
 
@@ -82,10 +126,10 @@ static void __cpuinit init_amd_k6(struct cpuinfo_x86 *c)
 
 		n = K6_BUG_LOOP;
 		f_vide = vide;
-		rdtscl(d);
+		d = rdtsc();
 		while (n--)
 			f_vide();
-		rdtscl(d2);
+		d2 = rdtsc();
 		d = d2-d;
 
 		if (d > 20*K6_BUG_LOOP)
@@ -93,7 +137,6 @@ static void __cpuinit init_amd_k6(struct cpuinfo_x86 *c)
 				"system stability may be impaired when more than 32 MB are used.\n");
 		else
 			printk(KERN_CONT "probably OK (after B9730xxxx).\n");
-		printk(KERN_INFO "Please see http://membres.lycos.fr/poulot/k6bug.html\n");
 	}
 
 	/* K6 with old style WHCR */
@@ -146,11 +189,10 @@ static void __cpuinit init_amd_k6(struct cpuinfo_x86 *c)
 	}
 }
 
-static void __cpuinit amd_k7_smp_check(struct cpuinfo_x86 *c)
+static void amd_k7_smp_check(struct cpuinfo_x86 *c)
 {
-#ifdef CONFIG_SMP
 	/* calling is from identify_secondary_cpu() ? */
-	if (c->cpu_index == boot_cpu_id)
+	if (!c->cpu_index)
 		return;
 
 	/*
@@ -160,11 +202,11 @@ static void __cpuinit amd_k7_smp_check(struct cpuinfo_x86 *c)
 	/* Athlon 660/661 is valid. */
 	if ((c->x86_model == 6) && ((c->x86_mask == 0) ||
 	    (c->x86_mask == 1)))
-		goto valid_k7;
+		return;
 
 	/* Duron 670 is valid */
 	if ((c->x86_model == 7) && (c->x86_mask == 0))
-		goto valid_k7;
+		return;
 
 	/*
 	 * Athlon 662, Duron 671, and Athlon >model 7 have capability
@@ -177,7 +219,7 @@ static void __cpuinit amd_k7_smp_check(struct cpuinfo_x86 *c)
 	    ((c->x86_model == 7) && (c->x86_mask >= 1)) ||
 	     (c->x86_model > 7))
 		if (cpu_has_mp)
-			goto valid_k7;
+			return;
 
 	/* If we get here, not a certified SMP capable AMD system. */
 
@@ -187,15 +229,10 @@ static void __cpuinit amd_k7_smp_check(struct cpuinfo_x86 *c)
 	 */
 	WARN_ONCE(1, "WARNING: This combination of AMD"
 		" processors is not suitable for SMP.\n");
-	if (!test_taint(TAINT_UNSAFE_SMP))
-		add_taint(TAINT_UNSAFE_SMP);
-
-valid_k7:
-	;
-#endif
+	add_taint(TAINT_UNSAFE_SMP, LOCKDEP_NOW_UNRELIABLE);
 }
 
-static void __cpuinit init_amd_k7(struct cpuinfo_x86 *c)
+static void init_amd_k7(struct cpuinfo_x86 *c)
 {
 	u32 l, h;
 
@@ -235,18 +272,22 @@ static void __cpuinit init_amd_k7(struct cpuinfo_x86 *c)
 }
 #endif
 
-#if defined(CONFIG_NUMA) && defined(CONFIG_X86_64)
-static int __cpuinit nearby_node(int apicid)
+#ifdef CONFIG_NUMA
+/*
+ * To workaround broken NUMA config.  Read the comment in
+ * srat_detect_node().
+ */
+static int nearby_node(int apicid)
 {
 	int i, node;
 
 	for (i = apicid - 1; i >= 0; i--) {
-		node = apicid_to_node[i];
+		node = __apicid_to_node[i];
 		if (node != NUMA_NO_NODE && node_online(node))
 			return node;
 	}
 	for (i = apicid + 1; i < MAX_LOCAL_APIC; i++) {
-		node = apicid_to_node[i];
+		node = __apicid_to_node[i];
 		if (node != NUMA_NO_NODE && node_online(node))
 			return node;
 	}
@@ -255,56 +296,20 @@ static int __cpuinit nearby_node(int apicid)
 #endif
 
 /*
- * Fixup core topology information for
- * (1) AMD multi-node processors
- *     Assumption: Number of cores in each internal node is the same.
- * (2) AMD processors supporting compute units
+ * Fix up cpu_core_id for pre-F17h systems to be in the
+ * [0 .. cores_per_node - 1] range. Not really needed but
+ * kept so as not to break existing setups.
  */
-#ifdef CONFIG_X86_HT
-static void __cpuinit amd_get_topology(struct cpuinfo_x86 *c)
+static void legacy_fixup_core_id(struct cpuinfo_x86 *c)
 {
-	u32 nodes, cores_per_cu = 1;
-	u8 node_id;
-	int cpu = smp_processor_id();
+	u32 cus_per_node;
 
-	/* get information required for multi-node processors */
-	if (cpu_has_topoext) {
-		u32 eax, ebx, ecx, edx;
-
-		cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
-		nodes = ((ecx >> 8) & 7) + 1;
-		node_id = ecx & 7;
-
-		/* get compute unit information */
-		c->compute_unit_id = ebx & 0xff;
-		cores_per_cu += ((ebx >> 8) & 3);
-	} else if (cpu_has(c, X86_FEATURE_NODEID_MSR)) {
-		u64 value;
-
-		rdmsrl(MSR_FAM10H_NODE_ID, value);
-		nodes = ((value >> 3) & 7) + 1;
-		node_id = value & 7;
-	} else
+	if (c->x86 >= 0x17)
 		return;
 
-	/* fixup multi-node processor information */
-	if (nodes > 1) {
-		u32 cores_per_node;
-		u32 cus_per_node;
-
-		set_cpu_cap(c, X86_FEATURE_AMD_DCM);
-		cores_per_node = c->x86_max_cores / nodes;
-		cus_per_node = cores_per_node / cores_per_cu;
-
-		/* store NodeID, use llc_shared_map to store sibling info */
-		per_cpu(cpu_llc_id, cpu) = node_id;
-
-		/* core id has to be in the [0 .. cores_per_node - 1] range */
-		c->cpu_core_id %= cores_per_node;
-		c->compute_unit_id %= cus_per_node;
-	}
+	cus_per_node = c->x86_max_cores / nodes_per_socket;
+	c->cpu_core_id %= cus_per_node;
 }
-#endif
 
 
 static void amd_get_topology_early(struct cpuinfo_x86 *c)
@@ -314,10 +319,70 @@ static void amd_get_topology_early(struct cpuinfo_x86 *c)
 }
 
 /*
+ * Fixup core topology information for
+ * (1) AMD multi-node processors
+ *     Assumption: Number of cores in each internal node is the same.
+ * (2) AMD processors supporting compute units
+ */
+#ifdef CONFIG_X86_HT
+static void amd_get_topology(struct cpuinfo_x86 *c)
+{
+	u8 node_id;
+	int cpu = smp_processor_id();
+
+	/* get information required for multi-node processors */
+	if (cpu_has_topoext) {
+		int err;
+		u32 eax, ebx, ecx, edx;
+
+		cpuid(0x8000001e, &eax, &ebx, &ecx, &edx);
+		nodes_per_socket = ((ecx >> 8) & 7) + 1;
+
+		node_id  = ecx & 0xff;
+
+		if (c->x86 == 0x15)
+			c->cu_id = ebx & 0xff;
+
+		if (c->x86 >= 0x17) {
+			c->cpu_core_id = ebx & 0xff;
+
+			if (smp_num_siblings > 1)
+				c->x86_max_cores /= smp_num_siblings;
+		}
+
+		/*
+		 * In case leaf B is available, use it to derive
+		 * topology information.
+		 */
+		err = detect_extended_topology(c);
+		if (!err)
+			c->x86_coreid_bits = get_count_order(c->x86_max_cores);
+
+		cacheinfo_amd_init_llc_id(c, cpu, node_id);
+
+	} else if (cpu_has(c, X86_FEATURE_NODEID_MSR)) {
+		u64 value;
+
+		rdmsrl(MSR_FAM10H_NODE_ID, value);
+		nodes_per_socket = ((value >> 3) & 7) + 1;
+		node_id = value & 7;
+
+		per_cpu(cpu_llc_id, cpu) = node_id;
+	} else
+		return;
+
+	if (nodes_per_socket > 1) {
+		set_cpu_cap(c, X86_FEATURE_AMD_DCM);
+		legacy_fixup_core_id(c);
+	}
+}
+#endif
+
+/*
  * On a AMD dual core setup the lower bits of the APIC id distingush the cores.
  * Assumes number of cores is a power of two.
  */
-static void __cpuinit amd_detect_cmp(struct cpuinfo_x86 *c)
+static void amd_detect_cmp(struct cpuinfo_x86 *c)
 {
 #ifdef CONFIG_X86_HT
 	unsigned bits;
@@ -330,13 +395,12 @@ static void __cpuinit amd_detect_cmp(struct cpuinfo_x86 *c)
 	c->phys_proc_id = c->initial_apicid >> bits;
 	/* use socket ID also for last level cache */
 	per_cpu(cpu_llc_id, cpu) = c->phys_proc_id;
-	amd_get_topology(c);
 #endif
 }
 
-int amd_get_nb_id(int cpu)
+u16 amd_get_nb_id(int cpu)
 {
-	int id = 0;
+	u16 id = 0;
 #ifdef CONFIG_SMP
 	id = per_cpu(cpu_llc_id, cpu);
 #endif
@@ -344,33 +408,50 @@ int amd_get_nb_id(int cpu)
 }
 EXPORT_SYMBOL_GPL(amd_get_nb_id);
 
-static void __cpuinit srat_detect_node(struct cpuinfo_x86 *c)
+static void srat_detect_node(struct cpuinfo_x86 *c)
 {
-#if defined(CONFIG_NUMA) && defined(CONFIG_X86_64)
+#ifdef CONFIG_NUMA
 	int cpu = smp_processor_id();
 	int node;
 	unsigned apicid = c->apicid;
 
-	node = per_cpu(cpu_llc_id, cpu);
+	node = numa_cpu_node(cpu);
+	if (node == NUMA_NO_NODE)
+		node = per_cpu(cpu_llc_id, cpu);
 
-	if (apicid_to_node[apicid] != NUMA_NO_NODE)
-		node = apicid_to_node[apicid];
+	/*
+	 * On multi-fabric platform (e.g. Numascale NumaChip) a
+	 * platform-specific handler needs to be called to fixup some
+	 * IDs of the CPU.
+	 */
+	if (x86_cpuinit.fixup_cpu_id)
+		x86_cpuinit.fixup_cpu_id(c, node);
+
 	if (!node_online(node)) {
-		/* Two possibilities here:
-		   - The CPU is missing memory and no node was created.
-		   In that case try picking one from a nearby CPU
-		   - The APIC IDs differ from the HyperTransport node IDs
-		   which the K8 northbridge parsing fills in.
-		   Assume they are all increased by a constant offset,
-		   but in the same order as the HT nodeids.
-		   If that doesn't result in a usable node fall back to the
-		   path for the previous case.  */
-
+		/*
+		 * Two possibilities here:
+		 *
+		 * - The CPU is missing memory and no node was created.  In
+		 *   that case try picking one from a nearby CPU.
+		 *
+		 * - The APIC IDs differ from the HyperTransport node IDs
+		 *   which the K8 northbridge parsing fills in.  Assume
+		 *   they are all increased by a constant offset, but in
+		 *   the same order as the HT nodeids.  If that doesn't
+		 *   result in a usable node fall back to the path for the
+		 *   previous case.
+		 *
+		 * This workaround operates directly on the mapping between
+		 * APIC ID and NUMA node, assuming certain relationship
+		 * between APIC ID, HT node ID and NUMA topology.  As going
+		 * through CPU mapping may alter the outcome, directly
+		 * access __apicid_to_node[].
+		 */
 		int ht_nodeid = c->initial_apicid;
 
 		if (ht_nodeid >= 0 &&
-		    apicid_to_node[ht_nodeid] != NUMA_NO_NODE)
-			node = apicid_to_node[ht_nodeid];
+		    __apicid_to_node[ht_nodeid] != NUMA_NO_NODE)
+			node = __apicid_to_node[ht_nodeid];
 		/* Pick a nearby node */
 		if (!node_online(node))
 			node = nearby_node(apicid);
@@ -379,7 +460,7 @@ static void __cpuinit srat_detect_node(struct cpuinfo_x86 *c)
 #endif
 }
 
-static void __cpuinit early_init_amd_mc(struct cpuinfo_x86 *c)
+static void early_init_amd_mc(struct cpuinfo_x86 *c)
 {
 #ifdef CONFIG_X86_HT
 	unsigned bits, ecx;
@@ -405,17 +486,30 @@ static void __cpuinit early_init_amd_mc(struct cpuinfo_x86 *c)
 #endif
 }
 
-static void __cpuinit bsp_init_amd(struct cpuinfo_x86 *c)
+static void bsp_init_amd(struct cpuinfo_x86 *c)
 {
+	if (cpu_has(c, X86_FEATURE_CONSTANT_TSC)) {
+
+		if (c->x86 > 0x10 ||
+		    (c->x86 == 0x10 && c->x86_model >= 0x2)) {
+			u64 val;
+
+			rdmsrl(MSR_K7_HWCR, val);
+			if (!(val & BIT(24)))
+				printk(KERN_WARNING FW_BUG "TSC doesn't count "
+					"with P0 frequency!\n");
+		}
+	}
+
 	if (c->x86 == 0x15) {
 		unsigned long upperbit;
 		u32 cpuid, assoc;
 
-		cpuid    = cpuid_edx(0x80000005);
-		assoc    = cpuid >> 16 & 0xff;
+		cpuid	 = cpuid_edx(0x80000005);
+		assoc	 = cpuid >> 16 & 0xff;
 		upperbit = ((cpuid >> 24) << 10) / assoc;
 
-		va_align.mask     = (upperbit - 1) & PAGE_MASK;
+		va_align.mask	  = (upperbit - 1) & PAGE_MASK;
 		va_align.flags    = ALIGN_VA_32 | ALIGN_VA_64;
 
 		/* A random value per boot for bit slice [12:upper_bit) */
@@ -423,10 +517,15 @@ static void __cpuinit bsp_init_amd(struct cpuinfo_x86 *c)
 	}
 }
 
-static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
+static void early_init_amd(struct cpuinfo_x86 *c)
 {
+	u64 value;
+	u32 dummy;
+
 	eager_fpu_not_needed();
 	early_init_amd_mc(c);
+
+	rdmsr_safe(MSR_AMD64_PATCH_LEVEL, &c->microcode, &dummy);
 
 	/*
 	 * c->x86_power is 8000_0007 edx. Bit 8 is TSC runs at constant rate
@@ -435,6 +534,8 @@ static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
 	if (c->x86_power & (1 << 8)) {
 		set_cpu_cap(c, X86_FEATURE_CONSTANT_TSC);
 		set_cpu_cap(c, X86_FEATURE_NONSTOP_TSC);
+		if (!check_tsc_unstable())
+			set_sched_clock_stable();
 	}
 
 #ifdef CONFIG_X86_64
@@ -463,21 +564,31 @@ static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
 			set_cpu_cap(c, X86_FEATURE_EXTD_APICID);
 	}
 #endif
+	/*
+	 * This is only needed to tell the kernel whether to use VMCALL
+	 * and VMMCALL.  VMMCALL is never executed except under virt, so
+	 * we can set it unconditionally.
+	 */
+	set_cpu_cap(c, X86_FEATURE_VMMCALL);
 
-	/* We need to do the following only once */
-	if (c != &boot_cpu_data)
-		return;
+	/*
+	 * BIOS support is required for SME. If BIOS has enabled SME then
+	 * adjust x86_phys_bits by the SME physical address space reduction
+	 * value. If BIOS has not enabled SME then don't advertise the
+	 * feature (set in scattered.c). Also, since the SME support requires
+	 * long mode, don't advertise the feature under CONFIG_X86_32.
+	 */
+	if (cpu_has(c, X86_FEATURE_SME)) {
+		u64 msr;
 
-	if (cpu_has(c, X86_FEATURE_CONSTANT_TSC)) {
-
-		if (c->x86 > 0x10 ||
-		    (c->x86 == 0x10 && c->x86_model >= 0x2)) {
-			u64 val;
-
-			rdmsrl(MSR_K7_HWCR, val);
-			if (!(val & BIT(24)))
-				printk(KERN_WARNING FW_BUG "TSC doesn't count "
-					"with P0 frequency!\n");
+		/* Check if SME is enabled */
+		rdmsrl(MSR_K8_SYSCFG, msr);
+		if (msr & MSR_K8_SYSCFG_MEM_ENCRYPT) {
+			c->x86_phys_bits -= (cpuid_ebx(0x8000001f) >> 6) & 0x3f;
+			if (IS_ENABLED(CONFIG_X86_32))
+				clear_cpu_cap(c, X86_FEATURE_SME);
+		} else {
+			clear_cpu_cap(c, X86_FEATURE_SME);
 		}
 	}
 
@@ -489,22 +600,17 @@ static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
 		case 0x16: bit = 33; break;
 		case 0x17: bit = 10;
 			   set_cpu_cap(c, X86_FEATURE_ZEN);
+#ifdef CONFIG_NUMA
+			   node_reclaim_distance = 32;
+#endif
 			   break;
 		default: return;
 		}
 		/*
 		 * Try to cache the base value so further operations can
 		 * avoid RMW. If that faults, do not enable SSBD.
-		 *
-		 * RHEL6 specific:
-		 * The access of the non-architectural MSR_AMD64_LS_CFG
-		 * MSR may cause fault in a VM. Fault in early boot may
-		 * panic the system. As a result, we have to disable the
-		 * AMD SSBD mitigation when running in a VM for the time
-		 * being.
 		 */
-		if (!boot_cpu_has(X86_FEATURE_HYPERVISOR) &&
-		    !rdmsrl_safe(MSR_AMD64_LS_CFG, &x86_amd_ls_cfg_base)) {
+		if (!rdmsrl_safe(MSR_AMD64_LS_CFG, &x86_amd_ls_cfg_base)) {
 			setup_force_cpu_cap(X86_FEATURE_LS_CFG_SSBD);
 			setup_force_cpu_cap(X86_FEATURE_SSBD);
 			x86_amd_ls_cfg_ssbd_mask = 1ULL << bit;
@@ -514,14 +620,13 @@ static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
 	/* re-enable TopologyExtensions if switched off by BIOS */
 	if ((c->x86 == 0x15) &&
 	    (c->x86_model >= 0x10) && (c->x86_model <= 0x1f) &&
-	    !cpu_has_topoext) {
-		u64 val;
+	    !cpu_has(c, X86_FEATURE_TOPOEXT)) {
 
-		if (!rdmsrl_safe(0xc0011005, &val)) {
-			val |= 1ULL << 54;
-			checking_wrmsrl(0xc0011005, val);
-			rdmsrl(0xc0011005, val);
-			if (val & (1ULL << 54)) {
+		if (!rdmsrl_safe(0xc0011005, &value)) {
+			value |= 1ULL << 54;
+			wrmsrl_safe(0xc0011005, value);
+			rdmsrl(0xc0011005, value);
+			if (value & (1ULL << 54)) {
 				set_cpu_cap(c, X86_FEATURE_TOPOEXT);
 				printk(KERN_INFO FW_INFO "CPU: Re-enabling "
 				  "disabled Topology Extensions Support\n");
@@ -532,11 +637,15 @@ static void __cpuinit early_init_amd(struct cpuinfo_x86 *c)
 	amd_get_topology_early(c);
 }
 
-static void __cpuinit init_amd(struct cpuinfo_x86 *c)
+static const int amd_erratum_383[];
+static const int amd_erratum_400[];
+static bool cpu_has_amd_erratum(struct cpuinfo_x86 *cpu, const int *erratum);
+
+static void init_amd(struct cpuinfo_x86 *c)
 {
-#ifdef CONFIG_SMP
 	unsigned long long value;
 
+#ifdef CONFIG_SMP
 	/*
 	 * Disable TLB flush filter by setting HWCR.FFDIS on K8
 	 * bit 6 of msr C001_0015
@@ -550,7 +659,6 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		wrmsrl(MSR_K7_HWCR, value);
 	}
 #endif
-
 	early_init_amd(c);
 
 	/*
@@ -574,12 +682,10 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		 * (AMD Erratum #110, docId: 25759).
 		 */
 		if (c->x86_model < 0x14 && cpu_has(c, X86_FEATURE_LAHF_LM)) {
-			u64 val;
-
 			clear_cpu_cap(c, X86_FEATURE_LAHF_LM);
-			if (!rdmsrl_amd_safe(0xc001100d, &val)) {
-				val &= ~(1ULL << 32);
-				wrmsrl_amd_safe(0xc001100d, val);
+			if (!rdmsrl_amd_safe(0xc001100d, &value)) {
+				value &= ~(1ULL << 32);
+				wrmsrl_amd_safe(0xc001100d, value);
 			}
 		}
 
@@ -628,9 +734,23 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		}
 	}
 
+	/*
+	 * The way access filter has a performance penalty on some workloads.
+	 * Disable it on the affected CPUs.
+	 */
+	if ((c->x86 == 0x15) &&
+	    (c->x86_model >= 0x02) && (c->x86_model < 0x20)) {
+
+		if (!rdmsrl_safe(0xc0011021, &value) && !(value & 0x1E)) {
+			value |= 0x1E;
+			wrmsrl_safe(0xc0011021, value);
+		}
+	}
+
 	cpu_detect_cache_sizes(c);
 
 	amd_detect_cmp(c);
+	amd_get_topology(c);
 	srat_detect_node(c);
 
 	init_amd_cacheinfo(c);
@@ -670,43 +790,71 @@ static void __cpuinit init_amd(struct cpuinfo_x86 *c)
 		 * benefit in doing so.
 		 */
 		if (!rdmsrl_safe(MSR_K8_TSEG_ADDR, &tseg)) {
+			unsigned long pfn = tseg >> PAGE_SHIFT;
+
 			printk(KERN_DEBUG "tseg: %010llx\n", tseg);
-			if ((tseg>>PMD_SHIFT) <
-				(max_low_pfn_mapped>>(PMD_SHIFT-PAGE_SHIFT)) ||
-				((tseg>>PMD_SHIFT) <
-				(max_pfn_mapped>>(PMD_SHIFT-PAGE_SHIFT)) &&
-				(tseg>>PMD_SHIFT) >= (1ULL<<(32 - PMD_SHIFT))))
+			if (pfn_range_is_mapped(pfn, pfn + 1))
 				set_memory_4k((unsigned long)__va(tseg), 1);
 		}
 	}
 #endif
 
 	/*
-	 * Disable GART TLB Walk Errors on Fam10h. We do this here
-	 * because this is always needed when GART is enabled, even in a
-	 * kernel which has no MCE support built in.
+	 * Family 0x12 and above processors have APIC timer
+	 * running in deep C states.
 	 */
+	if (c->x86 > 0x11)
+		set_cpu_cap(c, X86_FEATURE_ARAT);
+
 	if (c->x86 == 0x10) {
 		/*
+		 * Disable GART TLB Walk Errors on Fam10h. We do this here
+		 * because this is always needed when GART is enabled, even in a
+		 * kernel which has no MCE support built in.
 		 * BIOS should disable GartTlbWlk Errors themself. If
 		 * it doesn't do it here as suggested by the BKDG.
 		 *
 		 * Fixes: https://bugzilla.kernel.org/show_bug.cgi?id=33012
 		 */
 		u64 mask;
+		int err;
 
-		rdmsrl(MSR_AMD64_MCx_MASK(4), mask);
-		mask |= (1 << 10);
-		wrmsrl(MSR_AMD64_MCx_MASK(4), mask);
+		err = rdmsrl_safe(MSR_AMD64_MCx_MASK(4), &mask);
+		if (err == 0) {
+			mask |= (1 << 10);
+			wrmsrl_safe(MSR_AMD64_MCx_MASK(4), mask);
+		}
+
+		/*
+		 * On family 10h BIOS may not have properly enabled WC+ support,
+		 * causing it to be converted to CD memtype. This may result in
+		 * performance degradation for certain nested-paging guests.
+		 * Prevent this conversion by clearing bit 24 in
+		 * MSR_AMD64_BU_CFG2.
+		 *
+		 * NOTE: we want to use the _safe accessors so as not to #GP kvm
+		 * guests on older kvm hosts.
+		 */
+
+		rdmsrl_safe(MSR_AMD64_BU_CFG2, &value);
+		value &= ~(1ULL << 24);
+		wrmsrl_safe(MSR_AMD64_BU_CFG2, value);
+
+		if (cpu_has_amd_erratum(c, amd_erratum_383))
+			set_cpu_bug(c, X86_BUG_AMD_TLB_MMATCH);
 	}
+
+	if (cpu_has_amd_erratum(c, amd_erratum_400))
+		set_cpu_bug(c, X86_BUG_AMD_APIC_C1E);
 
 	if (c->x86 == 0x10 || c->x86 == 0x12)
 		set_cpu_cap(c, X86_FEATURE_IBP_DISABLE);
+
+	set_cpu_cap(c, X86_FEATURE_RETPOLINE_AMD);
 }
 
 #ifdef CONFIG_X86_32
-static unsigned int __cpuinit amd_size_cache(struct cpuinfo_x86 *c,
-							unsigned int size)
+static unsigned int amd_size_cache(struct cpuinfo_x86 *c, unsigned int size)
 {
 	/* AMD errata T13 (order #21922) */
 	if ((c->x86 == 6)) {
@@ -722,7 +870,67 @@ static unsigned int __cpuinit amd_size_cache(struct cpuinfo_x86 *c,
 }
 #endif
 
-static const struct cpu_dev __cpuinitconst amd_cpu_dev = {
+static void cpu_set_tlb_flushall_shift(struct cpuinfo_x86 *c)
+{
+	tlb_flushall_shift = 6;
+}
+
+static void cpu_detect_tlb_amd(struct cpuinfo_x86 *c)
+{
+	u32 ebx, eax, ecx, edx;
+	u16 mask = 0xfff;
+
+	if (c->x86 < 0xf)
+		return;
+
+	if (c->extended_cpuid_level < 0x80000006)
+		return;
+
+	cpuid(0x80000006, &eax, &ebx, &ecx, &edx);
+
+	tlb_lld_4k[ENTRIES] = (ebx >> 16) & mask;
+	tlb_lli_4k[ENTRIES] = ebx & mask;
+
+	/*
+	 * K8 doesn't have 2M/4M entries in the L2 TLB so read out the L1 TLB
+	 * characteristics from the CPUID function 0x80000005 instead.
+	 */
+	if (c->x86 == 0xf) {
+		cpuid(0x80000005, &eax, &ebx, &ecx, &edx);
+		mask = 0xff;
+	}
+
+	/* Handle DTLB 2M and 4M sizes, fall back to L1 if L2 is disabled */
+	if (!((eax >> 16) & mask)) {
+		u32 a, b, c, d;
+
+		cpuid(0x80000005, &a, &b, &c, &d);
+		tlb_lld_2m[ENTRIES] = (a >> 16) & 0xff;
+	} else {
+		tlb_lld_2m[ENTRIES] = (eax >> 16) & mask;
+	}
+
+	/* a 4M entry uses two 2M entries */
+	tlb_lld_4m[ENTRIES] = tlb_lld_2m[ENTRIES] >> 1;
+
+	/* Handle ITLB 2M and 4M sizes, fall back to L1 if L2 is disabled */
+	if (!(eax & mask)) {
+		/* Erratum 658 */
+		if (c->x86 == 0x15 && c->x86_model <= 0x1f) {
+			tlb_lli_2m[ENTRIES] = 1024;
+		} else {
+			cpuid(0x80000005, &eax, &ebx, &ecx, &edx);
+			tlb_lli_2m[ENTRIES] = eax & 0xff;
+		}
+	} else
+		tlb_lli_2m[ENTRIES] = eax & mask;
+
+	tlb_lli_4m[ENTRIES] = tlb_lli_2m[ENTRIES] >> 1;
+
+	cpu_set_tlb_flushall_shift(c);
+}
+
+static const struct cpu_dev amd_cpu_dev = {
 	.c_vendor	= "AMD",
 	.c_ident	= { "AuthenticAMD" },
 #ifdef CONFIG_X86_32
@@ -741,9 +949,93 @@ static const struct cpu_dev __cpuinitconst amd_cpu_dev = {
 	.c_size_cache	= amd_size_cache,
 #endif
 	.c_early_init   = early_init_amd,
+	.c_detect_tlb	= cpu_detect_tlb_amd,
 	.c_bsp_init	= bsp_init_amd,
 	.c_init		= init_amd,
 	.c_x86_vendor	= X86_VENDOR_AMD,
 };
 
 cpu_dev_register(amd_cpu_dev);
+
+/*
+ * AMD errata checking
+ *
+ * Errata are defined as arrays of ints using the AMD_LEGACY_ERRATUM() or
+ * AMD_OSVW_ERRATUM() macros. The latter is intended for newer errata that
+ * have an OSVW id assigned, which it takes as first argument. Both take a
+ * variable number of family-specific model-stepping ranges created by
+ * AMD_MODEL_RANGE().
+ *
+ * Example:
+ *
+ * const int amd_erratum_319[] =
+ *	AMD_LEGACY_ERRATUM(AMD_MODEL_RANGE(0x10, 0x2, 0x1, 0x4, 0x2),
+ *			   AMD_MODEL_RANGE(0x10, 0x8, 0x0, 0x8, 0x0),
+ *			   AMD_MODEL_RANGE(0x10, 0x9, 0x0, 0x9, 0x0));
+ */
+
+#define AMD_LEGACY_ERRATUM(...)		{ -1, __VA_ARGS__, 0 }
+#define AMD_OSVW_ERRATUM(osvw_id, ...)	{ osvw_id, __VA_ARGS__, 0 }
+#define AMD_MODEL_RANGE(f, m_start, s_start, m_end, s_end) \
+	((f << 24) | (m_start << 16) | (s_start << 12) | (m_end << 4) | (s_end))
+#define AMD_MODEL_RANGE_FAMILY(range)	(((range) >> 24) & 0xff)
+#define AMD_MODEL_RANGE_START(range)	(((range) >> 12) & 0xfff)
+#define AMD_MODEL_RANGE_END(range)	((range) & 0xfff)
+
+static const int amd_erratum_400[] =
+	AMD_OSVW_ERRATUM(1, AMD_MODEL_RANGE(0xf, 0x41, 0x2, 0xff, 0xf),
+			    AMD_MODEL_RANGE(0x10, 0x2, 0x1, 0xff, 0xf));
+
+static const int amd_erratum_383[] =
+	AMD_OSVW_ERRATUM(3, AMD_MODEL_RANGE(0x10, 0, 0, 0xff, 0xf));
+
+
+static bool cpu_has_amd_erratum(struct cpuinfo_x86 *cpu, const int *erratum)
+{
+	int osvw_id = *erratum++;
+	u32 range;
+	u32 ms;
+
+	if (osvw_id >= 0 && osvw_id < 65536 &&
+	    cpu_has(cpu, X86_FEATURE_OSVW)) {
+		u64 osvw_len;
+
+		rdmsrl(MSR_AMD64_OSVW_ID_LENGTH, osvw_len);
+		if (osvw_id < osvw_len) {
+			u64 osvw_bits;
+
+			rdmsrl(MSR_AMD64_OSVW_STATUS + (osvw_id >> 6),
+			    osvw_bits);
+			return osvw_bits & (1ULL << (osvw_id & 0x3f));
+		}
+	}
+
+	/* OSVW unavailable or ID unknown, match family-model-stepping range */
+	ms = (cpu->x86_model << 4) | cpu->x86_mask;
+	while ((range = *erratum++))
+		if ((cpu->x86 == AMD_MODEL_RANGE_FAMILY(range)) &&
+		    (ms >= AMD_MODEL_RANGE_START(range)) &&
+		    (ms <= AMD_MODEL_RANGE_END(range)))
+			return true;
+
+	return false;
+}
+
+void set_dr_addr_mask(unsigned long mask, int dr)
+{
+	if (!cpu_has_bpext)
+		return;
+
+	switch (dr) {
+	case 0:
+		wrmsr(MSR_F16H_DR0_ADDR_MASK, mask, 0);
+		break;
+	case 1:
+	case 2:
+	case 3:
+		wrmsr(MSR_F16H_DR1_ADDR_MASK - 1 + dr, mask, 0);
+		break;
+	default:
+		break;
+	}
+}

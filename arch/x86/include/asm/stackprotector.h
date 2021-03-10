@@ -38,7 +38,6 @@
 #include <asm/tsc.h>
 #include <asm/processor.h>
 #include <asm/percpu.h>
-#include <asm/system.h>
 #include <asm/desc.h>
 #include <linux/random.h>
 
@@ -71,14 +70,14 @@ static __always_inline void boot_init_stack_canary(void)
 	 * on during the bootup the random pool has true entropy too.
 	 */
 	get_random_bytes(&canary, sizeof(canary));
-	tsc = __native_read_tsc();
+	tsc = rdtsc();
 	canary += tsc + (tsc << 32UL);
 
 	current->stack_canary = canary;
 #ifdef CONFIG_X86_64
-	percpu_write(irq_stack_union.stack_canary, canary);
+	this_cpu_write(irq_stack_union.stack_canary, canary);
 #else
-	percpu_write(stack_canary.canary, canary);
+	this_cpu_write(stack_canary.canary, canary);
 #endif
 }
 

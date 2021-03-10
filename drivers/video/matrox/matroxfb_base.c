@@ -101,8 +101,6 @@
 
 #include <linux/version.h>
 
-#define __OLD_VIDIOC_
-
 #include "matroxfb_base.h"
 #include "matroxfb_misc.h"
 #include "matroxfb_accel.h"
@@ -113,6 +111,7 @@
 #include "matroxfb_g450.h"
 #include <linux/matroxfb.h>
 #include <linux/interrupt.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 
 #ifdef CONFIG_PPC_PMAC
@@ -148,7 +147,6 @@ static struct fb_var_screeninfo vesafb_defined = {
 	39721L,48L,16L,33L,10L,
 	96L,2L,~0,	/* No sync info */
 	FB_VMODE_NONINTERLACED,
-	0, {0,0,0,0,0}
 };
 
 
@@ -622,7 +620,7 @@ static int matroxfb_decode_var(const struct matrox_fb_info *minfo,
 		var->yoffset = var->yres_virtual - var->yres;
 
 	if (bpp == 16 && var->green.length == 5) {
-		bpp--; /* an artifical value - 15 */
+		bpp--; /* an artificial value - 15 */
 	}
 
 	for (rgbt = table; rgbt->bpp < bpp; rgbt++);
@@ -1151,7 +1149,6 @@ static int matroxfb_ioctl(struct fb_info *info,
 					return -EFAULT;
 				return err;
 			}
-		case VIDIOC_S_CTRL_OLD:
 		case VIDIOC_S_CTRL:
 			{
 				struct v4l2_control ctrl;
@@ -1246,46 +1243,46 @@ static struct { struct fb_bitfield red, green, blue, transp; int bits_per_pixel;
 };
 
 /* initialized by setup, see explanation at end of file (search for MODULE_PARM_DESC) */
-static unsigned int mem;		/* "matrox:mem:xxxxxM" */
+static unsigned int mem;		/* "matroxfb:mem:xxxxxM" */
 static int option_precise_width = 1;	/* cannot be changed, option_precise_width==0 must imply noaccel */
-static int inv24;			/* "matrox:inv24" */
-static int cross4MB = -1;		/* "matrox:cross4MB" */
-static int disabled;			/* "matrox:disabled" */
-static int noaccel;			/* "matrox:noaccel" */
-static int nopan;			/* "matrox:nopan" */
-static int no_pci_retry;		/* "matrox:nopciretry" */
-static int novga;			/* "matrox:novga" */
-static int nobios;			/* "matrox:nobios" */
-static int noinit = 1;			/* "matrox:init" */
-static int inverse;			/* "matrox:inverse" */
-static int sgram;			/* "matrox:sgram" */
+static int inv24;			/* "matroxfb:inv24" */
+static int cross4MB = -1;		/* "matroxfb:cross4MB" */
+static int disabled;			/* "matroxfb:disabled" */
+static int noaccel;			/* "matroxfb:noaccel" */
+static int nopan;			/* "matroxfb:nopan" */
+static int no_pci_retry;		/* "matroxfb:nopciretry" */
+static int novga;			/* "matroxfb:novga" */
+static int nobios;			/* "matroxfb:nobios" */
+static int noinit = 1;			/* "matroxfb:init" */
+static int inverse;			/* "matroxfb:inverse" */
+static int sgram;			/* "matroxfb:sgram" */
 #ifdef CONFIG_MTRR
-static int mtrr = 1;			/* "matrox:nomtrr" */
+static int mtrr = 1;			/* "matroxfb:nomtrr" */
 #endif
-static int grayscale;			/* "matrox:grayscale" */
-static int dev = -1;			/* "matrox:dev:xxxxx" */
-static unsigned int vesa = ~0;		/* "matrox:vesa:xxxxx" */
-static int depth = -1;			/* "matrox:depth:xxxxx" */
-static unsigned int xres;		/* "matrox:xres:xxxxx" */
-static unsigned int yres;		/* "matrox:yres:xxxxx" */
-static unsigned int upper = ~0;		/* "matrox:upper:xxxxx" */
-static unsigned int lower = ~0;		/* "matrox:lower:xxxxx" */
-static unsigned int vslen;		/* "matrox:vslen:xxxxx" */
-static unsigned int left = ~0;		/* "matrox:left:xxxxx" */
-static unsigned int right = ~0;		/* "matrox:right:xxxxx" */
-static unsigned int hslen;		/* "matrox:hslen:xxxxx" */
-static unsigned int pixclock;		/* "matrox:pixclock:xxxxx" */
-static int sync = -1;			/* "matrox:sync:xxxxx" */
-static unsigned int fv;			/* "matrox:fv:xxxxx" */
-static unsigned int fh;			/* "matrox:fh:xxxxxk" */
-static unsigned int maxclk;		/* "matrox:maxclk:xxxxM" */
-static int dfp;				/* "matrox:dfp */
-static int dfp_type = -1;		/* "matrox:dfp:xxx */
-static int memtype = -1;		/* "matrox:memtype:xxx" */
-static char outputs[8];			/* "matrox:outputs:xxx" */
+static int grayscale;			/* "matroxfb:grayscale" */
+static int dev = -1;			/* "matroxfb:dev:xxxxx" */
+static unsigned int vesa = ~0;		/* "matroxfb:vesa:xxxxx" */
+static int depth = -1;			/* "matroxfb:depth:xxxxx" */
+static unsigned int xres;		/* "matroxfb:xres:xxxxx" */
+static unsigned int yres;		/* "matroxfb:yres:xxxxx" */
+static unsigned int upper = ~0;		/* "matroxfb:upper:xxxxx" */
+static unsigned int lower = ~0;		/* "matroxfb:lower:xxxxx" */
+static unsigned int vslen;		/* "matroxfb:vslen:xxxxx" */
+static unsigned int left = ~0;		/* "matroxfb:left:xxxxx" */
+static unsigned int right = ~0;		/* "matroxfb:right:xxxxx" */
+static unsigned int hslen;		/* "matroxfb:hslen:xxxxx" */
+static unsigned int pixclock;		/* "matroxfb:pixclock:xxxxx" */
+static int sync = -1;			/* "matroxfb:sync:xxxxx" */
+static unsigned int fv;			/* "matroxfb:fv:xxxxx" */
+static unsigned int fh;			/* "matroxfb:fh:xxxxxk" */
+static unsigned int maxclk;		/* "matroxfb:maxclk:xxxxM" */
+static int dfp;				/* "matroxfb:dfp */
+static int dfp_type = -1;		/* "matroxfb:dfp:xxx */
+static int memtype = -1;		/* "matroxfb:memtype:xxx" */
+static char outputs[8];			/* "matroxfb:outputs:xxx" */
 
 #ifndef MODULE
-static char videomode[64];		/* "matrox:mode:xxxxx" or "matrox:xxxxx" */
+static char videomode[64];		/* "matroxfb:mode:xxxxx" or "matroxfb:xxxxx" */
 #endif
 
 static int matroxfb_getmemory(struct matrox_fb_info *minfo,
@@ -1548,8 +1545,8 @@ static struct board {
 
 #ifndef MODULE
 static struct fb_videomode defaultmode = {
-	/* 640x480 @ 60Hz, 31.5 kHz */
-	NULL, 60, 640, 480, 39721, 40, 24, 32, 11, 96, 2,
+	/* 1024x768 @ 60Hz */
+	NULL, 60, 1024, 768, 15384, 160, 24, 29, 3, 136, 6,
 	0, FB_VMODE_NONINTERLACED
 };
 #endif /* !MODULE */
@@ -1769,9 +1766,7 @@ static int initMatrox2(struct matrox_fb_info *minfo, struct board *b)
 	minfo->fbops = matroxfb_ops;
 	minfo->fbcon.fbops = &minfo->fbops;
 	minfo->fbcon.pseudo_palette = minfo->cmap;
-	/* after __init time we are like module... no logo */
-	minfo->fbcon.flags = hotplug ? FBINFO_FLAG_MODULE : FBINFO_FLAG_DEFAULT;
-	minfo->fbcon.flags |= FBINFO_PARTIAL_PAN_OK | 	 /* Prefer panning for scroll under MC viewer/edit */
+	minfo->fbcon.flags = FBINFO_PARTIAL_PAN_OK | 	 /* Prefer panning for scroll under MC viewer/edit */
 				      FBINFO_HWACCEL_COPYAREA |  /* We have hw-assisted bmove */
 				      FBINFO_HWACCEL_FILLRECT |  /* And fillrect */
 				      FBINFO_HWACCEL_IMAGEBLIT | /* And imageblit */
@@ -2495,7 +2490,7 @@ MODULE_PARM_DESC(inverse, "Inverse (0 or 1) (default=0)");
 module_param(dev, int, 0);
 MODULE_PARM_DESC(dev, "Multihead support, attach to device ID (0..N) (default=all working)");
 module_param(vesa, int, 0);
-MODULE_PARM_DESC(vesa, "Startup videomode (0x000-0x1FF) (default=0x101)");
+MODULE_PARM_DESC(vesa, "Startup videomode (0x000-0x1FF) (default=0x105)");
 module_param(xres, int, 0);
 MODULE_PARM_DESC(xres, "Horizontal resolution (px), overrides xres from vesa (default=vesa)");
 module_param(yres, int, 0);

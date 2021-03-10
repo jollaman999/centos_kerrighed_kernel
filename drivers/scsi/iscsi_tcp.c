@@ -232,8 +232,10 @@ static void iscsi_sw_tcp_conn_set_callbacks(struct iscsi_conn *conn)
 }
 
 static void
-iscsi_sw_tcp_conn_restore_callbacks(struct iscsi_sw_tcp_conn *tcp_sw_conn)
+iscsi_sw_tcp_conn_restore_callbacks(struct iscsi_conn *conn)
 {
+	struct iscsi_tcp_conn *tcp_conn = conn->dd_data;
+	struct iscsi_sw_tcp_conn *tcp_sw_conn = tcp_conn->dd_data;
 	struct sock *sk = tcp_sw_conn->sock->sk;
 
 	/* restore socket callbacks, see also: iscsi_conn_set_callbacks() */
@@ -242,7 +244,7 @@ iscsi_sw_tcp_conn_restore_callbacks(struct iscsi_sw_tcp_conn *tcp_sw_conn)
 	sk->sk_data_ready   = tcp_sw_conn->old_data_ready;
 	sk->sk_state_change = tcp_sw_conn->old_state_change;
 	sk->sk_write_space  = tcp_sw_conn->old_write_space;
-	sk->sk_no_check	 = 0;
+	sk->sk_no_check_tx = 0;
 	write_unlock_bh(&sk->sk_callback_lock);
 }
 
@@ -369,17 +371,24 @@ static inline int iscsi_sw_tcp_xmit_qlen(struct iscsi_conn *conn)
 static int iscsi_sw_tcp_pdu_xmit(struct iscsi_task *task)
 {
 	struct iscsi_conn *conn = task->conn;
-	int rc;
+	unsigned long pflags = current->flags;
+	int rc = 0;
+
+	current->flags |= PF_MEMALLOC;
 
 	while (iscsi_sw_tcp_xmit_qlen(conn)) {
 		rc = iscsi_sw_tcp_xmit(conn);
-		if (rc == 0)
-			return -EAGAIN;
+		if (rc == 0) {
+			rc = -EAGAIN;
+			break;
+		}
 		if (rc < 0)
-			return rc;
+			break;
+		rc = 0;
 	}
 
-	return 0;
+	tsk_restore_flags(current, pflags, PF_MEMALLOC);
+	return rc;
 }
 
 /*
@@ -581,7 +590,7 @@ static void iscsi_sw_tcp_release_conn(struct iscsi_conn *conn)
 		return;
 
 	sock_hold(sock->sk);
-	iscsi_sw_tcp_conn_restore_callbacks(tcp_sw_conn);
+	iscsi_sw_tcp_conn_restore_callbacks(conn);
 	sock_put(sock->sk);
 
 	spin_lock_bh(&session->lock);
@@ -617,10 +626,8 @@ static void iscsi_sw_tcp_conn_stop(struct iscsi_cls_conn *cls_conn, int flag)
 	if (!sock)
 		return;
 
-	if (sock->sk->sk_sleep) {
-		sock->sk->sk_err = EIO;
-		wake_up_interruptible(sock->sk->sk_sleep);
-	}
+	sock->sk->sk_err = EIO;
+	wake_up_interruptible(sk_sleep(sock->sk));
 
 	/* stop xmit side */
 	iscsi_suspend_tx(conn);
@@ -663,9 +670,10 @@ iscsi_sw_tcp_conn_bind(struct iscsi_cls_session *cls_session,
 
 	/* setup Socket parameters */
 	sk = sock->sk;
-	sk->sk_reuse = 1;
+	sk->sk_reuse = SK_CAN_REUSE;
 	sk->sk_sndtimeo = 15 * HZ; /* FIXME: make it configurable */
 	sk->sk_allocation = GFP_ATOMIC;
+	sk_set_memalloc(sk);
 
 	iscsi_sw_tcp_conn_set_callbacks(conn);
 	tcp_sw_conn->sendpage = tcp_sw_conn->sock->ops->sendpage;
@@ -718,13 +726,18 @@ static int iscsi_sw_tcp_conn_get_param(struct iscsi_cls_conn *cls_conn,
 	switch(param) {
 	case ISCSI_PARAM_CONN_PORT:
 	case ISCSI_PARAM_CONN_ADDRESS:
+	case ISCSI_PARAM_LOCAL_PORT:
 		spin_lock_bh(&conn->session->lock);
 		if (!tcp_sw_conn || !tcp_sw_conn->sock) {
 			spin_unlock_bh(&conn->session->lock);
 			return -ENOTCONN;
 		}
-		rc = kernel_getpeername(tcp_sw_conn->sock,
-					(struct sockaddr *)&addr, &len);
+		if (param == ISCSI_PARAM_LOCAL_PORT)
+			rc = kernel_getsockname(tcp_sw_conn->sock,
+						(struct sockaddr *)&addr, &len);
+		else
+			rc = kernel_getpeername(tcp_sw_conn->sock,
+						(struct sockaddr *)&addr, &len);
 		spin_unlock_bh(&conn->session->lock);
 		if (rc)
 			return rc;
@@ -751,6 +764,9 @@ static int iscsi_sw_tcp_host_get_param(struct Scsi_Host *shost,
 
 	switch (param) {
 	case ISCSI_HOST_PARAM_IPADDRESS:
+		if (!session)
+			return -ENOTCONN;
+
 		spin_lock_bh(&session->lock);
 		conn = session->leadconn;
 		if (!conn) {
@@ -863,7 +879,7 @@ static void iscsi_sw_tcp_session_destroy(struct iscsi_cls_session *cls_session)
 	iscsi_host_free(shost);
 }
 
-static mode_t iscsi_sw_tcp_attr_is_visible(int param_type, int param)
+static umode_t iscsi_sw_tcp_attr_is_visible(int param_type, int param)
 {
 	switch (param_type) {
 	case ISCSI_HOST_PARAM:
@@ -884,6 +900,7 @@ static mode_t iscsi_sw_tcp_attr_is_visible(int param_type, int param)
 		case ISCSI_PARAM_DATADGST_EN:
 		case ISCSI_PARAM_CONN_ADDRESS:
 		case ISCSI_PARAM_CONN_PORT:
+		case ISCSI_PARAM_LOCAL_PORT:
 		case ISCSI_PARAM_EXP_STATSN:
 		case ISCSI_PARAM_PERSISTENT_ADDRESS:
 		case ISCSI_PARAM_PERSISTENT_PORT:

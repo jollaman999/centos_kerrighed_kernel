@@ -4,17 +4,24 @@
 
 #include <asm/thread_info.h>
 #include <asm/page.h>
+
+/*
+ * Put .bss..swapper_pg_dir as the first thing in .bss. This will
+ * make sure it has 16k alignment.
+ */
+#define BSS_FIRST_SECTIONS *(.bss..swapper_pg_dir)
+
 #include <asm-generic/vmlinux.lds.h>
 
 #ifndef CONFIG_64BIT
 OUTPUT_FORMAT("elf32-s390", "elf32-s390", "elf32-s390")
-OUTPUT_ARCH(s390)
-ENTRY(_start)
+OUTPUT_ARCH(s390:31-bit)
+ENTRY(startup)
 jiffies = jiffies_64 + 4;
 #else
 OUTPUT_FORMAT("elf64-s390", "elf64-s390", "elf64-s390")
 OUTPUT_ARCH(s390:64-bit)
-ENTRY(_start)
+ENTRY(startup)
 jiffies = jiffies_64;
 #endif
 
@@ -28,10 +35,17 @@ SECTIONS
 {
 	. = 0x00000000;
 	.text : {
-	_text = .;		/* Text and read-only data */
+		/* Text and read-only data */
 		HEAD_TEXT
+		/*
+		 * E.g. perf doesn't like symbols starting at address zero,
+		 * therefore skip the initial PSW and channel program located
+		 * at address zero and let _text start at 0x200.
+		 */
+	_text = 0x200;
 		TEXT_TEXT
 		SCHED_TEXT
+		CPUIDLE_TEXT
 		LOCK_TEXT
 		KPROBES_TEXT
 		IRQENTRY_TEXT
@@ -39,11 +53,14 @@ SECTIONS
 		*(.gnu.warning)
 	} :text = 0x0700
 
+	. = ALIGN(PAGE_SIZE);
 	_etext = .;		/* End of text section */
 
 	NOTES :text :note
 
-	RODATA
+	.dummy : { *(.dummy) } :data
+
+	RO_DATA_SECTION(PAGE_SIZE)
 
 #ifdef CONFIG_SHARED_KERNEL
 	. = ALIGN(0x100000);	/* VM shared segments are 1MB aligned */
@@ -63,7 +80,25 @@ SECTIONS
 	. = ALIGN(PAGE_SIZE);	/* Init code and data */
 	__init_begin = .;
 
-	INIT_TEXT_SECTION(PAGE_SIZE)
+	. = ALIGN(PAGE_SIZE);
+	.init.text : AT(ADDR(.init.text) - LOAD_OFFSET) {
+		VMLINUX_SYMBOL(_sinittext) = . ;
+		INIT_TEXT
+		. = ALIGN(PAGE_SIZE);
+		VMLINUX_SYMBOL(_einittext) = . ;
+	}
+
+	/*
+	 * .exit.text is discarded at runtime, not link time,
+	 * to deal with references from __bug_table
+	*/
+	.exit.text : {
+		EXIT_TEXT
+	}
+
+	.exit.data : {
+		EXIT_DATA
+	}
 
 	/*
 	 * struct alt_inst entries. From the header (alternative.h):
@@ -89,14 +124,6 @@ SECTIONS
 	}
 
 	/*
-	 * .exit.text is discarded at runtime, not link time,
-	 * to deal with references from __bug_table
-	*/
-	.exit.text : {
-		EXIT_TEXT
-	}
-
-	/*
 	 * Table with the patch locations to undo expolines
 	*/
 	.nospec_call_table : {
@@ -114,11 +141,11 @@ SECTIONS
 	. = ALIGN(PAGE_SIZE);
 	INIT_DATA_SECTION(0x100)
 
-	PERCPU(PAGE_SIZE)
+	PERCPU_SECTION(0x100)
 	. = ALIGN(PAGE_SIZE);
 	__init_end = .;		/* freed after init ends here */
 
-	BSS_SECTION(0, 2, 0)
+	BSS_SECTION(PAGE_SIZE, 4 * PAGE_SIZE, PAGE_SIZE)
 
 	_end = . ;
 

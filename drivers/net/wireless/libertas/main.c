@@ -13,11 +13,7 @@
 #include <linux/netdevice.h>
 #include <linux/if_arp.h>
 #include <linux/kthread.h>
-#if 0 /* Not in RHEL */
 #include <linux/kfifo.h>
-#else
-#include <linux/kfifo-new.h>
-#endif
 #include <linux/slab.h>
 #include <net/cfg80211.h>
 
@@ -339,7 +335,7 @@ static inline int mac_in_list(unsigned char *list, int list_len,
 	return 0;
 }
 
-#if 0 /* Not in RHEL */
+
 static int lbs_add_mcast_addrs(struct cmd_ds_mac_multicast_adr *cmd,
 			       struct net_device *dev, int nr_addrs)
 {
@@ -374,38 +370,6 @@ static int lbs_add_mcast_addrs(struct cmd_ds_mac_multicast_adr *cmd,
 
 	return i;
 }
-#else
-static int lbs_add_mcast_addrs(struct cmd_ds_mac_multicast_adr *cmd,
-			       struct net_device *dev, int nr_addrs)
-{
-	int i = nr_addrs;
-	struct dev_mc_list *mc_list;
-
-	if ((dev->flags & (IFF_UP|IFF_MULTICAST)) != (IFF_UP|IFF_MULTICAST))
-		return nr_addrs;
-
-	netif_addr_lock_bh(dev);
-	for (mc_list = dev->mc_list; mc_list; mc_list = mc_list->next) {
-		if (mac_in_list(cmd->maclist, nr_addrs, mc_list->dmi_addr)) {
-			lbs_deb_net("mcast address %s:%pM skipped\n", dev->name,
-				    mc_list->dmi_addr);
-			continue;
-		}
-
-		if (i == MRVDRV_MAX_MULTICAST_LIST_SIZE)
-			break;
-		memcpy(&cmd->maclist[6*i], mc_list->dmi_addr, ETH_ALEN);
-		lbs_deb_net("mcast address %s:%pM added to filter\n", dev->name,
-			    mc_list->dmi_addr);
-		i++;
-	}
-	netif_addr_unlock_bh(dev);
-	if (mc_list)
-		return -EOVERFLOW;
-
-	return i;
-}
-#endif
 
 void lbs_update_mcast(struct lbs_private *priv)
 {
@@ -608,13 +572,9 @@ static int lbs_thread(void *data)
 				    le16_to_cpu(cmdnode->cmdbuf->command));
 			lbs_complete_command(priv, cmdnode, -ETIMEDOUT);
 
-#if 0 /* Not in RHEL */
 			/* Reset card, but only when it isn't in the process
 			 * of being shutdown anyway. */
 			if (!dev->dismantle && priv->reset_card)
-#else
-			if (priv->reset_card)
-#endif
 				priv->reset_card(priv);
 		}
 		priv->cmd_timed_out = 0;
@@ -707,7 +667,7 @@ static int lbs_setup_firmware(struct lbs_private *priv)
 	lbs_deb_enter(LBS_DEB_FW);
 
 	/* Read MAC address from firmware */
-	eth_broadcast_addr(priv->current_addr);
+	memset(priv->current_addr, 0xff, ETH_ALEN);
 	ret = lbs_update_hw_spec(priv);
 	if (ret)
 		goto done;
@@ -911,7 +871,7 @@ static int lbs_init_adapter(struct lbs_private *priv)
 
 	lbs_deb_enter(LBS_DEB_MAIN);
 
-	eth_broadcast_addr(priv->current_addr);
+	memset(priv->current_addr, 0xff, ETH_ALEN);
 
 	priv->connect_status = LBS_DISCONNECTED;
 	priv->channel = DEFAULT_AD_HOC_CHANNEL;
@@ -1021,11 +981,7 @@ struct lbs_private *lbs_add_card(void *card, struct device *dmdev)
 		goto err_wdev;
 	}
 
-#if 0 /* Not in RHEL */
-	dev = alloc_netdev(0, "wlan%d", NET_NAME_UNKNOWN, ether_setup);
-#else
 	dev = alloc_netdev(0, "wlan%d", ether_setup);
-#endif
 	if (!dev) {
 		dev_err(dmdev, "no memory for network device instance\n");
 		goto err_adapter;

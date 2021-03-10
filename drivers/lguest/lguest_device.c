@@ -15,6 +15,8 @@
 #include <linux/interrupt.h>
 #include <linux/virtio_ring.h>
 #include <linux/err.h>
+#include <linux/export.h>
+#include <linux/slab.h>
 #include <asm/io.h>
 #include <asm/paravirt.h>
 #include <asm/lguest_hcall.h>
@@ -92,7 +94,7 @@ static unsigned desc_size(const struct lguest_device_desc *desc)
 }
 
 /* This gets the device's feature bits. */
-static u32 lg_get_features(struct virtio_device *vdev)
+static u64 lg_get_features(struct virtio_device *vdev)
 {
 	unsigned int i;
 	u32 features = 0;
@@ -108,12 +110,23 @@ static u32 lg_get_features(struct virtio_device *vdev)
 }
 
 /*
+ * To notify on reset or feature finalization, we (ab)use the NOTIFY
+ * hypercall, with the descriptor address of the device.
+ */
+static void status_notify(struct virtio_device *vdev)
+{
+	unsigned long offset = (void *)to_lgdev(vdev)->desc - lguest_devices;
+
+	hcall(LHCALL_NOTIFY, (max_pfn << PAGE_SHIFT) + offset, 0, 0, 0);
+}
+
+/*
  * The virtio core takes the features the Host offers, and copies the ones
  * supported by the driver into the vdev->features array.  Once that's all
  * sorted out, this routine is called so we can tell the Host which features we
  * understand and accept.
  */
-static void lg_finalize_features(struct virtio_device *vdev)
+static int lg_finalize_features(struct virtio_device *vdev)
 {
 	unsigned int i, bits;
 	struct lguest_device_desc *desc = to_lgdev(vdev)->desc;
@@ -123,17 +136,25 @@ static void lg_finalize_features(struct virtio_device *vdev)
 	/* Give virtio_ring a chance to accept features. */
 	vring_transport_features(vdev);
 
+	/* Make sure we don't have any features > 32 bits! */
+	BUG_ON((u32)vdev->features != vdev->features);
+
 	/*
-	 * The vdev->feature array is a Linux bitmask: this isn't the same as a
-	 * the simple array of bits used by lguest devices for features.  So we
-	 * do this slow, manual conversion which is completely general.
+	 * Since lguest is currently x86-only, we're little-endian.  That
+	 * means we could just memcpy.  But it's not time critical, and in
+	 * case someone copies this code, we do it the slow, obvious way.
 	 */
 	memset(out_features, 0, desc->feature_len);
 	bits = min_t(unsigned, desc->feature_len, sizeof(vdev->features)) * 8;
 	for (i = 0; i < bits; i++) {
-		if (test_bit(i, vdev->features))
+		if (__virtio_test_bit(vdev, i))
 			out_features[i / 8] |= (1 << (i % 8));
 	}
+
+	/* Tell Host we've finished with this device's feature negotiation */
+	status_notify(vdev);
+
+	return 0;
 }
 
 /* Once they've found a field, getting a copy of it is easy. */
@@ -167,28 +188,21 @@ static u8 lg_get_status(struct virtio_device *vdev)
 	return to_lgdev(vdev)->desc->status;
 }
 
-/*
- * To notify on status updates, we (ab)use the NOTIFY hypercall, with the
- * descriptor address of the device.  A zero status means "reset".
- */
-static void set_status(struct virtio_device *vdev, u8 status)
-{
-	unsigned long offset = (void *)to_lgdev(vdev)->desc - lguest_devices;
-
-	/* We set the status. */
-	to_lgdev(vdev)->desc->status = status;
-	kvm_hypercall1(LHCALL_NOTIFY, (max_pfn << PAGE_SHIFT) + offset);
-}
-
 static void lg_set_status(struct virtio_device *vdev, u8 status)
 {
 	BUG_ON(!status);
-	set_status(vdev, status);
+	to_lgdev(vdev)->desc->status = status;
+
+	/* Tell Host immediately if we failed. */
+	if (status & VIRTIO_CONFIG_S_FAILED)
+		status_notify(vdev);
 }
 
 static void lg_reset(struct virtio_device *vdev)
 {
-	set_status(vdev, 0);
+	/* 0 status means "reset" */
+	to_lgdev(vdev)->desc->status = 0;
+	status_notify(vdev);
 }
 
 /*
@@ -220,7 +234,7 @@ struct lguest_vq_info {
  * make a hypercall.  We hand the physical address of the virtqueue so the Host
  * knows which virtqueue we're talking about.
  */
-static void lg_notify(struct virtqueue *vq)
+static bool lg_notify(struct virtqueue *vq)
 {
 	/*
 	 * We store our virtqueue information in the "priv" pointer of the
@@ -228,11 +242,12 @@ static void lg_notify(struct virtqueue *vq)
 	 */
 	struct lguest_vq_info *lvq = vq->priv;
 
-	kvm_hypercall1(LHCALL_NOTIFY, lvq->config.pfn << PAGE_SHIFT);
+	hcall(LHCALL_NOTIFY, lvq->config.pfn << PAGE_SHIFT, 0, 0, 0);
+	return true;
 }
 
 /* An extern declaration inside a C file is bad form.  Don't do it. */
-extern void lguest_setup_irq(unsigned int irq);
+extern int lguest_setup_irq(unsigned int irq);
 
 /*
  * This routine finds the Nth virtqueue described in the configuration of
@@ -253,6 +268,9 @@ static struct virtqueue *lg_find_vq(struct virtio_device *vdev,
 	struct lguest_vq_info *lvq;
 	struct virtqueue *vq;
 	int err;
+
+	if (!name)
+		return NULL;
 
 	/* We must have this many virtqueues. */
 	if (index >= ldev->desc->num_vq)
@@ -283,17 +301,21 @@ static struct virtqueue *lg_find_vq(struct virtio_device *vdev,
 
 	/*
 	 * OK, tell virtio_ring.c to set up a virtqueue now we know its size
-	 * and we've got a pointer to its pages.
+	 * and we've got a pointer to its pages.  Note that we set weak_barriers
+	 * to 'true': the host just a(nother) SMP CPU, so we only need inter-cpu
+	 * barriers.
 	 */
 	vq = vring_new_virtqueue(index, lvq->config.num, LGUEST_VRING_ALIGN, vdev,
-				 lvq->pages, lg_notify, callback, name);
+				 true, lvq->pages, lg_notify, callback, name);
 	if (!vq) {
 		err = -ENOMEM;
 		goto unmap;
 	}
 
 	/* Make sure the interrupt is allocated. */
-	lguest_setup_irq(lvq->config.irq);
+	err = lguest_setup_irq(lvq->config.irq);
+	if (err)
+		goto destroy_vring;
 
 	/*
 	 * Tell the interrupt for this virtqueue to go to the virtio_ring
@@ -306,7 +328,7 @@ static struct virtqueue *lg_find_vq(struct virtio_device *vdev,
 	err = request_irq(lvq->config.irq, vring_interrupt, IRQF_SHARED,
 			  dev_name(&vdev->dev), vq);
 	if (err)
-		goto destroy_vring;
+		goto free_desc;
 
 	/*
 	 * Last of all we hook up our 'struct lguest_vq_info" to the
@@ -315,6 +337,8 @@ static struct virtqueue *lg_find_vq(struct virtio_device *vdev,
 	vq->priv = lvq;
 	return vq;
 
+free_desc:
+	irq_free_desc(lvq->config.irq);
 destroy_vring:
 	vring_del_virtqueue(vq);
 unmap:
@@ -378,7 +402,7 @@ static const char *lg_bus_name(struct virtio_device *vdev)
 }
 
 /* The ops structure which hooks everything together. */
-static struct virtio_config_ops lguest_config_ops = {
+static const struct virtio_config_ops lguest_config_ops = {
 	.get_features = lg_get_features,
 	.finalize_features = lg_finalize_features,
 	.get = lg_get,

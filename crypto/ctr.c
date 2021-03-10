@@ -191,7 +191,7 @@ static struct crypto_instance *crypto_ctr_alloc(struct rtattr **tb)
 	alg = crypto_attr_alg(tb[1], CRYPTO_ALG_TYPE_CIPHER,
 				  CRYPTO_ALG_TYPE_MASK);
 	if (IS_ERR(alg))
-		return ERR_PTR(PTR_ERR(alg));
+		return ERR_CAST(alg);
 
 	/* Block size must be >= 4 bytes. */
 	err = -EINVAL;
@@ -343,17 +343,15 @@ static struct crypto_instance *crypto_rfc3686_alloc(struct rtattr **tb)
 	int err;
 
 	algt = crypto_get_attr_type(tb);
-	err = PTR_ERR(algt);
 	if (IS_ERR(algt))
-		return ERR_PTR(err);
+		return ERR_CAST(algt);
 
 	if ((algt->type ^ CRYPTO_ALG_TYPE_BLKCIPHER) & algt->mask)
 		return ERR_PTR(-EINVAL);
 
 	cipher_name = crypto_attr_alg_name(tb[1]);
-	err = PTR_ERR(cipher_name);
 	if (IS_ERR(cipher_name))
-		return ERR_PTR(err);
+		return ERR_CAST(cipher_name);
 
 	inst = kzalloc(sizeof(*inst) + sizeof(*spawn), GFP_KERNEL);
 	if (!inst)
@@ -468,4 +466,5 @@ module_exit(crypto_ctr_module_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("CTR Counter block mode");
-MODULE_ALIAS("rfc3686");
+MODULE_ALIAS_CRYPTO("rfc3686");
+MODULE_ALIAS_CRYPTO("ctr");

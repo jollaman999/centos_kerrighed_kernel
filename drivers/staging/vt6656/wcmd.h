@@ -29,17 +29,11 @@
 #ifndef __WCMD_H__
 #define __WCMD_H__
 
-#include "ttype.h"
 #include "80211hdr.h"
 #include "80211mgr.h"
 
-/*---------------------  Export Definitions -------------------------*/
-
-
-
 #define AUTHENTICATE_TIMEOUT   1000 //ms
 #define ASSOCIATE_TIMEOUT      1000 //ms
-
 
 // Command code
 typedef enum tagCMD_CODE {
@@ -74,11 +68,11 @@ typedef enum tagCMD_STATUS {
 
 typedef struct tagCMD_ITEM {
     CMD_CODE eCmd;
-    BYTE     abyCmdDesireSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
-    BOOL     bNeedRadioOFF;
-    BOOL     bRadioCmd;
-    BOOL     bForceSCAN;
-    WORD     wDeAuthenReason;
+    u8     abyCmdDesireSSID[WLAN_IEHDR_LEN + WLAN_SSID_MAXLEN + 1];
+    bool     bNeedRadioOFF;
+    bool     bRadioCmd;
+    bool     bForceSCAN;
+    u16     wDeAuthenReason;
 } CMD_ITEM, *PCMD_ITEM;
 
 // Command state
@@ -105,46 +99,21 @@ typedef enum tagCMD_STATE {
     WLAN_CMD_IDLE
 } CMD_STATE, *PCMD_STATE;
 
+struct vnt_private;
 
+void vResetCommandTimer(struct vnt_private *);
 
-/*---------------------  Export Classes  ----------------------------*/
+int bScheduleCommand(struct vnt_private *, CMD_CODE eCommand, u8 *pbyItem0);
 
-/*---------------------  Export Variables  --------------------------*/
+void vRunCommand(struct vnt_private *);
 
-
-/*---------------------  Export Types  ------------------------------*/
-
-
-/*---------------------  Export Functions  --------------------------*/
-VOID
-vResetCommandTimer(
-    IN HANDLE      hDeviceContext
-    );
-
-BOOL
-bScheduleCommand(
-    IN HANDLE      hDeviceContext,
-    IN CMD_CODE    eCommand,
-    IN PBYTE       pbyItem0
-    );
-
-VOID
-vRunCommand(
-    IN  HANDLE      hDeviceContext
-    );
 /*
-VOID
+void
 WCMDvCommandThread(
-    PVOID Context
+    void * Context
     );
 */
 
-//2007-0115-09<Add>by MikeLiu
-#ifdef TxInSleep
-VOID
-BSSvSecondTxData(
-    IN  HANDLE      hDeviceContext
-    );
-#endif
+void BSSvSecondTxData(struct vnt_private *);
 
-#endif //__WCMD_H__
+#endif /* __WCMD_H__ */

@@ -33,8 +33,6 @@
 #ifndef __NES_HW_H
 #define __NES_HW_H
 
-#include <linux/inet_lro.h>
-
 #define NES_PHY_TYPE_CX4       1
 #define NES_PHY_TYPE_1G        2
 #define NES_PHY_TYPE_ARGUS     4
@@ -1049,8 +1047,6 @@ struct nes_hw_tune_timer {
 #define NES_TIMER_ENABLE_LIMIT      4
 #define NES_MAX_LINK_INTERRUPTS     128
 #define NES_MAX_LINK_CHECK          200
-#define NES_MAX_LRO_DESCRIPTORS     32
-#define NES_LRO_MAX_AGGR            64
 
 struct nes_adapter {
 	u64              fw_ver;
@@ -1168,6 +1164,7 @@ struct nes_adapter {
 	u8  log_port;
 
 	/* PCI information */
+	struct nes_device *nesdev;
 	unsigned int  devfn;
 	unsigned char bus_number;
 	unsigned char OneG_Mode;
@@ -1200,12 +1197,6 @@ struct nes_fast_mr_wqe_pbl {
 	dma_addr_t	paddr;
 };
 
-struct nes_ib_fast_reg_page_list {
-	struct ib_fast_reg_page_list	ibfrpl;
-	struct nes_fast_mr_wqe_pbl 	nes_wqe_pbl;
-	u64 				pbl;
-};
-
 struct nes_listener {
 	struct work_struct      work;
 	struct workqueue_struct *wq;
@@ -1236,7 +1227,6 @@ struct nes_vnic {
 	/* void *mem; */
 	struct nes_device *nesdev;
 	struct net_device *netdev;
-	struct vlan_group *vlan_grp;
 	atomic_t          rx_skbs_needed;
 	atomic_t          rx_skb_timer_running;
 	int               budget;
@@ -1270,10 +1260,6 @@ struct nes_vnic {
 	u8  next_qp_nic_index;
 	u8  of_device_registered;
 	u8  rdma_enabled;
-	u8  rx_checksum_disabled;
-	u32 lro_max_aggr;
-	struct net_lro_mgr lro_mgr;
-	struct net_lro_desc lro_desc[NES_MAX_LRO_DESCRIPTORS];
 	struct timer_list event_timer;
 	enum ib_event_type delayed_event;
 	enum ib_event_type last_dispatched_event;
@@ -1390,8 +1376,5 @@ struct nes_terminate_hdr {
 /* Used for link status recheck after interrupt processing */
 #define NES_LINK_RECHECK_DELAY	msecs_to_jiffies(50)
 #define NES_LINK_RECHECK_MAX	60
-
-#define nes_vlan_rx vlan_hwaccel_receive_skb
-#define nes_netif_rx netif_receive_skb
 
 #endif		/* __NES_HW_H */

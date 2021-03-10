@@ -144,7 +144,7 @@ struct iscsi_transport {
 	int (*get_iface_param) (struct iscsi_iface *iface,
 				enum iscsi_param_type param_type,
 				int param, char *buf);
-	mode_t (*attr_is_visible)(int param_type, int param);
+	umode_t (*attr_is_visible)(int param_type, int param);
 	int (*bsg_request)(struct bsg_job *job);
 	int (*send_ping) (struct Scsi_Host *shost, uint32_t iface_num,
 			  uint32_t iface_type, uint32_t payload_size,
@@ -238,12 +238,15 @@ struct iscsi_cls_session {
 	struct work_struct unblock_work;
 	struct work_struct scan_work;
 	struct work_struct unbind_work;
+	struct mutex mutex;
 
 	/* recovery fields */
 	int recovery_tmo;
+	bool recovery_tmo_sysfs_override;
 	struct delayed_work recovery_work;
 
 	unsigned int target_id;
+	bool ida_used;
 
 	/*
 	 * pid of userspace process that created session or -1 if
@@ -270,7 +273,6 @@ struct iscsi_cls_session {
 
 struct iscsi_cls_host {
 	atomic_t nr_scans;
-	struct mutex mutex;
 	struct request_queue *bsg_q;
 	uint32_t port_speed;
 	uint32_t port_state;

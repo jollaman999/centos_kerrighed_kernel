@@ -34,6 +34,7 @@
 
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/kfifo.h>
 
 #include "t3_cpl.h"
 #include "t3cdev.h"
@@ -70,18 +71,18 @@ struct cxio_hal_ctrl_qp {
 	wait_queue_head_t waitq;/* wait for RspQ/CQE msg */
 	union t3_wr *workq;	/* the work request queue */
 	dma_addr_t dma_addr;	/* pci bus address of the workq */
-	DECLARE_PCI_UNMAP_ADDR(mapping)
+	DEFINE_DMA_UNMAP_ADDR(mapping);
 	void __iomem *doorbell;
 };
 
 struct cxio_hal_resource {
-	struct kfifo *tpt_fifo;
+	struct kfifo tpt_fifo;
 	spinlock_t tpt_fifo_lock;
-	struct kfifo *qpid_fifo;
+	struct kfifo qpid_fifo;
 	spinlock_t qpid_fifo_lock;
-	struct kfifo *cqid_fifo;
+	struct kfifo cqid_fifo;
 	spinlock_t cqid_fifo_lock;
-	struct kfifo *pdid_fifo;
+	struct kfifo pdid_fifo;
 	spinlock_t pdid_fifo_lock;
 };
 
@@ -195,8 +196,11 @@ int cxio_poll_cq(struct t3_wq *wq, struct t3_cq *cq, struct t3_cqe *cqe,
 		     u8 *cqe_flushed, u64 *cookie, u32 *credit);
 int iwch_cxgb3_ofld_send(struct t3cdev *tdev, struct sk_buff *skb);
 
-#define MOD "iw_cxgb3: "
-#define PDBG(fmt, args...) pr_debug(MOD fmt, ## args)
+#ifdef pr_fmt
+#undef pr_fmt
+#endif
+
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #ifdef DEBUG
 void cxio_dump_tpt(struct cxio_rdev *rev, u32 stag);

@@ -67,21 +67,50 @@ struct u64_stats_sync {
 #endif
 };
 
-static void inline u64_stats_update_begin(struct u64_stats_sync *syncp)
+
+#if BITS_PER_LONG == 32 && defined(CONFIG_SMP)
+# define u64_stats_init(syncp)	seqcount_init(syncp.seq)
+#else
+# define u64_stats_init(syncp)	do { } while (0)
+#endif
+
+static inline void u64_stats_update_begin(struct u64_stats_sync *syncp)
 {
 #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
 	write_seqcount_begin(&syncp->seq);
 #endif
 }
 
-static void inline u64_stats_update_end(struct u64_stats_sync *syncp)
+static inline void u64_stats_update_end(struct u64_stats_sync *syncp)
 {
 #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
 	write_seqcount_end(&syncp->seq);
 #endif
 }
 
-static unsigned int inline u64_stats_fetch_begin(const struct u64_stats_sync *syncp)
+static inline unsigned long
+u64_stats_update_begin_irqsave(struct u64_stats_sync *syncp)
+{
+	unsigned long flags = 0;
+
+#if BITS_PER_LONG==32 && defined(CONFIG_SMP)
+	local_irq_save(flags);
+	write_seqcount_begin(&syncp->seq);
+#endif
+	return flags;
+}
+
+static inline void
+u64_stats_update_end_irqrestore(struct u64_stats_sync *syncp,
+				unsigned long flags)
+{
+#if BITS_PER_LONG==32 && defined(CONFIG_SMP)
+	write_seqcount_end(&syncp->seq);
+	local_irq_restore(flags);
+#endif
+}
+
+static inline unsigned int u64_stats_fetch_begin(const struct u64_stats_sync *syncp)
 {
 #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
 	return read_seqcount_begin(&syncp->seq);
@@ -93,7 +122,7 @@ static unsigned int inline u64_stats_fetch_begin(const struct u64_stats_sync *sy
 #endif
 }
 
-static bool inline u64_stats_fetch_retry(const struct u64_stats_sync *syncp,
+static inline bool u64_stats_fetch_retry(const struct u64_stats_sync *syncp,
 					 unsigned int start)
 {
 #if BITS_PER_LONG==32 && defined(CONFIG_SMP)

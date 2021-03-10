@@ -43,7 +43,6 @@
 /* For SCSI -> ATAPI command conversion */
 #include <scsi/scsi.h>
 
-#include <linux/irq.h>
 #include <linux/io.h>
 #include <asm/byteorder.h>
 #include <linux/uaccess.h>
@@ -51,6 +50,7 @@
 
 #include "ide-cd.h"
 
+static DEFINE_MUTEX(ide_cd_mutex);
 static DEFINE_MUTEX(idecd_ref_mutex);
 
 static void ide_cd_release(struct device *);
@@ -257,17 +257,10 @@ static int ide_cd_breathe(ide_drive_t *drive, struct request *rq)
 	if (time_after(jiffies, info->write_timeout))
 		return 0;
 	else {
-		struct request_queue *q = drive->queue;
-		unsigned long flags;
-
 		/*
-		 * take a breather relying on the unplug timer to kick us again
+		 * take a breather
 		 */
-
-		spin_lock_irqsave(q->queue_lock, flags);
-		blk_plug_device(q);
-		spin_unlock_irqrestore(q->queue_lock, flags);
-
+		blk_delay_queue(drive->queue, 1);
 		return 1;
 	}
 }
@@ -507,15 +500,22 @@ int ide_cd_queue_pc(ide_drive_t *drive, const unsigned char *cmd,
 	return (flags & REQ_FAILED) ? -EIO : 0;
 }
 
-static void ide_cd_error_cmd(ide_drive_t *drive, struct ide_cmd *cmd)
+/*
+ * returns true if rq has been completed
+ */
+static bool ide_cd_error_cmd(ide_drive_t *drive, struct ide_cmd *cmd)
 {
 	unsigned int nr_bytes = cmd->nbytes - cmd->nleft;
 
 	if (cmd->tf_flags & IDE_TFLAG_WRITE)
 		nr_bytes -= cmd->last_xfer_len;
 
-	if (nr_bytes > 0)
+	if (nr_bytes > 0) {
 		ide_complete_rq(drive, 0, nr_bytes);
+		return true;
+	}
+
+	return false;
 }
 
 static ide_startstop_t cdrom_newpc_intr(ide_drive_t *drive)
@@ -680,7 +680,8 @@ out_end:
 		}
 
 		if (uptodate == 0 && rq->bio)
-			ide_cd_error_cmd(drive, cmd);
+			if (ide_cd_error_cmd(drive, cmd))
+				return ide_stopped;
 
 		/* make sure it's fully ended */
 		if (rq->cmd_type != REQ_TYPE_FS) {
@@ -776,7 +777,8 @@ static ide_startstop_t ide_cd_do_request(ide_drive_t *drive, struct request *rq,
 					sector_t block)
 {
 	struct ide_cmd cmd;
-	int uptodate = 0, nsectors;
+	int uptodate = 0;
+	unsigned int nsectors;
 
 	ide_debug_log(IDE_DBG_RQ, "cmd: 0x%x, block: %llu",
 				  rq->cmd[0], (unsigned long long)block);
@@ -1168,7 +1170,7 @@ static struct cdrom_device_ops ide_cdrom_dops = {
 	.open			= ide_cdrom_open_real,
 	.release		= ide_cdrom_release_real,
 	.drive_status		= ide_cdrom_drive_status,
-	.media_changed		= ide_cdrom_check_media_change_real,
+	.check_events		= ide_cdrom_check_events_real,
 	.tray_move		= ide_cdrom_tray_move,
 	.lock_door		= ide_cdrom_lock_door,
 	.select_speed		= ide_cdrom_select_speed,
@@ -1406,7 +1408,7 @@ static int idecd_capacity_proc_show(struct seq_file *m, void *v)
 
 static int idecd_capacity_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, idecd_capacity_proc_show, PDE(inode)->data);
+	return single_open(file, idecd_capacity_proc_show, PDE_DATA(inode));
 }
 
 static const struct file_operations idecd_capacity_proc_fops = {
@@ -1505,8 +1507,6 @@ static int ide_cdrom_setup(ide_drive_t *drive)
 	blk_queue_dma_alignment(q, 31);
 	blk_queue_update_dma_pad(q, 15);
 
-	q->unplug_delay = max((1 * HZ) / 1000, 1);
-
 	drive->dev_flags |= IDE_DFLAG_MEDIA_CHANGED;
 	drive->atapi_flags = IDE_AFLAG_NO_EJECT | ide_cd_flags(id);
 
@@ -1590,29 +1590,33 @@ static struct ide_driver ide_cdrom_driver = {
 
 static int idecd_open(struct block_device *bdev, fmode_t mode)
 {
-	struct cdrom_info *info = ide_cd_get(bdev->bd_disk);
-	int rc = -ENOMEM;
+	struct cdrom_info *info;
+	int rc = -ENXIO;
 
+	check_disk_change(bdev);
+
+	mutex_lock(&ide_cd_mutex);
+	info = ide_cd_get(bdev->bd_disk);
 	if (!info)
-		return -ENXIO;
+		goto out;
 
 	rc = cdrom_open(&info->devinfo, bdev, mode);
-
 	if (rc < 0)
 		ide_cd_put(info);
-
+out:
+	mutex_unlock(&ide_cd_mutex);
 	return rc;
 }
 
-static int idecd_release(struct gendisk *disk, fmode_t mode)
+static void idecd_release(struct gendisk *disk, fmode_t mode)
 {
 	struct cdrom_info *info = ide_drv_g(disk, cdrom_info);
 
+	mutex_lock(&ide_cd_mutex);
 	cdrom_release(&info->devinfo, mode);
 
 	ide_cd_put(info);
-
-	return 0;
+	mutex_unlock(&ide_cd_mutex);
 }
 
 static int idecd_set_spindown(struct cdrom_device_info *cdi, unsigned long arg)
@@ -1654,7 +1658,7 @@ static int idecd_get_spindown(struct cdrom_device_info *cdi, unsigned long arg)
 	return 0;
 }
 
-static int idecd_ioctl(struct block_device *bdev, fmode_t mode,
+static int idecd_locked_ioctl(struct block_device *bdev, fmode_t mode,
 			unsigned int cmd, unsigned long arg)
 {
 	struct cdrom_info *info = ide_drv_g(bdev->bd_disk, cdrom_info);
@@ -1676,10 +1680,24 @@ static int idecd_ioctl(struct block_device *bdev, fmode_t mode,
 	return err;
 }
 
-static int idecd_media_changed(struct gendisk *disk)
+static int idecd_ioctl(struct block_device *bdev, fmode_t mode,
+			     unsigned int cmd, unsigned long arg)
+{
+	int ret;
+
+	mutex_lock(&ide_cd_mutex);
+	ret = idecd_locked_ioctl(bdev, mode, cmd, arg);
+	mutex_unlock(&ide_cd_mutex);
+
+	return ret;
+}
+
+
+static unsigned int idecd_check_events(struct gendisk *disk,
+				       unsigned int clearing)
 {
 	struct cdrom_info *info = ide_drv_g(disk, cdrom_info);
-	return cdrom_media_changed(&info->devinfo);
+	return cdrom_check_events(&info->devinfo, clearing);
 }
 
 static int idecd_revalidate_disk(struct gendisk *disk)
@@ -1696,8 +1714,8 @@ static const struct block_device_operations idecd_ops = {
 	.owner			= THIS_MODULE,
 	.open			= idecd_open,
 	.release		= idecd_release,
-	.locked_ioctl		= idecd_ioctl,
-	.media_changed		= idecd_media_changed,
+	.ioctl			= idecd_ioctl,
+	.check_events		= idecd_check_events,
 	.revalidate_disk	= idecd_revalidate_disk
 };
 
@@ -1740,7 +1758,7 @@ static int ide_cd_probe(ide_drive_t *drive)
 
 	info->dev.parent = &drive->gendev;
 	info->dev.release = ide_cd_release;
-	dev_set_name(&info->dev, dev_name(&drive->gendev));
+	dev_set_name(&info->dev, "%s", dev_name(&drive->gendev));
 
 	if (device_register(&info->dev))
 		goto out_free_disk;
@@ -1763,7 +1781,7 @@ static int ide_cd_probe(ide_drive_t *drive)
 
 	ide_cd_read_toc(drive, &sense);
 	g->fops = &idecd_ops;
-	g->flags |= GENHD_FL_REMOVABLE;
+	g->flags |= GENHD_FL_REMOVABLE | GENHD_FL_BLOCK_EVENTS_ON_EXCL_WRITE;
 	add_disk(g);
 	return 0;
 

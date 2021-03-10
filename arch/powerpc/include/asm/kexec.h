@@ -2,6 +2,18 @@
 #define _ASM_POWERPC_KEXEC_H
 #ifdef __KERNEL__
 
+#if defined(CONFIG_FSL_BOOKE) || defined(CONFIG_44x)
+
+/*
+ * On FSL-BookE we setup a 1:1 mapping which covers the first 2GiB of memory
+ * and therefore we can only deal with memory within this range
+ */
+#define KEXEC_SOURCE_MEMORY_LIMIT	(2 * 1024 * 1024 * 1024UL - 1)
+#define KEXEC_DESTINATION_MEMORY_LIMIT	(2 * 1024 * 1024 * 1024UL - 1)
+#define KEXEC_CONTROL_MEMORY_LIMIT	(2 * 1024 * 1024 * 1024UL - 1)
+
+#else
+
 /*
  * Maximum page that is mapped directly into kernel memory.
  * XXX: Since we copy virt we can use any page we allocate
@@ -21,6 +33,7 @@
 /* TASK_SIZE, probably left over from use_mm ?? */
 #define KEXEC_CONTROL_MEMORY_LIMIT TASK_SIZE
 #endif
+#endif
 
 #define KEXEC_CONTROL_PAGE_SIZE 4096
 
@@ -36,7 +49,6 @@
 #define KEXEC_STATE_REAL_MODE 2
 
 #ifndef __ASSEMBLY__
-#include <linux/cpumask.h>
 #include <asm/reg.h>
 
 typedef void (*crash_shutdown_t)(void);
@@ -45,15 +57,15 @@ typedef void (*crash_shutdown_t)(void);
 
 #ifdef CONFIG_KEXEC_AUTO_RESERVE
 
-#if PAGE_SHIFT==12
-#ifndef KEXEC_AUTO_THRESHOLD
 #define KEXEC_AUTO_THRESHOLD (1ULL<<31) /* 2G */
-#endif
-#else
-#ifndef KEXEC_AUTO_THRESHOLD
-#define KEXEC_AUTO_THRESHOLD (1ULL<<33) /* 8G */
-#endif
-#endif /*PAGE_SHIFT == 12 */
+
+extern
+unsigned long long __init arch_default_crash_base(void);
+#define arch_default_crash_base arch_default_crash_base
+
+extern
+unsigned long long __init arch_default_crash_size(unsigned long long);
+#define arch_default_crash_size arch_default_crash_size
 
 #endif
 
@@ -76,11 +88,8 @@ extern void kexec_smp_wait(void);	/* get and clear naca physid, wait for
 					  master to copy new code to 0 */
 extern int crashing_cpu;
 extern void crash_send_ipi(void (*crash_ipi_callback)(struct pt_regs *));
-extern cpumask_t cpus_in_sr;
-static inline int kexec_sr_activated(int cpu)
-{
-	return cpu_isset(cpu,cpus_in_sr);
-}
+extern void crash_ipi_callback(struct pt_regs *);
+extern int crash_wake_offline;
 
 struct kimage;
 struct pt_regs;
@@ -94,9 +103,14 @@ extern void machine_kexec_simple(struct kimage *image);
 extern void crash_kexec_secondary(struct pt_regs *regs);
 extern int overlaps_crashkernel(unsigned long start, unsigned long size);
 extern void reserve_crashkernel(void);
+extern void machine_kexec_mask_interrupts(void);
+
+static inline bool kdump_in_progress(void)
+{
+	return crashing_cpu >= 0;
+}
 
 #else /* !CONFIG_KEXEC */
-static inline int kexec_sr_activated(int cpu) { return 0; }
 static inline void crash_kexec_secondary(struct pt_regs *regs) { }
 
 static inline int overlaps_crashkernel(unsigned long start, unsigned long size)
@@ -114,6 +128,17 @@ static inline int crash_shutdown_register(crash_shutdown_t handler)
 static inline int crash_shutdown_unregister(crash_shutdown_t handler)
 {
 	return 0;
+}
+
+static inline bool kdump_in_progress(void)
+{
+	return false;
+}
+
+static inline void crash_ipi_callback(struct pt_regs *regs) { }
+
+static inline void crash_send_ipi(void (*crash_ipi_callback)(struct pt_regs *))
+{
 }
 
 #endif /* CONFIG_KEXEC */

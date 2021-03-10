@@ -1,4 +1,5 @@
 #include <linux/fs.h>
+#include <linux/gfp.h>
 #include <linux/nfs.h>
 #include <linux/nfs3.h>
 #include <linux/nfs_fs.h>
@@ -6,6 +7,7 @@
 #include <linux/nfsacl.h>
 
 #include "internal.h"
+#include "nfs3_fs.h"
 
 #define NFSDBG_FACILITY	NFSDBG_PROC
 
@@ -69,7 +71,7 @@ ssize_t nfs3_getxattr(struct dentry *dentry, const char *name,
 		if (type == ACL_TYPE_ACCESS && acl->a_count == 0)
 			error = -ENODATA;
 		else
-			error = posix_acl_to_xattr(acl, buffer, size);
+			error = posix_acl_to_xattr(&init_user_ns, acl, buffer, size);
 		posix_acl_release(acl);
 	} else
 		error = -ENODATA;
@@ -91,7 +93,7 @@ int nfs3_setxattr(struct dentry *dentry, const char *name,
 	else
 		return -EOPNOTSUPP;
 
-	acl = posix_acl_from_xattr(value, size);
+	acl = posix_acl_from_xattr(&init_user_ns, value, size);
 	if (IS_ERR(acl))
 		return PTR_ERR(acl);
 	error = nfs3_proc_setacl(inode, type, acl);
@@ -129,7 +131,7 @@ static void __nfs3_forget_cached_acls(struct nfs_inode *nfsi)
 
 void nfs3_forget_cached_acls(struct inode *inode)
 {
-	dprintk("NFS: nfs3_forget_cached_acls(%s/%ld)\n", inode->i_sb->s_id,
+	dprintk("NFS: nfs3_forget_cached_acls(%s/%lu)\n", inode->i_sb->s_id,
 		inode->i_ino);
 	spin_lock(&inode->i_lock);
 	__nfs3_forget_cached_acls(NFS_I(inode));
@@ -160,7 +162,7 @@ static struct posix_acl *nfs3_get_cached_acl(struct inode *inode, int type)
 		acl = posix_acl_dup(acl);
 out:
 	spin_unlock(&inode->i_lock);
-	dprintk("NFS: nfs3_get_cached_acl(%s/%ld, %d) = %p\n", inode->i_sb->s_id,
+	dprintk("NFS: nfs3_get_cached_acl(%s/%lu, %d) = %p\n", inode->i_sb->s_id,
 		inode->i_ino, type, acl);
 	return acl;
 }
@@ -191,7 +193,7 @@ struct posix_acl *nfs3_proc_getacl(struct inode *inode, int type)
 		.pages = pages,
 	};
 	struct nfs3_getaclres res = {
-		0
+		NULL,
 	};
 	struct rpc_message msg = {
 		.rpc_argp	= &args,
@@ -304,7 +306,10 @@ static int nfs3_proc_setacls(struct inode *inode, struct posix_acl *acl,
 		.rpc_argp	= &args,
 		.rpc_resp	= &fattr,
 	};
-	int status;
+	int status = 0;
+
+	if (acl == NULL && (!S_ISDIR(inode->i_mode) || dfacl == NULL))
+		goto out;
 
 	status = -EOPNOTSUPP;
 	if (!nfs_server_capable(inode, NFS_CAP_ACLS))
@@ -414,7 +419,7 @@ fail:
 }
 
 int nfs3_proc_set_default_acl(struct inode *dir, struct inode *inode,
-		mode_t mode)
+		umode_t mode)
 {
 	struct posix_acl *dfacl, *acl;
 	int error = 0;
@@ -426,16 +431,12 @@ int nfs3_proc_set_default_acl(struct inode *dir, struct inode *inode,
 	}
 	if (!dfacl)
 		return 0;
-	acl = posix_acl_clone(dfacl, GFP_KERNEL);
-	error = -ENOMEM;
-	if (!acl)
-		goto out_release_dfacl;
-	error = posix_acl_create_masq(acl, &mode);
+	acl = posix_acl_dup(dfacl);
+	error = posix_acl_create(&acl, GFP_KERNEL, &mode);
 	if (error < 0)
-		goto out_release_acl;
+		goto out_release_dfacl;
 	error = nfs3_proc_setacls(inode, acl, S_ISDIR(inode->i_mode) ?
 						      dfacl : NULL);
-out_release_acl:
 	posix_acl_release(acl);
 out_release_dfacl:
 	posix_acl_release(dfacl);

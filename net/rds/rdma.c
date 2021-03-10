@@ -31,6 +31,7 @@
  *
  */
 #include <linux/pagemap.h>
+#include <linux/slab.h>
 #include <linux/rbtree.h>
 #include <linux/dma-mapping.h> /* for DMA_*_DEVICE */
 
@@ -134,7 +135,7 @@ void rds_rdma_drop_keys(struct rds_sock *rs)
 	/* Release any MRs associated with this socket */
 	spin_lock_irqsave(&rs->rs_rdma_lock, flags);
 	while ((node = rb_first(&rs->rs_rdma_keys))) {
-		mr = container_of(node, struct rds_mr, r_rb_node);
+		mr = rb_entry(node, struct rds_mr, r_rb_node);
 		if (mr->r_trans == rs->rs_transport)
 			mr->r_invalidate = 0;
 		rb_erase(&mr->r_rb_node, &rs->rs_rdma_keys);
@@ -434,9 +435,10 @@ void rds_rdma_unuse(struct rds_sock *rs, u32 r_key, int force)
 
 	/* If the MR was marked as invalidate, this will
 	 * trigger an async flush. */
-	if (zot_me)
+	if (zot_me) {
 		rds_destroy_mr(mr);
-	rds_mr_put(mr);
+		rds_mr_put(mr);
+	}
 }
 
 void rds_rdma_free_op(struct rm_rdma_op *ro)
@@ -563,12 +565,12 @@ int rds_cmsg_rdma_args(struct rds_sock *rs, struct rds_message *rm,
 
 	if (rs->rs_bound_addr == 0) {
 		ret = -ENOTCONN; /* XXX not a great errno */
-		goto out_ret;
+		goto out;
 	}
 
 	if (args->nr_local > UIO_MAXIOV) {
 		ret = -EMSGSIZE;
-		goto out_ret;
+		goto out;
 	}
 
 	/* Check whether to allocate the iovec area */
@@ -577,7 +579,7 @@ int rds_cmsg_rdma_args(struct rds_sock *rs, struct rds_message *rm,
 		iovs = sock_kmalloc(rds_rs_to_sk(rs), iov_size, GFP_KERNEL);
 		if (!iovs) {
 			ret = -ENOMEM;
-			goto out_ret;
+			goto out;
 		}
 	}
 
@@ -697,7 +699,6 @@ out:
 	if (iovs != iovstack)
 		sock_kfree_s(rds_rs_to_sk(rs), iovs, iov_size);
 	kfree(pages);
-out_ret:
 	if (ret)
 		rds_rdma_free_op(op);
 	else
@@ -718,8 +719,8 @@ int rds_cmsg_rdma_dest(struct rds_sock *rs, struct rds_message *rm,
 	u32 r_key;
 	int err = 0;
 
-	if (cmsg->cmsg_len < CMSG_LEN(sizeof(rds_rdma_cookie_t))
-	 || rm->m_rdma_cookie != 0)
+	if (cmsg->cmsg_len < CMSG_LEN(sizeof(rds_rdma_cookie_t)) ||
+	    rm->m_rdma_cookie != 0)
 		return -EINVAL;
 
 	memcpy(&rm->m_rdma_cookie, CMSG_DATA(cmsg), sizeof(rm->m_rdma_cookie));
@@ -755,8 +756,8 @@ int rds_cmsg_rdma_dest(struct rds_sock *rs, struct rds_message *rm,
 int rds_cmsg_rdma_map(struct rds_sock *rs, struct rds_message *rm,
 			  struct cmsghdr *cmsg)
 {
-	if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct rds_get_mr_args))
-	 || rm->m_rdma_cookie != 0)
+	if (cmsg->cmsg_len < CMSG_LEN(sizeof(struct rds_get_mr_args)) ||
+	    rm->m_rdma_cookie != 0)
 		return -EINVAL;
 
 	return __rds_rdma_map(rs, CMSG_DATA(cmsg), &rm->m_rdma_cookie, &rm->rdma.op_rdma_mr);

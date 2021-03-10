@@ -14,6 +14,9 @@
 
 #include <linux/sched.h>
 #include <linux/key-type.h>
+#include <linux/task_work.h>
+
+struct iovec;
 
 #ifdef __KDEBUG
 #define kenter(FMT, ...) \
@@ -51,8 +54,7 @@ struct key_user {
 	atomic_t		usage;		/* for accessing qnkeys & qnbytes */
 	atomic_t		nkeys;		/* number of keys */
 	atomic_t		nikeys;		/* number of instantiated keys */
-	uid_t			uid;
-	struct user_namespace	*user_ns;
+	kuid_t			uid;
 	int			qnkeys;		/* number of keys allocated to this user */
 	int			qnbytes;	/* number of bytes allocated to this user */
 };
@@ -61,8 +63,7 @@ extern struct rb_root	key_user_tree;
 extern spinlock_t	key_user_lock;
 extern struct key_user	root_key_user;
 
-extern struct key_user *key_user_lookup(uid_t uid,
-					struct user_namespace *user_ns);
+extern struct key_user *key_user_lookup(kuid_t uid);
 extern void key_user_put(struct key_user *user);
 
 /*
@@ -88,48 +89,61 @@ extern struct key_type *key_type_lookup(const char *type);
 extern void key_type_put(struct key_type *ktype);
 
 extern int __key_link_begin(struct key *keyring,
-			    const struct key_type *type,
-			    const char *description,
-			    unsigned long *_prealloc);
+			    const struct keyring_index_key *index_key,
+			    struct assoc_array_edit **_edit);
 extern int __key_link_check_live_key(struct key *keyring, struct key *key);
-extern void __key_link(struct key *keyring, struct key *key,
-		       unsigned long *_prealloc);
+extern void __key_link(struct key *key, struct assoc_array_edit **_edit);
 extern void __key_link_end(struct key *keyring,
-			   struct key_type *type,
-			   unsigned long prealloc);
+			   const struct keyring_index_key *index_key,
+			   struct assoc_array_edit *edit);
 
-extern key_ref_t __keyring_search_one(key_ref_t keyring_ref,
-				      const struct key_type *type,
-				      const char *description);
+extern key_ref_t find_key_to_update(key_ref_t keyring_ref,
+				    const struct keyring_index_key *index_key);
 
 extern struct key *keyring_search_instkey(struct key *keyring,
 					  key_serial_t target_id);
 
+extern int iterate_over_keyring(const struct key *keyring,
+				int (*func)(const struct key *key, void *data),
+				void *data);
+
 typedef int (*key_match_func_t)(const struct key *, const void *);
 
-extern key_ref_t keyring_search_aux(key_ref_t keyring_ref,
-				    const struct cred *cred,
-				    struct key_type *type,
-				    const void *description,
-				    key_match_func_t match,
-				    bool no_state_check);
+struct keyring_search_context {
+	struct keyring_index_key index_key;
+	const struct cred	*cred;
+	key_match_func_t	match;
+	const void		*match_data;
+	unsigned		flags;
+#define KEYRING_SEARCH_LOOKUP_TYPE	0x0001	/* [as type->def_lookup_type] */
+#define KEYRING_SEARCH_NO_STATE_CHECK	0x0002	/* Skip state checks */
+#define KEYRING_SEARCH_DO_STATE_CHECK	0x0004	/* Override NO_STATE_CHECK */
+#define KEYRING_SEARCH_NO_UPDATE_TIME	0x0008	/* Don't update times */
+#define KEYRING_SEARCH_NO_CHECK_PERM	0x0010	/* Don't check permissions */
+#define KEYRING_SEARCH_DETECT_TOO_DEEP	0x0020	/* Give an error on excessive depth */
+#define KEYRING_SEARCH_SKIP_EXPIRED	0x0040	/* Ignore expired keys (intention to replace) */
 
-extern key_ref_t search_my_process_keyrings(struct key_type *type,
-					    const void *description,
-					    key_match_func_t match,
-					    bool no_state_check,
-					    const struct cred *cred);
-extern key_ref_t search_process_keyrings(struct key_type *type,
-					 const void *description,
-					 key_match_func_t match,
-					 bool no_state_check,
-					 const struct cred *cred);
+	int (*iterator)(const void *object, void *iterator_data);
+
+	/* Internal stuff */
+	int			skipped_ret;
+	bool			possessed;
+	key_ref_t		result;
+	struct timespec		now;
+};
+
+extern key_ref_t keyring_search_aux(key_ref_t keyring_ref,
+				    struct keyring_search_context *ctx);
+
+extern key_ref_t search_my_process_keyrings(struct keyring_search_context *ctx);
+extern key_ref_t search_process_keyrings(struct keyring_search_context *ctx);
 
 extern struct key *find_keyring_by_name(const char *name, bool uid_keyring);
 
 extern int install_user_keyrings(void);
 extern int install_thread_keyring_to_cred(struct cred *);
 extern int install_process_keyring_to_cred(struct cred *);
+extern int install_session_keyring_to_cred(struct cred *, struct key *);
 
 extern struct key *request_key_and_link(struct key_type *type,
 					const char *description,
@@ -140,13 +154,12 @@ extern struct key *request_key_and_link(struct key_type *type,
 					unsigned long flags);
 
 extern int lookup_user_key_possessed(const struct key *key, const void *target);
-extern key_ref_t lookup_user_key(key_serial_t id, unsigned long flags,
-				 key_perm_t perm);
 #define KEY_LOOKUP_CREATE	0x01
 #define KEY_LOOKUP_PARTIAL	0x02
 #define KEY_LOOKUP_FOR_UNLINK	0x04
 
 extern long join_session_keyring(const char *name);
+extern void key_change_session_keyring(struct callback_head *twork);
 
 extern struct work_struct key_gc_work;
 extern unsigned key_gc_delay;
@@ -154,14 +167,6 @@ extern void keyring_gc(struct key *keyring, time_t limit);
 extern void key_schedule_gc(time_t gc_at);
 extern void key_schedule_gc_links(void);
 extern void key_gc_keytype(struct key_type *ktype);
-
-extern bool key_need_gc;
-static inline void key_schedule_gc_work(void)
-{
-	smp_wmb();
-	key_need_gc = true;
-	schedule_work(&key_gc_work);
-}
 
 extern int key_task_permission(const key_ref_t key_ref,
 			       const struct cred *cred,
@@ -249,6 +254,15 @@ extern long keyctl_invalidate_key(key_serial_t);
 extern long keyctl_instantiate_key_common(key_serial_t,
 					  const struct iovec *,
 					  unsigned, size_t, key_serial_t);
+#ifdef CONFIG_PERSISTENT_KEYRINGS
+extern long keyctl_get_persistent(uid_t, key_serial_t);
+extern unsigned persistent_keyring_expiry;
+#else
+static inline long keyctl_get_persistent(uid_t uid, key_serial_t destring)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 
 /*
  * Debugging key validation

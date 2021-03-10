@@ -17,6 +17,7 @@
 #include <linux/spinlock.h>
 #include <linux/dlm.h>
 #include <linux/dlm_device.h>
+#include <linux/slab.h>
 
 #include "dlm_internal.h"
 #include "lockspace.h"
@@ -212,9 +213,9 @@ void dlm_user_add_ast(struct dlm_lkb *lkb, uint32_t flags, int mode,
 		goto out;
 	}
 
-	if (list_empty(&lkb->lkb_astqueue)) {
+	if (list_empty(&lkb->lkb_cb_list)) {
 		kref_get(&lkb->lkb_ref);
-		list_add_tail(&lkb->lkb_astqueue, &proc->asts);
+		list_add_tail(&lkb->lkb_cb_list, &proc->asts);
 		wake_up_interruptible(&proc->wait);
 	}
 	spin_unlock(&proc->asts_spin);
@@ -237,6 +238,7 @@ static int device_user_lock(struct dlm_user_proc *proc,
 {
 	struct dlm_ls *ls;
 	struct dlm_user_args *ua;
+	uint32_t lkid;
 	int error = -ENOMEM;
 
 	ls = dlm_find_lockspace_local(proc->lockspace);
@@ -259,12 +261,20 @@ static int device_user_lock(struct dlm_user_proc *proc,
 	ua->bastaddr = params->bastaddr;
 	ua->xid = params->xid;
 
-	if (params->flags & DLM_LKF_CONVERT)
+	if (params->flags & DLM_LKF_CONVERT) {
 		error = dlm_user_convert(ls, ua,
 				         params->mode, params->flags,
 				         params->lkid, params->lvb,
 					 (unsigned long) params->timeout);
-	else {
+	} else if (params->flags & DLM_LKF_ORPHAN) {
+		error = dlm_user_adopt_orphan(ls, ua,
+					 params->mode, params->flags,
+					 params->name, params->namelen,
+					 (unsigned long) params->timeout,
+					 &lkid);
+		if (!error)
+			error = lkid;
+	} else {
 		error = dlm_user_request(ls, ua,
 					 params->mode, params->flags,
 					 params->name, params->namelen,
@@ -391,8 +401,9 @@ static int device_create_lockspace(struct dlm_lspace_params *params)
 	if (!capable(CAP_SYS_ADMIN))
 		return -EPERM;
 
-	error = dlm_new_lockspace(params->name, strlen(params->name),
-				  &lockspace, params->flags, DLM_USER_LVB_LEN);
+	error = dlm_new_lockspace(params->name, NULL, params->flags,
+				  DLM_USER_LVB_LEN, NULL, NULL, NULL,
+				  &lockspace);
 	if (error)
 		return error;
 
@@ -499,6 +510,13 @@ static ssize_t device_write(struct file *file, const char __user *buf,
 #else
 	if (count < sizeof(struct dlm_write_request))
 #endif
+		return -EINVAL;
+
+	/*
+	 * can't compare against COMPAT/dlm_write_request32 because
+	 * we don't yet know if is64bit is zero
+	 */
+	if (count > sizeof(struct dlm_write_request) + DLM_RESNAME_MAXLEN)
 		return -EINVAL;
 
 	kbuf = kzalloc(count + 1, GFP_NOFS);
@@ -610,7 +628,6 @@ static ssize_t device_write(struct file *file, const char __user *buf,
 
  out_sig:
 	sigprocmask(SIG_SETMASK, &tmpsig, NULL);
-	recalc_sigpending();
  out_free:
 	kfree(kbuf);
 	return error;
@@ -781,6 +798,7 @@ static ssize_t device_read(struct file *file, char __user *buf, size_t count,
 	DECLARE_WAITQUEUE(wait, current);
 	struct dlm_callback cb;
 	int rv, resid, copy_lvb = 0;
+	int old_mode, new_mode;
 
 	if (count == sizeof(struct dlm_device_version)) {
 		rv = copy_version_to_user(buf, count);
@@ -832,24 +850,27 @@ static ssize_t device_read(struct file *file, char __user *buf, size_t count,
 	}
 
 	/* if we empty lkb_callbacks, we don't want to unlock the spinlock
-	   without removing lkb_astqueue; so empty lkb_astqueue is always
+	   without removing lkb_cb_list; so empty lkb_cb_list is always
 	   consistent with empty lkb_callbacks */
 
-	lkb = list_entry(proc->asts.next, struct dlm_lkb, lkb_astqueue);
+	lkb = list_entry(proc->asts.next, struct dlm_lkb, lkb_cb_list);
+
+	/* rem_lkb_callback sets a new lkb_last_cast */
+	old_mode = lkb->lkb_last_cast.mode;
 
 	rv = dlm_rem_lkb_callback(lkb->lkb_resource->res_ls, lkb, &cb, &resid);
 	if (rv < 0) {
 		/* this shouldn't happen; lkb should have been removed from
 		   list when resid was zero */
 		log_print("dlm_rem_lkb_callback empty %x", lkb->lkb_id);
-		list_del_init(&lkb->lkb_astqueue);
+		list_del_init(&lkb->lkb_cb_list);
 		spin_unlock(&proc->asts_spin);
 		/* removes ref for proc->asts, may cause lkb to be freed */
 		dlm_put_lkb(lkb);
 		goto try_another;
 	}
 	if (!resid)
-		list_del_init(&lkb->lkb_astqueue);
+		list_del_init(&lkb->lkb_cb_list);
 	spin_unlock(&proc->asts_spin);
 
 	if (cb.flags & DLM_CB_SKIP) {
@@ -860,9 +881,6 @@ static ssize_t device_read(struct file *file, char __user *buf, size_t count,
 	}
 
 	if (cb.flags & DLM_CB_CAST) {
-		int old_mode, new_mode;
-
-		old_mode = lkb->lkb_last_cast.mode;
 		new_mode = cb.mode;
 
 		if (!cb.sb_status && lkb->lkb_lksb->sb_lvbptr &&
@@ -951,6 +969,7 @@ static const struct file_operations device_fops = {
 	.write   = device_write,
 	.poll    = device_poll,
 	.owner   = THIS_MODULE,
+	.llseek  = noop_llseek,
 };
 
 static const struct file_operations ctl_device_fops = {
@@ -959,6 +978,7 @@ static const struct file_operations ctl_device_fops = {
 	.read    = device_read,
 	.write   = device_write,
 	.owner   = THIS_MODULE,
+	.llseek  = noop_llseek,
 };
 
 static struct miscdevice ctl_device = {
@@ -971,6 +991,7 @@ static const struct file_operations monitor_device_fops = {
 	.open    = monitor_device_open,
 	.release = monitor_device_close,
 	.owner   = THIS_MODULE,
+	.llseek  = noop_llseek,
 };
 
 static struct miscdevice monitor_device = {

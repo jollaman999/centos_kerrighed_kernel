@@ -10,6 +10,7 @@
  */
 
 #include <linux/slab.h>
+#include <linux/export.h>
 #include <sound/core.h>
 #include <sound/control.h>
 #include <sound/tlv.h>
@@ -62,15 +63,18 @@ static int slave_update(struct link_slave *slave)
 	struct snd_ctl_elem_value *uctl;
 	int err, ch;
 
-	uctl = kmalloc(sizeof(*uctl), GFP_KERNEL);
+	uctl = kzalloc(sizeof(*uctl), GFP_KERNEL);
 	if (!uctl)
 		return -ENOMEM;
 	uctl->id = slave->slave.id;
 	err = slave->slave.get(&slave->slave, uctl);
+	if (err < 0)
+		goto error;
 	for (ch = 0; ch < slave->info.count; ch++)
 		slave->vals[ch] = uctl->value.integer.value[ch];
+ error:
 	kfree(uctl);
-	return 0;
+	return err < 0 ? err : 0;
 }
 
 /* get the slave ctl info and save the initial values */
@@ -241,7 +245,7 @@ static void slave_free(struct snd_kcontrol *kcontrol)
  * Add a slave control to the group with the given master control
  *
  * All slaves must be the same type (returning the same information
- * via info callback).  The fucntion doesn't check it, so it's your
+ * via info callback).  The function doesn't check it, so it's your
  * responsibility.
  *
  * Also, some additional limitations:
@@ -255,8 +259,8 @@ int _snd_ctl_add_slave(struct snd_kcontrol *master, struct snd_kcontrol *slave,
 	struct link_master *master_link = snd_kcontrol_chip(master);
 	struct link_slave *srec;
 
-	srec = kzalloc(sizeof(*srec) +
-		       slave->count * sizeof(*slave->vd), GFP_KERNEL);
+	srec = kzalloc(struct_size(srec, slave.vd, slave->count),
+		       GFP_KERNEL);
 	if (!srec)
 		return -ENOMEM;
 	srec->kctl = slave;
@@ -376,8 +380,7 @@ static void master_free(struct snd_kcontrol *kcontrol)
  * @name: name string of the control element to create
  * @tlv: optional TLV int array for dB information
  *
- * Creates a virtual matster control with the given name string.
- * Returns the created control element, or NULL for errors (ENOMEM).
+ * Creates a virtual master control with the given name string.
  *
  * After creating a vmaster element, you can add the slave controls
  * via snd_ctl_add_slave() or snd_ctl_add_slave_uncached().
@@ -386,6 +389,8 @@ static void master_free(struct snd_kcontrol *kcontrol)
  * for dB scale of the master control.  It should be a single element
  * with #SNDRV_CTL_TLVT_DB_SCALE, #SNDRV_CTL_TLV_DB_MINMAX or
  * #SNDRV_CTL_TLVT_DB_MINMAX_MUTE type, and should be the max 0dB.
+ *
+ * Return: The created control element, or %NULL for errors (ENOMEM).
  */
 struct snd_kcontrol *snd_ctl_make_virtual_master(char *name,
 						 const unsigned int *tlv)
@@ -416,13 +421,15 @@ struct snd_kcontrol *snd_ctl_make_virtual_master(char *name,
 	kctl->private_free = master_free;
 
 	/* additional (constant) TLV read */
-	if (tlv &&
-	    (tlv[0] == SNDRV_CTL_TLVT_DB_SCALE ||
-	     tlv[0] == SNDRV_CTL_TLVT_DB_MINMAX ||
-	     tlv[0] == SNDRV_CTL_TLVT_DB_MINMAX_MUTE)) {
-		kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
-		memcpy(master->tlv, tlv, sizeof(master->tlv));
-		kctl->tlv.p = master->tlv;
+	if (tlv) {
+		unsigned int type = tlv[SNDRV_CTL_TLVO_TYPE];
+		if (type == SNDRV_CTL_TLVT_DB_SCALE ||
+		    type == SNDRV_CTL_TLVT_DB_MINMAX ||
+		    type == SNDRV_CTL_TLVT_DB_MINMAX_MUTE) {
+			kctl->vd[0].access |= SNDRV_CTL_ELEM_ACCESS_TLV_READ;
+			memcpy(master->tlv, tlv, sizeof(master->tlv));
+			kctl->tlv.p = master->tlv;
+		}
 	}
 
 	return kctl;
@@ -437,6 +444,8 @@ EXPORT_SYMBOL(snd_ctl_make_virtual_master);
  *
  * Adds the given hook to the vmaster control element so that it's called
  * at each time when the value is changed.
+ *
+ * Return: Zero.
  */
 int snd_ctl_add_vmaster_hook(struct snd_kcontrol *kcontrol,
 			     void (*hook)(void *private_data, int),
@@ -482,15 +491,34 @@ void snd_ctl_sync_vmaster(struct snd_kcontrol *kcontrol, bool hook_only)
 EXPORT_SYMBOL_GPL(snd_ctl_sync_vmaster);
 
 /**
- * snd_ctl_sync_vmaster_hook - Sync the vmaster hook
- * @kcontrol: vmaster kctl element
+ * snd_ctl_apply_vmaster_slaves - Apply function to each vmaster slave
+ * @kctl: vmaster kctl element
+ * @func: function to apply
+ * @arg: optional function argument
  *
- * Call the hook function to synchronize with the current value of the given
- * vmaster element.  NOP when NULL is passed to @kcontrol or the hook doesn't
- * exist.
+ * Apply the function @func to each slave kctl of the given vmaster kctl.
+ * Returns 0 if successful, or a negative error code.
  */
-void snd_ctl_sync_vmaster_hook(struct snd_kcontrol *kcontrol)
+int snd_ctl_apply_vmaster_slaves(struct snd_kcontrol *kctl,
+				 int (*func)(struct snd_kcontrol *vslave,
+					     struct snd_kcontrol *slave,
+					     void *arg),
+				 void *arg)
 {
-	snd_ctl_sync_vmaster(kcontrol, true);
+	struct link_master *master;
+	struct link_slave *slave;
+	int err;
+
+	master = snd_kcontrol_chip(kctl);
+	err = master_init(master);
+	if (err < 0)
+		return err;
+	list_for_each_entry(slave, &master->slaves, list) {
+		err = func(slave->kctl, &slave->slave, arg);
+		if (err < 0)
+			return err;
+	}
+
+	return 0;
 }
-EXPORT_SYMBOL_GPL(snd_ctl_sync_vmaster_hook);
+EXPORT_SYMBOL_GPL(snd_ctl_apply_vmaster_slaves);

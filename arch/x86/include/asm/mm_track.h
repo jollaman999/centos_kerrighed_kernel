@@ -29,13 +29,16 @@ static inline void mm_track_pmd(pmd_t *pmdp)	{}
 static inline void mm_track_pud(pud_t *pudp)	{}
 static inline void mm_track_pgd(pgd_t *pgdp) 	{}
 static inline void mm_track_phys(void *physp)	{}
+static inline int harvest_user(void) { return 0; }
 
 #else
 
 #include <asm/page.h>
 #include <asm/atomic.h>
+#include <linux/static_key.h>
+
  /*
-  * For memory-tracking purposes, if active is true (non-zero), the other
+  * For memory-tracking purposes, if active is enabled, the other
   * elements of the structure are available for use.  Each time mm_track_pte
   * is called, it increments count and sets a bit in the bitvector table.
   * Each bit in the bitvector represents a physical page in memory.
@@ -44,7 +47,7 @@ static inline void mm_track_phys(void *physp)	{}
   *
   * The in_use element is used in the code which drives the memory tracking
   * environment.  When tracking is complete, the vector may be freed, but
-  * only after the active flag is set to zero and the in_use count goes to
+  * only after the active key is disabled and the in_use count goes to
   * zero.
   *
   * The count element indicates how many pages have been stored in the
@@ -52,45 +55,48 @@ static inline void mm_track_phys(void *physp)	{}
   * vector between harvest operations.
   */
 struct mm_tracker {
-	int active;		/* non-zero if this structure in use */
+	struct static_key active;	/* TRUE if this structure is in use */
 	atomic_t count;		/* number of pages tracked by mm_track() */
 	unsigned long *vector;	/* bit vector of modified pages */
 	unsigned long bitcnt;	/* number of bits in vector */
 };
 extern struct mm_tracker mm_tracking_struct;
 
+extern int mm_track_init(long);
+extern void mm_track_exit(void);
 extern void do_mm_track_pte(void *);
 extern void do_mm_track_pmd(void *);
 extern void do_mm_track_pud(void *);
 extern void do_mm_track_pgd(void *);
 extern void do_mm_track_phys(void *);
+extern int harvest_user(void);
 
 /*
  * The mm_track routine is needed by macros in pgtable.h
  */
 static inline void mm_track_pte(pte_t *ptep)
 {
-	if (unlikely(mm_tracking_struct.active))
+	if (static_key_false(&mm_tracking_struct.active))
 		do_mm_track_pte(ptep);
 }
 static inline void mm_track_pmd(pmd_t *pmdp)
 {
-	if (unlikely(mm_tracking_struct.active))
+	if (static_key_false(&mm_tracking_struct.active))
 		do_mm_track_pmd(pmdp);
 }
 static inline void mm_track_pud(pud_t *pudp)
 {
-	if (unlikely(mm_tracking_struct.active))
+	if (static_key_false(&mm_tracking_struct.active))
 		do_mm_track_pud(pudp);
 }
 static inline void mm_track_pgd(pgd_t *pgdp)
 {
-	if (unlikely(mm_tracking_struct.active))
+	if (static_key_false(&mm_tracking_struct.active))
 		do_mm_track_pgd(pgdp);
 }
 static inline void mm_track_phys(void *physp)
 {
-	if (unlikely(mm_tracking_struct.active))
+	if (static_key_false(&mm_tracking_struct.active))
 		do_mm_track_phys(physp);
 }
 #endif /* CONFIG_TRACK_DIRTY_PAGES */

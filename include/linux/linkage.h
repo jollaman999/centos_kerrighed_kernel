@@ -2,6 +2,8 @@
 #define _LINUX_LINKAGE_H
 
 #include <linux/compiler.h>
+#include <linux/stringify.h>
+#include <linux/export.h>
 #include <asm/linkage.h>
 
 #ifdef __cplusplus
@@ -14,12 +16,22 @@
 #define asmlinkage CPP_ASMLINKAGE
 #endif
 
-#ifndef asmregparm
-# define asmregparm
+#ifndef cond_syscall
+#define cond_syscall(x)	asm(				\
+	".weak " VMLINUX_SYMBOL_STR(x) "\n\t"		\
+	".set  " VMLINUX_SYMBOL_STR(x) ","		\
+		 VMLINUX_SYMBOL_STR(sys_ni_syscall))
 #endif
 
-#define __page_aligned_data	__section(.data.page_aligned) __aligned(PAGE_SIZE)
-#define __page_aligned_bss	__section(.bss.page_aligned) __aligned(PAGE_SIZE)
+#ifndef SYSCALL_ALIAS
+#define SYSCALL_ALIAS(alias, name) asm(			\
+	".globl " VMLINUX_SYMBOL_STR(alias) "\n\t"	\
+	".set   " VMLINUX_SYMBOL_STR(alias) ","		\
+		  VMLINUX_SYMBOL_STR(name))
+#endif
+
+#define __page_aligned_data	__section(.data..page_aligned) __aligned(PAGE_SIZE)
+#define __page_aligned_bss	__section(.bss..page_aligned) __aligned(PAGE_SIZE)
 
 /*
  * For assembly routines.
@@ -27,8 +39,8 @@
  * Note when using these that you must specify the appropriate
  * alignment directives yourself
  */
-#define __PAGE_ALIGNED_DATA	.section ".data.page_aligned", "aw"
-#define __PAGE_ALIGNED_BSS	.section ".bss.page_aligned", "aw"
+#define __PAGE_ALIGNED_DATA	.section ".data..page_aligned", "aw"
+#define __PAGE_ALIGNED_BSS	.section ".bss..page_aligned", "aw"
 
 /*
  * This is used by architectures to keep arguments on the stack
@@ -91,9 +103,5 @@
 #endif
 
 #endif
-
-#define NORET_TYPE    /**/
-#define ATTRIB_NORET  __attribute__((noreturn))
-#define NORET_AND     noreturn,
 
 #endif

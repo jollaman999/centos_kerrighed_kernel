@@ -37,7 +37,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -245,7 +244,7 @@ static void vsc_port_intr(u8 port_status, struct ata_port *ap)
 
 	qc = ata_qc_from_tag(ap, ap->link.active_tag);
 	if (qc && likely(!(qc->tf.flags & ATA_TFLAG_POLLING)))
-		handled = ata_sff_host_intr(ap, qc);
+		handled = ata_bmdma_port_intr(ap, qc);
 
 	/* We received an interrupt during a polled command,
 	 * or some other spurious condition.  Interrupt reporting
@@ -273,9 +272,8 @@ static irqreturn_t vsc_sata_interrupt(int irq, void *dev_instance)
 
 	if (unlikely(status == 0xffffffff || status == 0)) {
 		if (status)
-			dev_printk(KERN_ERR, host->dev,
-				": IRQ status == 0xffffffff, "
-				"PCI fault or device removal?\n");
+			dev_err(host->dev,
+				": IRQ status == 0xffffffff, PCI fault or device removal?\n");
 		goto out;
 	}
 
@@ -313,8 +311,7 @@ static struct ata_port_operations vsc_sata_ops = {
 	.scr_write		= vsc_sata_scr_write,
 };
 
-static void __devinit vsc_sata_setup_port(struct ata_ioports *port,
-					  void __iomem *base)
+static void vsc_sata_setup_port(struct ata_ioports *port, void __iomem *base)
 {
 	port->cmd_addr		= base + VSC_SATA_TF_CMD_OFFSET;
 	port->data_addr		= base + VSC_SATA_TF_DATA_OFFSET;
@@ -336,26 +333,23 @@ static void __devinit vsc_sata_setup_port(struct ata_ioports *port,
 }
 
 
-static int __devinit vsc_sata_init_one(struct pci_dev *pdev,
-				       const struct pci_device_id *ent)
+static int vsc_sata_init_one(struct pci_dev *pdev,
+			     const struct pci_device_id *ent)
 {
 	static const struct ata_port_info pi = {
-		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
-				  ATA_FLAG_MMIO,
+		.flags		= ATA_FLAG_SATA,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
 		.port_ops	= &vsc_sata_ops,
 	};
 	const struct ata_port_info *ppi[] = { &pi, NULL };
-	static int printed_version;
 	struct ata_host *host;
 	void __iomem *mmio_base;
 	int i, rc;
 	u8 cls;
 
-	if (!printed_version++)
-		dev_printk(KERN_DEBUG, &pdev->dev, "version " DRV_VERSION "\n");
+	ata_print_version_once(&pdev->dev, DRV_VERSION);
 
 	/* allocate host */
 	host = ata_host_alloc_pinfo(&pdev->dev, ppi, 4);
@@ -370,7 +364,7 @@ static int __devinit vsc_sata_init_one(struct pci_dev *pdev,
 	if (pci_resource_len(pdev, 0) == 0)
 		return -ENODEV;
 
-	/* map IO regions and intialize host accordingly */
+	/* map IO regions and initialize host accordingly */
 	rc = pcim_iomap_regions(pdev, 1 << VSC_MMIO_BAR, DRV_NAME);
 	if (rc == -EBUSY)
 		pcim_pin_device(pdev);
@@ -440,21 +434,10 @@ static struct pci_driver vsc_sata_pci_driver = {
 	.remove			= ata_pci_remove_one,
 };
 
-static int __init vsc_sata_init(void)
-{
-	return pci_register_driver(&vsc_sata_pci_driver);
-}
-
-static void __exit vsc_sata_exit(void)
-{
-	pci_unregister_driver(&vsc_sata_pci_driver);
-}
+module_pci_driver(vsc_sata_pci_driver);
 
 MODULE_AUTHOR("Jeremy Higdon");
 MODULE_DESCRIPTION("low-level driver for Vitesse VSC7174 SATA controller");
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, vsc_sata_pci_tbl);
 MODULE_VERSION(DRV_VERSION);
-
-module_init(vsc_sata_init);
-module_exit(vsc_sata_exit);

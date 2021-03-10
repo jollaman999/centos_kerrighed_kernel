@@ -16,27 +16,18 @@
 #include <linux/kobject.h>
 #include <linux/moduleparam.h>
 #include <linux/tracepoint.h>
+#include <linux/export.h>
 
-#include <asm/local.h>
+#include <linux/percpu.h>
 #include <asm/module.h>
 
-#include <trace/events/module.h>
+/* In stripped ARM and x86-64 modules, ~ is surprisingly rare. */
+#define MODULE_SIG_STRING "~Module signature appended~\n"
 
 /* Not Yet Implemented */
 #define MODULE_SUPPORTED_DEVICE(name)
 
-/* some toolchains uses a `_' prefix for all user symbols */
-#ifndef MODULE_SYMBOL_PREFIX
-#define MODULE_SYMBOL_PREFIX ""
-#endif
-
 #define MODULE_NAME_LEN MAX_PARAM_PREFIX_LEN
-
-struct kernel_symbol
-{
-	unsigned long value;
-	const char *name;
-};
 
 struct modversion_info
 {
@@ -44,20 +35,20 @@ struct modversion_info
 	char name[MODULE_NAME_LEN];
 };
 
-struct rheldata
-{
-	/* These two u8's make up the X.Y release tag */
-	u8 rhel_major;
-	u8 rhel_minor;
-	u16 rhel_release;
-};
-
 struct module;
 
+struct module_kobject {
+	struct kobject kobj;
+	struct module *mod;
+	struct kobject *drivers_dir;
+	struct module_param_attrs *mp;
+};
+
 struct module_attribute {
-        struct attribute attr;
-        ssize_t (*show)(struct module_attribute *, struct module *, char *);
-        ssize_t (*store)(struct module_attribute *, struct module *,
+	struct attribute attr;
+	ssize_t (*show)(struct module_attribute *, struct module_kobject *,
+			char *);
+	ssize_t (*store)(struct module_attribute *, struct module_kobject *,
 			 const char *, size_t count);
 	void (*setup)(struct module *, const char *);
 	int (*test)(struct module *);
@@ -68,15 +59,12 @@ struct module_version_attribute {
 	struct module_attribute mattr;
 	const char *module_name;
 	const char *version;
-};
+} __attribute__ ((__aligned__(sizeof(void *))));
 
-struct module_kobject
-{
-	struct kobject kobj;
-	struct module *mod;
-	struct kobject *drivers_dir;
-	struct module_param_attrs *mp;
-};
+extern ssize_t __modver_version_show(struct module_attribute *,
+				     struct module_kobject *, char *);
+
+extern struct module_attribute module_uevent;
 
 /* These are either module local, or the kernel's dummy ones. */
 extern int init_module(void);
@@ -93,18 +81,6 @@ void sort_extable(struct exception_table_entry *start,
 		  struct exception_table_entry *finish);
 void sort_main_extable(void);
 void trim_init_extable(struct module *m);
-
-#ifdef MODULE
-#define MODULE_GENERIC_TABLE(gtype,name)			\
-extern const struct gtype##_id __mod_##gtype##_table		\
-  __attribute__ ((unused, alias(__stringify(name))))
-
-extern struct module __this_module;
-#define THIS_MODULE (&__this_module)
-#else  /* !MODULE */
-#define MODULE_GENERIC_TABLE(gtype,name)
-#define THIS_MODULE ((struct module *)0)
-#endif
 
 /* Generic info of form tag = "info" */
 #define MODULE_INFO(tag, info) __MODULE_INFO(tag, tag, info)
@@ -156,13 +132,14 @@ extern struct module __this_module;
 /* What your module does. */
 #define MODULE_DESCRIPTION(_description) MODULE_INFO(description, _description)
 
-/* One for each parameter, describing how to use it.  Some files do
-   multiple of these per line, so can't just use MODULE_INFO. */
-#define MODULE_PARM_DESC(_parm, desc) \
-	__MODULE_INFO(parm, _parm, #_parm ":" desc)
-
-#define MODULE_DEVICE_TABLE(type,name)		\
-  MODULE_GENERIC_TABLE(type##_device,name)
+#ifdef MODULE
+/* Creates an alias so file2alias.c can find device table. */
+#define MODULE_DEVICE_TABLE(type, name)					\
+extern const typeof(name) __mod_##type##__##name##_device_table		\
+  __attribute__ ((unused, alias(__stringify(name))))
+#else  /* !MODULE */
+#define MODULE_DEVICE_TABLE(type, name)
+#endif
 
 /* Version of form [<epoch>:]<version>[-<extra-version>].
    Or for CVS/RCS ID version, everything but the number is stripped.
@@ -179,16 +156,11 @@ extern struct module __this_module;
   local headers in "srcversion".
 */
 
-#ifdef MODULE
+#if defined(MODULE) || !defined(CONFIG_SYSFS)
 #define MODULE_VERSION(_version) MODULE_INFO(version, _version)
 #else
 #define MODULE_VERSION(_version)					\
-	extern ssize_t __modver_version_show(struct module_attribute *,	\
-					     struct module *, char *);	\
-	static struct module_version_attribute __modver_version_attr	\
-	__used								\
-    __attribute__ ((__section__ ("__modver"),aligned(sizeof(void *)))) \
-	= {								\
+	static struct module_version_attribute ___modver_attr = {	\
 		.mattr	= {						\
 			.attr	= {					\
 				.name	= "version",			\
@@ -198,7 +170,10 @@ extern struct module __this_module;
 		},							\
 		.module_name	= KBUILD_MODNAME,			\
 		.version	= _version,				\
-	}
+	};								\
+	static const struct module_version_attribute			\
+	__used __attribute__ ((__section__ ("__modver")))		\
+	* __moduleparam_const __modver_attr = &___modver_attr
 #endif
 
 /* Optional firmware file (or files) needed by the module
@@ -213,62 +188,71 @@ struct notifier_block;
 
 #ifdef CONFIG_MODULES
 
+extern int modules_disabled; /* for sysctl */
 /* Get/put a kernel symbol (calls must be symmetric) */
 void *__symbol_get(const char *symbol);
 void *__symbol_get_gpl(const char *symbol);
-#define symbol_get(x) ((typeof(&x))(__symbol_get(MODULE_SYMBOL_PREFIX #x)))
+#define symbol_get(x) ((typeof(&x))(__symbol_get(VMLINUX_SYMBOL_STR(x))))
 
-#ifndef __GENKSYMS__
-#ifdef CONFIG_MODVERSIONS
-/* Mark the CRC weak since genksyms apparently decides not to
- * generate a checksums for some symbols */
-#define __CRC_SYMBOL(sym, sec)					\
-	extern void *__crc_##sym __attribute__((weak));		\
-	static const unsigned long __kcrctab_##sym		\
-	__used							\
-	__attribute__((section("__kcrctab" sec), unused))	\
-	= (unsigned long) &__crc_##sym;
-#else
-#define __CRC_SYMBOL(sym, sec)
+/* modules using other modules: kdb wants to see this. */
+struct module_use {
+	struct list_head source_list;
+	struct list_head target_list;
+	struct module *source, *target;
+};
+
+enum module_state {
+	MODULE_STATE_LIVE,	/* Normal state. */
+	MODULE_STATE_COMING,	/* Full formed, running module_init. */
+	MODULE_STATE_GOING,	/* Going away. */
+	MODULE_STATE_UNFORMED,	/* Still setting it up. */
+};
+
+/**
+ * struct module_ref - per cpu module reference counts
+ * @incs: number of module get on this cpu
+ * @decs: number of module put on this cpu
+ *
+ * We force an alignment on 8 or 16 bytes, so that alloc_percpu()
+ * put @incs/@decs in same cache line, with no extra memory cost,
+ * since alloc_percpu() is fine grained.
+ */
+struct module_ref {
+	unsigned long incs;
+	unsigned long decs;
+} __attribute((aligned(2 * sizeof(unsigned long))));
+
+#ifdef CONFIG_LIVEPATCH
+struct klp_modinfo {
+	Elf_Ehdr hdr;
+	Elf_Shdr *sechdrs;
+	char *secstrings;
+	unsigned int symndx;
+};
 #endif
 
-/* For every exported symbol, place a struct in the __ksymtab section */
-#define __EXPORT_SYMBOL(sym, sec)				\
-	extern typeof(sym) sym;					\
-	__CRC_SYMBOL(sym, sec)					\
-	static const char __kstrtab_##sym[]			\
-	__attribute__((section("__ksymtab_strings"), aligned(1))) \
-	= MODULE_SYMBOL_PREFIX #sym;                    	\
-	static const struct kernel_symbol __ksymtab_##sym	\
-	__used							\
-	__attribute__((section("__ksymtab" sec), unused))	\
-	= { (unsigned long)&sym, __kstrtab_##sym }
+/* extended module structure for RHEL */
+struct module_ext {
+	struct list_head next;
+	struct module *module; /* "parent" struct */
+	char *rhelversion;
+#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && !defined(CONFIG_X86_64)
+	unsigned int num_ftrace_callsites;
+	unsigned long *ftrace_callsites;
+#endif
+#ifdef CONFIG_LIVEPATCH
+	bool klp; /* Is this a livepatch module? */
+	bool klp_alive;
 
-#define EXPORT_SYMBOL(sym)					\
-	__EXPORT_SYMBOL(sym, "")
-
-#define EXPORT_SYMBOL_GPL(sym)					\
-	__EXPORT_SYMBOL(sym, "_gpl")
-
-#define EXPORT_SYMBOL_GPL_FUTURE(sym)				\
-	__EXPORT_SYMBOL(sym, "_gpl_future")
-
-
-#ifdef CONFIG_UNUSED_SYMBOLS
-#define EXPORT_UNUSED_SYMBOL(sym) __EXPORT_SYMBOL(sym, "_unused")
-#define EXPORT_UNUSED_SYMBOL_GPL(sym) __EXPORT_SYMBOL(sym, "_unused_gpl")
-#else
-#define EXPORT_UNUSED_SYMBOL(sym)
-#define EXPORT_UNUSED_SYMBOL_GPL(sym)
+	/* Elf information */
+	struct klp_modinfo *klp_info;
+#endif
+#if defined(CONFIG_PPC64) && defined(CONFIG_DYNAMIC_FTRACE)
+	unsigned long toc;
+	unsigned long tramp;
+	bool mprofile_kernel;
 #endif
 
-#endif
-
-enum module_state
-{
-	MODULE_STATE_LIVE,
-	MODULE_STATE_COMING,
-	MODULE_STATE_GOING,
 };
 
 struct module
@@ -314,6 +298,11 @@ struct module
 	const unsigned long *unused_gpl_crcs;
 #endif
 
+#ifdef CONFIG_MODULE_SIG
+	/* Signature was verified. */
+	bool sig_ok;
+#endif
+
 	/* symbols that will be GPL-only in the near future. */
 	const struct kernel_symbol *gpl_future_syms;
 	const unsigned long *gpl_future_crcs;
@@ -338,13 +327,17 @@ struct module
 	/* The size of the executable code in each section.  */
 	unsigned int init_text_size, core_text_size;
 
+	/* Size of RO sections of the module (text+rodata) */
+	unsigned int init_ro_size, core_ro_size;
+
 	/* Arch-specific module values */
 	struct mod_arch_specific arch;
 
+	/*
+	 * RHEL7 note - to preserve kABI, leave as an unsigned int, which
+	 * is wide enough to handle current TAINT_FLAGS_COUNT(32) bits
+	 */
 	unsigned int taints;	/* same bits as kernel:tainted */
-
-	/* Is this module GPG signed */
-	int gpgsig_ok;
 
 #ifdef CONFIG_GENERIC_BUG
 	/* Support for BUG */
@@ -370,40 +363,42 @@ struct module
 	struct module_notes_attrs *notes_attrs;
 #endif
 
-	/* Per-cpu data. */
-	void *percpu;
-
 	/* The command line arguments (may be mangled).  People like
 	   keeping pointers to this stuff */
 	char *args;
-#ifdef CONFIG_TRACEPOINTS
-	struct tracepoint *tracepoints;
-	unsigned int num_tracepoints;
+
+#ifdef CONFIG_SMP
+	/* Per-cpu data. */
+	void __percpu *percpu;
+	unsigned int percpu_size;
 #endif
 
+#ifdef CONFIG_TRACEPOINTS
+	unsigned int num_tracepoints;
+	struct tracepoint * const *tracepoints_ptrs;
+#endif
+#ifdef HAVE_JUMP_LABEL
+	struct jump_entry *jump_entries;
+	unsigned int num_jump_entries;
+#endif
 #ifdef CONFIG_TRACING
-	const char **trace_bprintk_fmt_start;
 	unsigned int num_trace_bprintk_fmt;
+	const char **trace_bprintk_fmt_start;
 #endif
 #ifdef CONFIG_EVENT_TRACING
-#ifdef __GENKSYMS__
-	struct ftrace_event_call *trace_events;
-#else
-	union {
-		struct ftrace_event_call  *events;
-		struct ftrace_event_call **ptrs;
-	} trace_events;
-#endif
+	struct ftrace_event_call **trace_events;
 	unsigned int num_trace_events;
 #endif
-#ifdef CONFIG_FTRACE_MCOUNT_RECORD
-	unsigned long *ftrace_callsites;
+#if defined(CONFIG_FTRACE_MCOUNT_RECORD) && defined(CONFIG_X86_64)
 	unsigned int num_ftrace_callsites;
+	unsigned long *ftrace_callsites;
 #endif
 
 #ifdef CONFIG_MODULE_UNLOAD
 	/* What modules depend on me? */
-	struct list_head modules_which_use_me;
+	struct list_head source_list;
+	/* What modules do I depend on? */
+	struct list_head target_list;
 
 	/* Who is waiting for us to be unloaded */
 	struct task_struct *waiter;
@@ -411,11 +406,7 @@ struct module
 	/* Destruction function. */
 	void (*exit)(void);
 
-#ifdef CONFIG_SMP
-	char *refptr;
-#else
-	local_t ref;
-#endif
+	struct module_ref __percpu *refptr;
 #endif
 
 #ifdef CONFIG_CONSTRUCTORS
@@ -429,6 +420,7 @@ struct module
 #endif
 
 extern struct mutex module_mutex;
+extern struct mutex module_ext_mutex;
 
 /* FIXME: It'd be nice to isolate modules during init, too, so they
    aren't used before they (may) fail.  But presently too much code
@@ -441,15 +433,16 @@ static inline int module_is_live(struct module *mod)
 struct module *__module_text_address(unsigned long addr);
 struct module *__module_address(unsigned long addr);
 bool is_module_address(unsigned long addr);
+bool is_module_percpu_address(unsigned long addr);
 bool is_module_text_address(unsigned long addr);
 
-static inline int within_module_core(unsigned long addr, struct module *mod)
+static inline int within_module_core(unsigned long addr, const struct module *mod)
 {
 	return (unsigned long)mod->module_core <= addr &&
 	       addr < (unsigned long)mod->module_core + mod->core_size;
 }
 
-static inline int within_module_init(unsigned long addr, struct module *mod)
+static inline int within_module_init(unsigned long addr, const struct module *mod)
 {
 	return (unsigned long)mod->module_init <= addr &&
 	       addr < (unsigned long)mod->module_init + mod->init_size;
@@ -457,6 +450,8 @@ static inline int within_module_init(unsigned long addr, struct module *mod)
 
 /* Search for module by name: must hold module_mutex. */
 struct module *find_module(const char *name);
+/* RHEL-only: find extended module struct associated with a module */
+struct module_ext *find_module_ext(struct module *mod);
 
 struct symsearch {
 	const struct kernel_symbol *start, *stop;
@@ -477,8 +472,9 @@ const struct kernel_symbol *find_symbol(const char *name,
 					bool warn);
 
 /* Walk the exported symbol table */
-bool each_symbol(bool (*fn)(const struct symsearch *arr, struct module *owner,
-			    unsigned int symnum, void *data), void *data);
+bool each_symbol_section(bool (*fn)(const struct symsearch *arr,
+				    struct module *owner,
+				    void *data), void *data);
 
 /* Returns 0 and fills in value, defined and namebuf, or -ERANGE if
    symnum out of range. */
@@ -497,50 +493,18 @@ extern void __module_put_and_exit(struct module *mod, long code)
 #define module_put_and_exit(code) __module_put_and_exit(THIS_MODULE, code);
 
 #ifdef CONFIG_MODULE_UNLOAD
-unsigned int module_refcount(struct module *mod);
+unsigned long module_refcount(struct module *mod);
 void __symbol_put(const char *symbol);
-#define symbol_put(x) __symbol_put(MODULE_SYMBOL_PREFIX #x)
+#define symbol_put(x) __symbol_put(VMLINUX_SYMBOL_STR(x))
 void symbol_put_addr(void *addr);
-
-static inline local_t *__module_ref_addr(struct module *mod, int cpu)
-{
-#ifdef CONFIG_SMP
-	return (local_t *) (mod->refptr + per_cpu_offset(cpu));
-#else
-	return &mod->ref;
-#endif
-}
 
 /* Sometimes we know we already have a refcount, and it's easier not
    to handle the error case (which only happens with rmmod --wait). */
-static inline void __module_get(struct module *module)
-{
-	if (module) {
-		unsigned int cpu = get_cpu();
-		local_inc(__module_ref_addr(module, cpu));
-		trace_module_get(module, _THIS_IP_,
-				 local_read(__module_ref_addr(module, cpu)));
-		put_cpu();
-	}
-}
+extern void __module_get(struct module *module);
 
-static inline int try_module_get(struct module *module)
-{
-	int ret = 1;
-
-	if (module) {
-		unsigned int cpu = get_cpu();
-		if (likely(module_is_live(module))) {
-			local_inc(__module_ref_addr(module, cpu));
-			trace_module_get(module, _THIS_IP_,
-				local_read(__module_ref_addr(module, cpu)));
-		}
-		else
-			ret = 0;
-		put_cpu();
-	}
-	return ret;
-}
+/* This is the Right Way to get a module: if it fails, it's being removed,
+ * so pretend it's not there. */
+extern bool try_module_get(struct module *module);
 
 extern void module_put(struct module *module);
 
@@ -559,7 +523,7 @@ static inline void __module_get(struct module *module)
 #define symbol_put_addr(p) do { } while(0)
 
 #endif /* CONFIG_MODULE_UNLOAD */
-int use_module(struct module *a, struct module *b);
+int ref_module(struct module *a, struct module *b);
 
 /* This is a #define so the string doesn't get put in every .o file */
 #define module_name(mod)			\
@@ -587,15 +551,29 @@ int unregister_module_notifier(struct notifier_block * nb);
 
 extern void print_modules(void);
 
-extern void module_update_tracepoints(void);
-extern int module_get_iter_tracepoints(struct tracepoint_iter *iter);
+bool check_module_rhelversion(struct module *mod, char *version);
+
+#ifdef CONFIG_LIVEPATCH
+static inline bool is_livepatch_module(struct module *mod)
+{
+	bool klp;
+
+	mutex_lock(&module_ext_mutex);
+	klp = find_module_ext(mod)->klp;
+	mutex_unlock(&module_ext_mutex);
+
+	return klp;
+}
+#else /* !CONFIG_LIVEPATCH */
+static inline bool is_livepatch_module(struct module *mod)
+{
+	return false;
+}
+#endif /* CONFIG_LIVEPATCH */
+
+bool is_module_sig_enforced(void);
 
 #else /* !CONFIG_MODULES... */
-#define EXPORT_SYMBOL(sym)
-#define EXPORT_SYMBOL_GPL(sym)
-#define EXPORT_SYMBOL_GPL_FUTURE(sym)
-#define EXPORT_UNUSED_SYMBOL(sym)
-#define EXPORT_UNUSED_SYMBOL_GPL(sym)
 
 /* Given an address, look for it in the exception tables. */
 static inline const struct exception_table_entry *
@@ -615,6 +593,11 @@ static inline struct module *__module_text_address(unsigned long addr)
 }
 
 static inline bool is_module_address(unsigned long addr)
+{
+	return false;
+}
+
+static inline bool is_module_percpu_address(unsigned long addr)
 {
 	return false;
 }
@@ -701,54 +684,22 @@ static inline void print_modules(void)
 {
 }
 
-static inline void module_update_tracepoints(void)
+static inline bool check_module_rhelversion(struct module *mod, char *version)
 {
+	return false;
 }
 
-static inline int module_get_iter_tracepoints(struct tracepoint_iter *iter)
+static inline bool is_module_sig_enforced(void)
 {
-	return 0;
+	return false;
 }
 
 #endif /* CONFIG_MODULES */
 
-struct device_driver;
 #ifdef CONFIG_SYSFS
-struct module;
-
 extern struct kset *module_kset;
 extern struct kobj_type module_ktype;
 extern int module_sysfs_initialized;
-
-int mod_sysfs_init(struct module *mod);
-int mod_sysfs_setup(struct module *mod,
-			   struct kernel_param *kparam,
-			   unsigned int num_params);
-int module_add_modinfo_attrs(struct module *mod);
-void module_remove_modinfo_attrs(struct module *mod);
-
-#else /* !CONFIG_SYSFS */
-
-static inline int mod_sysfs_init(struct module *mod)
-{
-	return 0;
-}
-
-static inline int mod_sysfs_setup(struct module *mod,
-			   struct kernel_param *kparam,
-			   unsigned int num_params)
-{
-	return 0;
-}
-
-static inline int module_add_modinfo_attrs(struct module *mod)
-{
-	return 0;
-}
-
-static inline void module_remove_modinfo_attrs(struct module *mod)
-{ }
-
 #endif /* CONFIG_SYSFS */
 
 #define symbol_request(x) try_then_request_module(symbol_get(x), "symbol:" #x)
@@ -757,19 +708,29 @@ static inline void module_remove_modinfo_attrs(struct module *mod)
 
 #define __MODULE_STRING(x) __stringify(x)
 
+#ifdef CONFIG_DEBUG_SET_MODULE_RONX
+extern void set_all_modules_text_rw(void);
+extern void set_all_modules_text_ro(void);
+extern void module_enable_ro(const struct module *mod);
+extern void module_disable_ro(const struct module *mod);
+#else
+static inline void set_all_modules_text_rw(void) { }
+static inline void set_all_modules_text_ro(void) { }
+static inline void module_enable_ro(const struct module *mod) { }
+static inline void module_disable_ro(const struct module *mod) { }
+#endif
 
 #ifdef CONFIG_GENERIC_BUG
-int  module_bug_finalize(const Elf_Ehdr *, const Elf_Shdr *,
+void module_bug_finalize(const Elf_Ehdr *, const Elf_Shdr *,
 			 struct module *);
 void module_bug_cleanup(struct module *);
 
 #else	/* !CONFIG_GENERIC_BUG */
 
-static inline int  module_bug_finalize(const Elf_Ehdr *hdr,
+static inline void module_bug_finalize(const Elf_Ehdr *hdr,
 					const Elf_Shdr *sechdrs,
 					struct module *mod)
 {
-	return 0;
 }
 static inline void module_bug_cleanup(struct module *mod) {}
 #endif	/* CONFIG_GENERIC_BUG */

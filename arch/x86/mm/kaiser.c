@@ -36,35 +36,34 @@
 #include <linux/mm.h>
 #include <linux/uaccess.h>
 #include <linux/stop_machine.h>
+#include <linux/cpu.h>
 
 #include <asm/kaiser.h>
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
 #include <asm/desc.h>
+#include <asm/kvmclock.h>
 #include <asm/cmpxchg.h>
-
-#include <xen/xen.h>
 
 #define KAISER_WALK_ATOMIC  0x1
 
 static pteval_t kaiser_pte_mask __read_mostly = ~(_PAGE_NX | _PAGE_GLOBAL);
 
 /*
- * We need a two-stage enable/disable for X86_FEATURE_PTI.
- * One (X86_FEATURE_PTI) to stop the ongoing work that keeps PTI from
- * being disabled (like PGD poisoning) and another (percpu flag) that we set
- * when it is completely safe to run without doing KAISER switches.
+ * We need a two-stage enable/disable.  One (kaiser_enabled) to stop
+ * the ongoing work that keeps KAISER from being disabled (like PGD
+ * poisoning) and another (kaiser_asm_do_switch) that we set when it
+ * is completely safe to run without doing KAISER switches.
  */
+int kaiser_enabled __read_mostly;
 
 /*
- * The flag that captures the command line "nopti" and "pti" options.
+ * The flag that captures the command line "nopti" option.
+ *  0 - auto
+ * -1 - disabled
  */
-static enum {
-	PTI_AUTO = 0,
-	PTI_ENABLED,
-	PTI_DISABLED
-} pti_option __read_mostly;
+static int kpti_force_enabled __read_mostly;
 
 /*
  * At runtime, the only things we map are some things for CPU
@@ -103,6 +102,7 @@ static DEFINE_SPINLOCK(shadow_table_allocation_lock);
 static inline unsigned long get_pa_from_kernel_map(unsigned long vaddr)
 {
 	pgd_t *pgd;
+	pud_t *pud;
 	pmd_t *pmd;
 	pte_t *pte;
 
@@ -121,15 +121,13 @@ static inline unsigned long get_pa_from_kernel_map(unsigned long vaddr)
 		WARN_ON_ONCE(1);
 		return -1;
 	}
-
-#ifdef CONFIG_X86_64
-	{
 	/*
 	 * PGDs are either 512GB or 128TB on all x86_64
 	 * configurations.  We don't handle these.
 	 */
-	pud_t *pud = pud_offset(pgd, vaddr);
+	BUILD_BUG_ON(pgd_large(*pgd) != 0);
 
+	pud = pud_offset(pgd, vaddr);
 	if (pud_none(*pud)) {
 		WARN_ON_ONCE(1);
 		return -1;
@@ -139,11 +137,6 @@ static inline unsigned long get_pa_from_kernel_map(unsigned long vaddr)
 		return (pud_pfn(*pud) << PAGE_SHIFT) | (vaddr & ~PUD_PAGE_MASK);
 
 	pmd = pmd_offset(pud, vaddr);
-	}
-#else
-	pmd = pmd_offset((pud_t *)pgd, vaddr);
-#endif
-
 	if (pmd_none(*pmd)) {
 		WARN_ON_ONCE(1);
 		return -1;
@@ -162,98 +155,6 @@ static inline unsigned long get_pa_from_kernel_map(unsigned long vaddr)
 }
 
 /*
- * Take a PGD location (pgdp) and a pgd value that needs
- * to be set there.  Populates the shadow and returns
- * the resulting PGD that must be set in the kernel copy
- * of the page tables.
- *
- * With PAE, the PGD (PUD) can't have the USER or NX bit set. So the
- * pgd_userspace_access() function can't be used.
- */
-#ifndef CONFIG_X86_PAE
-pgd_t __pti_set_user_pgd(pgd_t *pgdp, pgd_t pgd)
-{
-	if (pgd_userspace_access(pgd)) {
-		if (pgdp_maps_userspace(pgdp)) {
-			VM_WARN_ON_ONCE(!is_kaiser_pgd(pgdp));
-			/*
-			 * The user/shadow page tables get the full
-			 * PGD, accessible from userspace:
-			 */
-			kernel_to_shadow_pgdp(pgdp)->pgd = pgd.pgd;
-			/*
-			 * For the copy of the pgd that the kernel
-			 * uses, make it unusable to userspace.  This
-			 * ensures if we get out to userspace with the
-			 * wrong CR3 value, userspace will crash
-			 * instead of running.
-			 */
-			if (kaiser_active())
-				kaiser_poison_pgd(&pgd);
-		}
-	} else if (pgd_userspace_access(*pgdp)) {
-		/*
-		 * We are clearing a _PAGE_USER PGD for which we
-		 * presumably populated the shadow.  We must now
-		 * clear the shadow PGD entry.
-		 */
-		if (pgdp_maps_userspace(pgdp)) {
-			VM_WARN_ON_ONCE(!is_kaiser_pgd(pgdp));
-			kernel_to_shadow_pgdp(pgdp)->pgd = pgd.pgd;
-		} else {
-			/*
-			 * Attempted to clear a _PAGE_USER PGD which
-			 * is in the kernel porttion of the address
-			 * space.  PGDs are pre-populated and we
-			 * never clear them.
-			 */
-			VM_WARN_ON_ONCE(!is_kaiser_pgd(pgdp));
-		}
-	} else {
-		extern struct mutex kexec_mutex;
-
-		/*
-		 * _PAGE_USER was not set in either the PGD being set
-		 * or cleared.  All kernel PGDs should be
-		 * pre-populated so this should never happen after
-		 * boot except when kexec'ing a new kernel.
-		 */
-		VM_WARN_ON_ONCE(system_state == SYSTEM_RUNNING &&
-				!mutex_is_locked(&kexec_mutex) &&
-				is_kaiser_pgd(pgdp));
-	}
-	/* return the copy of the PGD we want the kernel to use */
-	return pgd;
-}
-#else /* CONFIG_X86_PAE */
-pgd_t __pti_set_user_pgd(pgd_t *pgdp, pgd_t pgd)
-{
-	/*
-	 * Changes to the high (kernel) portion of the kernelmode page
-	 * tables are not automatically propagated to the usermode tables.
-	 *
-	 * Users should keep in mind that, unlike the kernelmode tables,
-	 * there is no vmalloc_fault equivalent for the usermode tables.
-	 * Top-level entries added to init_mm's usermode pgd after boot
-	 * will not be automatically propagated to other mms.
-	 */
-	if (!pgdp_maps_userspace(pgdp))
-		return pgd;
-
-	VM_WARN_ON_ONCE(!is_kaiser_pgd(pgdp));
-
-	/*
-	 * The user page tables get the full PGD, accessible from
-	 * userspace:
-	 */
-	kernel_to_shadow_pgdp(pgdp)->pgd = pgd.pgd;
-
-	/* return the copy of the PGD we want the kernel to use: */
-	return pgd;
-}
-#endif /* CONFIG_X86_PAE */
-
-/*
  * Walk the shadow copy of the page tables (optionally) trying to
  * allocate page table pages on the way down.  Does not support
  * large pages since the data we are mapping is (generally) not
@@ -269,6 +170,7 @@ static pte_t *kaiser_shadow_pagetable_walk(unsigned long address,
 {
 	pte_t *pte;
 	pmd_t *pmd;
+	pud_t *pud;
 	pgd_t *pgd = kernel_to_shadow_pgdp(pgd_offset_k(address));
 	gfp_t gfp = (GFP_KERNEL | __GFP_NOTRACK | __GFP_ZERO);
 
@@ -286,11 +188,9 @@ static pte_t *kaiser_shadow_pagetable_walk(unsigned long address,
 		WARN_ONCE(1, "All shadow pgds should have been populated\n");
 		return NULL;
 	}
+	BUILD_BUG_ON(pgd_large(*pgd) != 0);
 
-#ifdef CONFIG_X86_64
-	{
-	pud_t *pud = pud_offset(pgd, address);
-
+	pud = pud_offset(pgd, address);
 	/* The shadow page tables do not use large mappings: */
 	if (pud_large(*pud)) {
 		WARN_ON(1);
@@ -310,10 +210,6 @@ static pte_t *kaiser_shadow_pagetable_walk(unsigned long address,
 	}
 
 	pmd = pmd_offset(pud, address);
-	}
-#else
-	pmd = pmd_offset((pud_t *)pgd, address);
-#endif
 	/* The shadow page tables do not use large mappings: */
 	if (pmd_large(*pmd)) {
 		WARN_ON(1);
@@ -341,68 +237,12 @@ static pte_t *kaiser_shadow_pagetable_walk(unsigned long address,
 }
 
 /*
- * Walk the kernel copy of the page tables to locate the kernel
- * PTE/PMD/PUD entry of the given address, if available, and then set
- * the _PAGE_GLOBAL bit.
- *
- * Returns true on success, false otherwise
- */
-static bool kaiser_set_kernel_pgtable_global(unsigned long address)
-{
-	pte_t *pte;
-	pmd_t *pmd;
-	pgd_t *pgd = pgd_offset_k(address);
-
-	if (address < PAGE_OFFSET) {
-		WARN_ONCE(1, "attempt to walk user address\n");
-		return false;
-	}
-
-	if (pgd_none(*pgd))
-		return false;
-
-#ifdef CONFIG_X86_64
-	{
-		pud_t *pud = pud_offset(pgd, address);
-
-		if (pud_none(*pud))
-			return false;
-
-		if (pud_large(*pud)) {
-			if (!(pud_flags(*pud) & _PAGE_GLOBAL))
-				native_set_pud(pud, native_make_pud
-					      (pud_val(*pud) | _PAGE_GLOBAL));
-			return false;
-		}
-
-		pmd = pmd_offset(pud, address);
-	}
-#else
-	pmd = pmd_offset((pud_t *)pgd, address);
-#endif
-	if (pmd_none(*pmd))
-		return false;
-
-	if (pmd_large(*pmd)) {
-		if (!(pmd_flags(*pmd) & _PAGE_GLOBAL))
-			native_set_pmd(pmd, native_make_pmd
-				      (pmd_val(*pmd) | _PAGE_GLOBAL));
-		return false;
-	}
-
-	pte = pte_offset_kernel(pmd, address);
-	if (!(pte_flags(*pte) & _PAGE_GLOBAL))
-		set_pte(pte, pte_set_flags(*pte, _PAGE_GLOBAL));
-	return true;
-}
-
-/*
  * Given a kernel address, @__start_addr, copy that mapping into
  * the user (shadow) page tables.  This may need to allocate page
  * table pages.
  */
 int kaiser_add_user_map(const void *__start_addr, unsigned long size,
-			pteval_t flags)
+			unsigned long flags)
 {
 	unsigned long start_addr = (unsigned long)__start_addr;
 	unsigned long address = start_addr & PAGE_MASK;
@@ -444,22 +284,13 @@ int kaiser_add_user_map(const void *__start_addr, unsigned long size,
 			 */
 			WARN_ON_ONCE(!pte_same(*pte, tmp));
 		}
-
-		/*
-		 * If the _PAGE_GLOBAL flag is set in the shadow page
-		 * table, set it also in the corresponding entry in
-		 * the kernel page table if kernel_page_global is set
-		 * so that they have the same _PAGE_GLOBAL state.
-		 */
-		if ((flags & _PAGE_GLOBAL) && kernel_page_global)
-			kaiser_set_kernel_pgtable_global(address);
 	}
 	return 0;
 }
 
 int kaiser_add_user_map_ptrs(const void *__start_addr,
 			     const void *__end_addr,
-			     pteval_t flags)
+			     unsigned long flags)
 {
 	return kaiser_add_user_map(__start_addr,
 				   __end_addr - __start_addr,
@@ -486,28 +317,19 @@ static void __init kaiser_init_all_pgds(void)
 		kaiser_pte_mask |= _PAGE_GLOBAL;
 
 	pgd = kernel_to_shadow_pgdp(pgd_offset_k(0UL));
-	for (i = PGD_KERNEL_START; i < PTRS_PER_PGD; i++) {
+	for (i = PTRS_PER_PGD / 2; i < PTRS_PER_PGD; i++) {
 		/*
 		 * Each PGD entry moves up PGDIR_SIZE bytes through
 		 * the address space, so get the first virtual
 		 * address mapped by PGD #i:
 		 */
 		unsigned long addr = i * PGDIR_SIZE;
-#ifdef CONFIG_X86_64
 		pud_t *pud = pud_alloc_one(&init_mm, addr);
 		if (!pud) {
 			WARN_ON(1);
 			break;
 		}
 		set_pgd(pgd + i, __pgd(_PAGE_TABLE | __pa(pud)));
-#else
-		pmd_t *pmd = pmd_alloc_one(&init_mm, addr);
-		if (!pmd) {
-			WARN_ON(1);
-			break;
-		}
-		set_pgd(pgd + i, __pgd(_PAGE_TABLE | __pa(pmd)));
-#endif
 	}
 }
 
@@ -524,13 +346,13 @@ static void __init kaiser_init_all_pgds(void)
 do {								\
 	int __ret = kaiser_add_user_map((__start), (__size),	\
 					(__flags));		\
-	WARN_ON(__ret);					\
+	WARN_ON(__ret);						\
 } while (0)
 
 #define kaiser_add_user_map_ptrs_early(__start, __end, __flags) do {	\
 	int __ret = kaiser_add_user_map_ptrs((__start), (__end),	\
 					     (__flags));		\
-	WARN_ON(__ret);						\
+	WARN_ON(__ret);							\
 } while (0)
 
 static void kaiser_enable_pcp(bool enable)
@@ -538,7 +360,7 @@ static void kaiser_enable_pcp(bool enable)
 	int cpu, val = 0;
 	if (enable) {
 		val = KAISER_PCP_ENABLED;
-		if (IS_ENABLED(CONFIG_X86_64) && boot_cpu_has(X86_FEATURE_PCID))
+		if (boot_cpu_has(X86_FEATURE_PCID))
 			val |= KAISER_PCP_PCID;
 	}
 	for_each_possible_cpu(cpu)
@@ -558,80 +380,21 @@ void kaiser_add_mapping_cpu_entry(int cpu)
 				  __PAGE_KERNEL | _PAGE_GLOBAL);
 }
 
-static int __init force_nopti(char *arg)
+static bool is_xen_pv_domain(void)
 {
-	pti_option = PTI_DISABLED;
+#ifdef CONFIG_XEN
+	return xen_pv_domain();
+#else
+	return false;
+#endif
+}
+
+static int __init force_nokpti(char *arg)
+{
+	kpti_force_enabled = -1;
 	return 0;
 }
-early_param("nopti", force_nopti);
-
-static int __init set_pti(char *arg)
-{
-	if (!arg)
-		return 0;
-	if (!strcmp(arg, "off"))
-		pti_option = PTI_DISABLED;
-	else if (!strcmp(arg, "on"))
-		pti_option = PTI_ENABLED;
-	else if (!strcmp(arg, "auto"))
-		pti_option = PTI_AUTO;
-	return 0;
-}
-early_param("pti", set_pti);
-
-#undef pr_fmt
-#define pr_fmt(fmt)	"Kernel/User page tables isolation: " fmt
-
-static void __init pti_print_if_insecure(const char *reason)
-{
-	if (boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN))
-		pr_info("%s\n", reason);
-}
-
-static void __init pti_print_if_secure(const char *reason)
-{
-	if (!boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN))
-		pr_info("%s\n", reason);
-}
-
-void __init pti_check_boottime_disable(void)
-{
-	if (pti_option == PTI_DISABLED) {
-		pti_print_if_insecure("disabled on command line.");
-		return;
-	} else if (pti_option == PTI_ENABLED) {
-		pti_print_if_secure("force enabled on command line.");
-		goto enable;
-	} else /* pti_option == PTI_AUTO */ {
-		if (!boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN))
-			return;
-		pr_info("enabled\n");
-	}
-enable:
-	setup_force_cpu_cap(X86_FEATURE_PTI);
-	kaiser_enable_pcp(true);
-}
-
-/*
- * The early init code should be run before cpu_init() of boot CPU.
- * This function can be called twice in case X86_FEATURE_PTI_SUPPORT
- * will be accessed really early:
- *  - kaiser_early_init(1)
- *  - kaiser_early_init(0)
- *
- * Or it can be called once with just kaiser_early_init(0).
- */
-void __init kaiser_early_init(bool preset)
-{
-	if (preset) {
-		set_cpu_cap(&boot_cpu_data, X86_FEATURE_PTI_SUPPORT);
-		return;
-	}
-	if (xen_pv_domain())
-		clear_cpu_cap(&boot_cpu_data, X86_FEATURE_PTI_SUPPORT);
-	else
-		setup_force_cpu_cap(X86_FEATURE_PTI_SUPPORT);
-}
+early_param("nopti", force_nokpti);
 
 /*
  * If anything in here fails, we will likely die on one of the
@@ -649,16 +412,8 @@ void __init kaiser_early_init(bool preset)
  */
 void __init kaiser_init(void)
 {
-	int cpu;
-
-	if (xen_pv_domain()) {
-		pti_print_if_insecure("disabled on XEN PV.");
-		return;
-	}
-
-	if (!boot_cpu_has(X86_FEATURE_PTI_SUPPORT))
-		return;
-
+	int cpu, idx;
+	extern enum { EMULATE, NATIVE, NONE } vsyscall_mode;
 	kaiser_init_all_pgds();
 
 	for_each_possible_cpu(cpu)
@@ -672,6 +427,10 @@ void __init kaiser_init(void)
 				  sizeof(gate_desc) * NR_VECTORS,
 				  __PAGE_KERNEL_RO | _PAGE_GLOBAL);
 
+	kaiser_add_user_map_early(&debug_idt_table,
+				  sizeof(gate_desc) * NR_VECTORS,
+				  __PAGE_KERNEL | _PAGE_GLOBAL);
+
 	kaiser_add_user_map_early(&trace_idt_table,
 				  sizeof(gate_desc) * NR_VECTORS,
 				  __PAGE_KERNEL | _PAGE_GLOBAL);
@@ -680,7 +439,6 @@ void __init kaiser_init(void)
 				       __kprobes_text_end,
 				       __PAGE_KERNEL_RX | _PAGE_GLOBAL);
 
-#ifdef CONFIG_X86_64
 	/*
 	 * .irqentry.text helps us identify code that runs before
 	 * we get a chance to call entering_irq().  This includes
@@ -694,28 +452,42 @@ void __init kaiser_init(void)
 				       __irqentry_text_end,
 				       __PAGE_KERNEL_RX | _PAGE_GLOBAL);
 
+	kaiser_add_user_map_early((void *)VVAR_ADDRESS, PAGE_SIZE,
+				  __PAGE_KERNEL_VVAR | _PAGE_GLOBAL);
 	kaiser_add_user_map_early((void *)VSYSCALL_START, PAGE_SIZE,
-				  __PAGE_KERNEL_VSYSCALL | _PAGE_GLOBAL);
+				  vsyscall_mode == NATIVE
+				  ? __PAGE_KERNEL_VSYSCALL | _PAGE_GLOBAL
+				  : __PAGE_KERNEL_VVAR | _PAGE_GLOBAL);
+#ifdef CONFIG_PARAVIRT_CLOCK
+	for (idx = 0; kvm_clock.archdata.vclock_mode == VCLOCK_PVCLOCK &&
+		     idx <= (PVCLOCK_FIXMAP_END-PVCLOCK_FIXMAP_BEGIN); idx++) {
+		kaiser_add_user_map_early((void *)__fix_to_virt(PVCLOCK_FIXMAP_BEGIN + idx),
+					  PAGE_SIZE,
+					  __PAGE_KERNEL_VVAR | _PAGE_GLOBAL);
+	}
 #endif
 
-	pti_check_boottime_disable();
+	if (is_xen_pv_domain()) {
+		pr_info("x86/pti: Xen PV detected, disabling "
+			"PTI protection\n");
+	} else if (!cpu_mitigations_off() && ((kpti_force_enabled > 0) ||
+		   (boot_cpu_has_bug(X86_BUG_CPU_MELTDOWN) &&
+		   !kpti_force_enabled))) {
+		pr_info("x86/pti: Unmapping kernel while in userspace\n");
+		kaiser_enable_pcp(true);
+		kaiser_enabled = 1;
+	}
 }
 
 int kaiser_add_mapping(unsigned long addr, unsigned long size,
-		       pteval_t flags)
+		       unsigned long flags)
 {
-	if (!boot_cpu_has(X86_FEATURE_PTI_SUPPORT))
-		return 0;
-
 	return kaiser_add_user_map((const void *)addr, size, flags);
 }
 
 void kaiser_remove_mapping(unsigned long start, unsigned long size)
 {
 	unsigned long addr;
-
-	if (!boot_cpu_has(X86_FEATURE_PTI_SUPPORT))
-		return;
 
 	/* The shadow page tables always use small pages: */
 	for (addr = start; addr < start + size; addr += PAGE_SIZE) {
@@ -744,7 +516,7 @@ void kaiser_remove_mapping(unsigned long start, unsigned long size)
 	 * expensive right now: this is called to unmap process
 	 * stacks in the exit() path.
 	 *
-	 * This can change if we get to the point where this is not
+	  This can change if we get to the point where this is not
 	 * in a remotely hot path, like only called via write_ldt().
 	 *
 	 * Note: we could probably also just invalidate the individual
@@ -761,7 +533,7 @@ static ssize_t kaiser_enabled_read_file(struct file *file, char __user *user_buf
 	char buf[32];
 	unsigned int len;
 
-	len = sprintf(buf, "%d\n", !!boot_cpu_has(X86_FEATURE_PTI));
+	len = sprintf(buf, "%d\n", kaiser_enabled);
 	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
 }
 
@@ -806,7 +578,6 @@ static ssize_t kaiser_enabled_write_file(struct file *file,
 		 const char __user *user_buf, size_t count, loff_t *ppos)
 {
 	char buf[32];
-	int cpu;
 	ssize_t len;
 	unsigned int enable;
 	ssize_t err;
@@ -824,7 +595,7 @@ static ssize_t kaiser_enabled_write_file(struct file *file,
 		return -EINVAL;
 
 	mutex_lock(&enable_mutex);
-	if (!!boot_cpu_has(X86_FEATURE_PTI) == enable)
+	if (kaiser_enabled == enable)
 		goto out_unlock;
 
 	first_stop_machine = FIRST_STOP_MACHINE_INIT;
@@ -834,15 +605,8 @@ static ssize_t kaiser_enabled_write_file(struct file *file,
 	if (err) {
 		VM_WARN_ON(1);
 		count = err;
-	} else if (enable) {
-		set_cpu_cap(&boot_cpu_data, X86_FEATURE_PTI);
-		for_each_possible_cpu(cpu)
-			set_cpu_cap(&cpu_data(cpu), X86_FEATURE_PTI);
-	} else {
-		clear_cpu_cap(&boot_cpu_data, X86_FEATURE_PTI);
-		for_each_possible_cpu(cpu)
-			clear_cpu_cap(&cpu_data(cpu), X86_FEATURE_PTI);
-	}
+	} else
+		kaiser_enabled = enable;
 
 out_unlock:
 	mutex_unlock(&enable_mutex);
@@ -857,7 +621,7 @@ static const struct file_operations fops_kaiser_enabled = {
 
 static int __init create_kpti_enabled(void)
 {
-	if (boot_cpu_has(X86_FEATURE_PTI_SUPPORT))
+	if (!xen_pv_domain() && !sme_active())
 		debugfs_create_file("pti_enabled", S_IRUSR | S_IWUSR,
 				    arch_debugfs_dir, NULL, &fops_kaiser_enabled);
 	return 0;

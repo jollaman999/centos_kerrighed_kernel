@@ -50,24 +50,9 @@ static int test_rtc_proc(struct device *dev, struct seq_file *seq)
 	return 0;
 }
 
-static int test_rtc_ioctl(struct device *dev, unsigned int cmd,
-	unsigned long arg)
+static int test_rtc_alarm_irq_enable(struct device *dev, unsigned int enable)
 {
-	/* We do support interrupts, they're generated
-	 * using the sysfs interface.
-	 */
-	switch (cmd) {
-	case RTC_PIE_ON:
-	case RTC_PIE_OFF:
-	case RTC_UIE_ON:
-	case RTC_UIE_OFF:
-	case RTC_AIE_ON:
-	case RTC_AIE_OFF:
-		return 0;
-
-	default:
-		return -ENOIOCTLCMD;
-	}
+	return 0;
 }
 
 static const struct rtc_class_ops test_rtc_ops = {
@@ -76,7 +61,7 @@ static const struct rtc_class_ops test_rtc_ops = {
 	.read_alarm = test_rtc_read_alarm,
 	.set_alarm = test_rtc_set_alarm,
 	.set_mmss = test_rtc_set_mmss,
-	.ioctl = test_rtc_ioctl,
+	.alarm_irq_enable = test_rtc_alarm_irq_enable,
 };
 
 static ssize_t test_irq_show(struct device *dev,
@@ -93,11 +78,16 @@ static ssize_t test_irq_store(struct device *dev,
 	struct rtc_device *rtc = platform_get_drvdata(plat_dev);
 
 	retval = count;
-	if (strncmp(buf, "tick", 4) == 0)
+	if (strncmp(buf, "tick", 4) == 0 && rtc->pie_enabled)
 		rtc_update_irq(rtc, 1, RTC_PF | RTC_IRQF);
-	else if (strncmp(buf, "alarm", 5) == 0)
-		rtc_update_irq(rtc, 1, RTC_AF | RTC_IRQF);
-	else if (strncmp(buf, "update", 6) == 0)
+	else if (strncmp(buf, "alarm", 5) == 0) {
+		struct rtc_wkalrm alrm;
+		int err = rtc_read_alarm(rtc, &alrm);
+
+		if (!err && alrm.enabled)
+			rtc_update_irq(rtc, 1, RTC_AF | RTC_IRQF);
+
+	} else if (strncmp(buf, "update", 6) == 0 && rtc->uie_rtctimer.enabled)
 		rtc_update_irq(rtc, 1, RTC_UF | RTC_IRQF);
 	else
 		retval = -EINVAL;
@@ -109,8 +99,10 @@ static DEVICE_ATTR(irq, S_IRUGO | S_IWUSR, test_irq_show, test_irq_store);
 static int test_probe(struct platform_device *plat_dev)
 {
 	int err;
-	struct rtc_device *rtc = rtc_device_register("test", &plat_dev->dev,
-						&test_rtc_ops, THIS_MODULE);
+	struct rtc_device *rtc;
+
+	rtc = devm_rtc_device_register(&plat_dev->dev, "test",
+				&test_rtc_ops, THIS_MODULE);
 	if (IS_ERR(rtc)) {
 		err = PTR_ERR(rtc);
 		return err;
@@ -125,15 +117,11 @@ static int test_probe(struct platform_device *plat_dev)
 	return 0;
 
 err:
-	rtc_device_unregister(rtc);
 	return err;
 }
 
-static int __devexit test_remove(struct platform_device *plat_dev)
+static int test_remove(struct platform_device *plat_dev)
 {
-	struct rtc_device *rtc = platform_get_drvdata(plat_dev);
-
-	rtc_device_unregister(rtc);
 	device_remove_file(&plat_dev->dev, &dev_attr_irq);
 
 	return 0;
@@ -141,7 +129,7 @@ static int __devexit test_remove(struct platform_device *plat_dev)
 
 static struct platform_driver test_driver = {
 	.probe	= test_probe,
-	.remove = __devexit_p(test_remove),
+	.remove = test_remove,
 	.driver = {
 		.name = "rtc-test",
 		.owner = THIS_MODULE,
@@ -162,24 +150,24 @@ static int __init test_init(void)
 
 	if ((test1 = platform_device_alloc("rtc-test", 1)) == NULL) {
 		err = -ENOMEM;
-		goto exit_free_test0;
+		goto exit_put_test0;
 	}
 
 	if ((err = platform_device_add(test0)))
-		goto exit_free_test1;
+		goto exit_put_test1;
 
 	if ((err = platform_device_add(test1)))
-		goto exit_device_unregister;
+		goto exit_del_test0;
 
 	return 0;
 
-exit_device_unregister:
-	platform_device_unregister(test0);
+exit_del_test0:
+	platform_device_del(test0);
 
-exit_free_test1:
+exit_put_test1:
 	platform_device_put(test1);
 
-exit_free_test0:
+exit_put_test0:
 	platform_device_put(test0);
 
 exit_driver_unregister:

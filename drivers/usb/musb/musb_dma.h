@@ -80,6 +80,17 @@ struct musb_hw_ep;
 #define tusb_dma_omap()			0
 #endif
 
+/* Anomaly 05000456 - USB Receive Interrupt Is Not Generated in DMA Mode 1
+ *	Only allow DMA mode 1 to be used when the USB will actually generate the
+ *	interrupts we expect.
+ */
+#ifdef CONFIG_BLACKFIN
+# undef USE_MODE1
+# if !ANOMALY_05000456
+#  define USE_MODE1
+# endif
+#endif
+
 /*
  * DMA channel status ... updated by the dma controller driver whenever that
  * status changes, and protected by the overall controller spinlock.
@@ -158,14 +169,16 @@ struct dma_controller {
 							dma_addr_t dma_addr,
 							u32 length);
 	int			(*channel_abort)(struct dma_channel *);
+	int			(*is_compatible)(struct dma_channel *channel,
+							u16 maxpacket,
+							void *buf, u32 length);
 };
 
 /* called after channel_program(), may indicate a fault */
 extern void musb_dma_completion(struct musb *musb, u8 epnum, u8 transmit);
 
 
-extern struct dma_controller *__init
-dma_controller_create(struct musb *, void __iomem *);
+extern struct dma_controller *dma_controller_create(struct musb *, void __iomem *);
 
 extern void dma_controller_destroy(struct dma_controller *);
 

@@ -78,7 +78,7 @@ The possible values in this file are:
 
      * - Not affected
        - The processor is not vulnerable.
-     * - KVM: Mitigation: Disabled huge pages
+     * - KVM: Mitigation: Split huge pages
        - Software changes mitigate this issue.
      * - KVM: Vulnerable
        - The processor is vulnerable, but no mitigation enabled
@@ -100,26 +100,43 @@ and will be set on CPU's which are mitigated against this issue.
 Mitigation mechanism
 -------------------------
 
-This erratum can be mitigated, with a performance cost depending on the
-virtual machine configuration, by avoiding the use of large page sizes.
-This forces all iTLB entries to be 4K, and removes the possibility of multiple
-hits.
+This erratum can be mitigated by restricting the use of large page sizes to
+non-executable pages.  This forces all iTLB entries to be 4K, and removes
+the possibility of multiple hits.
 
+In order to mitigate the vulnerability, KVM initially marks all huge pages
+as non-executable. If the guest attempts to execute in one of those pages,
+the page is broken down into 4K pages, which are then marked executable.
+
+If EPT is disabled or not available on the host, KVM is in control of
+TLB flushes and the problematic situation cannot happen.  However, the
+shadow EPT paging mechanism used by nested virtualization is vulnerable,
+because the nested guest can trigger multiple iTLB hits by modifying its own
+(non-nested) page tables.  For simplicity, KVM will make large pages
+non-executable in all shadow paging modes.
 
 Mitigation control on the kernel command line and KVM - module parameter
 ------------------------------------------------------------------------
 
 The kernel command line allows to control the iTLB multihit mitigations at boot
-time with the option "kvm.no_huge_pages=". The KVM hypervisor mitigation
-mechanism for avoiding use of huge pages can be controlled with a
-module parameter "no_huge_pages=".
+time with the option "kvm.nx_huge_pages=". The KVM hypervisor mitigation
+mechanism for marking huge pages as non-executable can be controlled with a
+module parameter "nx_huge_pages=".
+
 
 The valid arguments for these options are:
 
   ==========  ================================================================
-  1           Mitigation is enabled.
+  force       Mitigation is enabled. In this case, the mitigation implements
+              non-executable huge pages in Linux kernel KVM module. All huge
+              pages in the EPT are marked as non-executable.
+              If a guest attempts to execute in one of those pages, the page is
+              broken down into 4K pages, which are then marked executable.
 
-  0           Mitigation is disabled (default).
+  off	      Mitigation is disabled.
+
+  auto        Enable mitigation only if the platform is affected and the kernel
+              was not booted with the "mitigations=off" command line parameter.
   ==========  ================================================================
 
 

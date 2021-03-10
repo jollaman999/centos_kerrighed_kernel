@@ -16,7 +16,6 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
-#include <linux/nospec.h>
 #include "ath5k.h"
 #include "reg.h"
 #include "debug.h"
@@ -88,7 +87,6 @@ ath5k_ani_set_noise_immunity_level(struct ath5k_hw *ah, int level)
 			  level);
 		return;
 	}
-	level = array_index_nospec(level, ARRAY_SIZE(sz));
 
 	AR5K_REG_WRITE_BITS(ah, AR5K_PHY_DESIRED_SIZE,
 				AR5K_PHY_DESIRED_SIZE_TOT, sz[level]);
@@ -120,7 +118,6 @@ ath5k_ani_set_spur_immunity_level(struct ath5k_hw *ah, int level)
 			  level);
 		return;
 	}
-	level = array_index_nospec(level, ARRAY_SIZE(val));
 
 	AR5K_REG_WRITE_BITS(ah, AR5K_PHY_OFDM_SELFCORR,
 		AR5K_PHY_OFDM_SELFCORR_CYPWR_THR1, val[level]);
@@ -143,7 +140,6 @@ ath5k_ani_set_firstep_level(struct ath5k_hw *ah, int level)
 		ATH5K_ERR(ah, "firstep level %d out of range", level);
 		return;
 	}
-	level = array_index_nospec(level, ARRAY_SIZE(val));
 
 	AR5K_REG_WRITE_BITS(ah, AR5K_PHY_SIG,
 				AR5K_PHY_SIG_FIRSTEP, val[level]);
@@ -227,7 +223,7 @@ static void
 ath5k_ani_raise_immunity(struct ath5k_hw *ah, struct ath5k_ani_state *as,
 			 bool ofdm_trigger)
 {
-	int rssi = ewma_beacon_rssi_read(&ah->ah_beacon_rssi_avg);
+	int rssi = ewma_read(&ah->ah_beacon_rssi_avg);
 
 	ATH5K_DBG_UNLIMIT(ah, ATH5K_DEBUG_ANI, "raise immunity (%s)",
 		ofdm_trigger ? "ODFM" : "CCK");
@@ -313,7 +309,7 @@ ath5k_ani_raise_immunity(struct ath5k_hw *ah, struct ath5k_ani_state *as,
 static void
 ath5k_ani_lower_immunity(struct ath5k_hw *ah, struct ath5k_ani_state *as)
 {
-	int rssi = ewma_beacon_rssi_read(&ah->ah_beacon_rssi_avg);
+	int rssi = ewma_read(&ah->ah_beacon_rssi_avg);
 
 	ATH5K_DBG_UNLIMIT(ah, ATH5K_DEBUG_ANI, "lower immunity");
 

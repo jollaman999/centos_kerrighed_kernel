@@ -31,6 +31,7 @@
 #include <linux/module.h>
 #include <linux/genhd.h>
 #include <linux/blkdev.h>
+#include <linux/blk-mq.h>
 #include <linux/bio.h>
 #include <linux/dma-mapping.h>
 #include <linux/idr.h>
@@ -38,6 +39,7 @@
 #include <../drivers/ata/ahci.h>
 #include <linux/export.h>
 #include <linux/debugfs.h>
+#include <linux/prefetch.h>
 #include "mtip32xx.h"
 
 #define HW_CMD_SLOT_SZ		(MTIP_MAX_COMMAND_SLOTS * 32)
@@ -102,9 +104,9 @@
 /* Device instance number, incremented each time a device is probed. */
 static int instance;
 
-struct list_head online_list;
-struct list_head removing_list;
-spinlock_t dev_lock;
+static struct list_head online_list;
+static struct list_head removing_list;
+static spinlock_t dev_lock;
 
 /*
  * Global variable used to hold the major block device number
@@ -113,6 +115,8 @@ spinlock_t dev_lock;
 static int mtip_major;
 static struct dentry *dfs_parent;
 static struct dentry *dfs_device_status;
+
+static u32 cpu_use[NR_CPUS];
 
 static DEFINE_SPINLOCK(rssd_index_lock);
 static DEFINE_IDA(rssd_index_ida);
@@ -155,76 +159,70 @@ static bool mtip_check_surprise_removal(struct pci_dev *pdev)
 	if (vendor_id == 0xFFFF) {
 		dd->sr = true;
 		if (dd->queue)
-			set_bit(QUEUE_FLAG_DYING, &dd->queue->queue_flags);
+			set_bit(QUEUE_FLAG_DEAD, &dd->queue->queue_flags);
 		else
 			dev_warn(&dd->pdev->dev,
 				"%s: dd->queue is NULL\n", __func__);
-		if (dd->port) {
-			set_bit(MTIP_PF_SR_CLEANUP_BIT, &dd->port->flags);
-			wake_up_interruptible(&dd->port->svc_wait);
-		} else
-			dev_warn(&dd->pdev->dev,
-				"%s: dd->port is NULL\n", __func__);
 		return true; /* device removed */
 	}
 
 	return false; /* device present */
 }
 
-/*
- * Obtain an empty command slot.
- *
- * This function needs to be reentrant since it could be called
- * at the same time on multiple CPUs. The allocation of the
- * command slot must be atomic.
- *
- * @port Pointer to the port data structure.
- *
- * return value
- *	>= 0	Index of command slot obtained.
- *	-1	No command slots available.
- */
-static int get_slot(struct mtip_port *port)
+/* we have to use runtime tag to setup command header */
+static void mtip_init_cmd_header(struct request *rq)
 {
-	int slot, i;
-	unsigned int num_command_slots = port->dd->slot_groups * 32;
+	struct driver_data *dd = rq->q->queuedata;
+	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
 
-	/*
-	 * Try 10 times, because there is a small race here.
-	 *  that's ok, because it's still cheaper than a lock.
-	 *
-	 * Race: Since this section is not protected by lock, same bit
-	 * could be chosen by different process contexts running in
-	 * different processor. So instead of costly lock, we are going
-	 * with loop.
-	 */
-	for (i = 0; i < 10; i++) {
-		slot = find_next_zero_bit(port->allocated,
-					 num_command_slots, 1);
-		if ((slot < num_command_slots) &&
-		    (!test_and_set_bit(slot, port->allocated)))
-			return slot;
-	}
-	dev_warn(&port->dd->pdev->dev, "Failed to get a tag.\n");
+	/* Point the command headers at the command tables. */
+	cmd->command_header = dd->port->command_list +
+				(sizeof(struct mtip_cmd_hdr) * rq->tag);
+	cmd->command_header_dma = dd->port->command_list_dma +
+				(sizeof(struct mtip_cmd_hdr) * rq->tag);
 
-	mtip_check_surprise_removal(port->dd->pdev);
-	return -1;
+	if (test_bit(MTIP_PF_HOST_CAP_64, &dd->port->flags))
+		cmd->command_header->ctbau = __force_bit2int cpu_to_le32((cmd->command_dma >> 16) >> 16);
+
+	cmd->command_header->ctba = __force_bit2int cpu_to_le32(cmd->command_dma & 0xFFFFFFFF);
+}
+
+static struct mtip_cmd *mtip_get_int_command(struct driver_data *dd)
+{
+	struct request *rq;
+
+	if (mtip_check_surprise_removal(dd->pdev))
+		return NULL;
+
+	rq = blk_mq_alloc_request(dd->queue, READ, BLK_MQ_REQ_RESERVED);
+	if (IS_ERR(rq))
+		return NULL;
+
+	return blk_mq_rq_to_pdu(rq);
+}
+
+static void mtip_put_int_command(struct driver_data *dd, struct mtip_cmd *cmd)
+{
+	blk_put_request(blk_mq_rq_from_pdu(cmd));
 }
 
 /*
- * Release a command slot.
- *
- * @port Pointer to the port data structure.
- * @tag  Tag of command to release
- *
- * return value
- *	None
+ * Once we add support for one hctx per mtip group, this will change a bit
  */
-static inline void release_slot(struct mtip_port *port, int tag)
+static struct request *mtip_rq_from_tag(struct driver_data *dd,
+					unsigned int tag)
 {
-	smp_mb__before_clear_bit();
-	clear_bit(tag, port->allocated);
-	smp_mb__after_clear_bit();
+	struct blk_mq_hw_ctx *hctx = dd->queue->queue_hw_ctx[0];
+
+	return blk_mq_tag_to_rq(hctx->tags, tag);
+}
+
+static struct mtip_cmd *mtip_cmd_from_tag(struct driver_data *dd,
+					  unsigned int tag)
+{
+	struct request *rq = mtip_rq_from_tag(dd, tag);
+
+	return blk_mq_rq_to_pdu(rq);
 }
 
 /*
@@ -246,93 +244,22 @@ static inline void release_slot(struct mtip_port *port, int tag)
  *	None
  */
 static void mtip_async_complete(struct mtip_port *port,
-				int tag,
-				void *data,
-				int status)
+				int tag, struct mtip_cmd *cmd, int status)
 {
-	struct mtip_cmd *cmd;
-	struct driver_data *dd = data;
-	int unaligned, cb_status = status ? -EIO : 0;
-	void (*func)(void *, int);
+	struct driver_data *dd = port->dd;
+	struct request *rq;
 
 	if (unlikely(!dd) || unlikely(!port))
 		return;
-
-	cmd = &port->commands[tag];
 
 	if (unlikely(status == PORT_IRQ_TF_ERR)) {
 		dev_warn(&port->dd->pdev->dev,
 			"Command tag %d failed due to TFE\n", tag);
 	}
 
-	/* Clear the active flag */
-	atomic_set(&port->commands[tag].active, 0);
+	rq = mtip_rq_from_tag(dd, tag);
 
-	/* Upper layer callback */
-	func = cmd->async_callback;
-	if (likely(func && cmpxchg(&cmd->async_callback, func, 0) == func)) {
-
-		/* Unmap the DMA scatter list entries */
-		dma_unmap_sg(&dd->pdev->dev,
-			cmd->sg,
-			cmd->scatter_ents,
-			cmd->direction);
-
-		func(cmd->async_data, cb_status);
-		unaligned = cmd->unaligned;
-
-		/* Clear the allocated bit for the command */
-		release_slot(port, tag);
-
-		if (unlikely(unaligned))
-			up(&port->cmd_slot_unal);
-		else
-			up(&port->cmd_slot);
-	}
-}
-
-/*
- * This function is called for clean the pending command in the
- * command slot during the surprise removal of device and return
- * error to the upper layer.
- *
- * @dd Pointer to the DRIVER_DATA structure.
- *
- * return value
- *	None
- */
-static void mtip_command_cleanup(struct driver_data *dd)
-{
-	int tag = 0;
-	struct mtip_cmd *cmd;
-	struct mtip_port *port = dd->port;
-	unsigned int num_cmd_slots = dd->slot_groups * 32;
-
-	if (!test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag))
-		return;
-
-	if (!port)
-		return;
-
-	cmd = &port->commands[MTIP_TAG_INTERNAL];
-	if (atomic_read(&cmd->active))
-		if (readl(port->cmd_issue[MTIP_TAG_INTERNAL]) &
-					(1 << MTIP_TAG_INTERNAL))
-			if (cmd->comp_func)
-				cmd->comp_func(port, MTIP_TAG_INTERNAL,
-					 cmd->comp_data, -ENODEV);
-
-	while (1) {
-		tag = find_next_bit(port->allocated, num_cmd_slots, tag);
-		if (tag >= num_cmd_slots)
-			break;
-
-		cmd = &port->commands[tag];
-		if (atomic_read(&cmd->active))
-			mtip_async_complete(port, tag, dd, -ENODEV);
-	}
-
-	set_bit(MTIP_DDF_CLEANUP_BIT, &dd->dd_flag);
+	blk_mq_complete_request(rq, status);
 }
 
 /*
@@ -387,20 +314,15 @@ static int mtip_hba_reset(struct driver_data *dd)
  */
 static inline void mtip_issue_ncq_command(struct mtip_port *port, int tag)
 {
-	atomic_set(&port->commands[tag].active, 1);
+	int group = tag >> 5;
 
-	spin_lock(&port->cmd_issue_lock);
-
+	/* guard SACT and CI registers */
+	spin_lock(&port->cmd_issue_lock[group]);
 	writel((1 << MTIP_TAG_BIT(tag)),
 			port->s_active[MTIP_TAG_INDEX(tag)]);
 	writel((1 << MTIP_TAG_BIT(tag)),
 			port->cmd_issue[MTIP_TAG_INDEX(tag)]);
-
-	spin_unlock(&port->cmd_issue_lock);
-
-	/* Set the command's timeout value.*/
-	port->commands[tag].comp_time = jiffies + msecs_to_jiffies(
-					MTIP_NCQ_COMMAND_TIMEOUT_MS);
+	spin_unlock(&port->cmd_issue_lock[group]);
 }
 
 /*
@@ -513,6 +435,7 @@ static void mtip_init_port(struct mtip_port *port)
 			 port->mmio + PORT_LST_ADDR_HI);
 		writel((port->rxfis_dma >> 16) >> 16,
 			 port->mmio + PORT_FIS_ADDR_HI);
+		set_bit(MTIP_PF_HOST_CAP_64, &port->flags);
 	}
 
 	writel(port->command_list_dma & 0xFFFFFFFF,
@@ -648,129 +571,10 @@ static void print_tags(struct driver_data *dd,
 
 	memset(tagmap, 0, sizeof(tagmap));
 	for (group = SLOTBITS_IN_LONGS; group > 0; group--)
-		tagmap_len = sprintf(tagmap + tagmap_len, "%016lX ",
+		tagmap_len += sprintf(tagmap + tagmap_len, "%016lX ",
 						tagbits[group-1]);
 	dev_warn(&dd->pdev->dev,
 			"%d command(s) %s: tagmap [%s]", cnt, msg, tagmap);
-}
-
-/*
- * Called periodically to see if any read/write commands are
- * taking too long to complete.
- *
- * @data Pointer to the PORT data structure.
- *
- * return value
- *	None
- */
-static void mtip_timeout_function(unsigned long int data)
-{
-	struct mtip_port *port = (struct mtip_port *) data;
-	struct host_to_dev_fis *fis;
-	struct mtip_cmd *cmd;
-	int unaligned, tag, cmdto_cnt = 0;
-	unsigned int bit, group;
-	unsigned int num_command_slots;
-	unsigned long to, tagaccum[SLOTBITS_IN_LONGS];
-	void (*func)(void *, int);
-
-	if (unlikely(!port))
-		return;
-
-	if (unlikely(port->dd->sr))
-		return;
-
-	if (test_bit(MTIP_DDF_RESUME_BIT, &port->dd->dd_flag)) {
-		mod_timer(&port->cmd_timer,
-			jiffies + msecs_to_jiffies(30000));
-		return;
-	}
-	/* clear the tag accumulator */
-	memset(tagaccum, 0, SLOTBITS_IN_LONGS * sizeof(long));
-	num_command_slots = port->dd->slot_groups * 32;
-
-	for (tag = 0; tag < num_command_slots; tag++) {
-		/*
-		 * Skip internal command slot as it has
-		 * its own timeout mechanism
-		 */
-		if (tag == MTIP_TAG_INTERNAL)
-			continue;
-
-		if (atomic_read(&port->commands[tag].active) &&
-		   (time_after(jiffies, port->commands[tag].comp_time))) {
-			group = tag >> 5;
-			bit = tag & 0x1F;
-
-			cmd = &port->commands[tag];
-			fis = (struct host_to_dev_fis *) cmd->command;
-
-			set_bit(tag, tagaccum);
-			cmdto_cnt++;
-			if (cmdto_cnt == 1)
-				set_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags);
-
-			/*
-			 * Clear the completed bit. This should prevent
-			 *  any interrupt handlers from trying to retire
-			 *  the command.
-			 */
-			writel(1 << bit, port->completed[group]);
-
-			/* Clear the active flag for the command */
-			atomic_set(&port->commands[tag].active, 0);
-
-			func = cmd->async_callback;
-			if (func &&
-			    cmpxchg(&cmd->async_callback, func, 0) == func) {
-
-				/* Unmap the DMA scatter list entries */
-				dma_unmap_sg(&port->dd->pdev->dev,
-						cmd->sg,
-						cmd->scatter_ents,
-						cmd->direction);
-
-				func(cmd->async_data, -EIO);
-				unaligned = cmd->unaligned;
-
-				/* Clear the allocated bit for the command. */
-				release_slot(port, tag);
-
-				if (unaligned)
-					up(&port->cmd_slot_unal);
-				else
-					up(&port->cmd_slot);
-			}
-		}
-	}
-
-	if (cmdto_cnt) {
-		print_tags(port->dd, "timed out", tagaccum, cmdto_cnt);
-		if (!test_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags)) {
-			mtip_device_reset(port->dd);
-			wake_up_interruptible(&port->svc_wait);
-		}
-		clear_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags);
-	}
-
-	if (port->ic_pause_timer) {
-		to  = port->ic_pause_timer + msecs_to_jiffies(1000);
-		if (time_after(jiffies, to)) {
-			if (!test_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags)) {
-				port->ic_pause_timer = 0;
-				clear_bit(MTIP_PF_SE_ACTIVE_BIT, &port->flags);
-				clear_bit(MTIP_PF_DM_ACTIVE_BIT, &port->flags);
-				clear_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags);
-				wake_up_interruptible(&port->svc_wait);
-			}
-
-
-		}
-	}
-
-	/* Restart the timer */
-	mod_timer(&port->cmd_timer,
-		jiffies + msecs_to_jiffies(MTIP_TIMEOUT_CHECK_PERIOD));
 }
 
 /*
@@ -789,28 +593,16 @@ static void mtip_timeout_function(unsigned long int data)
  *	None
  */
 static void mtip_completion(struct mtip_port *port,
-			    int tag,
-			    void *data,
-			    int status)
+			    int tag, struct mtip_cmd *command, int status)
 {
-	struct mtip_cmd *command = &port->commands[tag];
-	struct completion *waiting = data;
+	struct completion *waiting = command->comp_data;
 	if (unlikely(status == PORT_IRQ_TF_ERR))
 		dev_warn(&port->dd->pdev->dev,
 			"Internal command %d completed with TFE\n", tag);
 
-	command->async_callback = NULL;
 	command->comp_func = NULL;
-
+	command->comp_data = NULL;
 	complete(waiting);
-}
-
-static void mtip_null_completion(struct mtip_port *port,
-			    int tag,
-			    void *data,
-			    int status)
-{
-	return;
 }
 
 static int mtip_read_log_page(struct mtip_port *port, u8 page, u16 *buffer,
@@ -842,21 +634,15 @@ static void mtip_handle_tfe(struct driver_data *dd)
 
 	port = dd->port;
 
-	/* Stop the timer to prevent command timeouts. */
-	del_timer(&port->cmd_timer);
-	set_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags);
-
-	if (test_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags) &&
-			test_bit(MTIP_TAG_INTERNAL, port->allocated)) {
-		cmd = &port->commands[MTIP_TAG_INTERNAL];
+	if (test_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags)) {
+		cmd = mtip_cmd_from_tag(dd, MTIP_TAG_INTERNAL);
 		dbg_printk(MTIP_DRV_NAME " TFE for the internal command\n");
 
-		atomic_inc(&cmd->active); /* active > 1 indicates error */
 		if (cmd->comp_data && cmd->comp_func) {
 			cmd->comp_func(port, MTIP_TAG_INTERNAL,
-					cmd->comp_data, PORT_IRQ_TF_ERR);
+					cmd, PORT_IRQ_TF_ERR);
 		}
-		goto handle_tfe_exit;
+		return;
 	}
 
 	/* clear the tag accumulator */
@@ -865,6 +651,8 @@ static void mtip_handle_tfe(struct driver_data *dd)
 	/* Loop through all the groups */
 	for (group = 0; group < dd->slot_groups; group++) {
 		completed = readl(port->completed[group]);
+
+		dev_warn(&dd->pdev->dev, "g=%u, comp=%x\n", group, completed);
 
 		/* clear completed status register in the hardware.*/
 		writel(completed, port->completed[group]);
@@ -879,15 +667,11 @@ static void mtip_handle_tfe(struct driver_data *dd)
 			if (tag == MTIP_TAG_INTERNAL)
 				continue;
 
-			cmd = &port->commands[tag];
+			cmd = mtip_cmd_from_tag(dd, tag);
 			if (likely(cmd->comp_func)) {
 				set_bit(tag, tagaccum);
 				cmd_cnt++;
-				atomic_set(&cmd->active, 0);
-				cmd->comp_func(port,
-					 tag,
-					 cmd->comp_data,
-					 0);
+				cmd->comp_func(port, tag, cmd, 0);
 			} else {
 				dev_err(&port->dd->pdev->dev,
 					"Missing completion func for tag %d",
@@ -931,7 +715,7 @@ static void mtip_handle_tfe(struct driver_data *dd)
 			fail_reason = "thermal shutdown";
 		}
 		if (buf[288] == 0xBF) {
-			set_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag);
+			set_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag);
 			dev_info(&dd->pdev->dev,
 				"Drive indicates rebuild has failed. Secure erase required.\n");
 			fail_all_ncq_cmds = 1;
@@ -947,11 +731,7 @@ static void mtip_handle_tfe(struct driver_data *dd)
 		for (bit = 0; bit < 32; bit++) {
 			reissue = 1;
 			tag = (group << 5) + bit;
-			cmd = &port->commands[tag];
-
-			/* If the active bit is set re-issue the command */
-			if (atomic_read(&cmd->active) == 0)
-				continue;
+			cmd = mtip_cmd_from_tag(dd, tag);
 
 			fis = (struct host_to_dev_fis *)cmd->command;
 
@@ -970,11 +750,9 @@ static void mtip_handle_tfe(struct driver_data *dd)
 					tag,
 					fail_reason != NULL ?
 						fail_reason : "unknown");
-					atomic_set(&cmd->active, 0);
 					if (cmd->comp_func) {
 						cmd->comp_func(port, tag,
-							cmd->comp_data,
-							-ENODATA);
+							cmd, -ENODATA);
 					}
 					continue;
 				}
@@ -997,14 +775,9 @@ static void mtip_handle_tfe(struct driver_data *dd)
 			/* Retire a command that will not be reissued */
 			dev_warn(&port->dd->pdev->dev,
 				"retiring tag %d\n", tag);
-			atomic_set(&cmd->active, 0);
 
 			if (cmd->comp_func)
-				cmd->comp_func(
-					port,
-					tag,
-					cmd->comp_data,
-					PORT_IRQ_TF_ERR);
+				cmd->comp_func(port, tag, cmd, PORT_IRQ_TF_ERR);
 			else
 				dev_warn(&port->dd->pdev->dev,
 					"Bad completion for tag %d\n",
@@ -1012,69 +785,54 @@ static void mtip_handle_tfe(struct driver_data *dd)
 		}
 	}
 	print_tags(dd, "reissued (TFE)", tagaccum, cmd_cnt);
-
-handle_tfe_exit:
-	/* clear eh_active */
-	clear_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags);
-	wake_up_interruptible(&port->svc_wait);
-
-	mod_timer(&port->cmd_timer,
-		 jiffies + msecs_to_jiffies(MTIP_TIMEOUT_CHECK_PERIOD));
 }
 
 /*
  * Handle a set device bits interrupt
  */
-static inline void mtip_process_sdbf(struct driver_data *dd)
+static inline void mtip_workq_sdbfx(struct mtip_port *port, int group,
+							u32 completed)
 {
-	struct mtip_port  *port = dd->port;
-	int group, tag, bit;
-	u32 completed;
+	struct driver_data *dd = port->dd;
+	int tag, bit;
 	struct mtip_cmd *command;
 
-	/* walk all bits in all slot groups */
-	for (group = 0; group < dd->slot_groups; group++) {
-		completed = readl(port->completed[group]);
-		if (!completed)
-			continue;
+	if (!completed) {
+		WARN_ON_ONCE(!completed);
+		return;
+	}
+	/* clear completed status register in the hardware.*/
+	writel(completed, port->completed[group]);
 
-		/* clear completed status register in the hardware.*/
-		writel(completed, port->completed[group]);
+	/* Process completed commands. */
+	for (bit = 0; (bit < 32) && completed; bit++) {
+		if (completed & 0x01) {
+			tag = (group << 5) | bit;
 
-		/* Process completed commands. */
-		for (bit = 0;
-		     (bit < 32) && completed;
-		     bit++, completed >>= 1) {
-			if (completed & 0x01) {
-				tag = (group << 5) | bit;
+			/* skip internal command slot. */
+			if (unlikely(tag == MTIP_TAG_INTERNAL))
+				continue;
 
-				/* skip internal command slot. */
-				if (unlikely(tag == MTIP_TAG_INTERNAL))
-					continue;
+			command = mtip_cmd_from_tag(dd, tag);
+			if (likely(command->comp_func))
+				command->comp_func(port, tag, command, 0);
+			else {
+				dev_dbg(&dd->pdev->dev,
+					"Null completion for tag %d",
+					tag);
 
-				command = &port->commands[tag];
-				/* make internal callback */
-				if (likely(command->comp_func)) {
-					command->comp_func(
-						port,
-						tag,
-						command->comp_data,
-						0);
-				} else {
-					dev_warn(&dd->pdev->dev,
-						"Null completion "
-						"for tag %d",
-						tag);
-
-					if (mtip_check_surprise_removal(
-						dd->pdev)) {
-						mtip_command_cleanup(dd);
-						return;
-					}
+				if (mtip_check_surprise_removal(
+					dd->pdev)) {
+					return;
 				}
 			}
 		}
+		completed >>= 1;
 	}
+
+	/* If last, re-enable interrupts */
+	if (atomic_dec_return(&dd->irq_workers_active) == 0)
+		writel(0xffffffff, dd->mmio + HOST_IRQ_STAT);
 }
 
 /*
@@ -1083,16 +841,13 @@ static inline void mtip_process_sdbf(struct driver_data *dd)
 static inline void mtip_process_legacy(struct driver_data *dd, u32 port_stat)
 {
 	struct mtip_port *port = dd->port;
-	struct mtip_cmd *cmd = &port->commands[MTIP_TAG_INTERNAL];
+	struct mtip_cmd *cmd = mtip_cmd_from_tag(dd, MTIP_TAG_INTERNAL);
 
 	if (test_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags) &&
 	    (cmd != NULL) && !(readl(port->cmd_issue[MTIP_TAG_INTERNAL])
 		& (1 << MTIP_TAG_INTERNAL))) {
 		if (cmd->comp_func) {
-			cmd->comp_func(port,
-				MTIP_TAG_INTERNAL,
-				cmd->comp_data,
-				0);
+			cmd->comp_func(port, MTIP_TAG_INTERNAL, cmd, 0);
 			return;
 		}
 	}
@@ -1105,8 +860,6 @@ static inline void mtip_process_legacy(struct driver_data *dd, u32 port_stat)
  */
 static inline void mtip_process_errors(struct driver_data *dd, u32 port_stat)
 {
-	if (likely(port_stat & (PORT_IRQ_TF_ERR | PORT_IRQ_IF_ERR)))
-		mtip_handle_tfe(dd);
 
 	if (unlikely(port_stat & PORT_IRQ_CONNECT)) {
 		dev_warn(&dd->pdev->dev,
@@ -1124,6 +877,12 @@ static inline void mtip_process_errors(struct driver_data *dd, u32 port_stat)
 		dev_warn(&dd->pdev->dev,
 			"Port stat errors %x unhandled\n",
 			(port_stat & ~PORT_IRQ_HANDLED));
+		if (mtip_check_surprise_removal(dd->pdev))
+			return;
+	}
+	if (likely(port_stat & (PORT_IRQ_TF_ERR | PORT_IRQ_IF_ERR))) {
+		set_bit(MTIP_PF_EH_ACTIVE_BIT, &dd->port->flags);
+		wake_up_interruptible(&dd->port->svc_wait);
 	}
 }
 
@@ -1133,6 +892,8 @@ static inline irqreturn_t mtip_handle_irq(struct driver_data *data)
 	struct mtip_port *port = dd->port;
 	u32 hba_stat, port_stat;
 	int rv = IRQ_NONE;
+	int do_irq_enable = 1, i, workers;
+	struct mtip_work *twork;
 
 	hba_stat = readl(dd->mmio + HOST_IRQ_STAT);
 	if (hba_stat) {
@@ -1140,11 +901,49 @@ static inline irqreturn_t mtip_handle_irq(struct driver_data *data)
 
 		/* Acknowledge the interrupt status on the port.*/
 		port_stat = readl(port->mmio + PORT_IRQ_STAT);
+		if (unlikely(port_stat == 0xFFFFFFFF)) {
+			mtip_check_surprise_removal(dd->pdev);
+			return IRQ_HANDLED;
+		}
 		writel(port_stat, port->mmio + PORT_IRQ_STAT);
 
 		/* Demux port status */
-		if (likely(port_stat & PORT_IRQ_SDB_FIS))
-			mtip_process_sdbf(dd);
+		if (likely(port_stat & PORT_IRQ_SDB_FIS)) {
+			do_irq_enable = 0;
+			WARN_ON_ONCE(atomic_read(&dd->irq_workers_active) != 0);
+
+			/* Start at 1: group zero is always local? */
+			for (i = 0, workers = 0; i < MTIP_MAX_SLOT_GROUPS;
+									i++) {
+				twork = &dd->work[i];
+				twork->completed = readl(port->completed[i]);
+				if (twork->completed)
+					workers++;
+			}
+
+			atomic_set(&dd->irq_workers_active, workers);
+			if (workers) {
+				for (i = 1; i < MTIP_MAX_SLOT_GROUPS; i++) {
+					twork = &dd->work[i];
+					if (twork->completed)
+						queue_work_on(
+							twork->cpu_binding,
+							dd->isr_workq,
+							&twork->work);
+				}
+
+				if (likely(dd->work[0].completed))
+					mtip_workq_sdbfx(port, 0,
+							dd->work[0].completed);
+
+			} else {
+				/*
+				 * Chip quirk: SDB interrupt but nothing
+				 * to complete
+				 */
+				do_irq_enable = 1;
+			}
+		}
 
 		if (unlikely(port_stat & PORT_IRQ_ERR)) {
 			if (unlikely(mtip_check_surprise_removal(dd->pdev))) {
@@ -1163,18 +962,10 @@ static inline irqreturn_t mtip_handle_irq(struct driver_data *data)
 	}
 
 	/* acknowledge interrupt */
-	writel(hba_stat, dd->mmio + HOST_IRQ_STAT);
+	if (unlikely(do_irq_enable))
+		writel(hba_stat, dd->mmio + HOST_IRQ_STAT);
 
 	return rv;
-}
-
-/*
- * Wrapper for mtip_handle_irq
- * (ignores return code)
- */
-static void mtip_tasklet(unsigned long data)
-{
-	mtip_handle_irq((struct driver_data *) data);
 }
 
 /*
@@ -1190,13 +981,12 @@ static void mtip_tasklet(unsigned long data)
 static irqreturn_t mtip_irq_handler(int irq, void *instance)
 {
 	struct driver_data *dd = instance;
-	tasklet_schedule(&dd->tasklet);
-	return IRQ_HANDLED;
+
+	return mtip_handle_irq(dd);
 }
 
 static void mtip_issue_non_ncq_command(struct mtip_port *port, int tag)
 {
-	atomic_set(&port->commands[tag].active, 1);
 	writel(1 << MTIP_TAG_BIT(tag),
 		port->cmd_issue[MTIP_TAG_INDEX(tag)]);
 }
@@ -1226,6 +1016,7 @@ static bool mtip_pause_ncq(struct mtip_port *port,
 			(fis->features == 0x27 || fis->features == 0x72 ||
 			 fis->features == 0x62 || fis->features == 0x26))) {
 		clear_bit(MTIP_DDF_SEC_LOCK_BIT, &port->dd->dd_flag);
+		clear_bit(MTIP_DDF_REBUILD_FAILED_BIT, &port->dd->dd_flag);
 		/* Com reset after secure erase or lowlevel format */
 		mtip_restart_port(port);
 		clear_bit(MTIP_PF_SE_ACTIVE_BIT, &port->flags);
@@ -1233,6 +1024,22 @@ static bool mtip_pause_ncq(struct mtip_port *port,
 	}
 
 	return false;
+}
+
+static bool mtip_commands_active(struct mtip_port *port)
+{
+	unsigned int active;
+	unsigned int n;
+
+	/*
+	 * Ignore s_active bit 0 of array element 0.
+	 * This bit will always be set
+	 */
+	active = readl(port->s_active[0]) & 0xFFFFFFFE;
+	for (n = 1; n < port->dd->slot_groups; n++)
+		active |= readl(port->s_active[n]);
+
+	return active != 0;
 }
 
 /*
@@ -1248,8 +1055,9 @@ static bool mtip_pause_ncq(struct mtip_port *port,
 static int mtip_quiesce_io(struct mtip_port *port, unsigned long timeout)
 {
 	unsigned long to;
-	unsigned int n;
-	unsigned int active = 1;
+	bool active = true;
+
+	blk_mq_stop_hw_queues(port->dd->queue);
 
 	to = jiffies + msecs_to_jiffies(timeout);
 	do {
@@ -1258,24 +1066,30 @@ static int mtip_quiesce_io(struct mtip_port *port, unsigned long timeout)
 			msleep(20);
 			continue; /* svc thd is actively issuing commands */
 		}
-		if (test_bit(MTIP_DDF_REMOVE_PENDING_BIT, &port->dd->dd_flag))
-			return -EFAULT;
-		/*
-		 * Ignore s_active bit 0 of array element 0.
-		 * This bit will always be set
-		 */
-		active = readl(port->s_active[0]) & 0xFFFFFFFE;
-		for (n = 1; n < port->dd->slot_groups; n++)
-			active |= readl(port->s_active[n]);
 
+		msleep(100);
+
+		if (mtip_check_surprise_removal(port->dd->pdev))
+			goto err_fault;
+
+		active = mtip_commands_active(port);
 		if (!active)
 			break;
-
-		msleep(20);
 	} while (time_before(jiffies, to));
 
+	blk_mq_start_stopped_hw_queues(port->dd->queue, true);
 	return active ? -EBUSY : 0;
+err_fault:
+	blk_mq_start_stopped_hw_queues(port->dd->queue, true);
+	return -EFAULT;
 }
+
+struct mtip_int_cmd {
+	int fis_len;
+	dma_addr_t buffer;
+	int buf_len;
+	u32 opts;
+};
 
 /*
  * Execute an internal command and wait for the completion.
@@ -1301,15 +1115,20 @@ static int mtip_exec_internal_command(struct mtip_port *port,
 					dma_addr_t buffer,
 					int buf_len,
 					u32 opts,
-					gfp_t atomic,
 					unsigned long timeout)
 {
-	struct mtip_cmd_sg *command_sg;
 	DECLARE_COMPLETION_ONSTACK(wait);
-	int rv = 0, ready2go = 1;
-	struct mtip_cmd *int_cmd = &port->commands[MTIP_TAG_INTERNAL];
-	unsigned long to;
+	struct mtip_cmd *int_cmd;
 	struct driver_data *dd = port->dd;
+	struct request *rq;
+	struct mtip_int_cmd icmd = {
+		.fis_len = fis_len,
+		.buffer = buffer,
+		.buf_len = buf_len,
+		.opts = opts
+	};
+	int rv = 0;
+	unsigned long start;
 
 	/* Make sure the buffer is 8 byte aligned. This is asic specific. */
 	if (buffer & 0x00000007) {
@@ -1317,19 +1136,14 @@ static int mtip_exec_internal_command(struct mtip_port *port,
 		return -EFAULT;
 	}
 
-	to = jiffies + msecs_to_jiffies(timeout);
-	do {
-		ready2go = !test_and_set_bit(MTIP_TAG_INTERNAL,
-						port->allocated);
-		if (ready2go)
-			break;
-		mdelay(100);
-	} while (time_before(jiffies, to));
-	if (!ready2go) {
-		dev_warn(&dd->pdev->dev,
-			"Internal cmd active. new cmd [%02X]\n", fis->command);
-		return -EBUSY;
+	int_cmd = mtip_get_int_command(dd);
+	if (!int_cmd) {
+		dbg_printk(MTIP_DRV_NAME "Unable to allocate tag for PIO cmd\n");
+		return -EFAULT;
 	}
+	rq = blk_mq_rq_from_pdu(int_cmd);
+	rq->end_io_data = &icmd;
+
 	set_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags);
 
 	if (fis->command == ATA_CMD_SEC_ERASE_PREP)
@@ -1337,126 +1151,62 @@ static int mtip_exec_internal_command(struct mtip_port *port,
 
 	clear_bit(MTIP_PF_DM_ACTIVE_BIT, &port->flags);
 
-	if (atomic == GFP_KERNEL) {
-		if (fis->command != ATA_CMD_STANDBYNOW1) {
-			/* wait for io to complete if non atomic */
-			if (mtip_quiesce_io(port, 5000) < 0) {
-				dev_warn(&dd->pdev->dev,
-					"Failed to quiesce IO\n");
-				release_slot(port, MTIP_TAG_INTERNAL);
-				clear_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags);
-				wake_up_interruptible(&port->svc_wait);
-				return -EBUSY;
-			}
+	if (fis->command != ATA_CMD_STANDBYNOW1) {
+		/* wait for io to complete if non atomic */
+		if (mtip_quiesce_io(port, MTIP_QUIESCE_IO_TIMEOUT_MS) < 0) {
+			dev_warn(&dd->pdev->dev, "Failed to quiesce IO\n");
+			mtip_put_int_command(dd, int_cmd);
+			clear_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags);
+			wake_up_interruptible(&port->svc_wait);
+			return -EBUSY;
 		}
-
-		/* Set the completion function and data for the command. */
-		int_cmd->comp_data = &wait;
-		int_cmd->comp_func = mtip_completion;
-
-	} else {
-		/* Clear completion - we're going to poll */
-		int_cmd->comp_data = NULL;
-		int_cmd->comp_func = mtip_null_completion;
 	}
+
+	/* Set the completion function and data for the command. */
+	int_cmd->comp_data = &wait;
+	int_cmd->comp_func = mtip_completion;
 
 	/* Copy the command to the command table */
 	memcpy(int_cmd->command, fis, fis_len*4);
 
-	/* Populate the SG list */
-	int_cmd->command_header->opts =
-		 __force_bit2int cpu_to_le32(opts | fis_len);
-	if (buf_len) {
-		command_sg = int_cmd->command + AHCI_CMD_TBL_HDR_SZ;
+	start = jiffies;
+	rq->timeout = timeout;
 
-		command_sg->info =
-			__force_bit2int cpu_to_le32((buf_len-1) & 0x3FFFFF);
-		command_sg->dba	=
-			__force_bit2int cpu_to_le32(buffer & 0xFFFFFFFF);
-		command_sg->dba_upper =
-			__force_bit2int cpu_to_le32((buffer >> 16) >> 16);
+	/* insert request and run queue */
+	blk_execute_rq_nowait(rq->q, NULL, rq, true, NULL);
 
-		int_cmd->command_header->opts |=
-			__force_bit2int cpu_to_le32((1 << 16));
-	}
+	wait_for_completion(&wait);
+	rv = rq->errors;
 
-	/* Populate the command header */
-	int_cmd->command_header->byte_count = 0;
+	if (rv < 0) {
+		if (rv == -ERESTARTSYS) { /* interrupted */
+			dev_err(&dd->pdev->dev,
+				"Internal command [%02X] was interrupted after %u ms\n",
+				fis->command,
+				jiffies_to_msecs(jiffies - start));
+			rv = -EINTR;
+			goto exec_ic_exit;
+		} else if (rv == 0) /* timeout */
+			dev_err(&dd->pdev->dev,
+				"Internal command did not complete [%02X] within timeout of  %lu ms\n",
+				fis->command, timeout);
+		else
+			dev_err(&dd->pdev->dev,
+				"Internal command [%02X] wait returned code [%d] after %lu ms - unhandled\n",
+				fis->command, rv, timeout);
 
-	/* Issue the command to the hardware */
-	mtip_issue_non_ncq_command(port, MTIP_TAG_INTERNAL);
-
-	if (atomic == GFP_KERNEL) {
-		/* Wait for the command to complete or timeout. */
-		if (wait_for_completion_interruptible_timeout(
-				&wait,
-				msecs_to_jiffies(timeout)) <= 0) {
-			if (rv == -ERESTARTSYS) { /* interrupted */
-				dev_err(&dd->pdev->dev,
-					"Internal command [%02X] was interrupted after %lu ms\n",
-					fis->command, timeout);
-				rv = -EINTR;
-				goto exec_ic_exit;
-			} else if (rv == 0) /* timeout */
-				dev_err(&dd->pdev->dev,
-					"Internal command did not complete [%02X] within timeout of  %lu ms\n",
-					fis->command, timeout);
-			else
-				dev_err(&dd->pdev->dev,
-					"Internal command [%02X] wait returned code [%d] after %lu ms - unhandled\n",
-					fis->command, rv, timeout);
-
-			if (mtip_check_surprise_removal(dd->pdev) ||
-				test_bit(MTIP_DDF_REMOVE_PENDING_BIT,
-						&dd->dd_flag)) {
-				dev_err(&dd->pdev->dev,
-					"Internal command [%02X] wait returned due to SR\n",
-					fis->command);
-				rv = -ENXIO;
-				goto exec_ic_exit;
-			}
-			mtip_device_reset(dd); /* recover from timeout issue */
-			rv = -EAGAIN;
+		if (mtip_check_surprise_removal(dd->pdev) ||
+			test_bit(MTIP_DDF_REMOVE_PENDING_BIT,
+					&dd->dd_flag)) {
+			dev_err(&dd->pdev->dev,
+				"Internal command [%02X] wait returned due to SR\n",
+				fis->command);
+			rv = -ENXIO;
 			goto exec_ic_exit;
 		}
-	} else {
-		u32 hba_stat, port_stat;
-
-		/* Spin for <timeout> checking if command still outstanding */
-		timeout = jiffies + msecs_to_jiffies(timeout);
-		while ((readl(port->cmd_issue[MTIP_TAG_INTERNAL])
-				& (1 << MTIP_TAG_INTERNAL))
-				&& time_before(jiffies, timeout)) {
-			if (mtip_check_surprise_removal(dd->pdev)) {
-				rv = -ENXIO;
-				goto exec_ic_exit;
-			}
-			if ((fis->command != ATA_CMD_STANDBYNOW1) &&
-				test_bit(MTIP_DDF_REMOVE_PENDING_BIT,
-						&dd->dd_flag)) {
-				rv = -ENXIO;
-				goto exec_ic_exit;
-			}
-			port_stat = readl(port->mmio + PORT_IRQ_STAT);
-			if (!port_stat)
-				continue;
-
-			if (port_stat & PORT_IRQ_ERR) {
-				dev_err(&dd->pdev->dev,
-					"Internal command [%02X] failed\n",
-					fis->command);
-				mtip_device_reset(dd);
-				rv = -EIO;
-				goto exec_ic_exit;
-			} else {
-				writel(port_stat, port->mmio + PORT_IRQ_STAT);
-				hba_stat = readl(dd->mmio + HOST_IRQ_STAT);
-				if (hba_stat)
-					writel(hba_stat,
-						dd->mmio + HOST_IRQ_STAT);
-			}
-			break;
-		}
+		mtip_device_reset(dd); /* recover from timeout issue */
+		rv = -EAGAIN;
+		goto exec_ic_exit;
 	}
 
 	if (readl(port->cmd_issue[MTIP_TAG_INTERNAL])
@@ -1469,8 +1219,7 @@ static int mtip_exec_internal_command(struct mtip_port *port,
 	}
 exec_ic_exit:
 	/* Clear the allocated and active bits for the internal command. */
-	atomic_set(&int_cmd->active, 0);
-	release_slot(port, MTIP_TAG_INTERNAL);
+	mtip_put_int_command(dd, int_cmd);
 	clear_bit(MTIP_PF_IC_ACTIVE_BIT, &port->flags);
 	if (rv >= 0 && mtip_pause_ncq(port, fis)) {
 		/* NCQ paused */
@@ -1527,7 +1276,7 @@ static void mtip_set_timeout(struct driver_data *dd,
 		*timeout = 15000;  /* 15 seconds */
 		break;
 	default:
-		*timeout = MTIP_IOCTL_COMMAND_TIMEOUT_MS;
+		*timeout = MTIP_IOCTL_CMD_TIMEOUT_MS;
 		break;
 	}
 }
@@ -1578,8 +1327,7 @@ static int mtip_get_identify(struct mtip_port *port, void __user *user_buffer)
 				port->identify_dma,
 				sizeof(u16) * ATA_ID_WORDS,
 				0,
-				GFP_KERNEL,
-				MTIP_INTERNAL_COMMAND_TIMEOUT_MS)
+				MTIP_INT_CMD_TIMEOUT_MS)
 				< 0) {
 		rv = -1;
 		goto out;
@@ -1664,7 +1412,6 @@ static int mtip_standby_immediate(struct mtip_port *port)
 					0,
 					0,
 					0,
-					GFP_ATOMIC,
 					timeout);
 	dbg_printk(MTIP_DRV_NAME "Time taken to complete standby cmd: %d ms\n",
 			jiffies_to_msecs(jiffies - start));
@@ -1710,8 +1457,7 @@ static int mtip_read_log_page(struct mtip_port *port, u8 page, u16 *buffer,
 					buffer_dma,
 					sectors * ATA_SECT_SIZE,
 					0,
-					GFP_ATOMIC,
-					MTIP_INTERNAL_COMMAND_TIMEOUT_MS);
+					MTIP_INT_CMD_TIMEOUT_MS);
 }
 
 /*
@@ -1745,7 +1491,6 @@ static int mtip_get_smart_data(struct mtip_port *port, u8 *buffer,
 					buffer_dma,
 					ATA_SECT_SIZE,
 					0,
-					GFP_ATOMIC,
 					15000);
 }
 
@@ -1873,7 +1618,6 @@ static int mtip_send_trim(struct driver_data *dd, unsigned int lba,
 					dma_addr,
 					ATA_SECT_SIZE,
 					0,
-					GFP_KERNEL,
 					MTIP_TRIM_TIMEOUT_MS) < 0)
 		rv = -EIO;
 
@@ -2004,6 +1748,7 @@ static int exec_drive_task(struct mtip_port *port, u8 *command)
 {
 	struct host_to_dev_fis	fis;
 	struct host_to_dev_fis *reply = (port->rxfis + RX_FIS_D2H_REG);
+	unsigned int to;
 
 	/* Build the FIS. */
 	memset(&fis, 0, sizeof(struct host_to_dev_fis));
@@ -2016,6 +1761,8 @@ static int exec_drive_task(struct mtip_port *port, u8 *command)
 	fis.cyl_low	= command[4];
 	fis.cyl_hi	= command[5];
 	fis.device	= command[6] & ~0x10; /* Clear the dev bit*/
+
+	mtip_set_timeout(port->dd, &fis, &to, 0);
 
 	dbg_printk(MTIP_DRV_NAME " %s: User Command: cmd %x, feat %x, nsect %x, sect %x, lcyl %x, hcyl %x, sel %x\n",
 		__func__,
@@ -2034,8 +1781,7 @@ static int exec_drive_task(struct mtip_port *port, u8 *command)
 				 0,
 				 0,
 				 0,
-				 GFP_KERNEL,
-				 MTIP_IOCTL_COMMAND_TIMEOUT_MS) < 0) {
+				 to) < 0) {
 		return -1;
 	}
 
@@ -2075,6 +1821,7 @@ static int exec_drive_command(struct mtip_port *port, u8 *command,
 	u8 *buf = NULL;
 	dma_addr_t dma_addr = 0;
 	int rv = 0, xfer_sz = command[3];
+	unsigned int to;
 
 	if (xfer_sz) {
 		if (!user_buffer)
@@ -2106,6 +1853,8 @@ static int exec_drive_command(struct mtip_port *port, u8 *command,
 		fis.cyl_hi	= 0xC2;
 	}
 
+	mtip_set_timeout(port->dd, &fis, &to, 0);
+
 	if (xfer_sz)
 		reply = (port->rxfis + RX_FIS_PIO_SETUP);
 	else
@@ -2127,8 +1876,7 @@ static int exec_drive_command(struct mtip_port *port, u8 *command,
 				 (xfer_sz ? dma_addr : 0),
 				 (xfer_sz ? ATA_SECT_SIZE * xfer_sz : 0),
 				 0,
-				 GFP_KERNEL,
-				 MTIP_IOCTL_COMMAND_TIMEOUT_MS)
+				 to)
 				 < 0) {
 		rv = -EFAULT;
 		goto exit_drive_command;
@@ -2239,26 +1987,19 @@ static int exec_drive_taskfile(struct driver_data *dd,
 	taskout = req_task->out_size;
 	taskin = req_task->in_size;
 	/* 130560 = 512 * 0xFF*/
-	if (taskin > 130560 || taskout > 130560) {
-		err = -EINVAL;
-		goto abort;
-	}
+	if (taskin > 130560 || taskout > 130560)
+		return -EINVAL;
 
 	if (taskout) {
-		outbuf = kzalloc(taskout, GFP_KERNEL);
-		if (outbuf == NULL) {
-			err = -ENOMEM;
-			goto abort;
-		}
-		if (copy_from_user(outbuf, buf + outtotal, taskout)) {
-			err = -EFAULT;
-			goto abort;
-		}
+		outbuf = memdup_user(buf + outtotal, taskout);
+		if (IS_ERR(outbuf))
+			return PTR_ERR(outbuf);
+
 		outbuf_dma = pci_map_single(dd->pdev,
 					 outbuf,
 					 taskout,
 					 DMA_TO_DEVICE);
-		if (outbuf_dma == 0) {
+		if (pci_dma_mapping_error(dd->pdev, outbuf_dma)) {
 			err = -ENOMEM;
 			goto abort;
 		}
@@ -2266,20 +2007,16 @@ static int exec_drive_taskfile(struct driver_data *dd,
 	}
 
 	if (taskin) {
-		inbuf = kzalloc(taskin, GFP_KERNEL);
-		if (inbuf == NULL) {
-			err = -ENOMEM;
-			goto abort;
-		}
-
-		if (copy_from_user(inbuf, buf + intotal, taskin)) {
-			err = -EFAULT;
+		inbuf = memdup_user(buf + intotal, taskin);
+		if (IS_ERR(inbuf)) {
+			err = PTR_ERR(inbuf);
+			inbuf = NULL;
 			goto abort;
 		}
 		inbuf_dma = pci_map_single(dd->pdev,
 					 inbuf,
 					 taskin, DMA_FROM_DEVICE);
-		if (inbuf_dma == 0) {
+		if (pci_dma_mapping_error(dd->pdev, inbuf_dma)) {
 			err = -ENOMEM;
 			goto abort;
 		}
@@ -2381,7 +2118,6 @@ static int exec_drive_taskfile(struct driver_data *dd,
 				 dma_buffer,
 				 transfer_size,
 				 0,
-				 GFP_KERNEL,
 				 timeout) < 0) {
 		err = -EIO;
 		goto abort;
@@ -2423,7 +2159,6 @@ static int exec_drive_taskfile(struct driver_data *dd,
 		req_task->hob_ports[1] = reply->features_ex;
 		req_task->hob_ports[2] = reply->sect_cnt_ex;
 	}
-
 	dbg_printk(MTIP_DRV_NAME
 		" %s: Completion: stat %x,"
 		"err %x, sect_cnt %x, lbalo %x,"
@@ -2583,22 +2318,23 @@ static int mtip_hw_ioctl(struct driver_data *dd, unsigned int cmd,
  * return value
  *	None
  */
-static void mtip_hw_submit_io(struct driver_data *dd, sector_t sector,
-			      int nsect, int nents, int tag, void *callback,
-			      void *data, int dir, int unaligned)
+static void mtip_hw_submit_io(struct driver_data *dd, struct request *rq,
+			      struct mtip_cmd *command, int nents,
+			      struct blk_mq_hw_ctx *hctx)
 {
 	struct host_to_dev_fis	*fis;
 	struct mtip_port *port = dd->port;
-	struct mtip_cmd *command = &port->commands[tag];
-	int dma_dir = (dir == READ) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
-	u64 start = sector;
+	int dma_dir = rq_data_dir(rq) == READ ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+	u64 start = blk_rq_pos(rq);
+	unsigned int nsect = blk_rq_sectors(rq);
 
 	/* Map the scatter list for DMA access */
 	nents = dma_map_sg(&dd->pdev->dev, command->sg, nents, dma_dir);
 
+	prefetch(&port->flags);
+
 	command->scatter_ents = nents;
 
-	command->unaligned = unaligned;
 	/*
 	 * The number of retries for this command before it is
 	 * reported as a failure to the upper layers.
@@ -2609,8 +2345,10 @@ static void mtip_hw_submit_io(struct driver_data *dd, sector_t sector,
 	fis = command->command;
 	fis->type        = 0x27;
 	fis->opts        = 1 << 7;
-	fis->command     =
-		(dir == READ ? ATA_CMD_FPDMA_READ : ATA_CMD_FPDMA_WRITE);
+	if (dma_dir == DMA_FROM_DEVICE)
+		fis->command = ATA_CMD_FPDMA_READ;
+	else
+		fis->command = ATA_CMD_FPDMA_WRITE;
 	fis->lba_low     = start & 0xFF;
 	fis->lba_mid     = (start >> 8) & 0xFF;
 	fis->lba_hi      = (start >> 16) & 0xFF;
@@ -2620,14 +2358,14 @@ static void mtip_hw_submit_io(struct driver_data *dd, sector_t sector,
 	fis->device	 = 1 << 6;
 	fis->features    = nsect & 0xFF;
 	fis->features_ex = (nsect >> 8) & 0xFF;
-	fis->sect_count  = ((tag << 3) | (tag >> 5));
+	fis->sect_count  = ((rq->tag << 3) | (rq->tag >> 5));
 	fis->sect_cnt_ex = 0;
 	fis->control     = 0;
 	fis->res2        = 0;
 	fis->res3        = 0;
 	fill_command_sg(dd, command, nents);
 
-	if (unaligned)
+	if (unlikely(command->unaligned))
 		fis->device |= 1 << 7;
 
 	/* Populate the command header */
@@ -2645,81 +2383,17 @@ static void mtip_hw_submit_io(struct driver_data *dd, sector_t sector,
 	command->direction = dma_dir;
 
 	/*
-	 * Set the completion function and data for the command passed
-	 * from the upper layer.
-	 */
-	command->async_data = data;
-	command->async_callback = callback;
-
-	/*
 	 * To prevent this command from being issued
 	 * if an internal command is in progress or error handling is active.
 	 */
-	if (port->flags & MTIP_PF_PAUSE_IO) {
-		set_bit(tag, port->cmds_to_issue);
+	if (unlikely(port->flags & MTIP_PF_PAUSE_IO)) {
+		set_bit(rq->tag, port->cmds_to_issue);
 		set_bit(MTIP_PF_ISSUE_CMDS_BIT, &port->flags);
 		return;
 	}
 
 	/* Issue the command to the hardware */
-	mtip_issue_ncq_command(port, tag);
-
-	return;
-}
-
-/*
- * Release a command slot.
- *
- * @dd  Pointer to the driver data structure.
- * @tag Slot tag
- *
- * return value
- *      None
- */
-static void mtip_hw_release_scatterlist(struct driver_data *dd, int tag,
-								int unaligned)
-{
-	struct semaphore *sem = unaligned ? &dd->port->cmd_slot_unal :
-							&dd->port->cmd_slot;
-	release_slot(dd->port, tag);
-	up(sem);
-}
-
-/*
- * Obtain a command slot and return its associated scatter list.
- *
- * @dd  Pointer to the driver data structure.
- * @tag Pointer to an int that will receive the allocated command
- *            slot tag.
- *
- * return value
- *	Pointer to the scatter list for the allocated command slot
- *	or NULL if no command slots are available.
- */
-static struct scatterlist *mtip_hw_get_scatterlist(struct driver_data *dd,
-						   int *tag, int unaligned)
-{
-	struct semaphore *sem = unaligned ? &dd->port->cmd_slot_unal :
-							&dd->port->cmd_slot;
-
-	/*
-	 * It is possible that, even with this semaphore, a thread
-	 * may think that no command slots are available. Therefore, we
-	 * need to make an attempt to get_slot().
-	 */
-	down(sem);
-	*tag = get_slot(dd->port);
-
-	if (unlikely(test_bit(MTIP_DDF_REMOVE_PENDING_BIT, &dd->dd_flag))) {
-		up(sem);
-		return NULL;
-	}
-	if (unlikely(*tag < 0)) {
-		up(sem);
-		return NULL;
-	}
-
-	return dd->port->commands[*tag].sg;
+	mtip_issue_ncq_command(port, rq->tag);
 }
 
 /*
@@ -2901,18 +2575,6 @@ static ssize_t mtip_hw_read_registers(struct file *f, char __user *ubuf,
 				readl(dd->mmio + HOST_IRQ_STAT));
 	size += sprintf(&buf[size], "\n");
 
-	size += sprintf(&buf[size], "L/ Allocated     : [ 0x");
-
-	for (n = dd->slot_groups-1; n >= 0; n--) {
-		if (sizeof(long) > sizeof(u32))
-			group_allocated =
-				dd->port->allocated[n/2] >> (32*(n&1));
-		else
-			group_allocated = dd->port->allocated[n];
-		size += sprintf(&buf[size], "%08X ", group_allocated);
-	}
-	size += sprintf(&buf[size], "]\n");
-
 	size += sprintf(&buf[size], "L/ Commands in Q : [ 0x");
 
 	for (n = dd->slot_groups-1; n >= 0; n--) {
@@ -3056,48 +2718,6 @@ static void mtip_hw_debugfs_exit(struct driver_data *dd)
 		debugfs_remove_recursive(dd->dfs_node);
 }
 
-static int mtip_free_orphan(struct driver_data *dd)
-{
-	struct kobject *kobj;
-
-	if (dd->bdev) {
-		if (dd->bdev->bd_holders >= 1)
-			return -2;
-
-		bdput(dd->bdev);
-		put_disk(dd->disk);
-		dd->bdev = NULL;
-	}
-
-	mtip_hw_debugfs_exit(dd);
-
-	spin_lock(&rssd_index_lock);
-	ida_remove(&rssd_index_ida, dd->index);
-	spin_unlock(&rssd_index_lock);
-
-	if (!test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag) &&
-			test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag)) {
-		put_disk(dd->disk);
-	} else {
-		if (dd->disk) {
-			kobj = kobject_get(&disk_to_dev(dd->disk)->kobj);
-			if (kobj) {
-				mtip_hw_sysfs_exit(dd, kobj);
-				kobject_put(kobj);
-			}
-			del_gendisk(dd->disk);
-			dd->disk = NULL;
-		}
-		if (dd->queue) {
-			dd->queue->queuedata = NULL;
-			blk_cleanup_queue(dd->queue);
-			dd->queue = NULL;
-		}
-	}
-	kfree(dd);
-	return 0;
-}
-
 /*
  * Perform any init/resume time hardware setup
  *
@@ -3229,6 +2849,42 @@ static int mtip_ftl_rebuild_poll(struct driver_data *dd)
 	return -EFAULT;
 }
 
+static void mtip_softirq_done_fn(struct request *rq)
+{
+	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+	struct driver_data *dd = rq->q->queuedata;
+
+	/* Unmap the DMA scatter list entries */
+	dma_unmap_sg(&dd->pdev->dev, cmd->sg, cmd->scatter_ents,
+							cmd->direction);
+
+	if (unlikely(cmd->unaligned))
+		up(&dd->port->cmd_slot_unal);
+
+	blk_mq_end_request(rq, rq->errors);
+}
+
+static void mtip_abort_cmd(struct request *req, void *data,
+							bool reserved)
+{
+	struct driver_data *dd = data;
+
+	dbg_printk(MTIP_DRV_NAME " Aborting request, tag = %d\n", req->tag);
+
+	clear_bit(req->tag, dd->port->cmds_to_issue);
+	req->errors = -EIO;
+	mtip_softirq_done_fn(req);
+}
+
+static void mtip_queue_cmd(struct request *req, void *data,
+							bool reserved)
+{
+	struct driver_data *dd = data;
+
+	set_bit(req->tag, dd->port->cmds_to_issue);
+	blk_abort_request(req);
+}
+
 /*
  * service thread to issue queued commands
  *
@@ -3241,31 +2897,68 @@ static int mtip_ftl_rebuild_poll(struct driver_data *dd)
 static int mtip_service_thread(void *data)
 {
 	struct driver_data *dd = (struct driver_data *)data;
-	unsigned long slot, slot_start, slot_wrap;
+	unsigned long slot, slot_start, slot_wrap, to;
 	unsigned int num_cmd_slots = dd->slot_groups * 32;
 	struct mtip_port *port = dd->port;
-	int ret;
 
 	while (1) {
+		if (kthread_should_stop() ||
+			test_bit(MTIP_PF_SVC_THD_STOP_BIT, &port->flags))
+			goto st_out;
+		clear_bit(MTIP_PF_SVC_THD_ACTIVE_BIT, &port->flags);
+
 		/*
 		 * the condition is to check neither an internal command is
 		 * is in progress nor error handling is active
 		 */
 		wait_event_interruptible(port->svc_wait, (port->flags) &&
-			!(port->flags & MTIP_PF_PAUSE_IO));
+			(port->flags & MTIP_PF_SVC_THD_WORK));
 
-		if (kthread_should_stop())
+		if (kthread_should_stop() ||
+			test_bit(MTIP_PF_SVC_THD_STOP_BIT, &port->flags))
 			goto st_out;
-
-		set_bit(MTIP_PF_SVC_THD_ACTIVE_BIT, &port->flags);
-
-		/* If I am an orphan, start self cleanup */
-		if (test_bit(MTIP_PF_SR_CLEANUP_BIT, &port->flags))
-			break;
 
 		if (unlikely(test_bit(MTIP_DDF_REMOVE_PENDING_BIT,
 				&dd->dd_flag)))
 			goto st_out;
+
+		set_bit(MTIP_PF_SVC_THD_ACTIVE_BIT, &port->flags);
+
+restart_eh:
+		/* Demux bits: start with error handling */
+		if (test_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags)) {
+			mtip_handle_tfe(dd);
+			clear_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags);
+		}
+
+		if (test_bit(MTIP_PF_EH_ACTIVE_BIT, &port->flags))
+			goto restart_eh;
+
+		if (test_bit(MTIP_PF_TO_ACTIVE_BIT, &port->flags)) {
+			to = jiffies + msecs_to_jiffies(5000);
+
+			do {
+				mdelay(100);
+			} while (atomic_read(&dd->irq_workers_active) != 0 &&
+				time_before(jiffies, to));
+
+			if (atomic_read(&dd->irq_workers_active) != 0)
+				dev_warn(&dd->pdev->dev,
+					"Completion workers still active!");
+
+			spin_lock(dd->queue->queue_lock);
+			blk_mq_tagset_busy_iter(&dd->tags,
+							mtip_queue_cmd, dd);
+			spin_unlock(dd->queue->queue_lock);
+
+			set_bit(MTIP_PF_ISSUE_CMDS_BIT, &dd->port->flags);
+
+			if (mtip_device_reset(dd))
+				blk_mq_tagset_busy_iter(&dd->tags,
+							mtip_abort_cmd, dd);
+
+			clear_bit(MTIP_PF_TO_ACTIVE_BIT, &dd->port->flags);
+		}
 
 		if (test_bit(MTIP_PF_ISSUE_CMDS_BIT, &port->flags)) {
 			slot = 1;
@@ -3296,38 +2989,14 @@ static int mtip_service_thread(void *data)
 			}
 
 			clear_bit(MTIP_PF_ISSUE_CMDS_BIT, &port->flags);
-		} else if (test_bit(MTIP_PF_REBUILD_BIT, &port->flags)) {
-			if (mtip_ftl_rebuild_poll(dd) < 0)
-				set_bit(MTIP_DDF_REBUILD_FAILED_BIT,
-							&dd->dd_flag);
-			clear_bit(MTIP_PF_REBUILD_BIT, &port->flags);
 		}
-		clear_bit(MTIP_PF_SVC_THD_ACTIVE_BIT, &port->flags);
 
-		if (test_bit(MTIP_PF_SVC_THD_STOP_BIT, &port->flags))
-			goto st_out;
-	}
-
-	/* wait for pci remove to exit */
-	while (1) {
-		if (test_bit(MTIP_DDF_REMOVE_DONE_BIT, &dd->dd_flag))
-			break;
-		msleep_interruptible(1000);
-		if (kthread_should_stop())
-			goto st_out;
-	}
-
-	while (1) {
-		ret = mtip_free_orphan(dd);
-		if (!ret) {
-			/* NOTE: All data structures are invalid, do not
-			 * access any here */
-			return 0;
+		if (test_bit(MTIP_PF_REBUILD_BIT, &port->flags)) {
+			if (mtip_ftl_rebuild_poll(dd) == 0)
+				clear_bit(MTIP_PF_REBUILD_BIT, &port->flags);
 		}
-		msleep_interruptible(1000);
-		if (kthread_should_stop())
-			goto st_out;
 	}
+
 st_out:
 	return 0;
 }
@@ -3342,7 +3011,6 @@ st_out:
  */
 static void mtip_dma_free(struct driver_data *dd)
 {
-	int i;
 	struct mtip_port *port = dd->port;
 
 	if (port->block1)
@@ -3352,13 +3020,6 @@ static void mtip_dma_free(struct driver_data *dd)
 	if (port->command_list) {
 		dmam_free_coherent(&dd->pdev->dev, AHCI_CMD_TBL_SZ,
 				port->command_list, port->command_list_dma);
-	}
-
-	for (i = 0; i < MTIP_MAX_COMMAND_SLOTS; i++) {
-		if (port->commands[i].command)
-			dmam_free_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
-				port->commands[i].command,
-				port->commands[i].command_dma);
 	}
 }
 
@@ -3373,8 +3034,6 @@ static void mtip_dma_free(struct driver_data *dd)
 static int mtip_dma_alloc(struct driver_data *dd)
 {
 	struct mtip_port *port = dd->port;
-	int i, rv = 0;
-	u32 host_cap_64 = readl(dd->mmio + HOST_CAP) & HOST_CAP_64;
 
 	/* Allocate dma memory for RX Fis, Identify, and Sector Bufffer */
 	port->block1 =
@@ -3407,41 +3066,63 @@ static int mtip_dma_alloc(struct driver_data *dd)
 	port->smart_buf     = port->block1 + AHCI_SMARTBUF_OFFSET;
 	port->smart_buf_dma = port->block1_dma + AHCI_SMARTBUF_OFFSET;
 
-	/* Setup per command SGL DMA region */
-
-	/* Point the command headers at the command tables */
-	for (i = 0; i < MTIP_MAX_COMMAND_SLOTS; i++) {
-		port->commands[i].command =
-			dmam_alloc_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
-				&port->commands[i].command_dma, GFP_KERNEL);
-		if (!port->commands[i].command) {
-			rv = -ENOMEM;
-			mtip_dma_free(dd);
-			return rv;
-		}
-		memset(port->commands[i].command, 0, CMD_DMA_ALLOC_SZ);
-
-		port->commands[i].command_header = port->command_list +
-					(sizeof(struct mtip_cmd_hdr) * i);
-		port->commands[i].command_header_dma =
-					dd->port->command_list_dma +
-					(sizeof(struct mtip_cmd_hdr) * i);
-
-		if (host_cap_64)
-			port->commands[i].command_header->ctbau =
-				__force_bit2int cpu_to_le32(
-				(port->commands[i].command_dma >> 16) >> 16);
-
-		port->commands[i].command_header->ctba =
-				__force_bit2int cpu_to_le32(
-				port->commands[i].command_dma & 0xFFFFFFFF);
-
-		sg_init_table(port->commands[i].sg, MTIP_MAX_SG);
-
-		/* Mark command as currently inactive */
-		atomic_set(&dd->port->commands[i].active, 0);
-	}
 	return 0;
+}
+
+static int mtip_hw_get_identify(struct driver_data *dd)
+{
+	struct smart_attr attr242;
+	unsigned char *buf;
+	int rv;
+
+	if (mtip_get_identify(dd->port, NULL) < 0)
+		return -EFAULT;
+
+	if (*(dd->port->identify + MTIP_FTL_REBUILD_OFFSET) ==
+		MTIP_FTL_REBUILD_MAGIC) {
+		set_bit(MTIP_PF_REBUILD_BIT, &dd->port->flags);
+		return MTIP_FTL_REBUILD_MAGIC;
+	}
+	mtip_dump_identify(dd->port);
+
+	/* check write protect, over temp and rebuild statuses */
+	rv = mtip_read_log_page(dd->port, ATA_LOG_SATA_NCQ,
+				dd->port->log_buf,
+				dd->port->log_buf_dma, 1);
+	if (rv) {
+		dev_warn(&dd->pdev->dev,
+			"Error in READ LOG EXT (10h) command\n");
+		/* non-critical error, don't fail the load */
+	} else {
+		buf = (unsigned char *)dd->port->log_buf;
+		if (buf[259] & 0x1) {
+			dev_info(&dd->pdev->dev,
+				"Write protect bit is set.\n");
+			set_bit(MTIP_DDF_WRITE_PROTECT_BIT, &dd->dd_flag);
+		}
+		if (buf[288] == 0xF7) {
+			dev_info(&dd->pdev->dev,
+				"Exceeded Tmax, drive in thermal shutdown.\n");
+			set_bit(MTIP_DDF_OVER_TEMP_BIT, &dd->dd_flag);
+		}
+		if (buf[288] == 0xBF) {
+			dev_info(&dd->pdev->dev,
+				"Drive indicates rebuild has failed.\n");
+			set_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag);
+		}
+	}
+
+	/* get write protect progess */
+	memset(&attr242, 0, sizeof(struct smart_attr));
+	if (mtip_get_smart_attr(dd->port, 242, &attr242))
+		dev_warn(&dd->pdev->dev,
+				"Unable to check write protect progress\n");
+	else
+		dev_info(&dd->pdev->dev,
+				"Write protect progress: %u%% (%u blocks)\n",
+				attr242.cur, le32_to_cpu(attr242.data));
+
+	return rv;
 }
 
 /*
@@ -3458,8 +3139,6 @@ static int mtip_hw_init(struct driver_data *dd)
 	int rv;
 	unsigned int num_command_slots;
 	unsigned long timeout, timetaken;
-	unsigned char *buf;
-	struct smart_attr attr242;
 
 	dd->mmio = pcim_iomap_table(dd->pdev)[MTIP_ABAR];
 
@@ -3472,14 +3151,17 @@ static int mtip_hw_init(struct driver_data *dd)
 
 	hba_setup(dd);
 
-	tasklet_init(&dd->tasklet, mtip_tasklet, (unsigned long)dd);
-
-	dd->port = kzalloc(sizeof(struct mtip_port), GFP_KERNEL);
+	dd->port = kzalloc_node(sizeof(struct mtip_port), GFP_KERNEL,
+				dd->numa_node);
 	if (!dd->port) {
 		dev_err(&dd->pdev->dev,
 			"Memory allocation: port structure\n");
 		return -ENOMEM;
 	}
+
+	/* Continue workqueue setup */
+	for (i = 0; i < MTIP_MAX_SLOT_GROUPS; i++)
+		dd->work[i].port = dd->port;
 
 	/* Enable unaligned IO constraints for some devices */
 	if (mtip_device_unaligned_constrained(dd))
@@ -3487,12 +3169,11 @@ static int mtip_hw_init(struct driver_data *dd)
 	else
 		dd->unal_qdepth = 0;
 
-	/* Counting semaphore to track command slot usage */
-	sema_init(&dd->port->cmd_slot, num_command_slots - 1 - dd->unal_qdepth);
 	sema_init(&dd->port->cmd_slot_unal, dd->unal_qdepth);
 
 	/* Spinlock to prevent concurrent issue */
-	spin_lock_init(&dd->port->cmd_issue_lock);
+	for (i = 0; i < MTIP_MAX_SLOT_GROUPS; i++)
+		spin_lock_init(&dd->port->cmd_issue_lock[i]);
 
 	/* Set the port mmio base address. */
 	dd->port->mmio	= dd->mmio + PORT_OFFSET;
@@ -3566,83 +3247,28 @@ static int mtip_hw_init(struct driver_data *dd)
 			"Unable to allocate IRQ %d\n", dd->pdev->irq);
 		goto out2;
 	}
+	irq_set_affinity_hint(dd->pdev->irq, get_cpu_mask(dd->isr_binding));
 
 	/* Enable interrupts on the HBA. */
 	writel(readl(dd->mmio + HOST_CTL) | HOST_IRQ_EN,
 					dd->mmio + HOST_CTL);
 
-	init_timer(&dd->port->cmd_timer);
 	init_waitqueue_head(&dd->port->svc_wait);
-
-	dd->port->cmd_timer.data = (unsigned long int) dd->port;
-	dd->port->cmd_timer.function = mtip_timeout_function;
-	mod_timer(&dd->port->cmd_timer,
-		jiffies + msecs_to_jiffies(MTIP_TIMEOUT_CHECK_PERIOD));
-
 
 	if (test_bit(MTIP_DDF_REMOVE_PENDING_BIT, &dd->dd_flag)) {
 		rv = -EFAULT;
 		goto out3;
 	}
 
-	if (mtip_get_identify(dd->port, NULL) < 0) {
-		rv = -EFAULT;
-		goto out3;
-	}
-	mtip_dump_identify(dd->port);
-
-	if (*(dd->port->identify + MTIP_FTL_REBUILD_OFFSET) ==
-		MTIP_FTL_REBUILD_MAGIC) {
-		set_bit(MTIP_PF_REBUILD_BIT, &dd->port->flags);
-		return MTIP_FTL_REBUILD_MAGIC;
-	}
-
-	/* check write protect, over temp and rebuild statuses */
-	rv = mtip_read_log_page(dd->port, ATA_LOG_SATA_NCQ,
-				dd->port->log_buf,
-				dd->port->log_buf_dma, 1);
-	if (rv) {
-		dev_warn(&dd->pdev->dev,
-			"Error in READ LOG EXT (10h) command\n");
-		/* non-critical error, don't fail the load */
-	} else {
-		buf = (unsigned char *)dd->port->log_buf;
-		if (buf[259] & 0x1) {
-			dev_info(&dd->pdev->dev,
-				"Write protect bit is set.\n");
-			set_bit(MTIP_DDF_WRITE_PROTECT_BIT, &dd->dd_flag);
-		}
-		if (buf[288] == 0xF7) {
-			dev_info(&dd->pdev->dev,
-				"Exceeded Tmax, drive in thermal shutdown.\n");
-			set_bit(MTIP_DDF_OVER_TEMP_BIT, &dd->dd_flag);
-		}
-		if (buf[288] == 0xBF) {
-			dev_info(&dd->pdev->dev,
-				"Drive is in security locked state.\n");
-			set_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag);
-		}
-	}
-
-	/* get write protect progess */
-	memset(&attr242, 0, sizeof(struct smart_attr));
-	if (mtip_get_smart_attr(dd->port, 242, &attr242))
-		dev_warn(&dd->pdev->dev,
-				"Unable to check write protect progress\n");
-	else
-		dev_info(&dd->pdev->dev,
-				"Write protect progress: %u%% (%u blocks)\n",
-				attr242.cur, le32_to_cpu(attr242.data));
 	return rv;
 
 out3:
-	del_timer_sync(&dd->port->cmd_timer);
-
 	/* Disable interrupts on the HBA. */
 	writel(readl(dd->mmio + HOST_CTL) & ~HOST_IRQ_EN,
 			dd->mmio + HOST_CTL);
 
-	/*Release the IRQ. */
+	/* Release the IRQ. */
+	irq_set_affinity_hint(dd->pdev->irq, NULL);
 	devm_free_irq(&dd->pdev->dev, dd->pdev->irq, dd);
 
 out2:
@@ -3656,6 +3282,27 @@ out1:
 	return rv;
 }
 
+static int mtip_standby_drive(struct driver_data *dd)
+{
+	int rv = 0;
+
+	if (dd->sr || !dd->port)
+		return -ENODEV;
+	/*
+	 * Send standby immediate (E0h) to the drive so that it
+	 * saves its state.
+	 */
+	if (!test_bit(MTIP_PF_REBUILD_BIT, &dd->port->flags) &&
+	    !test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag) &&
+	    !test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag)) {
+		rv = mtip_standby_immediate(dd->port);
+		if (rv)
+			dev_warn(&dd->pdev->dev,
+				"STANDBY IMMEDIATE failed\n");
+	}
+	return rv;
+}
+
 /*
  * Called to deinitialize an interface.
  *
@@ -3666,17 +3313,7 @@ out1:
  */
 static int mtip_hw_exit(struct driver_data *dd)
 {
-	/*
-	 * Send standby immediate (E0h) to the drive so that it
-	 * saves its state.
-	 */
 	if (!dd->sr) {
-		if (!test_bit(MTIP_PF_REBUILD_BIT, &dd->port->flags) &&
-		    !test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag))
-			if (mtip_standby_immediate(dd->port))
-				dev_warn(&dd->pdev->dev,
-					"STANDBY IMMEDIATE failed\n");
-
 		/* de-initialize the port. */
 		mtip_deinit_port(dd->port);
 
@@ -3685,13 +3322,10 @@ static int mtip_hw_exit(struct driver_data *dd)
 				dd->mmio + HOST_CTL);
 	}
 
-	del_timer_sync(&dd->port->cmd_timer);
-
 	/* Release the IRQ. */
+	irq_set_affinity_hint(dd->pdev->irq, NULL);
 	devm_free_irq(&dd->pdev->dev, dd->pdev->irq, dd);
-
-	/* Stop the bottom half tasklet. */
-	tasklet_kill(&dd->tasklet);
+	msleep(1000);
 
 	/* Free dma regions */
 	mtip_dma_free(dd);
@@ -3720,8 +3354,7 @@ static int mtip_hw_shutdown(struct driver_data *dd)
 	 * Send standby immediate (E0h) to the drive so that it
 	 * saves its state.
 	 */
-	if (!dd->sr && dd->port)
-		mtip_standby_immediate(dd->port);
+	mtip_standby_drive(dd);
 
 	return 0;
 }
@@ -3744,7 +3377,7 @@ static int mtip_hw_suspend(struct driver_data *dd)
 	 * Send standby immediate (E0h) to the drive
 	 * so that it saves its state.
 	 */
-	if (mtip_standby_immediate(dd->port) != 0) {
+	if (mtip_standby_drive(dd) != 0) {
 		dev_err(&dd->pdev->dev,
 			"Failed standby-immediate command\n");
 		return -EFAULT;
@@ -3982,6 +3615,28 @@ static int mtip_block_getgeo(struct block_device *dev,
 	return 0;
 }
 
+static int mtip_block_open(struct block_device *dev, fmode_t mode)
+{
+	struct driver_data *dd;
+
+	if (dev && dev->bd_disk) {
+		dd = (struct driver_data *) dev->bd_disk->private_data;
+
+		if (dd) {
+			if (test_bit(MTIP_DDF_REMOVAL_BIT,
+							&dd->dd_flag)) {
+				return -ENODEV;
+			}
+			return 0;
+		}
+	}
+	return -ENODEV;
+}
+
+static void mtip_block_release(struct gendisk *disk, fmode_t mode)
+{
+}
+
 /*
  * Block device operation function.
  *
@@ -3989,6 +3644,8 @@ static int mtip_block_getgeo(struct block_device *dev,
  * layer.
  */
 static const struct block_device_operations mtip_block_ops = {
+	.open		= mtip_block_open,
+	.release	= mtip_block_release,
 	.ioctl		= mtip_block_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl	= mtip_block_compat_ioctl,
@@ -4025,105 +3682,205 @@ static inline bool is_se_active(struct driver_data *dd)
  *
  * @queue Pointer to the request queue. Unused other than to obtain
  *              the driver data structure.
- * @bio   Pointer to the BIO.
+ * @rq    Pointer to the request.
  *
- * return value
- *	0
  */
-static int mtip_make_request(struct request_queue *queue, struct bio *bio)
+static int mtip_submit_request(struct blk_mq_hw_ctx *hctx, struct request *rq)
 {
-	struct driver_data *dd = queue->queuedata;
-	struct scatterlist *sg;
-	struct bio_vec *bvec;
-	int i, nents = 0;
-	int tag = 0, unaligned = 0;
+	struct driver_data *dd = hctx->queue->queuedata;
+	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+	unsigned int nents;
 
 	if (is_se_active(dd))
 		return -ENODATA;
 
- 	if (unlikely(dd->dd_flag & MTIP_DDF_STOP_IO)) {
- 		if (unlikely(test_bit(MTIP_DDF_REMOVE_PENDING_BIT,
- 							&dd->dd_flag))) {
- 			bio_endio(bio, -ENXIO);
- 			return 0;
- 		}
- 		if (unlikely(test_bit(MTIP_DDF_OVER_TEMP_BIT, &dd->dd_flag))) {
- 			bio_endio(bio, -ENODATA);
- 			return 0;
- 		}
- 		if (unlikely(test_bit(MTIP_DDF_WRITE_PROTECT_BIT,
- 							&dd->dd_flag) &&
- 				bio_data_dir(bio))) {
- 			bio_endio(bio, -ENODATA);
- 			return 0;
- 		}
-		if (unlikely(test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag))) {
-			bio_endio(bio, -ENODATA);
-			return 0;
+	if (unlikely(dd->dd_flag & MTIP_DDF_STOP_IO)) {
+		if (unlikely(test_bit(MTIP_DDF_REMOVE_PENDING_BIT,
+							&dd->dd_flag))) {
+			return -ENXIO;
 		}
-		if (test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag)) {
-			bio_endio(bio, -ENXIO);
-			return 0;
+		if (unlikely(test_bit(MTIP_DDF_OVER_TEMP_BIT, &dd->dd_flag))) {
+			return -ENODATA;
 		}
+		if (unlikely(test_bit(MTIP_DDF_WRITE_PROTECT_BIT,
+							&dd->dd_flag) &&
+				rq_data_dir(rq))) {
+			return -ENODATA;
+		}
+		if (unlikely(test_bit(MTIP_DDF_SEC_LOCK_BIT, &dd->dd_flag) ||
+			test_bit(MTIP_DDF_REBUILD_FAILED_BIT, &dd->dd_flag)))
+			return -ENODATA;
 	}
 
-	if (unlikely(bio->bi_rw & REQ_DISCARD)) {
-		bio_endio(bio, mtip_send_trim(dd, bio->bi_sector,
-						bio_sectors(bio)));
+	if (rq->cmd_flags & REQ_DISCARD) {
+		int err;
+
+		err = mtip_send_trim(dd, blk_rq_pos(rq), blk_rq_sectors(rq));
+		blk_mq_end_request(rq, err);
 		return 0;
 	}
 
-	if (unlikely(!bio_has_data(bio))) {
-		blk_queue_flush(queue, 0);
-		bio_endio(bio, 0);
-		return 0;
-	}
+	/* Create the scatter list for this request. */
+	nents = blk_rq_map_sg(hctx->queue, rq, cmd->sg);
 
-	if (bio_data_dir(bio) == WRITE && bio_sectors(bio) <= 64 &&
-							dd->unal_qdepth) {
-		if (bio->bi_sector % 8 != 0) /* Unaligned on 4k boundaries */
-			unaligned = 1;
-		else if (bio_sectors(bio) % 8 != 0) /* Aligned but not 4k/8k */
-			unaligned = 1;
-	}
-
-	sg = mtip_hw_get_scatterlist(dd, &tag, unaligned);
-	if (likely(sg != NULL)) {
-		blk_queue_bounce(queue, &bio);
-
-		if (unlikely((bio)->bi_vcnt > MTIP_MAX_SG)) {
-			dev_warn(&dd->pdev->dev,
-				"Maximum number of SGL entries exceeded\n");
-			bio_io_error(bio);
-			mtip_hw_release_scatterlist(dd, tag, unaligned);
-			return 0;
-		}
-
-		/* Create the scatter list for this bio. */
-		bio_for_each_segment(bvec, bio, i) {
-			sg_set_page(&sg[nents],
-					bvec->bv_page,
-					bvec->bv_len,
-					bvec->bv_offset);
-			nents++;
-		}
-
-		/* Issue the read/write. */
-		mtip_hw_submit_io(dd,
-				bio->bi_sector,
-				bio_sectors(bio),
-				nents,
-				tag,
-				bio_endio,
-				bio,
-				bio_data_dir(bio),
-				unaligned);
-	} else {
-		bio_io_error(bio);
-	}
-
+	/* Issue the read/write. */
+	mtip_hw_submit_io(dd, rq, cmd, nents, hctx);
 	return 0;
 }
+
+static bool mtip_check_unal_depth(struct blk_mq_hw_ctx *hctx,
+				  struct request *rq)
+{
+	struct driver_data *dd = hctx->queue->queuedata;
+	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+
+	if (rq_data_dir(rq) == READ || !dd->unal_qdepth)
+		return false;
+
+	/*
+	 * If unaligned depth must be limited on this controller, mark it
+	 * as unaligned if the IO isn't on a 4k boundary (start of length).
+	 */
+	if (blk_rq_sectors(rq) <= 64) {
+		if ((blk_rq_pos(rq) & 7) || (blk_rq_sectors(rq) & 7))
+			cmd->unaligned = 1;
+	}
+
+	if (cmd->unaligned && down_trylock(&dd->port->cmd_slot_unal))
+		return true;
+
+	return false;
+}
+
+static int mtip_issue_reserved_cmd(struct blk_mq_hw_ctx *hctx,
+				   struct request *rq)
+{
+	struct driver_data *dd = hctx->queue->queuedata;
+	struct mtip_int_cmd *icmd = rq->end_io_data;
+	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+	struct mtip_cmd_sg *command_sg;
+
+	if (mtip_commands_active(dd->port))
+		return BLK_MQ_RQ_QUEUE_BUSY;
+
+	rq->end_io_data = NULL;
+
+	/* Populate the SG list */
+	cmd->command_header->opts =
+		 __force_bit2int cpu_to_le32(icmd->opts | icmd->fis_len);
+	if (icmd->buf_len) {
+		command_sg = cmd->command + AHCI_CMD_TBL_HDR_SZ;
+
+		command_sg->info =
+			__force_bit2int cpu_to_le32((icmd->buf_len-1) & 0x3FFFFF);
+		command_sg->dba	=
+			__force_bit2int cpu_to_le32(icmd->buffer & 0xFFFFFFFF);
+		command_sg->dba_upper =
+			__force_bit2int cpu_to_le32((icmd->buffer >> 16) >> 16);
+
+		cmd->command_header->opts |=
+			__force_bit2int cpu_to_le32((1 << 16));
+	}
+
+	/* Populate the command header */
+	cmd->command_header->byte_count = 0;
+
+	blk_mq_start_request(rq);
+	mtip_issue_non_ncq_command(dd->port, rq->tag);
+	return BLK_MQ_RQ_QUEUE_OK;
+}
+
+static inline bool mtip_rq_is_reserved(struct request *rq)
+{
+	return rq->tag == 0;
+}
+
+static int mtip_queue_rq(struct blk_mq_hw_ctx *hctx,
+			 const struct blk_mq_queue_data *bd)
+{
+	struct request *rq = bd->rq;
+	int ret;
+
+	mtip_init_cmd_header(rq);
+
+	if (mtip_rq_is_reserved(rq))
+		return mtip_issue_reserved_cmd(hctx, rq);
+
+	if (unlikely(mtip_check_unal_depth(hctx, rq)))
+		return BLK_MQ_RQ_QUEUE_BUSY;
+
+	blk_mq_start_request(rq);
+
+	ret = mtip_submit_request(hctx, rq);
+	if (likely(!ret))
+		return BLK_MQ_RQ_QUEUE_OK;
+
+	rq->errors = ret;
+	return BLK_MQ_RQ_QUEUE_ERROR;
+}
+
+static void mtip_free_cmd(struct blk_mq_tag_set *set, struct request *rq,
+			  unsigned int hctx_idx)
+{
+	struct driver_data *dd = set->driver_data;
+	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+
+	if (!cmd->command)
+		return;
+
+	dmam_free_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
+				cmd->command, cmd->command_dma);
+}
+
+static int mtip_init_cmd(struct blk_mq_tag_set *set, struct request *rq,
+			 unsigned int hctx_idx, unsigned int numa_node)
+{
+	struct driver_data *dd = set->driver_data;
+	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
+
+	cmd->command = dmam_alloc_coherent(&dd->pdev->dev, CMD_DMA_ALLOC_SZ,
+			&cmd->command_dma, GFP_KERNEL);
+	if (!cmd->command)
+		return -ENOMEM;
+
+	memset(cmd->command, 0, CMD_DMA_ALLOC_SZ);
+
+	sg_init_table(cmd->sg, MTIP_MAX_SG);
+	return 0;
+}
+
+static enum blk_eh_timer_return mtip_cmd_timeout(struct request *req,
+								bool reserved)
+{
+	struct driver_data *dd = req->q->queuedata;
+
+	if (reserved) {
+		struct mtip_cmd *cmd = blk_mq_rq_to_pdu(req);
+
+		req->errors = -ETIME;
+		if (cmd->comp_func)
+			cmd->comp_func(dd->port, MTIP_TAG_INTERNAL, cmd, -ETIME);
+		goto exit_handler;
+	}
+
+	if (test_bit(req->tag, dd->port->cmds_to_issue))
+		goto exit_handler;
+
+	if (test_and_set_bit(MTIP_PF_TO_ACTIVE_BIT, &dd->port->flags))
+		goto exit_handler;
+
+	wake_up_interruptible(&dd->port->svc_wait);
+exit_handler:
+	return BLK_EH_RESET_TIMER;
+}
+
+static struct blk_mq_ops mtip_mq_ops = {
+	.queue_rq	= mtip_queue_rq,
+	.init_request	= mtip_init_cmd,
+	.exit_request	= mtip_free_cmd,
+	.complete	= mtip_softirq_done_fn,
+	.timeout        = mtip_cmd_timeout,
+};
 
 /*
  * Block layer initialization function.
@@ -4147,16 +3904,12 @@ static int mtip_block_initialize(struct driver_data *dd)
 	if (dd->disk)
 		goto skip_create_disk; /* hw init done, before rebuild */
 
-	/* Initialize the protocol layer. */
-	wait_for_rebuild = mtip_hw_init(dd);
-	if (wait_for_rebuild < 0) {
-		dev_err(&dd->pdev->dev,
-			"Protocol layer initialization failed\n");
+	if (mtip_hw_init(dd)) {
 		rv = -EINVAL;
 		goto protocol_init_error;
 	}
 
-	dd->disk = alloc_disk(MTIP_MAX_MINORS);
+	dd->disk = alloc_disk_node(MTIP_MAX_MINORS, dd->numa_node);
 	if (dd->disk  == NULL) {
 		dev_err(&dd->pdev->dev,
 			"Unable to allocate gendisk structure\n");
@@ -4166,8 +3919,10 @@ static int mtip_block_initialize(struct driver_data *dd)
 
 	/* Generate the disk name, implemented same as in sd.c */
 	do {
-		if (!ida_pre_get(&rssd_index_ida, GFP_KERNEL))
+		if (!ida_pre_get(&rssd_index_ida, GFP_KERNEL)) {
+			rv = -ENOMEM;
 			goto ida_get_error;
+		}
 
 		spin_lock(&rssd_index_lock);
 		rv = ida_get_new(&rssd_index_ida, &index);
@@ -4194,6 +3949,46 @@ static int mtip_block_initialize(struct driver_data *dd)
 
 	mtip_hw_debugfs_init(dd);
 
+	memset(&dd->tags, 0, sizeof(dd->tags));
+	dd->tags.ops = &mtip_mq_ops;
+	dd->tags.nr_hw_queues = 1;
+	dd->tags.queue_depth = MTIP_MAX_COMMAND_SLOTS;
+	dd->tags.reserved_tags = 1;
+	dd->tags.cmd_size = sizeof(struct mtip_cmd);
+	dd->tags.numa_node = dd->numa_node;
+	dd->tags.flags = BLK_MQ_F_SHOULD_MERGE;
+	dd->tags.driver_data = dd;
+	dd->tags.timeout = MTIP_NCQ_CMD_TIMEOUT_MS;
+
+	rv = blk_mq_alloc_tag_set(&dd->tags);
+	if (rv) {
+		dev_err(&dd->pdev->dev,
+			"Unable to allocate request queue\n");
+		goto block_queue_alloc_tag_error;
+	}
+
+	/* Allocate the request queue. */
+	dd->queue = blk_mq_init_queue(&dd->tags);
+	if (IS_ERR(dd->queue)) {
+		dev_err(&dd->pdev->dev,
+			"Unable to allocate request queue\n");
+		rv = -ENOMEM;
+		goto block_queue_alloc_init_error;
+	}
+
+	dd->disk->queue		= dd->queue;
+	dd->queue->queuedata	= dd;
+
+skip_create_disk:
+	/* Initialize the protocol layer. */
+	wait_for_rebuild = mtip_hw_get_identify(dd);
+	if (wait_for_rebuild < 0) {
+		dev_err(&dd->pdev->dev,
+			"Protocol layer initialization failed\n");
+		rv = -EINVAL;
+		goto init_hw_cmds_error;
+	}
+
 	/*
 	 * if rebuild pending, start the service thread, and delay the block
 	 * queue creation and add_disk()
@@ -4201,24 +3996,9 @@ static int mtip_block_initialize(struct driver_data *dd)
 	if (wait_for_rebuild == MTIP_FTL_REBUILD_MAGIC)
 		goto start_service_thread;
 
-skip_create_disk:
-	/* Allocate the request queue. */
-	dd->queue = blk_alloc_queue(GFP_KERNEL);
-	if (dd->queue == NULL) {
-		dev_err(&dd->pdev->dev,
-			"Unable to allocate request queue\n");
-		rv = -ENOMEM;
-		goto block_queue_alloc_init_error;
-	}
-
-	/* Attach our request function to the request queue. */
-	blk_queue_make_request(dd->queue, mtip_make_request);
-
-	dd->disk->queue		= dd->queue;
-	dd->queue->queuedata	= dd;
-
 	/* Set device limits. */
 	set_bit(QUEUE_FLAG_NONROT, &dd->queue->queue_flags);
+	clear_bit(QUEUE_FLAG_ADD_RANDOM, &dd->queue->queue_flags);
 	blk_queue_max_segments(dd->queue, MTIP_MAX_SG);
 	blk_queue_physical_block_size(dd->queue, 4096);
 	blk_queue_max_hw_sectors(dd->queue, 0xffff);
@@ -4271,9 +4051,8 @@ skip_create_disk:
 
 start_service_thread:
 	sprintf(thd_name, "mtip_svc_thd_%02d", index);
-
-	dd->mtip_svc_handler = kthread_run(mtip_service_thread,
-						dd, thd_name);
+	dd->mtip_svc_handler = kthread_create_on_node(mtip_service_thread,
+						dd, dd->numa_node, thd_name);
 
 	if (IS_ERR(dd->mtip_svc_handler)) {
 		dev_err(&dd->pdev->dev, "service thread failed to start\n");
@@ -4281,7 +4060,7 @@ start_service_thread:
 		rv = -EFAULT;
 		goto kthread_run_error;
 	}
-
+	wake_up_process(dd->mtip_svc_handler);
 	if (wait_for_rebuild == MTIP_FTL_REBUILD_MAGIC)
 		rv = wait_for_rebuild;
 
@@ -4295,9 +4074,11 @@ kthread_run_error:
 	del_gendisk(dd->disk);
 
 read_capacity_error:
+init_hw_cmds_error:
 	blk_cleanup_queue(dd->queue);
-
 block_queue_alloc_init_error:
+	blk_mq_free_tag_set(&dd->tags);
+block_queue_alloc_tag_error:
 	mtip_hw_debugfs_exit(dd);
 disk_index_error:
 	spin_lock(&rssd_index_lock);
@@ -4314,6 +4095,23 @@ protocol_init_error:
 	return rv;
 }
 
+static void mtip_no_dev_cleanup(struct request *rq, void *data, bool reserv)
+{
+	struct driver_data *dd = (struct driver_data *)data;
+	struct mtip_cmd *cmd;
+
+	if (likely(!reserv))
+		blk_mq_complete_request(rq, -ENODEV);
+	else if (test_bit(MTIP_PF_IC_ACTIVE_BIT, &dd->port->flags)) {
+
+		cmd = mtip_cmd_from_tag(dd, MTIP_TAG_INTERNAL);
+		rq->errors = -ENODEV;
+		if (cmd->comp_func)
+			cmd->comp_func(dd->port, MTIP_TAG_INTERNAL,
+					cmd, -ENODEV);
+	}
+}
+
 /*
  * Block layer deinitialization function.
  *
@@ -4328,48 +4126,62 @@ static int mtip_block_remove(struct driver_data *dd)
 {
 	struct kobject *kobj;
 
+	mtip_hw_debugfs_exit(dd);
+
+	if (dd->mtip_svc_handler) {
+		set_bit(MTIP_PF_SVC_THD_STOP_BIT, &dd->port->flags);
+		wake_up_interruptible(&dd->port->svc_wait);
+		kthread_stop(dd->mtip_svc_handler);
+	}
+
+	/* Clean up the sysfs attributes, if created */
+	if (test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag)) {
+		kobj = kobject_get(&disk_to_dev(dd->disk)->kobj);
+		if (kobj) {
+			mtip_hw_sysfs_exit(dd, kobj);
+			kobject_put(kobj);
+		}
+	}
+
 	if (!dd->sr) {
-		mtip_hw_debugfs_exit(dd);
-
-		if (dd->mtip_svc_handler) {
-			set_bit(MTIP_PF_SVC_THD_STOP_BIT, &dd->port->flags);
-			wake_up_interruptible(&dd->port->svc_wait);
-			kthread_stop(dd->mtip_svc_handler);
-		}
-
-		/* Clean up the sysfs attributes, if created */
-		if (test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag)) {
-			kobj = kobject_get(&disk_to_dev(dd->disk)->kobj);
-			if (kobj) {
-				mtip_hw_sysfs_exit(dd, kobj);
-				kobject_put(kobj);
-			}
-		}
 		/*
-		 * Delete our gendisk structure. This also removes the device
-		 * from /dev
+		 * Explicitly wait here for IOs to quiesce,
+		 * as mtip_standby_drive usually won't wait for IOs.
 		 */
-		if (dd->bdev) {
-			bdput(dd->bdev);
-			dd->bdev = NULL;
-		}
-		if (dd->disk) {
-			del_gendisk(dd->disk);
-			if (dd->disk->queue) {
-				blk_cleanup_queue(dd->queue);
-				dd->queue = NULL;
-			}
-			put_disk(dd->disk);
-		}
-		dd->disk  = NULL;
-
-		spin_lock(&rssd_index_lock);
-		ida_remove(&rssd_index_ida, dd->index);
-		spin_unlock(&rssd_index_lock);
-	} else {
+		if (!mtip_quiesce_io(dd->port, MTIP_QUIESCE_IO_TIMEOUT_MS))
+			mtip_standby_drive(dd);
+	}
+	else
 		dev_info(&dd->pdev->dev, "device %s surprise removal\n",
 						dd->disk->disk_name);
+
+	blk_freeze_queue_start(dd->queue);
+	blk_mq_stop_hw_queues(dd->queue);
+	blk_mq_tagset_busy_iter(&dd->tags, mtip_no_dev_cleanup, dd);
+
+	/*
+	 * Delete our gendisk structure. This also removes the device
+	 * from /dev
+	 */
+	if (dd->bdev) {
+		bdput(dd->bdev);
+		dd->bdev = NULL;
 	}
+	if (dd->disk) {
+		if (test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag))
+			del_gendisk(dd->disk);
+		if (dd->disk->queue) {
+			blk_cleanup_queue(dd->queue);
+			blk_mq_free_tag_set(&dd->tags);
+			dd->queue = NULL;
+		}
+		put_disk(dd->disk);
+	}
+	dd->disk  = NULL;
+
+	spin_lock(&rssd_index_lock);
+	ida_remove(&rssd_index_ida, dd->index);
+	spin_unlock(&rssd_index_lock);
 
 	/* De-initialize the protocol layer. */
 	mtip_hw_exit(dd);
@@ -4391,14 +4203,18 @@ static int mtip_block_remove(struct driver_data *dd)
  */
 static int mtip_block_shutdown(struct driver_data *dd)
 {
+	mtip_hw_shutdown(dd);
+
 	/* Delete our gendisk structure, and cleanup the blk queue. */
 	if (dd->disk) {
 		dev_info(&dd->pdev->dev,
 			"Shutting down %s ...\n", dd->disk->disk_name);
 
-		del_gendisk(dd->disk);
+		if (test_bit(MTIP_DDF_INIT_DONE_BIT, &dd->dd_flag))
+			del_gendisk(dd->disk);
 		if (dd->disk->queue) {
 			blk_cleanup_queue(dd->queue);
+			blk_mq_free_tag_set(&dd->tags);
 		}
 		put_disk(dd->disk);
 		dd->disk  = NULL;
@@ -4408,8 +4224,6 @@ static int mtip_block_shutdown(struct driver_data *dd)
 	spin_lock(&rssd_index_lock);
 	ida_remove(&rssd_index_ida, dd->index);
 	spin_unlock(&rssd_index_lock);
-
-	mtip_hw_shutdown(dd);
 	return 0;
 }
 
@@ -4428,6 +4242,56 @@ static int mtip_block_resume(struct driver_data *dd)
 	mtip_hw_resume(dd);
 	return 0;
 }
+
+static void drop_cpu(int cpu)
+{
+	cpu_use[cpu]--;
+}
+
+static int get_least_used_cpu_on_node(int node)
+{
+	int cpu, least_used_cpu, least_cnt;
+	const struct cpumask *node_mask;
+
+	node_mask = cpumask_of_node(node);
+	least_used_cpu = cpumask_first(node_mask);
+	least_cnt = cpu_use[least_used_cpu];
+	cpu = least_used_cpu;
+
+	for_each_cpu(cpu, node_mask) {
+		if (cpu_use[cpu] < least_cnt) {
+			least_used_cpu = cpu;
+			least_cnt = cpu_use[cpu];
+		}
+	}
+	cpu_use[least_used_cpu]++;
+	return least_used_cpu;
+}
+
+/* Helper for selecting a node in round robin mode */
+static inline int mtip_get_next_rr_node(void)
+{
+	static int next_node = -1;
+
+	if (next_node == -1) {
+		next_node = first_online_node;
+		return next_node;
+	}
+
+	next_node = next_online_node(next_node);
+	if (next_node == MAX_NUMNODES)
+		next_node = first_online_node;
+	return next_node;
+}
+
+static DEFINE_HANDLER(0);
+static DEFINE_HANDLER(1);
+static DEFINE_HANDLER(2);
+static DEFINE_HANDLER(3);
+static DEFINE_HANDLER(4);
+static DEFINE_HANDLER(5);
+static DEFINE_HANDLER(6);
+static DEFINE_HANDLER(7);
 
 static void mtip_disable_link_opts(struct driver_data *dd, struct pci_dev *pdev)
 {
@@ -4494,10 +4358,26 @@ static int mtip_pci_probe(struct pci_dev *pdev,
 {
 	int rv = 0;
 	struct driver_data *dd = NULL;
+	char cpu_list[256];
+	const struct cpumask *node_mask;
+	int cpu, i = 0, j = 0;
+	int my_node = NUMA_NO_NODE;
 	unsigned long flags;
 
 	/* Allocate memory for this devices private data. */
-	dd = kzalloc(sizeof(struct driver_data), GFP_KERNEL);
+	my_node = pcibus_to_node(pdev->bus);
+	if (my_node != NUMA_NO_NODE) {
+		if (!node_online(my_node))
+			my_node = mtip_get_next_rr_node();
+	} else {
+		dev_info(&pdev->dev, "Kernel not reporting proximity, choosing a node\n");
+		my_node = mtip_get_next_rr_node();
+	}
+	dev_info(&pdev->dev, "NUMA node %d (closest: %d,%d, probe on %d:%d)\n",
+		my_node, pcibus_to_node(pdev->bus), dev_to_node(&pdev->dev),
+		cpu_to_node(raw_smp_processor_id()), raw_smp_processor_id());
+
+	dd = kzalloc_node(sizeof(struct driver_data), GFP_KERNEL, my_node);
 	if (dd == NULL) {
 		dev_err(&pdev->dev,
 			"Unable to allocate memory for driver data\n");
@@ -4534,21 +4414,86 @@ static int mtip_pci_probe(struct pci_dev *pdev,
 		}
 	}
 
+	/* Copy the info we may need later into the private data structure. */
+	dd->major	= mtip_major;
+	dd->instance	= instance;
+	dd->pdev	= pdev;
+	dd->numa_node	= my_node;
+
+	INIT_LIST_HEAD(&dd->online_list);
+	INIT_LIST_HEAD(&dd->remove_list);
+
+	memset(dd->workq_name, 0, 32);
+	snprintf(dd->workq_name, 31, "mtipq%d", dd->instance);
+
+	dd->isr_workq = create_workqueue(dd->workq_name);
+	if (!dd->isr_workq) {
+		dev_warn(&pdev->dev, "Can't create wq %d\n", dd->instance);
+		rv = -ENOMEM;
+		goto block_initialize_err;
+	}
+
+	memset(cpu_list, 0, sizeof(cpu_list));
+
+	node_mask = cpumask_of_node(dd->numa_node);
+	if (!cpumask_empty(node_mask)) {
+		for_each_cpu(cpu, node_mask)
+		{
+			snprintf(&cpu_list[j], 256 - j, "%d ", cpu);
+			j = strlen(cpu_list);
+		}
+
+		dev_info(&pdev->dev, "Node %d on package %d has %d cpu(s): %s\n",
+			dd->numa_node,
+			topology_physical_package_id(cpumask_first(node_mask)),
+			nr_cpus_node(dd->numa_node),
+			cpu_list);
+	} else
+		dev_dbg(&pdev->dev, "mtip32xx: node_mask empty\n");
+
+	dd->isr_binding = get_least_used_cpu_on_node(dd->numa_node);
+	dev_info(&pdev->dev, "Initial IRQ binding node:cpu %d:%d\n",
+		cpu_to_node(dd->isr_binding), dd->isr_binding);
+
+	/* first worker context always runs in ISR */
+	dd->work[0].cpu_binding = dd->isr_binding;
+	dd->work[1].cpu_binding = get_least_used_cpu_on_node(dd->numa_node);
+	dd->work[2].cpu_binding = get_least_used_cpu_on_node(dd->numa_node);
+	dd->work[3].cpu_binding = dd->work[0].cpu_binding;
+	dd->work[4].cpu_binding = dd->work[1].cpu_binding;
+	dd->work[5].cpu_binding = dd->work[2].cpu_binding;
+	dd->work[6].cpu_binding = dd->work[2].cpu_binding;
+	dd->work[7].cpu_binding = dd->work[1].cpu_binding;
+
+	/* Log the bindings */
+	for_each_present_cpu(cpu) {
+		memset(cpu_list, 0, sizeof(cpu_list));
+		for (i = 0, j = 0; i < MTIP_MAX_SLOT_GROUPS; i++) {
+			if (dd->work[i].cpu_binding == cpu) {
+				snprintf(&cpu_list[j], 256 - j, "%d ", i);
+				j = strlen(cpu_list);
+			}
+		}
+		if (j)
+			dev_info(&pdev->dev, "CPU %d: WQs %s\n", cpu, cpu_list);
+	}
+
+	INIT_WORK(&dd->work[0].work, mtip_workq_sdbf0);
+	INIT_WORK(&dd->work[1].work, mtip_workq_sdbf1);
+	INIT_WORK(&dd->work[2].work, mtip_workq_sdbf2);
+	INIT_WORK(&dd->work[3].work, mtip_workq_sdbf3);
+	INIT_WORK(&dd->work[4].work, mtip_workq_sdbf4);
+	INIT_WORK(&dd->work[5].work, mtip_workq_sdbf5);
+	INIT_WORK(&dd->work[6].work, mtip_workq_sdbf6);
+	INIT_WORK(&dd->work[7].work, mtip_workq_sdbf7);
+
 	pci_set_master(pdev);
 	rv = pci_enable_msi(pdev);
 	if (rv) {
 		dev_warn(&pdev->dev,
 			"Unable to enable MSI interrupt.\n");
-		goto block_initialize_err;
+		goto msi_initialize_err;
 	}
-
-	/* Copy the info we may need later into the private data structure. */
-	dd->major	= mtip_major;
-	dd->instance	= instance;
-	dd->pdev	= pdev;
-
-	INIT_LIST_HEAD(&dd->online_list);
-	INIT_LIST_HEAD(&dd->remove_list);
 
 	mtip_fix_ero_nosnoop(dd, pdev);
 
@@ -4580,6 +4525,14 @@ static int mtip_pci_probe(struct pci_dev *pdev,
 block_initialize_err:
 	pci_disable_msi(pdev);
 
+msi_initialize_err:
+	if (dd->isr_workq) {
+		flush_workqueue(dd->isr_workq);
+		destroy_workqueue(dd->isr_workq);
+		drop_cpu(dd->work[0].cpu_binding);
+		drop_cpu(dd->work[1].cpu_binding);
+		drop_cpu(dd->work[2].cpu_binding);
+	}
 setmask_err:
 	pcim_iounmap_regions(pdev, 1 << MTIP_ABAR);
 
@@ -4601,9 +4554,9 @@ done:
 static void mtip_pci_remove(struct pci_dev *pdev)
 {
 	struct driver_data *dd = pci_get_drvdata(pdev);
-	unsigned long flags;
+	unsigned long flags, to;
 
-	set_bit(MTIP_DDF_REMOVE_PENDING_BIT, &dd->dd_flag);
+	set_bit(MTIP_DDF_REMOVAL_BIT, &dd->dd_flag);
 
 	spin_lock_irqsave(&dev_lock, flags);
 	list_del_init(&dd->online_list);
@@ -4613,11 +4566,34 @@ static void mtip_pci_remove(struct pci_dev *pdev)
 	mtip_check_surprise_removal(pdev);
 	synchronize_irq(dd->pdev->irq);
 
-	/* Cleanup the outstanding commands */
-	mtip_command_cleanup(dd);
+	/* Spin until workers are done */
+	to = jiffies + msecs_to_jiffies(4000);
+	do {
+		msleep(20);
+	} while (atomic_read(&dd->irq_workers_active) != 0 &&
+		time_before(jiffies, to));
+
+	if (!dd->sr)
+		fsync_bdev(dd->bdev);
+
+	if (atomic_read(&dd->irq_workers_active) != 0) {
+		dev_warn(&dd->pdev->dev,
+			"Completion workers still active!\n");
+	}
+
+	blk_set_queue_dying(dd->queue);
+	set_bit(MTIP_DDF_REMOVE_PENDING_BIT, &dd->dd_flag);
 
 	/* Clean up the block layer. */
 	mtip_block_remove(dd);
+
+	if (dd->isr_workq) {
+		flush_workqueue(dd->isr_workq);
+		destroy_workqueue(dd->isr_workq);
+		drop_cpu(dd->work[0].cpu_binding);
+		drop_cpu(dd->work[1].cpu_binding);
+		drop_cpu(dd->work[2].cpu_binding);
+	}
 
 	pci_disable_msi(pdev);
 
@@ -4625,15 +4601,10 @@ static void mtip_pci_remove(struct pci_dev *pdev)
 	list_del_init(&dd->remove_list);
 	spin_unlock_irqrestore(&dev_lock, flags);
 
-	if (!dd->sr)
-		kfree(dd);
-	else
-		set_bit(MTIP_DDF_REMOVE_DONE_BIT, &dd->dd_flag);
+	kfree(dd);
 
 	pcim_iounmap_regions(pdev, 1 << MTIP_ABAR);
 	pci_set_drvdata(pdev, NULL);
-	pci_dev_put(pdev);
-
 }
 
 /*

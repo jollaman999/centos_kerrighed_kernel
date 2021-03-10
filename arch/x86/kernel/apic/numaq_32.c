@@ -26,6 +26,7 @@
 #include <linux/nodemask.h>
 #include <linux/topology.h>
 #include <linux/bootmem.h>
+#include <linux/memblock.h>
 #include <linux/threads.h>
 #include <linux/cpumask.h>
 #include <linux/kernel.h>
@@ -46,8 +47,6 @@
 #include <asm/apic.h>
 #include <asm/e820.h>
 #include <asm/ipi.h>
-
-#define	MB_TO_PAGES(addr)		((addr) << (20 - PAGE_SHIFT))
 
 int found_numaq;
 
@@ -78,31 +77,20 @@ int					quad_local_to_mp_bus_id[NR_CPUS/4][4];
 static inline void numaq_register_node(int node, struct sys_cfg_data *scd)
 {
 	struct eachquadmem *eq = scd->eq + node;
+	u64 start = (u64)(eq->hi_shrd_mem_start - eq->priv_mem_size) << 20;
+	u64 end = (u64)(eq->hi_shrd_mem_start + eq->hi_shrd_mem_size) << 20;
+	int ret;
 
-	node_set_online(node);
-
-	/* Convert to pages */
-	node_start_pfn[node] =
-		 MB_TO_PAGES(eq->hi_shrd_mem_start - eq->priv_mem_size);
-
-	node_end_pfn[node] =
-		 MB_TO_PAGES(eq->hi_shrd_mem_start + eq->hi_shrd_mem_size);
-
-	e820_register_active_regions(node, node_start_pfn[node],
-						node_end_pfn[node]);
-
-	memory_present(node, node_start_pfn[node], node_end_pfn[node]);
-
-	node_remap_size[node] = node_memmap_size_bytes(node,
-					node_start_pfn[node],
-					node_end_pfn[node]);
+	node_set(node, numa_nodes_parsed);
+	ret = numa_add_memblk(node, start, end);
+	BUG_ON(ret < 0);
 }
 
 /*
  * Function: smp_dump_qct()
  *
  * Description: gets memory layout from the quad config table.  This
- * function also updates node_online_map with the nodes (quads) present.
+ * function also updates numa_nodes_parsed with the nodes (quads) present.
  */
 static void __init smp_dump_qct(void)
 {
@@ -111,14 +99,13 @@ static void __init smp_dump_qct(void)
 
 	scd = (void *)__va(SYS_CFG_DATA_PRIV_ADDR);
 
-	nodes_clear(node_online_map);
 	for_each_node(node) {
 		if (scd->quads_present31_0 & (1 << node))
 			numaq_register_node(node, scd);
 	}
 }
 
-void __cpuinit numaq_tsc_disable(void)
+void numaq_tsc_disable(void)
 {
 	if (!found_numaq)
 		return;
@@ -264,11 +251,6 @@ static void __init smp_read_mpc_oem(struct mpc_table *mpc)
 static __init void early_check_numaq(void)
 {
 	/*
-	 * Find possible boot-time SMP configuration:
-	 */
-	early_find_smp_config();
-
-	/*
 	 * get boot-time SMP configuration:
 	 */
 	if (smp_found_config)
@@ -282,17 +264,18 @@ static __init void early_check_numaq(void)
 		x86_init.mpparse.mpc_oem_pci_bus = mpc_oem_pci_bus;
 		x86_init.mpparse.mpc_oem_bus_info = mpc_oem_bus_info;
 		x86_init.timers.tsc_pre_init = numaq_tsc_init;
+		x86_init.pci.init = pci_numaq_init;
 	}
 }
 
-int __init get_memcfg_numaq(void)
+int __init numaq_numa_init(void)
 {
 	early_check_numaq();
 	if (!found_numaq)
-		return 0;
+		return -ENOENT;
 	smp_dump_qct();
 
-	return 1;
+	return 0;
 }
 
 #define NUMAQ_APIC_DFR_VALUE	(APIC_DFR_CLUSTER)
@@ -334,10 +317,9 @@ static inline const struct cpumask *numaq_target_cpus(void)
 	return cpu_all_mask;
 }
 
-static inline unsigned long
-numaq_check_apicid_used(physid_mask_t bitmap, int apicid)
+static unsigned long numaq_check_apicid_used(physid_mask_t *map, int apicid)
 {
-	return physid_isset(apicid, bitmap);
+	return physid_isset(apicid, *map);
 }
 
 static inline unsigned long numaq_check_apicid_present(int bit)
@@ -371,17 +353,10 @@ static inline int numaq_multi_timer_check(int apic, int irq)
 	return apic != 0 && irq == 0;
 }
 
-static inline physid_mask_t numaq_ioapic_phys_id_map(physid_mask_t phys_map)
+static inline void numaq_ioapic_phys_id_map(physid_mask_t *phys_map, physid_mask_t *retmap)
 {
 	/* We don't have a good way to do this yet - hack */
-	return physids_promote(0xFUL);
-}
-
-static inline int numaq_cpu_to_logical_apicid(int cpu)
-{
-	if (cpu >= nr_cpu_ids)
-		return BAD_APICID;
-	return cpu_2_logical_apicid[cpu];
+	return physids_promote(0xFUL, retmap);
 }
 
 /*
@@ -402,12 +377,21 @@ static inline int numaq_apicid_to_node(int logical_apicid)
 	return logical_apicid >> 4;
 }
 
-static inline physid_mask_t numaq_apicid_to_cpu_present(int logical_apicid)
+static int numaq_numa_cpu_node(int cpu)
+{
+	int logical_apicid = early_per_cpu(x86_cpu_to_logical_apicid, cpu);
+
+	if (logical_apicid != BAD_APICID)
+		return numaq_apicid_to_node(logical_apicid);
+	return NUMA_NO_NODE;
+}
+
+static void numaq_apicid_to_cpu_present(int logical_apicid, physid_mask_t *retmap)
 {
 	int node = numaq_apicid_to_node(logical_apicid);
 	int cpu = __ffs(logical_apicid & 0xf);
 
-	return physid_mask_of_physid(cpu + 4*node);
+	physid_set_mask_of_physid(cpu + 4*node, retmap);
 }
 
 /* Where the IO area was mapped on multiquad, always 0 otherwise */
@@ -422,16 +406,13 @@ static inline int numaq_check_phys_apicid_present(int phys_apicid)
  * We use physical apicids here, not logical, so just return the default
  * physical broadcast to stop people from breaking us
  */
-static unsigned int numaq_cpu_mask_to_apicid(const struct cpumask *cpumask)
-{
-	return 0x0F;
-}
-
-static inline unsigned int
+static int
 numaq_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
-			     const struct cpumask *andmask)
+			     const struct cpumask *andmask,
+			     unsigned int *apicid)
 {
-	return 0x0F;
+	*apicid = 0x0F;
+	return 0;
 }
 
 /* No NUMA-Q box has a HT CPU, but it can't hurt to use the default code. */
@@ -457,20 +438,6 @@ static int probe_numaq(void)
 	return found_numaq;
 }
 
-static void numaq_vector_allocation_domain(int cpu, struct cpumask *retmask)
-{
-	/* Careful. Some cpus do not strictly honor the set of cpus
-	 * specified in the interrupt destination when using lowest
-	 * priority interrupt delivery mode.
-	 *
-	 * In particular there was a hyperthreading cpu observed to
-	 * deliver interrupts to the wrong hyperthread when only one
-	 * hyperthread was specified in the interrupt desitination.
-	 */
-	cpumask_clear(retmask);
-	cpumask_bits(retmask)[0] = APIC_ALL_CPUS;
-}
-
 static void numaq_setup_portio_remap(void)
 {
 	int num_quads = num_online_nodes();
@@ -488,12 +455,13 @@ static void numaq_setup_portio_remap(void)
 		(u_long) xquad_portio, (u_long) num_quads*XQUAD_PORTIO_QUAD);
 }
 
-/* Use __refdata to keep false positive warning calm.	*/
-struct apic __refdata apic_numaq = {
+/* Use __refdata to keep false positive warning calm.  */
+static struct apic __refdata apic_numaq = {
 
 	.name				= "NUMAQ",
 	.probe				= probe_numaq,
 	.acpi_madt_oem_check		= NULL,
+	.apic_id_valid			= default_apic_id_valid,
 	.apic_id_registered		= numaq_apic_id_registered,
 
 	.irq_delivery_mode		= dest_LowestPrio,
@@ -506,14 +474,12 @@ struct apic __refdata apic_numaq = {
 	.check_apicid_used		= numaq_check_apicid_used,
 	.check_apicid_present		= numaq_check_apicid_present,
 
-	.vector_allocation_domain	= numaq_vector_allocation_domain,
+	.vector_allocation_domain	= flat_vector_allocation_domain,
 	.init_apic_ldr			= numaq_init_apic_ldr,
 
 	.ioapic_phys_id_map		= numaq_ioapic_phys_id_map,
 	.setup_apic_routing		= numaq_setup_apic_routing,
 	.multi_timer_check		= numaq_multi_timer_check,
-	.apicid_to_node			= numaq_apicid_to_node,
-	.cpu_to_logical_apicid		= numaq_cpu_to_logical_apicid,
 	.cpu_present_to_apicid		= numaq_cpu_present_to_apicid,
 	.apicid_to_cpu_present		= numaq_apicid_to_cpu_present,
 	.setup_portio_remap		= numaq_setup_portio_remap,
@@ -526,7 +492,6 @@ struct apic __refdata apic_numaq = {
 	.set_apic_id			= NULL,
 	.apic_id_mask			= 0x0F << 24,
 
-	.cpu_mask_to_apicid		= numaq_cpu_mask_to_apicid,
 	.cpu_mask_to_apicid_and		= numaq_cpu_mask_to_apicid_and,
 
 	.send_IPI_mask			= numaq_send_IPI_mask,
@@ -552,4 +517,9 @@ struct apic __refdata apic_numaq = {
 	.icr_write			= native_apic_icr_write,
 	.wait_icr_idle			= native_apic_wait_icr_idle,
 	.safe_wait_icr_idle		= native_safe_apic_wait_icr_idle,
+
+	.x86_32_early_logical_apicid	= noop_x86_32_early_logical_apicid,
+	.x86_32_numa_cpu_node		= numaq_numa_cpu_node,
 };
+
+apic_driver(apic_numaq);

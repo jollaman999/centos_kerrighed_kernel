@@ -17,13 +17,26 @@
 #ifndef _LINUX_CRYPTO_H
 #define _LINUX_CRYPTO_H
 
-#include <asm/atomic.h>
-#include <linux/module.h>
+#include <linux/atomic.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
+#include <linux/bug.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+
+/*
+ * Autoloaded crypto modules should only use a prefixed name to avoid allowing
+ * arbitrary modules to be loaded. Loading from userspace may still need the
+ * unprefixed names, so retains those aliases as well.
+ * This uses __MODULE_INFO directly instead of MODULE_ALIAS because pre-4.3
+ * gcc (e.g. avr32 toolchain) uses __LINE__ for uniqueness, and this macro
+ * expands twice on the same line. Instead, use a separate base name for the
+ * alias.
+ */
+#define MODULE_ALIAS_CRYPTO(name)	\
+		__MODULE_INFO(alias, alias_userspace, name);	\
+		__MODULE_INFO(alias, alias_crypto, "crypto-" name)
 
 /*
  * Algorithm masks and types.
@@ -39,12 +52,17 @@
 #define CRYPTO_ALG_TYPE_HASH		0x00000008
 #define CRYPTO_ALG_TYPE_SHASH		0x00000009
 #define CRYPTO_ALG_TYPE_AHASH		0x0000000a
+#define CRYPTO_ALG_TYPE_KPP		0x0000000e
+#define CRYPTO_ALG_TYPE_ACOMPRESS	0x0000000a
+#define CRYPTO_ALG_TYPE_SCOMPRESS	0x0000000b
 #define CRYPTO_ALG_TYPE_RNG		0x0000000c
+#define CRYPTO_ALG_TYPE_AKCIPHER	0x0000000d
 #define CRYPTO_ALG_TYPE_PCOMPRESS	0x0000000f
 
 #define CRYPTO_ALG_TYPE_HASH_MASK	0x0000000e
 #define CRYPTO_ALG_TYPE_AHASH_MASK	0x0000000c
 #define CRYPTO_ALG_TYPE_BLKCIPHER_MASK	0x0000000c
+#define CRYPTO_ALG_TYPE_ACOMPRESS_MASK	0x0000000e
 
 #define CRYPTO_ALG_LARVAL		0x00000010
 #define CRYPTO_ALG_DEAD			0x00000020
@@ -70,6 +88,22 @@
  */
 
 #define CRYPTO_ALG_TESTED		0x00000400
+
+/*
+ * Set if the algorithm is an instance that is build from templates.
+ */
+#define CRYPTO_ALG_INSTANCE		0x00000800
+
+/* Set this bit if the algorithm provided is hardware accelerated but
+ * not available to userspace via instruction set or so.
+ */
+#define CRYPTO_ALG_KERN_DRIVER_ONLY	0x00001000
+
+/*
+ * Mark a cipher as a service implementation only usable by another
+ * cipher and never by a normal user of the kernel crypto API
+ */
+#define CRYPTO_ALG_INTERNAL		0x00002000
 
 /*
  * Transform masks and values (for crt_flags).
@@ -99,13 +133,7 @@
  * as arm where pointers are 32-bit aligned but there are data types such as
  * u64 which require 64-bit alignment.
  */
-#if defined(ARCH_KMALLOC_MINALIGN)
 #define CRYPTO_MINALIGN ARCH_KMALLOC_MINALIGN
-#elif defined(ARCH_SLAB_MINALIGN)
-#define CRYPTO_MINALIGN ARCH_SLAB_MINALIGN
-#else
-#define CRYPTO_MINALIGN __alignof__(unsigned long long)
-#endif
 
 #define CRYPTO_MINALIGN_ATTR __attribute__ ((__aligned__(CRYPTO_MINALIGN)))
 
@@ -250,29 +278,6 @@ struct cipher_alg {
 	void (*cia_decrypt)(struct crypto_tfm *tfm, u8 *dst, const u8 *src);
 };
 
-struct digest_alg {
-	unsigned int dia_digestsize;
-	void (*dia_init)(struct crypto_tfm *tfm);
-	void (*dia_update)(struct crypto_tfm *tfm, const u8 *data,
-			   unsigned int len);
-	void (*dia_final)(struct crypto_tfm *tfm, u8 *out);
-	int (*dia_setkey)(struct crypto_tfm *tfm, const u8 *key,
-	                  unsigned int keylen);
-};
-
-struct hash_alg {
-	int (*init)(struct hash_desc *desc);
-	int (*update)(struct hash_desc *desc, struct scatterlist *sg,
-		      unsigned int nbytes);
-	int (*final)(struct hash_desc *desc, u8 *out);
-	int (*digest)(struct hash_desc *desc, struct scatterlist *sg,
-		      unsigned int nbytes, u8 *out);
-	int (*setkey)(struct crypto_hash *tfm, const u8 *key,
-		      unsigned int keylen);
-
-	unsigned int digestsize;
-};
-
 struct compress_alg {
 	int (*coa_compress)(struct crypto_tfm *tfm, const u8 *src,
 			    unsigned int slen, u8 *dst, unsigned int *dlen);
@@ -293,8 +298,6 @@ struct rng_alg {
 #define cra_aead	cra_u.aead
 #define cra_blkcipher	cra_u.blkcipher
 #define cra_cipher	cra_u.cipher
-#define cra_digest	cra_u.digest
-#define cra_hash	cra_u.hash
 #define cra_compress	cra_u.compress
 #define cra_rng		cra_u.rng
 
@@ -320,8 +323,6 @@ struct crypto_alg {
 		struct aead_alg aead;
 		struct blkcipher_alg blkcipher;
 		struct cipher_alg cipher;
-		struct digest_alg digest;
-		struct hash_alg hash;
 		struct compress_alg compress;
 		struct rng_alg rng;
 	} cra_u;
@@ -540,11 +541,6 @@ static inline int crypto_tfm_alg_priority(struct crypto_tfm *tfm)
 	return tfm->__crt_alg->cra_priority;
 }
 
-static inline const char *crypto_tfm_alg_modname(struct crypto_tfm *tfm)
-{
-	return module_name(tfm->__crt_alg->cra_module);
-}
-
 static inline u32 crypto_tfm_alg_type(struct crypto_tfm *tfm)
 {
 	return tfm->__crt_alg->cra_flags & CRYPTO_ALG_TYPE_MASK;
@@ -738,9 +734,9 @@ static inline void ablkcipher_request_free(struct ablkcipher_request *req)
 
 static inline void ablkcipher_request_set_callback(
 	struct ablkcipher_request *req,
-	u32 flags, crypto_completion_t complete, void *data)
+	u32 flags, crypto_completion_t compl, void *data)
 {
-	req->base.complete = complete;
+	req->base.complete = compl;
 	req->base.data = data;
 	req->base.flags = flags;
 }
@@ -854,7 +850,7 @@ static inline struct aead_request *aead_request_alloc(struct crypto_aead *tfm,
 {
 	struct aead_request *req;
 
-	req = kmalloc(sizeof(*req) + crypto_aead_reqsize(tfm), gfp);
+	req = kzalloc(sizeof(*req) + crypto_aead_reqsize(tfm), gfp);
 
 	if (likely(req))
 		aead_request_set_tfm(req, tfm);
@@ -869,10 +865,10 @@ static inline void aead_request_free(struct aead_request *req)
 
 static inline void aead_request_set_callback(struct aead_request *req,
 					     u32 flags,
-					     crypto_completion_t complete,
+					     crypto_completion_t compl,
 					     void *data)
 {
-	req->base.complete = complete;
+	req->base.complete = compl;
 	req->base.data = data;
 	req->base.flags = flags;
 }

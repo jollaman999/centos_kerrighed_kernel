@@ -7,9 +7,11 @@
 
 #include "dm-exception-store.h"
 
+#include <linux/ctype.h>
 #include <linux/mm.h>
 #include <linux/pagemap.h>
 #include <linux/vmalloc.h>
+#include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/dm-io.h>
 #include "dm-bufio.h"
@@ -251,9 +253,10 @@ static int chunk_io(struct pstore *ps, void *area, chunk_t chunk, int rw,
 	 * Issue the synchronous I/O from a different thread
 	 * to avoid generic_make_request recursion.
 	 */
-	INIT_WORK(&req.work, do_metadata);
+	INIT_WORK_ONSTACK(&req.work, do_metadata);
 	queue_work(ps->metadata_wq, &req.work);
 	flush_workqueue(ps->metadata_wq);
+	destroy_work_on_stack(&req.work);
 
 	return req.result;
 }
@@ -844,10 +847,10 @@ static void persistent_drop_snapshot(struct dm_exception_store *store)
 		DMWARN("write header failed");
 }
 
-static int persistent_ctr(struct dm_exception_store *store,
-			  unsigned argc, char **argv)
+static int persistent_ctr(struct dm_exception_store *store, char *options)
 {
 	struct pstore *ps;
+	int r;
 
 	/* allocate the pstore */
 	ps = kzalloc(sizeof(*ps), GFP_KERNEL);
@@ -867,16 +870,34 @@ static int persistent_ctr(struct dm_exception_store *store,
 	atomic_set(&ps->pending_count, 0);
 	ps->callbacks = NULL;
 
-	ps->metadata_wq = create_singlethread_workqueue("ksnaphd");
+	ps->metadata_wq = alloc_workqueue("ksnaphd", WQ_MEM_RECLAIM, 0);
 	if (!ps->metadata_wq) {
-		kfree(ps);
 		DMERR("couldn't start header metadata update thread");
-		return -ENOMEM;
+		r = -ENOMEM;
+		goto err_workqueue;
+	}
+
+	if (options) {
+		char overflow = toupper(options[0]);
+		if (overflow == 'O')
+			store->userspace_supports_overflow = true;
+		else {
+			DMERR("Unsupported persistent store option: %s", options);
+			r = -EINVAL;
+			goto err_options;
+		}
 	}
 
 	store->context = ps;
 
 	return 0;
+
+err_options:
+	destroy_workqueue(ps->metadata_wq);
+err_workqueue:
+	kfree(ps);
+
+	return r;
 }
 
 static unsigned persistent_status(struct dm_exception_store *store,
@@ -889,7 +910,8 @@ static unsigned persistent_status(struct dm_exception_store *store,
 	case STATUSTYPE_INFO:
 		break;
 	case STATUSTYPE_TABLE:
-		DMEMIT(" P %llu", (unsigned long long)store->chunk_size);
+		DMEMIT(" %s %llu", store->userspace_supports_overflow ? "PO" : "P",
+		       (unsigned long long)store->chunk_size);
 	}
 
 	return sz;

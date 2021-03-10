@@ -988,8 +988,8 @@ int __orinoco_hw_setup_enc(struct orinoco_private *priv)
  * tsc must be NULL or up to 8 bytes
  */
 int __orinoco_hw_set_tkip_key(struct orinoco_private *priv, int key_idx,
-			      int set_tx, const u8 *key, const u8 *rsc,
-			      size_t rsc_len, const u8 *tsc, size_t tsc_len)
+			      int set_tx, u8 *key, u8 *rsc, size_t rsc_len,
+			      u8 *tsc, size_t tsc_len)
 {
 	struct {
 		__le16 idx;
@@ -1086,22 +1086,14 @@ int __orinoco_hw_set_multicast_list(struct orinoco_private *priv,
 	 * group address if either we want to multicast, or if we were
 	 * multicasting and want to stop */
 	if (!promisc && (mc_count || priv->mc_count)) {
-#if 0 /* Not in RHEL */
 		struct netdev_hw_addr *ha;
-#else
-		struct dev_addr_list *ha;
-#endif
 		struct hermes_multicast mclist;
 		int i = 0;
 
 		netdev_for_each_mc_addr(ha, dev) {
 			if (i == mc_count)
 				break;
-#if 0 /* Not in RHEL */
 			memcpy(mclist.addr[i++], ha->addr, ETH_ALEN);
-#else
-			memcpy(mclist.addr[i++], ha->dmi_addr, ETH_ALEN);
-#endif
 		}
 
 		err = hw->ops->write_ltv(hw, USER_BAP,
@@ -1201,7 +1193,7 @@ int orinoco_hw_get_freq(struct orinoco_private *priv)
 		goto out;
 
 	}
-	freq = ieee80211_channel_to_frequency(channel, IEEE80211_BAND_2GHZ);
+	freq = ieee80211_dsss_chan_to_freq(channel);
 
  out:
 	orinoco_unlock(priv, &flags);

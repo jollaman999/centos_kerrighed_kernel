@@ -11,16 +11,9 @@
  *        David S. Miller (davem@caip.rutgers.edu), 1995
  */
 
-#include <linux/time.h>
-#include <linux/capability.h>
-#include <linux/fs.h>
-#include <linux/jbd.h>
-#include <linux/ext3_fs.h>
-#include <linux/ext3_jbd.h>
 #include <linux/quotaops.h>
-#include <linux/buffer_head.h>
 #include <linux/blkdev.h>
-#include <trace/events/ext3.h>
+#include "ext3.h"
 
 /*
  * balloc.c contains the blocks allocation and deallocation routines
@@ -426,7 +419,7 @@ static inline int rsv_is_empty(struct ext3_reserve_window *rsv)
 void ext3_init_block_alloc_info(struct inode *inode)
 {
 	struct ext3_inode_info *ei = EXT3_I(inode);
-	struct ext3_block_alloc_info *block_i = ei->i_block_alloc_info;
+	struct ext3_block_alloc_info *block_i;
 	struct super_block *sb = inode->i_sb;
 
 	block_i = kmalloc(sizeof(*block_i), GFP_NOFS);
@@ -490,7 +483,7 @@ void ext3_discard_reservation(struct inode *inode)
  * ext3_free_blocks_sb() -- Free given blocks and update quota
  * @handle:			handle to this transaction
  * @sb:				super block
- * @block:			start physcial block to free
+ * @block:			start physical block to free
  * @count:			number of blocks to free
  * @pdquot_freed_blocks:	pointer to quota
  */
@@ -594,7 +587,7 @@ do_more:
 				BUFFER_TRACE(debug_bh, "Deleted!");
 				if (!bh2jh(bitmap_bh)->b_committed_data)
 					BUFFER_TRACE(debug_bh,
-						"No commited data in bitmap");
+						"No committed data in bitmap");
 				BUFFER_TRACE2(debug_bh, bitmap_bh, "bitmap");
 				__brelse(debug_bh);
 			}
@@ -693,7 +686,7 @@ void ext3_free_blocks(handle_t *handle, struct inode *inode,
 	trace_ext3_free_blocks(inode, block, count);
 	ext3_free_blocks_sb(handle, sb, block, count, &dquot_freed_blocks);
 	if (dquot_freed_blocks)
-		vfs_dq_free_block(inode, dquot_freed_blocks);
+		dquot_free_block(inode, dquot_freed_blocks);
 	return;
 }
 
@@ -808,9 +801,9 @@ find_next_usable_block(ext3_grpblk_t start, struct buffer_head *bh,
 	if (here < 0)
 		here = 0;
 
-	p = ((char *)bh->b_data) + (here >> 3);
+	p = bh->b_data + (here >> 3);
 	r = memscan(p, 0, ((maxblocks + 7) >> 3) - (here >> 3));
-	next = (r - ((char *)bh->b_data)) << 3;
+	next = (r - bh->b_data) << 3;
 
 	if (next < maxblocks && next >= start && ext3_test_allocatable(next, bh))
 		return next;
@@ -826,8 +819,9 @@ find_next_usable_block(ext3_grpblk_t start, struct buffer_head *bh,
 
 /**
  * claim_block()
+ * @lock:		the spin lock for this block group
  * @block:		the free block (group relative) to allocate
- * @bh:			the bufferhead containts the block group bitmap
+ * @bh:			the buffer_head contains the block group bitmap
  *
  * We think we can allocate this block in this bitmap.  Try to set the bit.
  * If that succeeds then check that nobody has allocated and then freed the
@@ -972,9 +966,11 @@ fail_access:
  *		but we will shift to the place where start_block is,
  *		then start from there, when looking for a reservable space.
  *
- *	@size: the target new reservation window size
+ *	@my_rsv: the reservation window
  *
- *	@group_first_block: the first block we consider to start
+ *	@sb: the super block
+ *
+ *	@start_block: the first block we consider to start
  *			the real search from
  *
  *	@last_block:
@@ -1060,7 +1056,7 @@ static int find_next_reservable_window(
 		rsv_window_remove(sb, my_rsv);
 
 	/*
-	 * Let's book the whole avaliable window for now.  We will check the
+	 * Let's book the whole available window for now.  We will check the
 	 * disk bitmap later and then, if there are free blocks then we adjust
 	 * the window size if it's larger than requested.
 	 * Otherwise, we will remove this node from the tree next time
@@ -1100,7 +1096,7 @@ static int find_next_reservable_window(
  *
  *	failed: we failed to find a reservation window in this group
  *
- *	@rsv: the reservation
+ *	@my_rsv: the reservation window
  *
  *	@grp_goal: The goal (group-relative).  It is where the search for a
  *		free reservable space should start from.
@@ -1293,8 +1289,8 @@ static void try_to_extend_reservation(struct ext3_reserve_window_node *my_rsv,
  * @group:		given allocation block group
  * @bitmap_bh:		bufferhead holds the block bitmap
  * @grp_goal:		given target block within the group
- * @count:		target number of blocks to allocate
  * @my_rsv:		reservation window
+ * @count:		target number of blocks to allocate
  * @errp:		pointer to store the error code
  *
  * This is the main function used to allocate a new block and its reservation
@@ -1443,8 +1439,9 @@ static int ext3_has_free_blocks(struct ext3_sb_info *sbi, int use_reservation)
 	free_blocks = percpu_counter_read_positive(&sbi->s_freeblocks_counter);
 	root_blocks = le32_to_cpu(sbi->s_es->s_r_blocks_count);
 	if (free_blocks < root_blocks + 1 && !capable(CAP_SYS_RESOURCE) &&
-		!use_reservation && sbi->s_resuid != current_fsuid() &&
-		(sbi->s_resgid == 0 || !in_group_p (sbi->s_resgid))) {
+		!use_reservation && !uid_eq(sbi->s_resuid, current_fsuid()) &&
+		(gid_eq(sbi->s_resgid, GLOBAL_ROOT_GID) ||
+		 !in_group_p (sbi->s_resgid))) {
 		return 0;
 	}
 	return 1;
@@ -1457,7 +1454,7 @@ static int ext3_has_free_blocks(struct ext3_sb_info *sbi, int use_reservation)
  *
  * ext3_should_retry_alloc() is called when ENOSPC is returned, and if
  * it is profitable to retry the operation, this function will wait
- * for the current or commiting transaction to complete, and then
+ * for the current or committing transaction to complete, and then
  * return TRUE.
  *
  * if the total number of retries exceed three times, return FALSE.
@@ -1519,8 +1516,9 @@ ext3_fsblk_t ext3_new_blocks(handle_t *handle, struct inode *inode,
 	/*
 	 * Check quota for allocation of this block.
 	 */
-	if (vfs_dq_alloc_block(inode, num)) {
-		*errp = -EDQUOT;
+	err = dquot_alloc_block(inode, num);
+	if (err) {
+		*errp = err;
 		return 0;
 	}
 
@@ -1601,6 +1599,12 @@ retry_alloc:
 			goto io_error;
 		free_blocks = le16_to_cpu(gdp->bg_free_blocks_count);
 		/*
+		 * skip this group (and avoid loading bitmap) if there
+		 * are no free blocks
+		 */
+		if (!free_blocks)
+			continue;
+		/*
 		 * skip this group if the number of
 		 * free blocks is less than half of the reservation
 		 * window size.
@@ -1624,9 +1628,9 @@ retry_alloc:
 			goto allocated;
 	}
 	/*
-	 * We may end up a bogus ealier ENOSPC error due to
+	 * We may end up a bogus earlier ENOSPC error due to
 	 * filesystem is "full" of reservations, but
-	 * there maybe indeed free blocks avaliable on disk
+	 * there maybe indeed free blocks available on disk
 	 * In this case, we just forget about the reservations
 	 * just do block allocation as without reservations.
 	 */
@@ -1734,7 +1738,7 @@ allocated:
 	brelse(bitmap_bh);
 
 	if (num < *count) {
-		vfs_dq_free_block(inode, *count-num);
+		dquot_free_block(inode, *count-num);
 		*count = num;
 	}
 
@@ -1754,7 +1758,7 @@ out:
 	 * Undo the block allocation
 	 */
 	if (!performed_allocation)
-		vfs_dq_free_block(inode, *count);
+		dquot_free_block(inode, *count);
 	brelse(bitmap_bh);
 	return 0;
 }
@@ -1809,7 +1813,7 @@ ext3_fsblk_t ext3_count_free_blocks(struct super_block *sb)
 	brelse(bitmap_bh);
 	printk("ext3_count_free_blocks: stored = "E3FSBLK
 		", computed = "E3FSBLK", "E3FSBLK"\n",
-	       le32_to_cpu(es->s_free_blocks_count),
+	       (ext3_fsblk_t)le32_to_cpu(es->s_free_blocks_count),
 		desc_count, bitmap_count);
 	return bitmap_count;
 #else
@@ -1962,7 +1966,7 @@ static ext3_grpblk_t ext3_trim_all_free(struct super_block *sb,
 	sbi = EXT3_SB(sb);
 
 	 /* Walk through the whole group */
-	while (start < max) {
+	while (start <= max) {
 		start = bitmap_search_next_usable_block(start, bitmap_bh, max);
 		if (start < 0)
 			break;
@@ -1972,7 +1976,7 @@ static ext3_grpblk_t ext3_trim_all_free(struct super_block *sb,
 		 * Allocate contiguous free extents by setting bits in the
 		 * block bitmap
 		 */
-		while (next < max
+		while (next <= max
 			&& claim_block(sb_bgl_lock(sbi, group),
 					next, bitmap_bh)) {
 			next++;
@@ -2101,10 +2105,10 @@ int ext3_trim_fs(struct super_block *sb, struct fstrim_range *range)
 	    start >= max_blks ||
 	    range->len < sb->s_blocksize)
 		return -EINVAL;
-	if (unlikely(end >= max_blks))
+	if (end >= max_blks)
 		end = max_blks - 1;
 	if (end <= first_data_blk)
-		return 0;
+		goto out;
 	if (start < first_data_blk)
 		start = first_data_blk;
 
@@ -2116,31 +2120,30 @@ int ext3_trim_fs(struct super_block *sb, struct fstrim_range *range)
 	ext3_get_group_no_and_offset(sb, (ext3_fsblk_t) end,
 				     &last_group, &last_block);
 
-	/* The last block to discard in the group */
-	end = EXT3_BLOCKS_PER_GROUP(sb);
+	/* end now represents the last block to discard in this group */
+	end = EXT3_BLOCKS_PER_GROUP(sb) - 1;
 
 	for (group = first_group; group <= last_group; group++) {
 		gdp = ext3_get_group_desc(sb, group, NULL);
 		if (!gdp)
 			break;
 
-		if (le16_to_cpu(gdp->bg_free_blocks_count) < minlen)
-			continue;
-
 		/*
 		 * For all the groups except the last one, last block will
-		 * always be EXT3_BLOCKS_PER_GROUP(sb), so we only need to
+		 * always be EXT3_BLOCKS_PER_GROUP(sb)-1, so we only need to
 		 * change it for the last group, note that last_block is
 		 * already computed earlier by ext3_get_group_no_and_offset()
 		 */
 		if (group == last_group)
 			end = last_block;
 
-		ret = ext3_trim_all_free(sb, group, first_block,
-					 end, minlen);
-		if (ret < 0)
-			break;
-		trimmed += ret;
+		if (le16_to_cpu(gdp->bg_free_blocks_count) >= minlen) {
+			ret = ext3_trim_all_free(sb, group, first_block,
+						 end, minlen);
+			if (ret < 0)
+				break;
+			trimmed += ret;
+		}
 
 		/*
 		 * For every group except the first one, we are sure
@@ -2151,7 +2154,8 @@ int ext3_trim_fs(struct super_block *sb, struct fstrim_range *range)
 
 	if (ret > 0)
 		ret = 0;
-	range->len = trimmed * sb->s_blocksize;
 
+out:
+	range->len = trimmed * sb->s_blocksize;
 	return ret;
 }

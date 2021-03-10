@@ -9,14 +9,14 @@
  */
 
 #include <linux/fs.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/stat.h>
 #include <linux/time.h>
 #include <linux/namei.h>
 #include <linux/poll.h>
 
 
-static loff_t bad_file_llseek(struct file *file, loff_t offset, int origin)
+static loff_t bad_file_llseek(struct file *file, loff_t offset, int whence)
 {
 	return -EIO;
 }
@@ -55,12 +55,6 @@ static unsigned int bad_file_poll(struct file *filp, poll_table *wait)
 	return POLLERR;
 }
 
-static int bad_file_ioctl (struct inode *inode, struct file *filp,
-			unsigned int cmd, unsigned long arg)
-{
-	return -EIO;
-}
-
 static long bad_file_unlocked_ioctl(struct file *file, unsigned cmd,
 			unsigned long arg)
 {
@@ -93,8 +87,8 @@ static int bad_file_release(struct inode *inode, struct file *filp)
 	return -EIO;
 }
 
-static int bad_file_fsync(struct file *file, struct dentry *dentry,
-			int datasync)
+static int bad_file_fsync(struct file *file, loff_t start, loff_t end,
+			  int datasync)
 {
 	return -EIO;
 }
@@ -160,7 +154,6 @@ static const struct file_operations bad_file_ops =
 	.aio_write	= bad_file_aio_write,
 	.readdir	= bad_file_readdir,
 	.poll		= bad_file_poll,
-	.ioctl		= bad_file_ioctl,
 	.unlocked_ioctl	= bad_file_unlocked_ioctl,
 	.compat_ioctl	= bad_file_compat_ioctl,
 	.mmap		= bad_file_mmap,
@@ -180,13 +173,13 @@ static const struct file_operations bad_file_ops =
 };
 
 static int bad_inode_create (struct inode *dir, struct dentry *dentry,
-		int mode, struct nameidata *nd)
+		umode_t mode, bool excl)
 {
 	return -EIO;
 }
 
 static struct dentry *bad_inode_lookup(struct inode *dir,
-			struct dentry *dentry, struct nameidata *nd)
+			struct dentry *dentry, unsigned int flags)
 {
 	return ERR_PTR(-EIO);
 }
@@ -209,7 +202,7 @@ static int bad_inode_symlink (struct inode *dir, struct dentry *dentry,
 }
 
 static int bad_inode_mkdir(struct inode *dir, struct dentry *dentry,
-			int mode)
+			umode_t mode)
 {
 	return -EIO;
 }
@@ -220,13 +213,20 @@ static int bad_inode_rmdir (struct inode *dir, struct dentry *dentry)
 }
 
 static int bad_inode_mknod (struct inode *dir, struct dentry *dentry,
-			int mode, dev_t rdev)
+			umode_t mode, dev_t rdev)
 {
 	return -EIO;
 }
 
-static int bad_inode_rename (struct inode *old_dir, struct dentry *old_dentry,
-		struct inode *new_dir, struct dentry *new_dentry)
+static int bad_inode_rename(struct inode *old_dir, struct dentry *old_dentry,
+			    struct inode *new_dir, struct dentry *new_dentry)
+{
+	return -EIO;
+}
+
+static int bad_inode_rename2(struct inode *old_dir, struct dentry *old_dentry,
+			     struct inode *new_dir, struct dentry *new_dentry,
+			     unsigned int flags)
 {
 	return -EIO;
 }
@@ -276,8 +276,15 @@ static int bad_inode_removexattr(struct dentry *dentry, const char *name)
 	return -EIO;
 }
 
-static const struct inode_operations bad_inode_ops =
+static int bad_inode_tmpfile(struct inode *inode, struct dentry *dentry,
+			     umode_t mode)
 {
+	return -EIO;
+}
+
+static const struct inode_operations_wrapper bad_inode_ops =
+{
+	.ops = {
 	.create		= bad_inode_create,
 	.lookup		= bad_inode_lookup,
 	.link		= bad_inode_link,
@@ -299,7 +306,9 @@ static const struct inode_operations bad_inode_ops =
 	.getxattr	= bad_inode_getxattr,
 	.listxattr	= bad_inode_listxattr,
 	.removexattr	= bad_inode_removexattr,
-	/* truncate_range returns void */
+	},
+	.rename2	= bad_inode_rename2,
+	.tmpfile	= bad_inode_tmpfile,
 };
 
 
@@ -328,8 +337,9 @@ void make_bad_inode(struct inode *inode)
 	inode->i_mode = S_IFREG;
 	inode->i_atime = inode->i_mtime = inode->i_ctime =
 		current_fs_time(inode->i_sb);
-	inode->i_op = &bad_inode_ops;	
-	inode->i_fop = &bad_file_ops;	
+	inode->i_op = &bad_inode_ops.ops;
+	inode->i_fop = &bad_file_ops;
+	inode->i_flags |= S_IOPS_WRAPPER;
 }
 EXPORT_SYMBOL(make_bad_inode);
 
@@ -348,7 +358,7 @@ EXPORT_SYMBOL(make_bad_inode);
  
 int is_bad_inode(struct inode *inode)
 {
-	return (inode->i_op == &bad_inode_ops);	
+	return (inode->i_op == &bad_inode_ops.ops);
 }
 
 EXPORT_SYMBOL(is_bad_inode);

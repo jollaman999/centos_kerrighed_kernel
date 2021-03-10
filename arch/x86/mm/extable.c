@@ -1,11 +1,94 @@
 #include <linux/module.h>
 #include <linux/spinlock.h>
+#include <linux/sort.h>
 #include <asm/uaccess.h>
 
+typedef bool (*ex_handler_t)(const struct mc_exception_table_entry *,
+			    struct pt_regs *, int);
+
+static inline unsigned long
+ex_insn_addr(const struct exception_table_entry *x)
+{
+	return (unsigned long)&x->insn + x->insn;
+}
+static inline unsigned long
+mc_ex_insn_addr(const struct mc_exception_table_entry *x)
+{
+	return (unsigned long)&x->insn + x->insn;
+}
+static inline unsigned long
+ex_fixup_addr(const struct exception_table_entry *x)
+{
+	return (unsigned long)&x->fixup + x->fixup;
+}
+static inline unsigned long
+mc_ex_fixup_addr(const struct mc_exception_table_entry *x)
+{
+	return (unsigned long)&x->fixup + x->fixup;
+}
+static inline ex_handler_t
+ex_fixup_handler(const struct mc_exception_table_entry *x)
+{
+	return (ex_handler_t)((unsigned long)&x->handler + x->handler);
+}
+
+bool ex_handler_fault(const struct mc_exception_table_entry *fixup,
+		     struct pt_regs *regs, int trapnr)
+{
+	regs->ip = mc_ex_fixup_addr(fixup);
+	regs->ax = trapnr;
+	return true;
+}
+
+extern struct mc_exception_table_entry __start___mc_table[];
+extern struct mc_exception_table_entry __stop___mc_table[];
+
+/*
+ * This table is small, just do a linear search
+ */
+const struct mc_exception_table_entry *mc_search_extable(unsigned long value)
+{
+	const struct mc_exception_table_entry *e;
+
+	for (e = __start___mc_table; e < __stop___mc_table; e++) {
+		unsigned long addr = mc_ex_insn_addr(e);
+
+		if (addr == value)
+			return e;
+	}
+	return NULL;
+}
+
+bool ex_has_fault_handler(unsigned long ip)
+{
+	const struct mc_exception_table_entry *e;
+	ex_handler_t handler;
+
+	e = mc_search_extable(ip);
+	if (!e)
+		return false;
+	handler = ex_fixup_handler(e);
+
+	return handler == ex_handler_fault;
+}
+
+int mc_fixup_exception(struct pt_regs *regs, int trapnr)
+{
+	const struct mc_exception_table_entry *e;
+	ex_handler_t handler;
+
+	e = mc_search_extable(regs->ip);
+	if (!e)
+		return 0;
+
+	handler = ex_fixup_handler(e);
+	return handler(e, regs, trapnr);
+}
 
 int fixup_exception(struct pt_regs *regs)
 {
 	const struct exception_table_entry *fixup;
+	unsigned long new_ip;
 
 #ifdef CONFIG_PNPBIOS
 	if (unlikely(SEGMENT_IS_PNP_CODE(regs->cs))) {
@@ -23,46 +106,135 @@ int fixup_exception(struct pt_regs *regs)
 
 	fixup = search_exception_tables(regs->ip);
 	if (fixup) {
-		/* If fixup is less than 16, it means uaccess error */
-		if (fixup->fixup < 16) {
-			current_thread_info()->uaccess_err = -EFAULT;
-			regs->ip += fixup->fixup;
-			return 1;
+		new_ip = ex_fixup_addr(fixup);
+
+		if (fixup->fixup - fixup->insn >= 0x7ffffff0 - 4) {
+			/* Special hack for uaccess_err */
+			current_thread_info()->uaccess_err = 1;
+			new_ip -= 0x7ffffff0;
 		}
-		regs->ip = fixup->fixup;
+		regs->ip = new_ip;
 		return 1;
 	}
 
 	return 0;
 }
 
-#ifdef CONFIG_X86_64
+/* Restricted version used during very early boot */
+int __init early_fixup_exception(unsigned long *ip)
+{
+	const struct exception_table_entry *fixup;
+	unsigned long new_ip;
+
+	fixup = search_exception_tables(*ip);
+	if (fixup) {
+		new_ip = ex_fixup_addr(fixup);
+
+		if (fixup->fixup - fixup->insn >= 0x7ffffff0 - 4) {
+			/* uaccess handling not supported during early boot */
+			return 0;
+		}
+
+		*ip = new_ip;
+		return 1;
+	}
+
+	return 0;
+}
+
 /*
- * Need to defined our own search_extable on X86_64 to work around
- * a B stepping K8 bug.
+ * Search one exception table for an entry corresponding to the
+ * given instruction address, and return the address of the entry,
+ * or NULL if none is found.
+ * We use a binary search, and thus we assume that the table is
+ * already sorted.
  */
 const struct exception_table_entry *
 search_extable(const struct exception_table_entry *first,
 	       const struct exception_table_entry *last,
 	       unsigned long value)
 {
-	/* B stepping K8 bug */
-	if ((value >> 32) == 0)
-		value |= 0xffffffffUL << 32;
-
 	while (first <= last) {
 		const struct exception_table_entry *mid;
-		long diff;
+		unsigned long addr;
 
-		mid = (last - first) / 2 + first;
-		diff = mid->insn - value;
-		if (diff == 0)
-			return mid;
-		else if (diff < 0)
-			first = mid+1;
+		mid = ((last - first) >> 1) + first;
+		addr = ex_insn_addr(mid);
+		if (addr < value)
+			first = mid + 1;
+		else if (addr > value)
+			last = mid - 1;
 		else
-			last = mid-1;
-	}
-	return NULL;
+			return mid;
+        }
+        return NULL;
 }
-#endif
+
+/*
+ * The exception table needs to be sorted so that the binary
+ * search that we use to find entries in it works properly.
+ * This is used both for the kernel exception table and for
+ * the exception tables of modules that get loaded.
+ *
+ */
+static int cmp_ex(const void *a, const void *b)
+{
+	const struct exception_table_entry *x = a, *y = b;
+
+	/*
+	 * This value will always end up fittin in an int, because on
+	 * both i386 and x86-64 the kernel symbol-reachable address
+	 * space is < 2 GiB.
+	 *
+	 * This compare is only valid after normalization.
+	 */
+	return x->insn - y->insn;
+}
+
+void sort_extable(struct exception_table_entry *start,
+		  struct exception_table_entry *finish)
+{
+	struct exception_table_entry *p;
+	int i;
+
+	/* Convert all entries to being relative to the start of the section */
+	i = 0;
+	for (p = start; p < finish; p++) {
+		p->insn += i;
+		i += 4;
+		p->fixup += i;
+		i += 4;
+	}
+
+	sort(start, finish - start, sizeof(struct exception_table_entry),
+	     cmp_ex, NULL);
+
+	/* Denormalize all entries */
+	i = 0;
+	for (p = start; p < finish; p++) {
+		p->insn -= i;
+		i += 4;
+		p->fixup -= i;
+		i += 4;
+	}
+}
+
+#ifdef CONFIG_MODULES
+/*
+ * If the exception table is sorted, any referring to the module init
+ * will be at the beginning or the end.
+ */
+void trim_init_extable(struct module *m)
+{
+	/*trim the beginning*/
+	while (m->num_exentries &&
+	       within_module_init(ex_insn_addr(&m->extable[0]), m)) {
+		m->extable++;
+		m->num_exentries--;
+	}
+	/*trim the end*/
+	while (m->num_exentries &&
+	       within_module_init(ex_insn_addr(&m->extable[m->num_exentries-1]), m))
+		m->num_exentries--;
+}
+#endif /* CONFIG_MODULES */

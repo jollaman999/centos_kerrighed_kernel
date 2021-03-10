@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0+ */
 /*
  * ipmi_smi.h
  *
@@ -9,26 +10,6 @@
  *
  * Copyright 2002 MontaVista Software Inc.
  *
- *  This program is free software; you can redistribute it and/or modify it
- *  under the terms of the GNU General Public License as published by the
- *  Free Software Foundation; either version 2 of the License, or (at your
- *  option) any later version.
- *
- *
- *  THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
- *  WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- *  MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
- *  IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
- *  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
- *  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
- *  OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- *  ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR
- *  TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE
- *  USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- *
- *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #ifndef __LINUX_IPMI_SMI_H
@@ -36,9 +17,10 @@
 
 #include <linux/ipmi_msgdefs.h>
 #include <linux/proc_fs.h>
-#include <linux/module.h>
-#include <linux/device.h>
 #include <linux/platform_device.h>
+#include <linux/ipmi.h>
+
+struct device;
 
 /* This files describes the interface for IPMI system management interface
    drivers to bind into the IPMI message handler. */
@@ -85,6 +67,13 @@ struct ipmi_smi_handlers {
 	   this call. */
 	int (*start_processing)(void       *send_info,
 				ipmi_smi_t new_intf);
+
+	/*
+	 * Get the detailed private info of the low level interface and store
+	 * it into the structure of ipmi_smi_data. For example: the
+	 * ACPI device handle will be returned for the pnp_acpi IPMI device.
+	 */
+	int (*get_smi_info)(void *send_info, struct ipmi_smi_info *data);
 
 	/* Called to enqueue an SMI message to be sent.  This
 	   operation is not allowed to fail.  If an error occurs, it
@@ -143,18 +132,17 @@ struct ipmi_shadow_smi_handlers {
 	 * ----------------------------------------------------------
 	 */
 
-	/* Get the detailed private info of the low level interface and store
-	 * it into the structure of ipmi_smi_data. For example: the
-	 * ACPI device handle will be returned for the pnp_acpi IPMI device.
-	 */
-	int (*get_smi_info)(void *send_info, struct ipmi_smi_info *data);
-
 	/* Called by the upper layer when some user requires that the
 	   interface watch for events, received messages, watchdog
 	   pretimeouts, or not.  Used by the SMI to know if it should
 	   watch for these.  This may be NULL if the SMI does not
 	   implement it. */
 	void (*set_need_watch)(void *send_info, int enable);
+
+	/*
+	 * Called when flushing all pending messages.
+	 */
+	void (*flush_messages)(void *send_info);
 };
 
 struct ipmi_shadow_smi_handlers *ipmi_get_shadow_smi_handlers(void);
@@ -175,27 +163,27 @@ struct ipmi_device_id {
 #define ipmi_version_major(v) ((v)->ipmi_version & 0xf)
 #define ipmi_version_minor(v) ((v)->ipmi_version >> 4)
 
-/* Take a pointer to a raw data buffer and a length and extract device
-   id information from it.  The first byte of data must point to the
-   netfn << 2, the data should be of the format:
-      netfn << 2, cmd, completion code, data
-   as normally comes from a device interface. */
-static inline int ipmi_demangle_device_id(const unsigned char *data,
+/* Take a pointer to an IPMI response and extract device id information from
+ * it. @netfn is in the IPMI_NETFN_ format, so may need to be shifted from
+ * a SI response.
+ */
+static inline int ipmi_demangle_device_id(uint8_t netfn, uint8_t cmd,
+					  const unsigned char *data,
 					  unsigned int data_len,
 					  struct ipmi_device_id *id)
 {
-	if (data_len < 9)
+	if (data_len < 7)
 		return -EINVAL;
-	if (data[0] != IPMI_NETFN_APP_RESPONSE << 2 ||
-	    data[1] != IPMI_GET_DEVICE_ID_CMD)
+	if (netfn != IPMI_NETFN_APP_RESPONSE || cmd != IPMI_GET_DEVICE_ID_CMD)
 		/* Strange, didn't get the response we expected. */
 		return -EINVAL;
-	if (data[2] != 0)
+	if (data[0] != 0)
 		/* That's odd, it shouldn't be able to fail. */
 		return -EINVAL;
 
-	data += 3;
-	data_len -= 3;
+	data++;
+	data_len--;
+
 	id->device_id = data[0];
 	id->device_revision = data[1];
 	id->firmware_revision_1 = data[2];
@@ -239,13 +227,8 @@ int ipmi_register_smi(struct ipmi_smi_handlers *handlers,
 int ipmi_unregister_smi(ipmi_smi_t intf);
 
 /*
- * Indicate to the IPMI driver that probing has been completed
- */
-void ipmi_smi_probe_complete(void);
-
-/*
  * The lower layer reports received messages through this interface.
- * The data_size should be zero if this is an asyncronous message.  If
+ * The data_size should be zero if this is an asynchronous message.  If
  * the lower layer gets an error sending a message, it should format
  * an error response in the message response.
  */
@@ -261,11 +244,13 @@ static inline void ipmi_free_smi_msg(struct ipmi_smi_msg *msg)
 	msg->done(msg);
 }
 
+#ifdef CONFIG_IPMI_PROC_INTERFACE
 /* Allow the lower layer to add things to the proc filesystem
    directory for this interface.  Note that the entry will
    automatically be dstroyed when the interface is destroyed. */
 int ipmi_smi_add_proc_entry(ipmi_smi_t smi, char *name,
-			    read_proc_t *read_proc,
+			    const struct file_operations *proc_ops,
 			    void *data);
+#endif
 
 #endif /* __LINUX_IPMI_SMI_H */

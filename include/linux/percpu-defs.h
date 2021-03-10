@@ -2,16 +2,10 @@
 #define _LINUX_PERCPU_DEFS_H
 
 #ifdef CONFIG_PAGE_TABLE_ISOLATION
-#define USER_MAPPED_SECTION ".user_mapped"
+#define USER_MAPPED_SECTION "..user_mapped"
 #else
 #define USER_MAPPED_SECTION ""
 #endif
-
-/*
- * Determine the real variable name from the name visible in the
- * kernel sources.
- */
-#define per_cpu_var(var) per_cpu__##var
 
 /*
  * Base implementations of per-CPU variable declarations and definitions, where
@@ -24,11 +18,24 @@
  * that section.
  */
 #define __PCPU_ATTRS(sec)						\
-	__attribute__((section(PER_CPU_BASE_SECTION sec)))		\
+	__percpu __attribute__((section(PER_CPU_BASE_SECTION sec)))	\
 	PER_CPU_ATTRIBUTES
 
 #define __PCPU_DUMMY_ATTRS						\
 	__attribute__((section(".discard"), unused))
+
+/*
+ * Macro which verifies @ptr is a percpu pointer without evaluating
+ * @ptr.  This is to be used in percpu accessors to verify that the
+ * input parameter is a percpu pointer.
+ *
+ * + 0 is required in order to convert the pointer type from a
+ * potential array type to a pointer to a single item of the array.
+ */
+#define __verify_pcpu_ptr(ptr)	do {					\
+	const void __percpu *__vpp_verify = (typeof((ptr) + 0))NULL;	\
+	(void)__vpp_verify;						\
+} while (0)
 
 /*
  * s390 and alpha modules require percpu variables to be defined as
@@ -62,23 +69,24 @@
  */
 #define DECLARE_PER_CPU_SECTION(type, name, sec)			\
 	extern __PCPU_DUMMY_ATTRS char __pcpu_scope_##name;		\
-	extern __PCPU_ATTRS(sec) __typeof__(type) per_cpu__##name
+	extern __PCPU_ATTRS(sec) __typeof__(type) name
 
 #define DEFINE_PER_CPU_SECTION(type, name, sec)				\
 	__PCPU_DUMMY_ATTRS char __pcpu_scope_##name;			\
+	extern __PCPU_DUMMY_ATTRS char __pcpu_unique_##name;		\
 	__PCPU_DUMMY_ATTRS char __pcpu_unique_##name;			\
 	__PCPU_ATTRS(sec) PER_CPU_DEF_ATTRIBUTES __weak			\
-	__typeof__(type) per_cpu__##name
+	__typeof__(type) name
 #else
 /*
  * Normal declaration and definition macros.
  */
 #define DECLARE_PER_CPU_SECTION(type, name, sec)			\
-	extern __PCPU_ATTRS(sec) __typeof__(type) per_cpu__##name
+	extern __PCPU_ATTRS(sec) __typeof__(type) name
 
 #define DEFINE_PER_CPU_SECTION(type, name, sec)				\
 	__PCPU_ATTRS(sec) PER_CPU_DEF_ATTRIBUTES			\
-	__typeof__(type) per_cpu__##name
+	__typeof__(type) name
 #endif
 
 /*
@@ -146,28 +154,58 @@
  * Declaration/definition used for per-CPU variables that must be page aligned.
  */
 #define DECLARE_PER_CPU_PAGE_ALIGNED(type, name)			\
-	DECLARE_PER_CPU_SECTION(type, name, ".page_aligned")		\
+	DECLARE_PER_CPU_SECTION(type, name, "..page_aligned")		\
 	__aligned(PAGE_SIZE)
 
 #define DEFINE_PER_CPU_PAGE_ALIGNED(type, name)				\
-	DEFINE_PER_CPU_SECTION(type, name, ".page_aligned")		\
+	DEFINE_PER_CPU_SECTION(type, name, "..page_aligned")		\
 	__aligned(PAGE_SIZE)
 /*
  * Declaration/definition used for per-CPU variables that must be page aligned and need to be mapped in user mode.
  */
 #define DECLARE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(type, name)		\
-	DECLARE_PER_CPU_SECTION(type, name, USER_MAPPED_SECTION".page_aligned") \
+	DECLARE_PER_CPU_SECTION(type, name, USER_MAPPED_SECTION"..page_aligned") \
 	__aligned(PAGE_SIZE)
 
 #define DEFINE_PER_CPU_PAGE_ALIGNED_USER_MAPPED(type, name)		\
-	DEFINE_PER_CPU_SECTION(type, name, USER_MAPPED_SECTION".page_aligned") \
+	DEFINE_PER_CPU_SECTION(type, name, USER_MAPPED_SECTION"..page_aligned") \
 	__aligned(PAGE_SIZE)
 
 /*
- * Intermodule exports for per-CPU variables.
+ * Declaration/definition used for per-CPU variables that must be read mostly.
  */
-#define EXPORT_PER_CPU_SYMBOL(var) EXPORT_SYMBOL(per_cpu__##var)
-#define EXPORT_PER_CPU_SYMBOL_GPL(var) EXPORT_SYMBOL_GPL(per_cpu__##var)
+#define DECLARE_PER_CPU_READ_MOSTLY(type, name)			\
+	DECLARE_PER_CPU_SECTION(type, name, "..readmostly")
 
+#define DEFINE_PER_CPU_READ_MOSTLY(type, name)				\
+	DEFINE_PER_CPU_SECTION(type, name, "..readmostly")
+
+/*
+ * Declaration/definition used for per-CPU variables that should be accessed
+ * as decrypted when memory encryption is enabled in the guest.
+ */
+#if defined(CONFIG_VIRTUALIZATION) && defined(CONFIG_AMD_MEM_ENCRYPT)
+
+#define DECLARE_PER_CPU_DECRYPTED(type, name)				\
+	DECLARE_PER_CPU_SECTION(type, name, "..decrypted")
+
+#define DEFINE_PER_CPU_DECRYPTED(type, name)				\
+	DEFINE_PER_CPU_SECTION(type, name, "..decrypted")
+#else
+#define DEFINE_PER_CPU_DECRYPTED(type, name)	DEFINE_PER_CPU(type, name)
+#endif
+
+/*
+ * Intermodule exports for per-CPU variables.  sparse forgets about
+ * address space across EXPORT_SYMBOL(), change EXPORT_SYMBOL() to
+ * noop if __CHECKER__.
+ */
+#ifndef __CHECKER__
+#define EXPORT_PER_CPU_SYMBOL(var) EXPORT_SYMBOL(var)
+#define EXPORT_PER_CPU_SYMBOL_GPL(var) EXPORT_SYMBOL_GPL(var)
+#else
+#define EXPORT_PER_CPU_SYMBOL(var)
+#define EXPORT_PER_CPU_SYMBOL_GPL(var)
+#endif
 
 #endif /* _LINUX_PERCPU_DEFS_H */

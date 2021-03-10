@@ -18,7 +18,7 @@
  *
  * Copyright (C) IBM Corporation, 2004
  *
- * Author: Max Asböck <amax@us.ibm.com>
+ * Author: Max AsbÃ¶ck <amax@us.ibm.com>
  *
  */
 
@@ -211,7 +211,7 @@ void ibmasmfs_unregister(void);
 void ibmasmfs_add_sp(struct service_processor *sp);
 
 /* uart */
-#ifdef CONFIG_SERIAL_8250
+#if IS_ENABLED(CONFIG_SERIAL_8250)
 void ibmasm_register_uart(struct service_processor *sp);
 void ibmasm_unregister_uart(struct service_processor *sp);
 #else

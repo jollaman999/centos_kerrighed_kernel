@@ -1,6 +1,6 @@
 #include <linux/module.h>
-#include <linux/uaccess.h>
 #include <asm/alternative.h>
+#include <asm/facility.h>
 #include <asm/nospec-branch.h>
 
 #define MAX_PATCH_LEN (255 - 1)
@@ -61,17 +61,10 @@ static void __init_or_module add_padding(void *insns, unsigned int len)
 static void __init_or_module __apply_alternatives(struct alt_instr *start,
 						  struct alt_instr *end)
 {
-	unsigned long long facility_bits[2];
-	int nr_facilities;
 	struct alt_instr *a;
 	u8 *instr, *replacement;
 	u8 insnbuf[MAX_PATCH_LEN];
 
-	nr_facilities = min(stfle(facility_bits, 2), 2) * BITS_PER_LONG;
-	if (gmb_flag == 0)	/* Clear facility bit 81 */
-		facility_bits[1] &= ~(1ULL << 46);
-	if (nobp_flag == 0)	/* Clear facility bit 82 */
-		facility_bits[1] &= ~(1ULL << 45);
 	/*
 	 * The scan order should be from start to end. A later scanned
 	 * alternative code can overwrite previously scanned alternative code.
@@ -82,9 +75,8 @@ static void __init_or_module __apply_alternatives(struct alt_instr *start,
 		instr = (u8 *)&a->instr_offset + a->instr_offset;
 		replacement = (u8 *)&a->repl_offset + a->repl_offset;
 
-		if (a->facility >= nr_facilities ||
-		    !(((unsigned char *) facility_bits)[a->facility >> 3] &
-		      (0x80 >> (a->facility & 7))))
+		if (!__test_facility(a->facility,
+				     S390_lowcore.alt_stfle_fac_list))
 			continue;
 
 		if (unlikely(a->instrlen % 2 || a->replacementlen % 2)) {

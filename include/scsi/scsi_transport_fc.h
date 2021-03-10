@@ -28,6 +28,7 @@
 #define SCSI_TRANSPORT_FC_H
 
 #include <linux/sched.h>
+#include <asm/unaligned.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_netlink.h>
 
@@ -136,6 +137,8 @@ enum fc_vport_state {
 #define FC_PORTSPEED_50GBIT		0x200
 #define FC_PORTSPEED_100GBIT		0x400
 #define FC_PORTSPEED_25GBIT		0x800
+#define FC_PORTSPEED_64GBIT		0x1000
+#define FC_PORTSPEED_128GBIT		0x2000
 #define FC_PORTSPEED_NOT_NEGOTIATED	(1 << 15) /* Speed not established */
 
 /*
@@ -159,6 +162,10 @@ enum fc_tgtid_binding_type  {
 #define FC_PORT_ROLE_FCP_TARGET			0x01
 #define FC_PORT_ROLE_FCP_INITIATOR		0x02
 #define FC_PORT_ROLE_IP_PORT			0x04
+#define FC_PORT_ROLE_FCP_DUMMY_INITIATOR	0x08
+#define FC_PORT_ROLE_NVME_INITIATOR		0x10
+#define FC_PORT_ROLE_NVME_TARGET		0x20
+#define FC_PORT_ROLE_NVME_DISCOVERY		0x40
 
 /* The following are for compatibility */
 #define FC_RPORT_ROLE_UNKNOWN			FC_PORT_ROLE_UNKNOWN
@@ -198,9 +205,9 @@ struct fc_vport_identifiers {
  *
  * This structure exists for each FC port is a virtual FC port. Virtual
  * ports share the physical link with the Physical port. Each virtual
- * ports has a unique presense on the SAN, and may be instantiated via
+ * ports has a unique presence on the SAN, and may be instantiated via
  * NPIV, Virtual Fabrics, or via additional ALPAs. As the vport is a
- * unique presense, each vport has it's own view of the fabric,
+ * unique presence, each vport has it's own view of the fabric,
  * authentication privilege, and priorities.
  *
  * A virtual port may support 1 or more FC4 roles. Typically it is a
@@ -358,9 +365,6 @@ struct fc_rport {	/* aka fc_starget_attrs */
  	struct work_struct stgt_delete_work;
 	struct work_struct rport_delete_work;
 	struct request_queue *rqst_q;	/* bsg support */
-#ifndef __GENKSYMS__
-	struct work_struct rport_terminate_io_work;
-#endif
 } __attribute__((aligned(sizeof(unsigned long))));
 
 /* bit field values for struct fc_rport "flags" field: */
@@ -379,7 +383,7 @@ struct fc_rport {	/* aka fc_starget_attrs */
 /*
  * FC SCSI Target Attributes
  *
- * The SCSI Target is considered an extention of a remote port (as
+ * The SCSI Target is considered an extension of a remote port (as
  * a remote port can be more than a SCSI Target). Within the scsi
  * subsystem, we leave the Target as a separate entity. Doing so
  * provides backward compatibility with prior FC transport api's,
@@ -435,6 +439,18 @@ struct fc_host_statistics {
 	u64 fcp_control_requests;
 	u64 fcp_input_megabytes;
 	u64 fcp_output_megabytes;
+	u64 fcp_packet_alloc_failures;	/* fcp packet allocation failures */
+	u64 fcp_packet_aborts;		/* fcp packet aborted */
+	u64 fcp_frame_alloc_failures;	/* fcp frame allocation failures */
+
+	/* fc exches statistics */
+	u64 fc_no_free_exch;		/* no free exch memory */
+	u64 fc_no_free_exch_xid;	/* no free exch id */
+	u64 fc_xid_not_found;		/* exch not found for a response */
+	u64 fc_xid_busy;		/* exch exist for new a request */
+	u64 fc_seq_not_found;		/* seq is not found for exchange */
+	u64 fc_non_bls_resp;		/* a non BLS response frame with
+					   a sequence responder in new exch */
 };
 
 
@@ -495,6 +511,13 @@ struct fc_host_attrs {
 	u32 maxframe_size;
 	u16 max_npiv_vports;
 	char serial_number[FC_SERIAL_NUMBER_SIZE];
+	char manufacturer[FC_SERIAL_NUMBER_SIZE];
+	char model[FC_SYMBOLIC_NAME_SIZE];
+	char model_description[FC_SYMBOLIC_NAME_SIZE];
+	char hardware_version[FC_VERSION_STRING_SIZE];
+	char driver_version[FC_VERSION_STRING_SIZE];
+	char firmware_version[FC_VERSION_STRING_SIZE];
+	char optionrom_version[FC_VERSION_STRING_SIZE];
 
 	/* Dynamic Attributes */
 	u32 port_id;
@@ -527,15 +550,6 @@ struct fc_host_attrs {
 
 	/* bsg support */
 	struct request_queue *rqst_q;
-#ifndef __GENKSYMS__
-	char manufacturer[FC_SERIAL_NUMBER_SIZE];
-	char model[FC_SYMBOLIC_NAME_SIZE];
-	char model_description[FC_SYMBOLIC_NAME_SIZE];
-	char hardware_version[FC_VERSION_STRING_SIZE];
-	char driver_version[FC_VERSION_STRING_SIZE];
-	char firmware_version[FC_VERSION_STRING_SIZE];
-	char optionrom_version[FC_VERSION_STRING_SIZE];
-#endif
 };
 
 #define shost_to_fc_host(x) \
@@ -732,6 +746,13 @@ struct fc_function_template {
 	unsigned long	show_host_supported_speeds:1;
 	unsigned long	show_host_maxframe_size:1;
 	unsigned long	show_host_serial_number:1;
+	unsigned long	show_host_manufacturer:1;
+	unsigned long	show_host_model:1;
+	unsigned long	show_host_model_description:1;
+	unsigned long	show_host_hardware_version:1;
+	unsigned long	show_host_driver_version:1;
+	unsigned long	show_host_firmware_version:1;
+	unsigned long	show_host_optionrom_version:1;
 	/* host dynamic attributes */
 	unsigned long	show_host_port_id:1;
 	unsigned long	show_host_port_type:1;
@@ -743,20 +764,6 @@ struct fc_function_template {
 	unsigned long	show_host_system_hostname:1;
 
 	unsigned long	disable_target_scan:1;
-#ifndef __GENKSYMS__
-	/* Note: These belong in the fixed attr. area above
-	 * We move them down here to accomodate abi.  Note that
-	 * we can only do this because there are leftover bits
-	 * in the unsigned long area that these go in
-	 */
-	unsigned long	show_host_manufacturer:1;
-	unsigned long	show_host_model:1;
-	unsigned long	show_host_model_description:1;
-	unsigned long	show_host_hardware_version:1;
-	unsigned long	show_host_driver_version:1;
-	unsigned long	show_host_firmware_version:1;
-	unsigned long	show_host_optionrom_version:1;
-#endif
 };
 
 
@@ -797,22 +804,12 @@ fc_remote_port_chkready(struct fc_rport *rport)
 
 static inline u64 wwn_to_u64(u8 *wwn)
 {
-	return (u64)wwn[0] << 56 | (u64)wwn[1] << 48 |
-	    (u64)wwn[2] << 40 | (u64)wwn[3] << 32 |
-	    (u64)wwn[4] << 24 | (u64)wwn[5] << 16 |
-	    (u64)wwn[6] <<  8 | (u64)wwn[7];
+	return get_unaligned_be64(wwn);
 }
 
 static inline void u64_to_wwn(u64 inm, u8 *wwn)
 {
-	wwn[0] = (inm >> 56) & 0xff;
-	wwn[1] = (inm >> 48) & 0xff;
-	wwn[2] = (inm >> 40) & 0xff;
-	wwn[3] = (inm >> 32) & 0xff;
-	wwn[4] = (inm >> 24) & 0xff;
-	wwn[5] = (inm >> 16) & 0xff;
-	wwn[6] = (inm >> 8) & 0xff;
-	wwn[7] = inm & 0xff;
+	put_unaligned_be64(inm, wwn);
 }
 
 /**

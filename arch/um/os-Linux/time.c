@@ -8,11 +8,9 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/time.h>
-#include "kern_constants.h"
-#include "kern_util.h"
-#include "os.h"
-#include "process.h"
-#include "user.h"
+#include <kern_util.h>
+#include <os.h>
+#include "internal.h"
 
 int set_interval(void)
 {
@@ -60,7 +58,7 @@ static inline long long timeval_to_ns(const struct timeval *tv)
 long long disable_timer(void)
 {
 	struct itimerval time = ((struct itimerval) { { 0, 0 }, { 0, 0 } });
-	int remain, max = UM_NSEC_PER_SEC / UM_HZ;
+	long long remain, max = UM_NSEC_PER_SEC / UM_HZ;
 
 	if (setitimer(ITIMER_VIRTUAL, &time, &time) < 0)
 		printk(UM_KERN_ERR "disable_timer - setitimer failed, "
@@ -81,7 +79,7 @@ long long os_nsecs(void)
 	return timeval_to_ns(&tv);
 }
 
-#ifdef UML_CONFIG_NO_HZ
+#ifdef UML_CONFIG_NO_HZ_COMMON
 static int after_sleep_interval(struct timespec *ts)
 {
 	return 0;
@@ -89,7 +87,7 @@ static int after_sleep_interval(struct timespec *ts)
 
 static void deliver_alarm(void)
 {
-	alarm_handler(SIGVTALRM, NULL);
+	alarm_handler(SIGVTALRM, NULL, NULL);
 }
 
 static unsigned long long sleep_time(unsigned long long nsecs)
@@ -116,7 +114,7 @@ static void deliver_alarm(void)
 	skew += this_tick - last_tick;
 
 	while (skew >= one_tick) {
-		alarm_handler(SIGVTALRM, NULL);
+		alarm_handler(SIGVTALRM, NULL, NULL);
 		skew -= one_tick;
 	}
 

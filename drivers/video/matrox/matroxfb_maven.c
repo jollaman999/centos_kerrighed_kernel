@@ -17,6 +17,7 @@
 #include "matroxfb_DAC1064.h"
 #include <linux/i2c.h>
 #include <linux/matroxfb.h>
+#include <linux/slab.h>
 #include <asm/div64.h>
 
 #define MGATVO_B	1
@@ -136,8 +137,20 @@ static int* get_ctrl_ptr(struct maven_data* md, int idx) {
 
 static int maven_get_reg(struct i2c_client* c, char reg) {
 	char dst;
-	struct i2c_msg msgs[] = {{ c->addr, I2C_M_REV_DIR_ADDR, sizeof(reg), &reg },
-				 { c->addr, I2C_M_RD | I2C_M_NOSTART, sizeof(dst), &dst }};
+	struct i2c_msg msgs[] = {
+		{
+			.addr = c->addr,
+			.flags = I2C_M_REV_DIR_ADDR,
+			.len = sizeof(reg),
+			.buf = &reg
+		},
+		{
+			.addr = c->addr,
+			.flags = I2C_M_RD | I2C_M_NOSTART,
+			.len = sizeof(dst),
+			.buf = &dst
+		}
+	};
 	s32 err;
 
 	err = i2c_transfer(c->adapter, msgs, 2);
@@ -279,7 +292,7 @@ static int matroxfb_PLL_mavenclock(const struct matrox_pll_features2* pll,
 	return fxtal * (*feed) / (*in) * ctl->den;
 }
 
-static unsigned int matroxfb_mavenclock(const struct matrox_pll_ctl* ctl,
+static int matroxfb_mavenclock(const struct matrox_pll_ctl *ctl,
 		unsigned int htotal, unsigned int vtotal,
 		unsigned int* in, unsigned int* feed, unsigned int* post,
 		unsigned int* htotal2) {
@@ -1242,6 +1255,7 @@ static int maven_probe(struct i2c_client *client,
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_WRITE_WORD_DATA |
 					      I2C_FUNC_SMBUS_BYTE_DATA |
+					      I2C_FUNC_NOSTART |
 					      I2C_FUNC_PROTOCOL_MANGLING))
 		goto ERROR0;
 	if (!(data = kzalloc(sizeof(*data), GFP_KERNEL))) {

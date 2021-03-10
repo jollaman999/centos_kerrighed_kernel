@@ -38,15 +38,15 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter_ipv6.h>
+#include <linux/slab.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/skbuff.h>
 #include <linux/xfrm.h>
-#include <linux/nospec.h>
 #include <net/xfrm.h>
 #include <net/checksum.h>
 #include <net/udp.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 
 #include "avc.h"
 #include "objsec.h"
@@ -112,7 +112,7 @@ int selinux_xfrm_policy_lookup(struct xfrm_sec_ctx *ctx, u32 fl_secid, u8 dir)
  */
 
 int selinux_xfrm_state_pol_flow_match(struct xfrm_state *x, struct xfrm_policy *xp,
-			struct flowi *fl)
+			const struct flowi *fl)
 {
 	u32 state_sid;
 	int rc;
@@ -135,10 +135,10 @@ int selinux_xfrm_state_pol_flow_match(struct xfrm_state *x, struct xfrm_policy *
 
 	state_sid = x->security->ctx_sid;
 
-	if (fl->secid != state_sid)
+	if (fl->flowi_secid != state_sid)
 		return 0;
 
-	rc = avc_has_perm(fl->secid, state_sid, SECCLASS_ASSOCIATION,
+	rc = avc_has_perm(fl->flowi_secid, state_sid, SECCLASS_ASSOCIATION,
 			  ASSOCIATION__SENDTO,
 			  NULL)? 0:1;
 
@@ -239,13 +239,12 @@ static int selinux_xfrm_sec_ctx_alloc(struct xfrm_sec_ctx **ctxp,
 	if (!uctx)
 		goto not_from_user;
 
-	if (uctx->ctx_doi != XFRM_SC_ALG_SELINUX)
+	if (uctx->ctx_alg != XFRM_SC_ALG_SELINUX)
 		return -EINVAL;
 
 	str_len = uctx->ctx_len;
 	if (str_len >= PAGE_SIZE)
 		return -ENOMEM;
-	str_len = array_index_nospec(str_len, PAGE_SIZE);
 
 	*ctxp = ctx = kmalloc(sizeof(*ctx) +
 			      str_len + 1,
@@ -342,12 +341,13 @@ int selinux_xfrm_policy_clone(struct xfrm_sec_ctx *old_ctx,
 
 	if (old_ctx) {
 		new_ctx = kmalloc(sizeof(*old_ctx) + old_ctx->ctx_len,
-				  GFP_KERNEL);
+				  GFP_ATOMIC);
 		if (!new_ctx)
 			return -ENOMEM;
 
 		memcpy(new_ctx, old_ctx, sizeof(*new_ctx));
 		memcpy(new_ctx->ctx_str, old_ctx->ctx_str, new_ctx->ctx_len);
+		atomic_inc(&selinux_xfrm_refcount);
 		*new_ctxp = new_ctx;
 	}
 	return 0;
@@ -358,6 +358,7 @@ int selinux_xfrm_policy_clone(struct xfrm_sec_ctx *old_ctx,
  */
 void selinux_xfrm_policy_free(struct xfrm_sec_ctx *ctx)
 {
+	atomic_dec(&selinux_xfrm_refcount);
 	kfree(ctx);
 }
 
@@ -367,17 +368,13 @@ void selinux_xfrm_policy_free(struct xfrm_sec_ctx *ctx)
 int selinux_xfrm_policy_delete(struct xfrm_sec_ctx *ctx)
 {
 	const struct task_security_struct *tsec = current_security();
-	int rc = 0;
 
-	if (ctx) {
-		rc = avc_has_perm(tsec->sid, ctx->ctx_sid,
-				  SECCLASS_ASSOCIATION,
-				  ASSOCIATION__SETCONTEXT, NULL);
-		if (rc == 0)
-			atomic_dec(&selinux_xfrm_refcount);
-	}
+	if (!ctx)
+		return 0;
 
-	return rc;
+	return avc_has_perm(tsec->sid, ctx->ctx_sid,
+			    SECCLASS_ASSOCIATION, ASSOCIATION__SETCONTEXT,
+			    NULL);
 }
 
 /*
@@ -402,8 +399,8 @@ int selinux_xfrm_state_alloc(struct xfrm_state *x, struct xfrm_user_sec_ctx *uct
  */
 void selinux_xfrm_state_free(struct xfrm_state *x)
 {
-	struct xfrm_sec_ctx *ctx = x->security;
-	kfree(ctx);
+	atomic_dec(&selinux_xfrm_refcount);
+	kfree(x->security);
 }
 
  /*
@@ -413,17 +410,13 @@ int selinux_xfrm_state_delete(struct xfrm_state *x)
 {
 	const struct task_security_struct *tsec = current_security();
 	struct xfrm_sec_ctx *ctx = x->security;
-	int rc = 0;
 
-	if (ctx) {
-		rc = avc_has_perm(tsec->sid, ctx->ctx_sid,
-				  SECCLASS_ASSOCIATION,
-				  ASSOCIATION__SETCONTEXT, NULL);
-		if (rc == 0)
-			atomic_dec(&selinux_xfrm_refcount);
-	}
+	if (!ctx)
+		return 0;
 
-	return rc;
+	return avc_has_perm(tsec->sid, ctx->ctx_sid,
+			    SECCLASS_ASSOCIATION, ASSOCIATION__SETCONTEXT,
+			    NULL);
 }
 
 /*

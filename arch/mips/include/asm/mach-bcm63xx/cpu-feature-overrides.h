@@ -24,7 +24,7 @@
 #define cpu_has_smartmips		0
 #define cpu_has_vtag_icache		0
 
-#if !defined(BCMCPU_RUNTIME_DETECT) && (defined(CONFIG_BCMCPU_IS_6348) || defined(CONFIG_CPU_IS_6338) || defined(CONFIG_CPU_IS_BCM6345))
+#if !defined(BCMCPU_RUNTIME_DETECT) && (defined(CONFIG_BCM63XX_CPU_6348) || defined(CONFIG_BCM63XX_CPU_6345) || defined(CONFIG_BCM63XX_CPU_6338))
 #define cpu_has_dc_aliases		0
 #endif
 
@@ -37,6 +37,7 @@
 #define cpu_has_mips64r2		0
 
 #define cpu_has_dsp			0
+#define cpu_has_dsp2			0
 #define cpu_has_mipsmt			0
 #define cpu_has_userlocal		0
 

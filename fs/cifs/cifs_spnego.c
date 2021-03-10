@@ -20,6 +20,7 @@
  */
 
 #include <linux/list.h>
+#include <linux/slab.h>
 #include <linux/string.h>
 #include <keys/user-type.h>
 #include <linux/key-type.h>
@@ -33,18 +34,17 @@ static const struct cred *spnego_cred;
 
 /* create a new cifs key */
 static int
-cifs_spnego_key_instantiate(struct key *key, const void *data, size_t datalen)
+cifs_spnego_key_instantiate(struct key *key, struct key_preparsed_payload *prep)
 {
 	char *payload;
 	int ret;
 
 	ret = -ENOMEM;
-	payload = kmalloc(datalen, GFP_KERNEL);
+	payload = kmemdup(prep->data, prep->datalen, GFP_KERNEL);
 	if (!payload)
 		goto error;
 
 	/* attach the data */
-	memcpy(payload, data, datalen);
 	key->payload.data = payload;
 	ret = 0;
 
@@ -116,8 +116,10 @@ cifs_get_spnego_key(struct cifs_ses *sesInfo)
 		   MAX_MECH_STR_LEN +
 		   UID_KEY_LEN + (sizeof(uid_t) * 2) +
 		   CREDUID_KEY_LEN + (sizeof(uid_t) * 2) +
-		   USER_KEY_LEN + strlen(sesInfo->user_name) +
 		   PID_KEY_LEN + (sizeof(pid_t) * 2) + 1;
+
+	if (sesInfo->user_name)
+		desc_len += USER_KEY_LEN + strlen(sesInfo->user_name);
 
 	spnego_key = ERR_PTR(-ENOMEM);
 	description = kzalloc(desc_len, GFP_KERNEL);
@@ -146,22 +148,28 @@ cifs_get_spnego_key(struct cifs_ses *sesInfo)
 		sprintf(dp, ";sec=krb5");
 	else if (server->sec_mskerberos)
 		sprintf(dp, ";sec=mskrb5");
-	else
-		goto out;
+	else {
+		cifs_dbg(VFS, "unknown or missing server auth type, use krb5\n");
+		sprintf(dp, ";sec=krb5");
+	}
 
 	dp = description + strlen(description);
-	sprintf(dp, ";uid=0x%x", sesInfo->linux_uid);
+	sprintf(dp, ";uid=0x%x",
+		from_kuid_munged(&init_user_ns, sesInfo->linux_uid));
 
 	dp = description + strlen(description);
-	sprintf(dp, ";creduid=0x%x", sesInfo->cred_uid);
+	sprintf(dp, ";creduid=0x%x",
+		from_kuid_munged(&init_user_ns, sesInfo->cred_uid));
 
-	dp = description + strlen(description);
-	sprintf(dp, ";user=%s", sesInfo->user_name);
+	if (sesInfo->user_name) {
+		dp = description + strlen(description);
+		sprintf(dp, ";user=%s", sesInfo->user_name);
+	}
 
 	dp = description + strlen(description);
 	sprintf(dp, ";pid=0x%x", current->pid);
 
-	cFYI(1, "key description = %s", description);
+	cifs_dbg(FYI, "key description = %s\n", description);
 	saved_cred = override_creds(spnego_cred);
 	spnego_key = request_key(&cifs_spnego_key_type, description, "");
 	revert_creds(saved_cred);
@@ -186,7 +194,8 @@ init_cifs_spnego(void)
 	struct key *keyring;
 	int ret;
 
-	cFYI(1, "Registering the %s key type", cifs_spnego_key_type.name);
+	cifs_dbg(FYI, "Registering the %s key type\n",
+		 cifs_spnego_key_type.name);
 
 	/*
 	 * Create an override credential set with special thread keyring for
@@ -197,7 +206,8 @@ init_cifs_spnego(void)
 	if (!cred)
 		return -ENOMEM;
 
-	keyring = keyring_alloc(".cifs.spnego", 0, 0, cred,
+	keyring = keyring_alloc(".cifs_spnego",
+				GLOBAL_ROOT_UID, GLOBAL_ROOT_GID, cred,
 				(KEY_POS_ALL & ~KEY_POS_SETATTR) |
 				KEY_USR_VIEW | KEY_USR_READ,
 				KEY_ALLOC_NOT_IN_QUOTA, NULL);
@@ -219,7 +229,7 @@ init_cifs_spnego(void)
 	cred->jit_keyring = KEY_REQKEY_DEFL_THREAD_KEYRING;
 	spnego_cred = cred;
 
-	cFYI(1, "cifs spnego keyring: %d", key_serial(keyring));
+	cifs_dbg(FYI, "cifs spnego keyring: %d\n", key_serial(keyring));
 	return 0;
 
 failed_put_key:
@@ -235,5 +245,5 @@ exit_cifs_spnego(void)
 	key_revoke(spnego_cred->thread_keyring);
 	unregister_key_type(&cifs_spnego_key_type);
 	put_cred(spnego_cred);
-	cFYI(1, "Unregistered %s key type", cifs_spnego_key_type.name);
+	cifs_dbg(FYI, "Unregistered %s key type\n", cifs_spnego_key_type.name);
 }

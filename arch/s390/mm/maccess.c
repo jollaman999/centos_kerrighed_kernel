@@ -14,7 +14,7 @@
 #include <linux/gfp.h>
 #include <linux/cpu.h>
 #include <linux/export.h>
-#include <asm/system.h>
+#include <asm/ctl_reg.h>
 
 /*
  * This function writes to kernel memory bypassing DAT and possible
@@ -22,7 +22,7 @@
  * using the stura instruction.
  * Returns the number of bytes copied or -EFAULT.
  */
-static long probe_kernel_write_odd(void *dst, void *src, size_t size)
+static long probe_kernel_write_odd(void *dst, const void *src, size_t size)
 {
 	unsigned long count, aligned;
 	int offset, mask;
@@ -48,10 +48,14 @@ static long probe_kernel_write_odd(void *dst, void *src, size_t size)
 	return rc ? rc : count;
 }
 
-long probe_kernel_write(void *dst, void *src, size_t size)
+static DEFINE_SPINLOCK(s390_kernel_write_lock);
+
+long probe_kernel_write(void *dst, const void *src, size_t size)
 {
+	unsigned long flags;
 	long copied = 0;
 
+	spin_lock_irqsave(&s390_kernel_write_lock, flags);
 	while (size) {
 		copied = probe_kernel_write_odd(dst, src, size);
 		if (copied < 0)
@@ -60,24 +64,18 @@ long probe_kernel_write(void *dst, void *src, size_t size)
 		src += copied;
 		size -= copied;
 	}
+	spin_unlock_irqrestore(&s390_kernel_write_lock, flags);
 	return copied < 0 ? -EFAULT : 0;
 }
 
-/*
- * Copy memory in real mode (kernel to kernel)
- */
-int memcpy_real(void *dest, void *src, size_t count)
+static int __memcpy_real(void *dest, void *src, size_t count)
 {
 	register unsigned long _dest asm("2") = (unsigned long) dest;
 	register unsigned long _len1 asm("3") = (unsigned long) count;
 	register unsigned long _src  asm("4") = (unsigned long) src;
 	register unsigned long _len2 asm("5") = (unsigned long) count;
-	unsigned long flags;
 	int rc = -EFAULT;
 
-	if (!count)
-		return 0;
-	flags = __raw_local_irq_stnsm(0xf8UL);
 	asm volatile (
 		"0:	mvcle	%1,%2,0x0\n"
 		"1:	jo	0b\n"
@@ -88,30 +86,54 @@ int memcpy_real(void *dest, void *src, size_t count)
 		  "+d" (_len2), "=m" (*((long *) dest))
 		: "m" (*((long *) src))
 		: "cc", "memory");
-	__raw_local_irq_ssm(flags);
 	return rc;
 }
 
 /*
- * Copy memory to absolute zero
+ * Copy memory in real mode (kernel to kernel)
  */
-void copy_to_absolute_zero(void *dest, void *src, size_t count)
+int memcpy_real(void *dest, void *src, size_t count)
 {
-	unsigned long cr0;
+	unsigned long flags;
+	int rc;
 
-	BUG_ON((unsigned long) dest + count >= sizeof(struct _lowcore));
-	preempt_disable();
+	if (!count)
+		return 0;
+	local_irq_save(flags);
+	__arch_local_irq_stnsm(0xfbUL);
+	rc = __memcpy_real(dest, src, count);
+	local_irq_restore(flags);
+	return rc;
+}
+
+/*
+ * Copy memory in absolute mode (kernel to kernel)
+ */
+void memcpy_absolute(void *dest, void *src, size_t count)
+{
+	unsigned long cr0, flags, prefix;
+
+	flags = arch_local_irq_save();
 	__ctl_store(cr0, 0, 0);
 	__ctl_clear_bit(0, 28); /* disable lowcore protection */
-	memcpy_real(dest + store_prefix(), src, count);
+	prefix = store_prefix();
+	if (prefix) {
+		local_mcck_disable();
+		set_prefix(0);
+		memcpy(dest, src, count);
+		set_prefix(prefix);
+		local_mcck_enable();
+	} else {
+		memcpy(dest, src, count);
+	}
 	__ctl_load(cr0, 0, 0);
-	preempt_enable();
+	arch_local_irq_restore(flags);
 }
 
 /*
  * Copy memory from kernel (real) to user (virtual)
  */
-int copy_to_user_real(void __user *dest, void *src, size_t count)
+int copy_to_user_real(void __user *dest, void *src, unsigned long count)
 {
 	int offs = 0, size, rc;
 	char *buf;
@@ -137,7 +159,7 @@ out:
 /*
  * Copy memory from user (virtual) to kernel (real)
  */
-int copy_from_user_real(void *dest, void __user *src, size_t count)
+int copy_from_user_real(void *dest, void __user *src, unsigned long count)
 {
 	int offs = 0, size, rc;
 	char *buf;
@@ -180,26 +202,12 @@ static int is_swapped(unsigned long addr)
 }
 
 /*
- * Return swapped prefix or zero page address
- */
-static unsigned long get_swapped(unsigned long addr)
-{
-	unsigned long prefix = store_prefix();
-
-	if (addr < sizeof(struct _lowcore))
-		return addr + prefix;
-	if (addr >= prefix && addr < prefix + sizeof(struct _lowcore))
-		return addr - prefix;
-	return addr;
-}
-
-/*
  * Convert a physical pointer for /dev/mem access
  *
  * For swapped prefix pages a new buffer is returned that contains a copy of
  * the absolute memory. The buffer size is maximum one page large.
  */
-void *xlate_dev_mem_ptr(unsigned long addr)
+void *xlate_dev_mem_ptr(phys_addr_t addr)
 {
 	void *bounce = (void *) addr;
 	unsigned long size;
@@ -210,7 +218,7 @@ void *xlate_dev_mem_ptr(unsigned long addr)
 		size = PAGE_SIZE - (addr & ~PAGE_MASK);
 		bounce = (void *) __get_free_page(GFP_ATOMIC);
 		if (bounce)
-			memcpy_real(bounce, (void *) get_swapped(addr), size);
+			memcpy_absolute(bounce, (void *) addr, size);
 	}
 	preempt_enable();
 	put_online_cpus();
@@ -221,7 +229,7 @@ EXPORT_SYMBOL_GPL(xlate_dev_mem_ptr);
 /*
  * Free converted buffer for /dev/mem access (if necessary)
  */
-void unxlate_dev_mem_ptr(unsigned long addr, void *buf)
+void unxlate_dev_mem_ptr(phys_addr_t addr, void *buf)
 {
 	if ((void *) addr != buf)
 		free_page((unsigned long) buf);

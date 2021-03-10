@@ -64,250 +64,224 @@
 
 // Pre-configured Authenticaiton Mode (from XP)
 typedef enum tagWMAC_AUTHENTICATION_MODE {
-
-    WMAC_AUTH_OPEN,
-    WMAC_AUTH_SHAREKEY,
-    WMAC_AUTH_AUTO,
-    WMAC_AUTH_WPA,
-    WMAC_AUTH_WPAPSK,
-    WMAC_AUTH_WPANONE,
-    WMAC_AUTH_WPA2,
-    WMAC_AUTH_WPA2PSK,
-    WMAC_AUTH_MAX       // Not a real mode, defined as upper bound
-
+	WMAC_AUTH_OPEN,
+	WMAC_AUTH_SHAREKEY,
+	WMAC_AUTH_AUTO,
+	WMAC_AUTH_WPA,
+	WMAC_AUTH_WPAPSK,
+	WMAC_AUTH_WPANONE,
+	WMAC_AUTH_WPA2,
+	WMAC_AUTH_WPA2PSK,
+	WMAC_AUTH_MAX       // Not a real mode, defined as upper bound
 } WMAC_AUTHENTICATION_MODE, *PWMAC_AUTHENTICATION_MODE;
 
 typedef enum tagWMAC_ENCRYPTION_MODE {
-
-    WMAC_ENCRYPTION_WEPEnabled,
-    WMAC_ENCRYPTION_WEPDisabled,
-    WMAC_ENCRYPTION_WEPKeyAbsent,
-    WMAC_ENCRYPTION_WEPNotSupported,
-    WMAC_ENCRYPTION_TKIPEnabled,
-    WMAC_ENCRYPTION_TKIPKeyAbsent,
-    WMAC_ENCRYPTION_AESEnabled,
-    WMAC_ENCRYPTION_AESKeyAbsent
-
+	WMAC_ENCRYPTION_WEPEnabled,
+	WMAC_ENCRYPTION_WEPDisabled,
+	WMAC_ENCRYPTION_WEPKeyAbsent,
+	WMAC_ENCRYPTION_WEPNotSupported,
+	WMAC_ENCRYPTION_TKIPEnabled,
+	WMAC_ENCRYPTION_TKIPKeyAbsent,
+	WMAC_ENCRYPTION_AESEnabled,
+	WMAC_ENCRYPTION_AESKeyAbsent
 } WMAC_ENCRYPTION_MODE, *PWMAC_ENCRYPTION_MODE;
 
 // Pre-configured Mode (from XP)
 
 typedef enum tagWMAC_CONFIG_MODE {
-
-    WMAC_CONFIG_ESS_STA = 0,
-    WMAC_CONFIG_IBSS_STA,
-    WMAC_CONFIG_AUTO,
-    WMAC_CONFIG_AP
-
+	WMAC_CONFIG_ESS_STA = 0,
+	WMAC_CONFIG_IBSS_STA,
+	WMAC_CONFIG_AUTO,
+	WMAC_CONFIG_AP
 } WMAC_CONFIG_MODE, *PWMAC_CONFIG_MODE;
 
-
-
 typedef enum tagWMAC_POWER_MODE {
-
-    WMAC_POWER_CAM,
-    WMAC_POWER_FAST,
-    WMAC_POWER_MAX
-
+	WMAC_POWER_CAM,
+	WMAC_POWER_FAST,
+	WMAC_POWER_MAX
 } WMAC_POWER_MODE, *PWMAC_POWER_MODE;
 
 #define VNTWIFIbIsShortSlotTime(wCapInfo)               \
-        WLAN_GET_CAP_INFO_SHORTSLOTTIME(wCapInfo)       \
+	WLAN_GET_CAP_INFO_SHORTSLOTTIME(wCapInfo)       \
 
 #define VNTWIFIbIsProtectMode(byERP)                    \
-        ((byERP & WLAN_EID_ERP_USE_PROTECTION) != 0)    \
+	((byERP & WLAN_EID_ERP_USE_PROTECTION) != 0)    \
 
 #define VNTWIFIbIsBarkerMode(byERP)                     \
-        ((byERP & WLAN_EID_ERP_BARKER_MODE) != 0)       \
+	((byERP & WLAN_EID_ERP_BARKER_MODE) != 0)       \
 
 #define VNTWIFIbIsShortPreamble(wCapInfo)               \
-        WLAN_GET_CAP_INFO_SHORTPREAMBLE(wCapInfo)       \
+	WLAN_GET_CAP_INFO_SHORTPREAMBLE(wCapInfo)       \
 
-#define VNTWIFIbIsEncryption(wCapInfo)                  \
-        WLAN_GET_CAP_INFO_PRIVACY(wCapInfo)             \
+#define VNTWIFIbIsEncryption(wCapInfo)		\
+	WLAN_GET_CAP_INFO_PRIVACY(wCapInfo)	\
 
-#define VNTWIFIbIsESS(wCapInfo)                         \
-        WLAN_GET_CAP_INFO_ESS(wCapInfo)                 \
-
+#define VNTWIFIbIsESS(wCapInfo)			\
+	WLAN_GET_CAP_INFO_ESS(wCapInfo)		\
 
 /*---------------------  Export Classes  ----------------------------*/
 
 /*---------------------  Export Variables  --------------------------*/
 
-
 /*---------------------  Export Types  ------------------------------*/
-
 
 /*---------------------  Export Functions  --------------------------*/
 
-VOID
-VNTWIFIvSetIBSSParameter (
-    IN PVOID pMgmtHandle,
-    IN WORD  wBeaconPeriod,
-    IN WORD  wATIMWindow,
-    IN UINT  uChannel
-    );
+void
+VNTWIFIvSetIBSSParameter(
+	void *pMgmtHandle,
+	unsigned short wBeaconPeriod,
+	unsigned short wATIMWindow,
+	unsigned int uChannel
+);
 
-VOID
-VNTWIFIvSetOPMode (
-    IN PVOID pMgmtHandle,
-    IN WMAC_CONFIG_MODE eOPMode
-    );
+void
+VNTWIFIvSetOPMode(
+	void *pMgmtHandle,
+	WMAC_CONFIG_MODE eOPMode
+);
 
 PWLAN_IE_SSID
 VNTWIFIpGetCurrentSSID(
-    IN PVOID pMgmtHandle
-    );
+	void *pMgmtHandle
+);
 
-UINT
+unsigned int
 VNTWIFIpGetCurrentChannel(
-    IN PVOID pMgmtHandle
-    );
+	void *pMgmtHandle
+);
 
-WORD
-VNTWIFIwGetAssocID (
-    IN PVOID pMgmtHandle
-    );
+unsigned short
+VNTWIFIwGetAssocID(
+	void *pMgmtHandle
+);
 
-BYTE
-VNTWIFIbyGetMaxSupportRate (
-    IN PWLAN_IE_SUPP_RATES pSupportRateIEs,
-    IN PWLAN_IE_SUPP_RATES pExtSupportRateIEs
-    );
+unsigned char
+VNTWIFIbyGetMaxSupportRate(
+	PWLAN_IE_SUPP_RATES pSupportRateIEs,
+	PWLAN_IE_SUPP_RATES pExtSupportRateIEs
+);
 
-BYTE
-VNTWIFIbyGetACKTxRate (
-    IN BYTE byRxDataRate,
-    IN PWLAN_IE_SUPP_RATES pSupportRateIEs,
-    IN PWLAN_IE_SUPP_RATES pExtSupportRateIEs
-    );
+unsigned char
+VNTWIFIbyGetACKTxRate(
+	unsigned char byRxDataRate,
+	PWLAN_IE_SUPP_RATES pSupportRateIEs,
+	PWLAN_IE_SUPP_RATES pExtSupportRateIEs
+);
 
-VOID
-VNTWIFIvSetAuthenticationMode (
-    IN PVOID pMgmtHandle,
-    IN WMAC_AUTHENTICATION_MODE eAuthMode
-    );
+void
+VNTWIFIvSetAuthenticationMode(
+	void *pMgmtHandle,
+	WMAC_AUTHENTICATION_MODE eAuthMode
+);
 
-VOID
-VNTWIFIvSetEncryptionMode (
-    IN PVOID pMgmtHandle,
-    IN WMAC_ENCRYPTION_MODE eEncryptionMode
-    );
+void
+VNTWIFIvSetEncryptionMode(
+	void *pMgmtHandle,
+	WMAC_ENCRYPTION_MODE eEncryptionMode
+);
 
-
-BOOL
+bool
 VNTWIFIbConfigPhyMode(
-    IN PVOID pMgmtHandle,
-    IN CARD_PHY_TYPE ePhyType
-    );
+	void *pMgmtHandle,
+	CARD_PHY_TYPE ePhyType
+);
 
-VOID
+void
 VNTWIFIbGetConfigPhyMode(
-    IN  PVOID pMgmtHandle,
-    OUT PVOID pePhyType
-    );
+	void *pMgmtHandle,
+	void *pePhyType
+);
 
-VOID
-VNTWIFIvQueryBSSList(
-    IN PVOID    pMgmtHandle,
-    OUT PUINT   puBSSCount,
-    OUT PVOID   *pvFirstBSS
-    );
+void
+VNTWIFIvQueryBSSList(void *pMgmtHandle, unsigned int *puBSSCount,
+		     void **pvFirstBSS);
 
+void
+VNTWIFIvGetNextBSS(
+	void *pMgmtHandle,
+	void *pvCurrentBSS,
+	void **pvNextBSS
+);
 
-
-
-VOID
-VNTWIFIvGetNextBSS (
-    IN PVOID            pMgmtHandle,
-    IN PVOID            pvCurrentBSS,
-    OUT PVOID           *pvNextBSS
-    );
-
-
-
-VOID
+void
 VNTWIFIvUpdateNodeTxCounter(
-    IN PVOID    pMgmtHandle,
-    IN PBYTE    pbyDestAddress,
-    IN BOOL     bTxOk,
-    IN WORD     wRate,
-    IN PBYTE    pbyTxFailCount
-    );
+	void *pMgmtHandle,
+	unsigned char *pbyDestAddress,
+	bool bTxOk,
+	unsigned short wRate,
+	unsigned char *pbyTxFailCount
+);
 
-
-VOID
+void
 VNTWIFIvGetTxRate(
-    IN PVOID    pMgmtHandle,
-    IN PBYTE    pbyDestAddress,
-    OUT PWORD   pwTxDataRate,
-    OUT PBYTE   pbyACKRate,
-    OUT PBYTE   pbyCCKBasicRate,
-    OUT PBYTE   pbyOFDMBasicRate
-    );
+	void *pMgmtHandle,
+	unsigned char *pbyDestAddress,
+	unsigned short *pwTxDataRate,
+	unsigned char *pbyACKRate,
+	unsigned char *pbyCCKBasicRate,
+	unsigned char *pbyOFDMBasicRate
+);
 /*
-BOOL
-VNTWIFIbInit(
-    IN PVOID    pAdapterHandler,
-    OUT PVOID   *pMgmtHandler
-    );
+  bool
+  VNTWIFIbInit(
+  void *pAdapterHandler,
+  void **pMgmtHandler
+);
 */
 
-BYTE
+unsigned char
 VNTWIFIbyGetKeyCypher(
-    IN PVOID    pMgmtHandle,
-    IN BOOL     bGroupKey
-    );
+	void *pMgmtHandle,
+	bool bGroupKey
+);
 
+bool
+VNTWIFIbSetPMKIDCache(
+	void *pMgmtObject,
+	unsigned long ulCount,
+	void *pPMKIDInfo
+);
 
+bool
+VNTWIFIbCommandRunning(
+	void *pMgmtObject
+);
 
-
-BOOL
-VNTWIFIbSetPMKIDCache (
-    IN PVOID pMgmtObject,
-    IN ULONG ulCount,
-    IN PVOID pPMKIDInfo
-    );
-
-BOOL
-VNTWIFIbCommandRunning (
-    IN PVOID pMgmtObject
-    );
-
-WORD
+unsigned short
 VNTWIFIwGetMaxSupportRate(
-    IN PVOID pMgmtObject
-    );
+	void *pMgmtObject
+);
 
 // for 802.11h
-VOID
-VNTWIFIvSet11h (
-    IN PVOID pMgmtObject,
-    IN BOOL  b11hEnable
-    );
+void
+VNTWIFIvSet11h(
+	void *pMgmtObject,
+	bool b11hEnable
+);
 
-BOOL
+bool
 VNTWIFIbMeasureReport(
-    IN PVOID pMgmtObject,
-    IN BOOL  bEndOfReport,
-    IN PVOID pvMeasureEID,
-    IN BYTE  byReportMode,
-    IN BYTE  byBasicMap,
-    IN BYTE  byCCAFraction,
-    IN PBYTE pbyRPIs
-    );
+	void *pMgmtObject,
+	bool bEndOfReport,
+	void *pvMeasureEID,
+	unsigned char byReportMode,
+	unsigned char byBasicMap,
+	unsigned char byCCAFraction,
+	unsigned char *pbyRPIs
+);
 
-BOOL
+bool
 VNTWIFIbChannelSwitch(
-    IN PVOID pMgmtObject,
-    IN BYTE  byNewChannel
-    );
+	void *pMgmtObject,
+	unsigned char byNewChannel
+);
 /*
-BOOL
-VNTWIFIbRadarPresent(
-    IN PVOID pMgmtObject,
-    IN BYTE  byChannel
-    );
+  bool
+  VNTWIFIbRadarPresent(
+  void *pMgmtObject,
+  unsigned char byChannel
+);
 */
 
 #endif //__VNTWIFI_H__

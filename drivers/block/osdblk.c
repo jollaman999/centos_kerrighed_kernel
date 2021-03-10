@@ -63,6 +63,7 @@
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/fs.h>
+#include <linux/slab.h>
 #include <scsi/osd_initiator.h>
 #include <scsi/osd_attributes.h>
 #include <scsi/osd_sec.h>
@@ -265,11 +266,10 @@ static struct bio *bio_chain_clone(struct bio *old_chain, gfp_t gfpmask)
 	struct bio *tmp, *new_chain = NULL, *tail = NULL;
 
 	while (old_chain) {
-		tmp = bio_kmalloc(gfpmask, old_chain->bi_max_vecs);
+		tmp = bio_clone_kmalloc(old_chain, gfpmask);
 		if (!tmp)
 			goto err_out;
 
-		__bio_clone(tmp, old_chain);
 		tmp->bi_bdev = NULL;
 		gfpmask &= ~__GFP_WAIT;
 		tmp->bi_next = NULL;
@@ -423,7 +423,7 @@ static int osdblk_init_disk(struct osdblk_device *osdev)
 	}
 
 	/* switch queue to TCQ mode; allocate tag map */
-	rc = blk_queue_init_tags(q, OSDBLK_MAX_REQ, NULL);
+	rc = blk_queue_init_tags(q, OSDBLK_MAX_REQ, NULL, BLK_TAG_ALLOC_FIFO);
 	if (rc) {
 		blk_cleanup_queue(q);
 		put_disk(disk);
@@ -468,7 +468,9 @@ static void class_osdblk_release(struct class *cls)
 	kfree(cls);
 }
 
-static ssize_t class_osdblk_list(struct class *c, char *data)
+static ssize_t class_osdblk_list(struct class *c,
+				struct class_attribute *attr,
+				char *data)
 {
 	int n = 0;
 	struct list_head *tmp;
@@ -492,7 +494,9 @@ static ssize_t class_osdblk_list(struct class *c, char *data)
 	return n;
 }
 
-static ssize_t class_osdblk_add(struct class *c, const char *buf, size_t count)
+static ssize_t class_osdblk_add(struct class *c,
+				struct class_attribute *attr,
+				const char *buf, size_t count)
 {
 	struct osdblk_device *osdev;
 	ssize_t rc;
@@ -584,7 +588,9 @@ err_out_mod:
 	return rc;
 }
 
-static ssize_t class_osdblk_remove(struct class *c, const char *buf,
+static ssize_t class_osdblk_remove(struct class *c,
+					struct class_attribute *attr,
+					const char *buf,
 					size_t count)
 {
 	struct osdblk_device *osdev = NULL;

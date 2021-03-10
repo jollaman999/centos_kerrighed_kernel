@@ -1,5 +1,5 @@
 /*
- * Copyright IBM Corp. 1999,2009
+ * Copyright IBM Corp. 1999, 2010
  *
  *    Author(s): Hartmut Penner <hp@de.ibm.com>
  *		 Martin Schwidefsky <schwidefsky@de.ibm.com>
@@ -22,12 +22,10 @@
  */
 
 #include <linux/init.h>
-#include <asm/setup.h>
-#include <asm/lowcore.h>
+#include <linux/linkage.h>
 #include <asm/asm-offsets.h>
 #include <asm/thread_info.h>
 #include <asm/page.h>
-#include <asm/cpu.h>
 
 #ifdef CONFIG_64BIT
 #define ARCH_OFFSET	4
@@ -36,125 +34,7 @@
 #endif
 
 __HEAD
-#ifndef CONFIG_IPL
-	.org   0
-	.long  0x00080000,0x80000000+startup	# Just a restart PSW
-#else
-#ifdef CONFIG_IPL_TAPE
-#define IPL_BS 1024
-	.org   0
-	.long  0x00080000,0x80000000+iplstart	# The first 24 bytes are loaded
-	.long  0x27000000,0x60000001		# by ipl to addresses 0-23.
-	.long  0x02000000,0x20000000+IPL_BS	# (a PSW and two CCWs).
-	.long  0x00000000,0x00000000		# external old psw
-	.long  0x00000000,0x00000000		# svc old psw
-	.long  0x00000000,0x00000000		# program check old psw
-	.long  0x00000000,0x00000000		# machine check old psw
-	.long  0x00000000,0x00000000		# io old psw
-	.long  0x00000000,0x00000000
-	.long  0x00000000,0x00000000
-	.long  0x00000000,0x00000000
-	.long  0x000a0000,0x00000058		# external new psw
-	.long  0x000a0000,0x00000060		# svc new psw
-	.long  0x000a0000,0x00000068		# program check new psw
-	.long  0x000a0000,0x00000070		# machine check new psw
-	.long  0x00080000,0x80000000+.Lioint	# io new psw
 
-	.org   0x100
-#
-# subroutine for loading from tape
-# Parameters:
-#  R1 = device number
-#  R2 = load address
-.Lloader:
-	st	%r14,.Lldret
-	la	%r3,.Lorbread		# r3 = address of orb
-	la	%r5,.Lirb		# r5 = address of irb
-	st	%r2,.Lccwread+4 	# initialize CCW data addresses
-	lctl	%c6,%c6,.Lcr6
-	slr	%r2,%r2
-.Lldlp:
-	la	%r6,3			# 3 retries
-.Lssch:
-	ssch	0(%r3)			# load chunk of IPL_BS bytes
-	bnz	.Llderr
-.Lw4end:
-	bas	%r14,.Lwait4io
-	tm	8(%r5),0x82		# do we have a problem ?
-	bnz	.Lrecov
-	slr	%r7,%r7
-	icm	%r7,3,10(%r5)		# get residual count
-	lcr	%r7,%r7
-	la	%r7,IPL_BS(%r7) 	# IPL_BS-residual=#bytes read
-	ar	%r2,%r7 		# add to total size
-	tm	8(%r5),0x01		# found a tape mark ?
-	bnz	.Ldone
-	l	%r0,.Lccwread+4 	# update CCW data addresses
-	ar	%r0,%r7
-	st	%r0,.Lccwread+4
-	b	.Lldlp
-.Ldone:
-	l	%r14,.Lldret
-	br	%r14			# r2 contains the total size
-.Lrecov:
-	bas	%r14,.Lsense		# do the sensing
-	bct	%r6,.Lssch		# dec. retry count & branch
-	b	.Llderr
-#
-# Sense subroutine
-#
-.Lsense:
-	st	%r14,.Lsnsret
-	la	%r7,.Lorbsense
-	ssch	0(%r7)			# start sense command
-	bnz	.Llderr
-	bas	%r14,.Lwait4io
-	l	%r14,.Lsnsret
-	tm	8(%r5),0x82		# do we have a problem ?
-	bnz	.Llderr
-	br	%r14
-#
-# Wait for interrupt subroutine
-#
-.Lwait4io:
-	lpsw	.Lwaitpsw
-.Lioint:
-	c	%r1,0xb8		# compare subchannel number
-	bne	.Lwait4io
-	tsch	0(%r5)
-	slr	%r0,%r0
-	tm	8(%r5),0x82		# do we have a problem ?
-	bnz	.Lwtexit
-	tm	8(%r5),0x04		# got device end ?
-	bz	.Lwait4io
-.Lwtexit:
-	br	%r14
-.Llderr:
-	lpsw	.Lcrash
-
-	.align	8
-.Lorbread:
-	.long	0x00000000,0x0080ff00,.Lccwread
-	.align	8
-.Lorbsense:
-	.long	0x00000000,0x0080ff00,.Lccwsense
-	.align	8
-.Lccwread:
-	.long	0x02200000+IPL_BS,0x00000000
-.Lccwsense:
-	.long	0x04200001,0x00000000
-.Lwaitpsw:
-	.long	0x020a0000,0x80000000+.Lioint
-
-.Lirb:	.long	0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
-.Lcr6:	.long	0xff000000
-	.align	8
-.Lcrash:.long	0x000a0000,0x00000000
-.Lldret:.long	0
-.Lsnsret: .long 0
-#endif	/* CONFIG_IPL_TAPE */
-
-#ifdef CONFIG_IPL_VM
 #define IPL_BS	0x730
 	.org	0
 	.long	0x00080000,0x80000000+iplstart	# The first 24 bytes are loaded
@@ -183,6 +63,23 @@ __HEAD
 	.long	0x020006e0,0x20000050
 
 	.org	0x200
+#
+# subroutine to set architecture mode
+#
+.Lsetmode:
+#ifdef CONFIG_64BIT
+	mvi	__LC_AR_MODE_ID,1	# set esame flag
+	slr	%r0,%r0 		# set cpuid to zero
+	lhi	%r1,2			# mode 2 = esame (dump)
+	sigp	%r1,%r0,0x12		# switch to esame mode
+	bras	%r13,0f
+	.fill	16,4,0x0
+0:	lmh	%r0,%r15,0(%r13)	# clear high-order half of gprs
+	sam31				# switch to 31 bit addressing mode
+#else
+	mvi	__LC_AR_MODE_ID,0	# set ESA flag (mode 0)
+#endif
+	br	%r14
 
 #
 # subroutine to wait for end I/O
@@ -278,29 +175,6 @@ __HEAD
 	.long	0x02600050,0x00000000
 	.endr
 	.long	0x02200050,0x00000000
-#endif	/* CONFIG_IPL_VM */
-
-#endif /* CONFIG_IPL */
-
-#
-# subroutine to set architecture mode
-#
-.Lsetmode:
-#ifdef CONFIG_64BIT
-	mvi	__LC_AR_MODE_ID,1	# set esame flag
-	slr	%r0,%r0 		# set cpuid to zero
-	lhi	%r1,2			# mode 2 = esame (dump)
-	sigp	%r1,%r0,0x12		# switch to esame mode
-	bras	%r13,0f
-	.fill	16,4,0x0
-0:	lmh	%r0,%r15,0(%r13)	# clear high-order half of gprs
-	sam31				# switch to 31 bit addressing mode
-#else
-	mvi	__LC_AR_MODE_ID,0	# set ESA flag (mode 0)
-#endif
-	br	%r14
-
-#ifdef CONFIG_IPL
 
 iplstart:
 	bas	%r14,.Lsetmode		# Immediately switch to 64 bit mode
@@ -331,19 +205,7 @@ iplstart:
 	bz	.Lagain1		# skip dateset trailer
 	la	%r5,0(%r4,%r2)
 	lr	%r3,%r2
-.Lidebc:
-	tm	0(%r5),0x80		# high order bit set ?
-	bo	.Ldocv			#  yes -> convert from EBCDIC
-	ahi	%r5,-1
-	bct	%r3,.Lidebc
-	b	.Lnocv
-.Ldocv:
-	l	%r3,.Lcvtab
-	tr	0(256,%r4),0(%r3)	# convert parameters to ascii
-	tr	256(256,%r4),0(%r3)
-	tr	512(256,%r4),0(%r3)
-	tr	768(122,%r4),0(%r3)
-.Lnocv: la	%r3,COMMAND_LINE-PARMAREA(%r12) # load adr. of command line
+	la	%r3,COMMAND_LINE-PARMAREA(%r12) # load adr. of command line
 	mvc	0(256,%r3),0(%r4)
 	mvc	256(256,%r3),256(%r4)
 	mvc	512(256,%r3),512(%r4)
@@ -382,7 +244,6 @@ iplstart:
 	clc	0(3,%r2),.L_eof
 	bz	.Lagain2
 
-#ifdef CONFIG_IPL_VM
 #
 # reset files in VM reader
 #
@@ -407,8 +268,6 @@ iplstart:
 .Lnoreset:
 	b	.Lnoload
 
-#endif
-
 #
 # everything loaded, go for it
 #
@@ -416,10 +275,9 @@ iplstart:
 	l	%r1,.Lstartup
 	br	%r1
 
-.Linitrd:.long _end + 0x400000		# default address of initrd
+.Linitrd:.long _end			# default address of initrd
 .Lparm:	.long  PARMAREA
 .Lstartup: .long startup
-.Lcvtab:.long	_ebcasc 		# ebcdic to ascii table
 .Lreset:.byte	0xc3,0xc8,0xc1,0xd5,0xc7,0xc5,0x40,0xd9,0xc4,0xd9,0x40
 	.byte	0xc1,0xd3,0xd3,0x40,0xd2,0xc5,0xc5,0xd7,0x40,0xd5,0xd6
 	.byte	0xc8,0xd6,0xd3,0xc4	# "change rdr all keep nohold"
@@ -428,16 +286,13 @@ iplstart:
 	.align	8
 .Lcpuid:.fill	8,1,0
 
-#endif	/* CONFIG_IPL */
-
 #
 # SALIPL loader support. Based on a patch by Rob van der Heij.
 # This entry point is called directly from the SALIPL loader and
 # doesn't need a builtin ipl record.
 #
 	.org	0x800
-	.globl	start
-start:
+ENTRY(start)
 	stm	%r0,%r15,0x07b0		# store registers
 	bas	%r14,.Lsetmode		# Immediately switch to 64 bit mode
 	basr	%r12,%r0
@@ -455,13 +310,10 @@ start:
 .sk8x8:
 	mvc	0(240,%r8),0(%r9)	# copy iplparms into buffer
 .gotr:
-	l	%r10,.tbl		# EBCDIC to ASCII table
-	tr	0(240,%r8),0(%r10)
 	slr	%r0,%r0
 	st	%r0,INITRD_SIZE+ARCH_OFFSET-PARMAREA(%r11)
 	st	%r0,INITRD_START+ARCH_OFFSET-PARMAREA(%r11)
 	j	startup 		# continue with startup
-.tbl:	.long	_ebcasc			# translate table
 .cmd:	.long	COMMAND_LINE		# address of command line buffer
 .parm:	.long	PARMAREA
 .lowcase:
@@ -505,8 +357,9 @@ start:
 # or linload or SALIPL
 #
 	.org	0x10000
-startup:
+ENTRY(startup)
 	j	.Lep_startup_normal
+	.org	0x10008
 #
 # This is a list of s390 kernel entry points. At address 0x1000f the number of
 # valid entry points is stored.
@@ -519,7 +372,7 @@ startup:
 # kdump startup-code at 0x10010, running in 64 bit absolute addressing mode
 #
 	.org	0x10010
-startup_kdump:
+ENTRY(startup_kdump)
 	j	.Lep_startup_kdump
 .Lep_startup_normal:
 #ifdef CONFIG_64BIT
@@ -539,72 +392,95 @@ startup_kdump:
 	xc	0x200(256),0x200	# partially clear lowcore
 	xc	0x300(256),0x300
 	xc	0xe00(256),0xe00
-	l	%r1,5f-.LPG0(%r13)
-	stck	0(%r1)
+	stck	__LC_LAST_UPDATE_CLOCK
 	spt	6f-.LPG0(%r13)
-	mvc	__LC_LAST_UPDATE_CLOCK(8),0(%r1)
 	mvc	__LC_LAST_UPDATE_TIMER(8),6f-.LPG0(%r13)
-	mvc	__LC_EXIT_TIMER(8),5f-.LPG0(%r13)
+	xc	__LC_STFL_FAC_LIST(8),__LC_STFL_FAC_LIST
 #ifndef CONFIG_MARCH_G5
 	# check capabilities against MARCH_{G5,Z900,Z990,Z9_109,Z10}
-	xc	__LC_STFL_FAC_LIST(8),__LC_STFL_FAC_LIST
-	stfl	__LC_STFL_FAC_LIST	# store facility list
+	.insn	s,0xb2b10000,__LC_STFL_FAC_LIST	# store facility list
 	tm	__LC_STFL_FAC_LIST,0x01	# stfle available ?
 	jz	0f
-	la	%r0,0
+	la	%r0,1
 	.insn	s,0xb2b00000,__LC_STFL_FAC_LIST	# store facility list extended
-0:	l	%r0,__LC_STFL_FAC_LIST
-	n	%r0,2f+8-.LPG0(%r13)
-	cl	%r0,2f+8-.LPG0(%r13)
-	jne	1f
-	l	%r0,__LC_STFL_FAC_LIST+4
-	n	%r0,2f+12-.LPG0(%r13)
-	cl	%r0,2f+12-.LPG0(%r13)
-	je	3f
-1:	l	%r15,.Lstack-.LPG0(%r13)
-	ahi	%r15,1<<(PAGE_SHIFT+THREAD_ORDER) # init_task_union+THREAD_SIZE
+	# verify if all required facilities are supported by the machine
+0:	la	%r1,__LC_STFL_FAC_LIST
+	la	%r2,3f+8-.LPG0(%r13)
+	l	%r3,0(%r2)
+1:	l	%r0,0(%r1)
+	n	%r0,4(%r2)
+	cl	%r0,4(%r2)
+	jne	2f
+	la	%r1,4(%r1)
+	la	%r2,4(%r2)
+	ahi	%r3,-1
+	jnz	1b
+	j	4f
+2:	l	%r15,.Lstack-.LPG0(%r13)
 	ahi	%r15,-96
 	la	%r2,.Lals_string-.LPG0(%r13)
 	l	%r3,.Lsclp_print-.LPG0(%r13)
 	basr	%r14,%r3
-	lpsw	2f-.LPG0(%r13)		# machine type not good enough, crash
+	lpsw	3f-.LPG0(%r13)		# machine type not good enough, crash
 .Lals_string:
 	.asciz	"The Linux kernel requires more recent processor hardware"
 .Lsclp_print:
 	.long	_sclp_print_early
 .Lstack:
-	.long	init_thread_union
+	.long	0x8000 + (1<<(PAGE_SHIFT+THREAD_ORDER))
 	.align 16
-2:	.long	0x000a0000,0x8badcccc
+3:	.long	0x000a0000,0x8badcccc
+
+# List of facilities that are required. If not all facilities are present
+# the kernel will crash. Format is number of facility words with bits set,
+# followed by the facility words.
+
 #if defined(CONFIG_64BIT)
-#if defined(CONFIG_MARCH_Z10)
-	.long 0xc100efe3, 0xf0680000
+#if defined(CONFIG_MARCH_Z13)
+	.long 3, 0xc100eff2, 0xf46ce800, 0x00400000
+#elif defined(CONFIG_MARCH_ZEC12)
+	.long 3, 0xc100efe3, 0xf46ce000, 0x00400000
+#elif defined(CONFIG_MARCH_Z196)
+	.long 2, 0xc100efe3, 0xf46c0000
+#elif defined(CONFIG_MARCH_Z10)
+	.long 2, 0xc100efe3, 0xf0680000
 #elif defined(CONFIG_MARCH_Z9_109)
-	.long 0xc100efc3, 0x00000000
+	.long 1, 0xc100efc3
 #elif defined(CONFIG_MARCH_Z990)
-	.long 0xc0002000, 0x00000000
+	.long 1, 0xc0002000
 #elif defined(CONFIG_MARCH_Z900)
-	.long 0xc0000000, 0x00000000
+	.long 1, 0xc0000000
 #endif
 #else
-#if defined(CONFIG_MARCH_Z10)
-	.long 0x8100c880, 0x00000000
+#if defined(CONFIG_MARCH_ZEC12)
+	.long 1, 0x8100c880
+#elif defined(CONFIG_MARCH_Z196)
+	.long 1, 0x8100c880
+#elif defined(CONFIG_MARCH_Z10)
+	.long 1, 0x8100c880
 #elif defined(CONFIG_MARCH_Z9_109)
-	.long 0x8100c880, 0x00000000
+	.long 1, 0x8100c880
 #elif defined(CONFIG_MARCH_Z990)
-	.long 0x80002000, 0x00000000
+	.long 1, 0x80002000
 #elif defined(CONFIG_MARCH_Z900)
-	.long 0x80000000, 0x00000000
+	.long 1, 0x80000000
 #endif
 #endif
-3:
+4:
 #endif
 
-	l	%r13,4f-.LPG0(%r13)
+#ifdef CONFIG_64BIT
+	/* Continue with 64bit startup code in head64.S */
+	sam64				# switch to 64 bit mode
+	jg	startup_continue
+#else
+	/* Continue with 31bit startup code in head31.S */
+	l	%r13,5f-.LPG0(%r13)
 	b	0(%r13)
-	.align	4
-4:	.long	startup_continue
-5:	.long	sched_clock_base_cc
+	.align	8
+5:	.long	startup_continue
+#endif
+
 	.align	8
 6:	.long	0x7fffffff,0xffffffff
 
@@ -624,8 +500,4 @@ startup_kdump:
 	.byte	"root=/dev/ram0 ro"
 	.byte	0
 
-#ifdef CONFIG_64BIT
-#include "head64.S"
-#else
-#include "head31.S"
-#endif
+	.org	0x11000

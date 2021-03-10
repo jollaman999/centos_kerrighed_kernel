@@ -25,7 +25,6 @@
 #include <asm/tlbflush.h>
 #include <asm/vdso.h>
 #include <asm/proto.h>
-#include <asm/asm-offsets.h>
 
 enum {
 	VDSO_DISABLED = 0,
@@ -206,9 +205,9 @@ void syscall32_cpu_init(void)
 {
 	/* Load these always in case some future AMD CPU supports
 	   SYSENTER from compat mode too. */
-	checking_wrmsrl(MSR_IA32_SYSENTER_CS, (u64)__KERNEL_CS);
-	checking_wrmsrl(MSR_IA32_SYSENTER_ESP, 0ULL);
-	checking_wrmsrl(MSR_IA32_SYSENTER_EIP, (u64)ia32_sysenter_target);
+	wrmsrl_safe(MSR_IA32_SYSENTER_CS, (u64)__KERNEL_CS);
+	wrmsrl_safe(MSR_IA32_SYSENTER_ESP, 0ULL);
+	wrmsrl_safe(MSR_IA32_SYSENTER_EIP, (u64)ia32_sysenter_target);
 
 	wrmsrl(MSR_CSTAR, ia32_cstar_target);
 }
@@ -228,7 +227,6 @@ void enable_sep_cpu(void)
 {
 	int cpu = get_cpu();
 	struct tss_struct *tss = &per_cpu(init_tss, cpu);
-	unsigned long tss_stack;
 
 	if (!boot_cpu_has(X86_FEATURE_SEP)) {
 		put_cpu();
@@ -236,9 +234,9 @@ void enable_sep_cpu(void)
 	}
 
 	tss->x86_tss.ss1 = __KERNEL_CS;
-	tss_stack = TSS_stack + TSS_stack_size + (unsigned long) tss;
+	tss->x86_tss.sp1 = sizeof(struct tss_struct) + (unsigned long) tss;
 	wrmsr(MSR_IA32_SYSENTER_CS, __KERNEL_CS, 0);
-	wrmsr(MSR_IA32_SYSENTER_ESP, tss_stack, 0);
+	wrmsr(MSR_IA32_SYSENTER_ESP, tss->x86_tss.sp1, 0);
 	wrmsr(MSR_IA32_SYSENTER_EIP, (unsigned long) ia32_sysenter_target, 0);
 	put_cpu();	
 }
@@ -313,6 +311,11 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 	int ret = 0;
 	bool compat;
 
+#ifdef CONFIG_X86_X32_ABI
+	if (test_thread_flag(TIF_X32))
+		return x32_setup_additional_pages(bprm, uses_interp);
+#endif
+
 	if (vdso_enabled == VDSO_DISABLED)
 		return 0;
 
@@ -327,7 +330,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 	if (compat)
 		addr = VDSO_HIGH_BASE;
 	else {
-		addr = get_unmapped_area_prot(NULL, 0, PAGE_SIZE, 0, 0, 1);
+		addr = get_unmapped_area(NULL, 0, PAGE_SIZE, 0, 0);
 		if (IS_ERR_VALUE(addr)) {
 			ret = addr;
 			goto up_fail;
@@ -363,7 +366,7 @@ int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 
 #ifdef CONFIG_X86_64
 
-__initcall(sysenter_setup);
+subsys_initcall(sysenter_setup);
 
 #ifdef CONFIG_SYSCTL
 /* Register vsyscall32 into the ABI table */
@@ -382,7 +385,6 @@ static ctl_table abi_table2[] = {
 
 static ctl_table abi_root_table2[] = {
 	{
-		.ctl_name = CTL_ABI,
 		.procname = "abi",
 		.mode = 0555,
 		.child = abi_table2

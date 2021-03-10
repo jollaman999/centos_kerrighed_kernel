@@ -24,9 +24,6 @@ static int ssb_pcihost_suspend(struct device *d)
 	struct pci_dev *dev = to_pci_dev(d);
 	struct ssb_bus *ssb = pci_get_drvdata(dev);
 	int err;
-#if 1 /* in RHEL */
-	int i, wakeup_path = 0;
-#endif
 
 	err = ssb_bus_suspend(ssb);
 	if (err)
@@ -36,20 +33,10 @@ static int ssb_pcihost_suspend(struct device *d)
 
 	/* if there is a wakeup enabled child device on ssb bus,
 	   enable pci wakeup posibility. */
-#if 0 /* Not in RHEL */
 	device_set_wakeup_enable(d, d->power.wakeup_path);
-#else
-	for (i = 0; i < ssb->nr_devices; i++) {
-		struct ssb_device *sdev = &ssb->devices[i];
-		if (sdev && sdev->dev && sdev->dev->power.should_wakeup) {
-			wakeup_path = 1;
-			break;
-		}
-	}
-	device_set_wakeup_enable(d, wakeup_path);
-#endif
 
 	pci_prepare_to_sleep(dev);
+
 	return 0;
 }
 

@@ -385,7 +385,7 @@ void sd_dif_prepare(struct request *rq, sector_t hw_sector,
 		virt = bio->bi_integrity->bip_sector & 0xffffffff;
 
 		bip_for_each_vec(iv, bio->bi_integrity, i) {
-			sdt = kmap_atomic(iv->bv_page, KM_USER0)
+			sdt = kmap_atomic(iv->bv_page)
 				+ iv->bv_offset;
 
 			for (j = 0 ; j < iv->bv_len ; j += tuple_sz, sdt++) {
@@ -397,7 +397,7 @@ void sd_dif_prepare(struct request *rq, sector_t hw_sector,
 				phys++;
 			}
 
-			kunmap_atomic(sdt, KM_USER0);
+			kunmap_atomic(sdt);
 		}
 
 		bio->bi_flags |= (1 << BIO_MAPPED_INTEGRITY);
@@ -416,6 +416,7 @@ void sd_dif_complete(struct scsi_cmnd *scmd, unsigned int good_bytes)
 	struct sd_dif_tuple *sdt;
 	unsigned int i, j, sectors, sector_sz;
 	u32 phys, virt;
+	unsigned int shift;
 
 	sdkp = scsi_disk(scmd->request->rq_disk);
 
@@ -425,9 +426,8 @@ void sd_dif_complete(struct scsi_cmnd *scmd, unsigned int good_bytes)
 	sector_sz = scmd->device->sector_size;
 	sectors = good_bytes / sector_sz;
 
-	phys = blk_rq_pos(scmd->request) & 0xffffffff;
-	if (sector_sz == 4096)
-		phys >>= 3;
+	shift = (sector_sz == 4096) ? 3 : 0;
+	phys = (blk_rq_pos(scmd->request) >> shift) & 0xffffffff;
 
 	__rq_for_each_bio(bio, scmd->request) {
 		struct bio_vec *iv;
@@ -435,13 +435,13 @@ void sd_dif_complete(struct scsi_cmnd *scmd, unsigned int good_bytes)
 		virt = bio->bi_integrity->bip_sector & 0xffffffff;
 
 		bip_for_each_vec(iv, bio->bi_integrity, i) {
-			sdt = kmap_atomic(iv->bv_page, KM_USER0)
+			sdt = kmap_atomic(iv->bv_page)
 				+ iv->bv_offset;
 
 			for (j = 0 ; j < iv->bv_len ; j += tuple_sz, sdt++) {
 
 				if (sectors == 0) {
-					kunmap_atomic(sdt, KM_USER0);
+					kunmap_atomic(sdt);
 					return;
 				}
 
@@ -453,7 +453,7 @@ void sd_dif_complete(struct scsi_cmnd *scmd, unsigned int good_bytes)
 				sectors--;
 			}
 
-			kunmap_atomic(sdt, KM_USER0);
+			kunmap_atomic(sdt);
 		}
 	}
 }

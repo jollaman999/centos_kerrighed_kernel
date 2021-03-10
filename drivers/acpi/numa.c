@@ -28,6 +28,9 @@
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/acpi.h>
+#include <linux/numa.h>
+#include <linux/nodemask.h>
+#include <linux/topology.h>
 #include <acpi/acpi_bus.h>
 
 #define PREFIX "ACPI: "
@@ -40,14 +43,16 @@ static nodemask_t nodes_found_map = NODE_MASK_NONE;
 
 /* maps to convert between proximity domain and logical node ID */
 static int pxm_to_node_map[MAX_PXM_DOMAINS]
-				= { [0 ... MAX_PXM_DOMAINS - 1] = NID_INVAL };
+			= { [0 ... MAX_PXM_DOMAINS - 1] = NUMA_NO_NODE };
 static int node_to_pxm_map[MAX_NUMNODES]
-				= { [0 ... MAX_NUMNODES - 1] = PXM_INVAL };
+			= { [0 ... MAX_NUMNODES - 1] = PXM_INVAL };
+
+unsigned char acpi_srat_revision __initdata;
 
 int pxm_to_node(int pxm)
 {
 	if (pxm < 0)
-		return NID_INVAL;
+		return NUMA_NO_NODE;
 	return pxm_to_node_map[pxm];
 }
 
@@ -60,17 +65,24 @@ int node_to_pxm(int node)
 
 static void __acpi_map_pxm_to_node(int pxm, int node)
 {
-	pxm_to_node_map[pxm] = node;
-	node_to_pxm_map[node] = pxm;
+	if (pxm_to_node_map[pxm] == NUMA_NO_NODE || node < pxm_to_node_map[pxm])
+		pxm_to_node_map[pxm] = node;
+	if (node_to_pxm_map[node] == PXM_INVAL || pxm < node_to_pxm_map[node])
+		node_to_pxm_map[node] = pxm;
 }
 
 int acpi_map_pxm_to_node(int pxm)
 {
-	int node = pxm_to_node_map[pxm];
+	int node;
 
-	if (node < 0){
+	if (pxm < 0 || pxm >= MAX_PXM_DOMAINS)
+		return NUMA_NO_NODE;
+
+	node = pxm_to_node_map[pxm];
+
+	if (node == NUMA_NO_NODE) {
 		if (nodes_weight(nodes_found_map) >= MAX_NUMNODES)
-			return NID_INVAL;
+			return NUMA_NO_NODE;
 		node = first_unset_node(nodes_found_map);
 		__acpi_map_pxm_to_node(pxm, node);
 		node_set(node, nodes_found_map);
@@ -79,15 +91,46 @@ int acpi_map_pxm_to_node(int pxm)
 	return node;
 }
 
-#if 0
-void __cpuinit acpi_unmap_pxm_to_node(int node)
+/**
+ * acpi_map_pxm_to_online_node - Map proximity ID to online node
+ * @pxm: ACPI proximity ID
+ *
+ * This is similar to acpi_map_pxm_to_node(), but always returns an online
+ * node.  When the mapped node from a given proximity ID is offline, it
+ * looks up the node distance table and returns the nearest online node.
+ *
+ * ACPI device drivers, which are called after the NUMA initialization has
+ * completed in the kernel, can call this interface to obtain their device
+ * NUMA topology from ACPI tables.  Such drivers do not have to deal with
+ * offline nodes.  A node may be offline when a device proximity ID is
+ * unique, SRAT memory entry does not exist, or NUMA is disabled, ex.
+ * "numa=off" on x86.
+ */
+int acpi_map_pxm_to_online_node(int pxm)
 {
-	int pxm = node_to_pxm_map[node];
-	pxm_to_node_map[pxm] = NID_INVAL;
-	node_to_pxm_map[node] = PXM_INVAL;
-	node_clear(node, nodes_found_map);
+	int node, min_node;
+
+	node = acpi_map_pxm_to_node(pxm);
+
+	if (node == NUMA_NO_NODE)
+		node = 0;
+
+	min_node = node;
+	if (!node_online(node)) {
+		int min_dist = INT_MAX, dist, n;
+
+		for_each_online_node(n) {
+			dist = node_distance(node, n);
+			if (dist < min_dist) {
+				min_dist = dist;
+				min_node = n;
+			}
+		}
+	}
+
+	return min_node;
 }
-#endif  /*  0  */
+EXPORT_SYMBOL(acpi_map_pxm_to_online_node);
 
 static void __init
 acpi_table_print_srat_entry(struct acpi_subtable_header *header)
@@ -121,14 +164,16 @@ acpi_table_print_srat_entry(struct acpi_subtable_header *header)
 			struct acpi_srat_mem_affinity *p =
 			    (struct acpi_srat_mem_affinity *)header;
 			ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-					  "SRAT Memory (0x%lx length 0x%lx) in proximity domain %d %s%s\n",
+					  "SRAT Memory (0x%lx length 0x%lx) in proximity domain %d %s%s%s\n",
 					  (unsigned long)p->base_address,
 					  (unsigned long)p->length,
 					  p->proximity_domain,
 					  (p->flags & ACPI_SRAT_MEM_ENABLED)?
 					  "enabled" : "disabled",
 					  (p->flags & ACPI_SRAT_MEM_HOT_PLUGGABLE)?
-					  " hot-pluggable" : ""));
+					  " hot-pluggable" : "",
+					  (p->flags & ACPI_SRAT_MEM_NON_VOLATILE)?
+					  " non-volatile" : ""));
 		}
 #endif				/* ACPI_DEBUG_OUTPUT */
 		break;
@@ -242,6 +287,8 @@ acpi_parse_processor_affinity(struct acpi_subtable_header *header,
 	return 0;
 }
 
+static int __initdata parsed_numa_memblks;
+
 static int __init
 acpi_parse_memory_affinity(struct acpi_subtable_header * header,
 			   const unsigned long end)
@@ -255,26 +302,28 @@ acpi_parse_memory_affinity(struct acpi_subtable_header * header,
 	acpi_table_print_srat_entry(header);
 
 	/* let architecture-dependent part to do it */
-	acpi_numa_memory_affinity_init(memory_affinity);
-
+	if (!acpi_numa_memory_affinity_init(memory_affinity))
+		parsed_numa_memblks++;
 	return 0;
 }
 
 static int __init acpi_parse_srat(struct acpi_table_header *table)
 {
 	struct acpi_table_srat *srat;
-
 	if (!table)
 		return -EINVAL;
 
 	srat = (struct acpi_table_srat *)table;
+	acpi_srat_revision = srat->header.revision;
+
+	/* Real work done in acpi_table_parse_srat below. */
 
 	return 0;
 }
 
 static int __init
 acpi_table_parse_srat(enum acpi_srat_type id,
-		      acpi_table_entry_handler handler, unsigned int max_entries)
+		      acpi_tbl_entry_handler handler, unsigned int max_entries)
 {
 	return acpi_table_parse_entries(ACPI_SIG_SRAT,
 					    sizeof(struct acpi_table_srat), id,
@@ -283,6 +332,8 @@ acpi_table_parse_srat(enum acpi_srat_type id,
 
 int __init acpi_numa_init(void)
 {
+	int cnt = 0;
+
 	/*
 	 * Should not limit number with cpu num that is from NR_CPUS or nr_cpus=
 	 * SRAT cpu entries could have different order with that in MADT.
@@ -303,15 +354,20 @@ int __init acpi_numa_init(void)
 					sizeof(struct acpi_table_srat),
 					srat_proc, ARRAY_SIZE(srat_proc), 0);
 
-		acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
-				      acpi_parse_memory_affinity,
-				      NR_NODE_MEMBLKS);
+		cnt = acpi_table_parse_srat(ACPI_SRAT_TYPE_MEMORY_AFFINITY,
+					    acpi_parse_memory_affinity,
+					    NR_NODE_MEMBLKS);
 	}
 
 	/* SLIT: System Locality Information Table */
 	acpi_table_parse(ACPI_SIG_SLIT, acpi_parse_slit);
 
 	acpi_numa_arch_fixup();
+
+	if (cnt < 0)
+		return cnt;
+	else if (!parsed_numa_memblks)
+		return -ENOENT;
 	return 0;
 }
 
@@ -337,8 +393,6 @@ int acpi_get_node(acpi_handle handle)
 	int pxm;
 
 	pxm = acpi_get_pxm(handle);
-	if (pxm < 0 || pxm >= MAX_PXM_DOMAINS)
-		return NUMA_NO_NODE;
 
 	return acpi_map_pxm_to_node(pxm);
 }

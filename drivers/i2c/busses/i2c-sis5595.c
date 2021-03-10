@@ -11,10 +11,6 @@
     but WITHOUT ANY WARRANTY; without even the implied warranty of
     MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
     GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with this program; if not, write to the Free Software
-    Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 
 /* Note: we assume there can only be one SIS5595 with one SMBus interface */
@@ -61,7 +57,7 @@
 #include <linux/init.h>
 #include <linux/i2c.h>
 #include <linux/acpi.h>
-#include <asm/io.h>
+#include <linux/io.h>
 
 static int blacklist[] = {
 	PCI_DEVICE_ID_SI_540,
@@ -147,7 +143,7 @@ static int sis5595_setup(struct pci_dev *SIS5595_dev)
 	u16 a;
 	u8 val;
 	int *i;
-	int retval = -ENODEV;
+	int retval;
 
 	/* Look for imposters */
 	for (i = blacklist; *i != 0; i++) {
@@ -223,7 +219,7 @@ static int sis5595_setup(struct pci_dev *SIS5595_dev)
 
 error:
 	release_region(sis5595_base + SMB_INDEX, 2);
-	return retval;
+	return -ENODEV;
 }
 
 static int sis5595_transaction(struct i2c_adapter *adap)
@@ -369,14 +365,14 @@ static struct i2c_adapter sis5595_adapter = {
 	.algo		= &smbus_algorithm,
 };
 
-static struct pci_device_id sis5595_ids[] __devinitdata = {
+static const struct pci_device_id sis5595_ids[] = {
 	{ PCI_DEVICE(PCI_VENDOR_ID_SI, PCI_DEVICE_ID_SI_503) }, 
 	{ 0, }
 };
 
 MODULE_DEVICE_TABLE (pci, sis5595_ids);
 
-static int __devinit sis5595_probe(struct pci_dev *dev, const struct pci_device_id *id)
+static int sis5595_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	int err;
 

@@ -9,7 +9,6 @@
  *
  *  Common directory handling for ADFS
  */
-#include <linux/smp_lock.h>
 #include "adfs.h"
 
 /*
@@ -20,14 +19,12 @@ static DEFINE_RWLOCK(adfs_dir_lock);
 static int
 adfs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 {
-	struct inode *inode = filp->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 	struct super_block *sb = inode->i_sb;
 	struct adfs_dir_ops *ops = ADFS_SB(sb)->s_dir;
 	struct object_info obj;
 	struct adfs_dir dir;
 	int ret = 0;
-
-	lock_kernel();	
 
 	if (filp->f_pos >> 32)
 		goto out;
@@ -70,7 +67,6 @@ free_out:
 	ops->free(&dir);
 
 out:
-	unlock_kernel();
 	return ret;
 }
 
@@ -197,11 +193,11 @@ const struct file_operations adfs_dir_operations = {
 	.read		= generic_read_dir,
 	.llseek		= generic_file_llseek,
 	.readdir	= adfs_readdir,
-	.fsync		= simple_fsync,
+	.fsync		= generic_file_fsync,
 };
 
 static int
-adfs_hash(struct dentry *parent, struct qstr *qstr)
+adfs_hash(const struct dentry *parent, struct qstr *qstr)
 {
 	const unsigned int name_len = ADFS_SB(parent->d_sb)->s_namelen;
 	const unsigned char *name;
@@ -237,17 +233,18 @@ adfs_hash(struct dentry *parent, struct qstr *qstr)
  * requirements of the underlying filesystem.
  */
 static int
-adfs_compare(struct dentry *parent, struct qstr *entry, struct qstr *name)
+adfs_compare(const struct dentry *parent, const struct dentry *dentry,
+		unsigned int len, const char *str, const struct qstr *name)
 {
 	int i;
 
-	if (entry->len != name->len)
+	if (len != name->len)
 		return 1;
 
 	for (i = 0; i < name->len; i++) {
 		char a, b;
 
-		a = entry->name[i];
+		a = str[i];
 		b = name->name[i];
 
 		if (a >= 'A' && a <= 'Z')
@@ -267,14 +264,12 @@ const struct dentry_operations adfs_dentry_operations = {
 };
 
 static struct dentry *
-adfs_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *nd)
+adfs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
 	struct inode *inode = NULL;
 	struct object_info obj;
 	int error;
 
-	dentry->d_op = &adfs_dentry_operations;	
-	lock_kernel();
 	error = adfs_dir_lookup_byname(dir, &dentry->d_name, &obj);
 	if (error == 0) {
 		error = -EACCES;
@@ -286,7 +281,6 @@ adfs_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *nd)
 		if (inode)
 			error = 0;
 	}
-	unlock_kernel();
 	d_add(dentry, inode);
 	return ERR_PTR(error);
 }

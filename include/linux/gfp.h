@@ -1,6 +1,7 @@
 #ifndef __LINUX_GFP_H
 #define __LINUX_GFP_H
 
+#include <linux/mmdebug.h>
 #include <linux/mmzone.h>
 #include <linux/stddef.h>
 #include <linux/linkage.h>
@@ -10,18 +11,51 @@
 struct vm_area_struct;
 
 /*
+ * In case of changes, please don't forget to update
+ * include/trace/events/gfpflags.h and tools/perf/builtin-kmem.c
+ */
+
+/* Plain integer GFP bitmasks. Do not use this directly. */
+#define ___GFP_DMA		0x01u
+#define ___GFP_HIGHMEM		0x02u
+#define ___GFP_DMA32		0x04u
+#define ___GFP_MOVABLE		0x08u
+#define ___GFP_WAIT		0x10u
+#define ___GFP_HIGH		0x20u
+#define ___GFP_IO		0x40u
+#define ___GFP_FS		0x80u
+#define ___GFP_COLD		0x100u
+#define ___GFP_NOWARN		0x200u
+#define ___GFP_REPEAT		0x400u
+#define ___GFP_NOFAIL		0x800u
+#define ___GFP_NORETRY		0x1000u
+#define ___GFP_MEMALLOC		0x2000u
+#define ___GFP_COMP		0x4000u
+#define ___GFP_ZERO		0x8000u
+#define ___GFP_NOMEMALLOC	0x10000u
+#define ___GFP_HARDWALL		0x20000u
+#define ___GFP_THISNODE		0x40000u
+#define ___GFP_RECLAIMABLE	0x80000u
+#define ___GFP_ACCOUNT		0x100000u
+#define ___GFP_NOTRACK		0x200000u
+#define ___GFP_NO_KSWAPD	0x400000u
+#define ___GFP_OTHER_NODE	0x800000u
+#define ___GFP_WRITE		0x1000000u
+/* If the above are modified, __GFP_BITS_SHIFT may need updating */
+
+/*
  * GFP bitmasks..
  *
  * Zone modifiers (see linux/mmzone.h - low three bits)
  *
  * Do not put any conditional on these. If necessary modify the definitions
- * without the underscores and use the consistently. The definitions here may
+ * without the underscores and use them consistently. The definitions here may
  * be used in bit comparisons.
  */
-#define __GFP_DMA	((__force gfp_t)0x01u)
-#define __GFP_HIGHMEM	((__force gfp_t)0x02u)
-#define __GFP_DMA32	((__force gfp_t)0x04u)
-#define __GFP_MOVABLE	((__force gfp_t)0x08u)  /* Page is movable */
+#define __GFP_DMA	((__force gfp_t)___GFP_DMA)
+#define __GFP_HIGHMEM	((__force gfp_t)___GFP_HIGHMEM)
+#define __GFP_DMA32	((__force gfp_t)___GFP_DMA32)
+#define __GFP_MOVABLE	((__force gfp_t)___GFP_MOVABLE)  /* Page is movable */
 #define GFP_ZONEMASK	(__GFP_DMA|__GFP_HIGHMEM|__GFP_DMA32|__GFP_MOVABLE)
 /*
  * Action modifiers - doesn't change the zoning
@@ -30,37 +64,42 @@ struct vm_area_struct;
  * _might_ fail.  This depends upon the particular VM implementation.
  *
  * __GFP_NOFAIL: The VM implementation _must_ retry infinitely: the caller
- * cannot handle allocation failures.
+ * cannot handle allocation failures.  This modifier is deprecated and no new
+ * users should be added.
  *
  * __GFP_NORETRY: The VM implementation must not retry indefinitely.
  *
  * __GFP_MOVABLE: Flag that this page will be movable by the page migration
  * mechanism or reclaimed
+ *
+ * __GFP_ACCOUNT causes the allocation to be accounted to kmemcg
  */
-#define __GFP_WAIT	((__force gfp_t)0x10u)	/* Can wait and reschedule? */
-#define __GFP_HIGH	((__force gfp_t)0x20u)	/* Should access emergency pools? */
-#define __GFP_IO	((__force gfp_t)0x40u)	/* Can start physical IO? */
-#define __GFP_FS	((__force gfp_t)0x80u)	/* Can call down to low-level FS? */
-#define __GFP_COLD	((__force gfp_t)0x100u)	/* Cache-cold page required */
-#define __GFP_NOWARN	((__force gfp_t)0x200u)	/* Suppress page allocation failure warning */
-#define __GFP_REPEAT	((__force gfp_t)0x400u)	/* See above */
-#define __GFP_NOFAIL	((__force gfp_t)0x800u)	/* See above */
-#define __GFP_NORETRY	((__force gfp_t)0x1000u)/* See above */
-#define __GFP_COMP	((__force gfp_t)0x4000u)/* Add compound page metadata */
-#define __GFP_ZERO	((__force gfp_t)0x8000u)/* Return zeroed page on success */
-#define __GFP_NOMEMALLOC ((__force gfp_t)0x10000u) /* Don't use emergency reserves */
-#define __GFP_HARDWALL   ((__force gfp_t)0x20000u) /* Enforce hardwall cpuset memory allocs */
-#define __GFP_THISNODE	((__force gfp_t)0x40000u)/* No fallback, no policies */
-#define __GFP_RECLAIMABLE ((__force gfp_t)0x80000u) /* Page is reclaimable */
+#define __GFP_WAIT	((__force gfp_t)___GFP_WAIT)	/* Can wait and reschedule? */
+#define __GFP_HIGH	((__force gfp_t)___GFP_HIGH)	/* Should access emergency pools? */
+#define __GFP_IO	((__force gfp_t)___GFP_IO)	/* Can start physical IO? */
+#define __GFP_FS	((__force gfp_t)___GFP_FS)	/* Can call down to low-level FS? */
+#define __GFP_COLD	((__force gfp_t)___GFP_COLD)	/* Cache-cold page required */
+#define __GFP_NOWARN	((__force gfp_t)___GFP_NOWARN)	/* Suppress page allocation failure warning */
+#define __GFP_REPEAT	((__force gfp_t)___GFP_REPEAT)	/* See above */
+#define __GFP_NOFAIL	((__force gfp_t)___GFP_NOFAIL)	/* See above */
+#define __GFP_NORETRY	((__force gfp_t)___GFP_NORETRY) /* See above */
+#define __GFP_MEMALLOC	((__force gfp_t)___GFP_MEMALLOC)/* Allow access to emergency reserves */
+#define __GFP_COMP	((__force gfp_t)___GFP_COMP)	/* Add compound page metadata */
+#define __GFP_ZERO	((__force gfp_t)___GFP_ZERO)	/* Return zeroed page on success */
+#define __GFP_NOMEMALLOC ((__force gfp_t)___GFP_NOMEMALLOC) /* Don't use emergency reserves.
+							 * This takes precedence over the
+							 * __GFP_MEMALLOC flag if both are
+							 * set
+							 */
+#define __GFP_HARDWALL   ((__force gfp_t)___GFP_HARDWALL) /* Enforce hardwall cpuset memory allocs */
+#define __GFP_THISNODE	((__force gfp_t)___GFP_THISNODE)/* No fallback, no policies */
+#define __GFP_ACCOUNT	((__force gfp_t)___GFP_ACCOUNT)
+#define __GFP_RECLAIMABLE ((__force gfp_t)___GFP_RECLAIMABLE) /* Page is reclaimable */
+#define __GFP_NOTRACK	((__force gfp_t)___GFP_NOTRACK)  /* Don't track with kmemcheck */
 
-#ifdef CONFIG_KMEMCHECK
-#define __GFP_NOTRACK	((__force gfp_t)0x200000u)  /* Don't track with kmemcheck */
-#else
-#define __GFP_NOTRACK	((__force gfp_t)0)
-#endif
-
-#define __GFP_NO_KSWAPD	((__force gfp_t)0x400000u)
-#define __GFP_OTHER_NODE ((__force gfp_t)0x800000u)
+#define __GFP_NO_KSWAPD	((__force gfp_t)___GFP_NO_KSWAPD)
+#define __GFP_OTHER_NODE ((__force gfp_t)___GFP_OTHER_NODE) /* On behalf of other node */
+#define __GFP_WRITE	((__force gfp_t)___GFP_WRITE)	/* Allocator intends to dirty page */
 
 /*
  * This may seem redundant, but it's a way of annotating false positives vs.
@@ -68,7 +107,7 @@ struct vm_area_struct;
  */
 #define __GFP_NOTRACK_FALSE_POSITIVE (__GFP_NOTRACK)
 
-#define __GFP_BITS_SHIFT 23	/* Room for 23 __GFP_FOO bits */
+#define __GFP_BITS_SHIFT 25	/* Room for N __GFP_FOO bits */
 #define __GFP_BITS_MASK ((__force gfp_t)((1 << __GFP_BITS_SHIFT) - 1))
 
 /* This equals 0, but use constants in case they ever change */
@@ -78,6 +117,7 @@ struct vm_area_struct;
 #define GFP_NOIO	(__GFP_WAIT)
 #define GFP_NOFS	(__GFP_WAIT | __GFP_IO)
 #define GFP_KERNEL	(__GFP_WAIT | __GFP_IO | __GFP_FS)
+#define GFP_KERNEL_ACCOUNT (GFP_KERNEL | __GFP_ACCOUNT)
 #define GFP_TEMPORARY	(__GFP_WAIT | __GFP_IO | __GFP_FS | \
 			 __GFP_RECLAIMABLE)
 #define GFP_USER	(__GFP_WAIT | __GFP_IO | __GFP_FS | __GFP_HARDWALL)
@@ -91,6 +131,10 @@ struct vm_area_struct;
 			 __GFP_NOMEMALLOC | __GFP_NORETRY | __GFP_NOWARN | \
 			 __GFP_NO_KSWAPD)
 
+/*
+ * GFP_THISNODE does not perform any reclaim, you most likely want to
+ * use __GFP_THISNODE to allocate from a given node without fallback!
+ */
 #ifdef CONFIG_NUMA
 #define GFP_THISNODE	(__GFP_THISNODE | __GFP_NOWARN | __GFP_NORETRY)
 #else
@@ -103,10 +147,10 @@ struct vm_area_struct;
 /* Control page allocator reclaim behavior */
 #define GFP_RECLAIM_MASK (__GFP_WAIT|__GFP_HIGH|__GFP_IO|__GFP_FS|\
 			__GFP_NOWARN|__GFP_REPEAT|__GFP_NOFAIL|\
-			__GFP_NORETRY|__GFP_NOMEMALLOC)
+			__GFP_NORETRY|__GFP_MEMALLOC|__GFP_NOMEMALLOC)
 
 /* Control slab gfp mask during early boot */
-#define GFP_BOOT_MASK __GFP_BITS_MASK & ~(__GFP_WAIT|__GFP_IO|__GFP_FS)
+#define GFP_BOOT_MASK (__GFP_BITS_MASK & ~(__GFP_WAIT|__GFP_IO|__GFP_FS))
 
 /* Control allocation constraints */
 #define GFP_CONSTRAINT_MASK (__GFP_HARDWALL|__GFP_THISNODE)
@@ -123,7 +167,7 @@ struct vm_area_struct;
 #define GFP_DMA32	__GFP_DMA32
 
 /* Convert GFP flags to their corresponding migrate type */
-static inline int allocflags_to_migratetype(gfp_t gfp_flags)
+static inline int gfpflags_to_migratetype(const gfp_t gfp_flags)
 {
 	WARN_ON((gfp_flags & GFP_MOVABLE_MASK) == GFP_MOVABLE_MASK);
 
@@ -133,6 +177,11 @@ static inline int allocflags_to_migratetype(gfp_t gfp_flags)
 	/* Group based on mobility */
 	return (((gfp_flags & __GFP_MOVABLE) != 0) << 1) |
 		((gfp_flags & __GFP_RECLAIMABLE) != 0);
+}
+
+static inline bool gfpflags_allow_blocking(const gfp_t gfp_flags)
+{
+	return !!(gfp_flags & __GFP_WAIT);
 }
 
 #ifdef CONFIG_HIGHMEM
@@ -157,12 +206,12 @@ static inline int allocflags_to_migratetype(gfp_t gfp_flags)
  * GFP_ZONE_TABLE is a word size bitstring that is used for looking up the
  * zone to use given the lowest 4 bits of gfp_t. Entries are ZONE_SHIFT long
  * and there are 16 of them to cover all possible combinations of
- * __GFP_DMA, __GFP_DMA32, __GFP_MOVABLE and __GFP_HIGHMEM
+ * __GFP_DMA, __GFP_DMA32, __GFP_MOVABLE and __GFP_HIGHMEM.
  *
  * The zone fallback order is MOVABLE=>HIGHMEM=>NORMAL=>DMA32=>DMA.
  * But GFP_MOVABLE is not only a zone specifier but also an allocation
  * policy. Therefore __GFP_MOVABLE plus another zone selector is valid.
- * Only 1bit of the lowest 3 bit (DMA,DMA32,HIGHMEM) can be set to "1".
+ * Only 1 bit of the lowest 3 bits (DMA,DMA32,HIGHMEM) can be set to "1".
  *
  *       bit       result
  *       =================
@@ -183,56 +232,56 @@ static inline int allocflags_to_migratetype(gfp_t gfp_flags)
  *       0xe    => BAD (MOVABLE+DMA32+HIGHMEM)
  *       0xf    => BAD (MOVABLE+DMA32+HIGHMEM+DMA)
  *
- * ZONES_SHIFT must be <= 2 on 32 bit platforms.
+ * GFP_ZONES_SHIFT must be <= 2 on 32 bit platforms.
  */
 
-#if 16 * ZONES_SHIFT > BITS_PER_LONG
-#error ZONES_SHIFT too large to create GFP_ZONE_TABLE integer
+#if defined(CONFIG_ZONE_DEVICE) && (MAX_NR_ZONES-1) <= 4
+/* ZONE_DEVICE is not a valid GFP zone specifier */
+#define GFP_ZONES_SHIFT 2
+#else
+#define GFP_ZONES_SHIFT ZONES_SHIFT
+#endif
+
+#if 16 * GFP_ZONES_SHIFT > BITS_PER_LONG
+#error GFP_ZONES_SHIFT too large to create GFP_ZONE_TABLE integer
 #endif
 
 #define GFP_ZONE_TABLE ( \
-	(ZONE_NORMAL << 0 * ZONES_SHIFT)				\
-	| (OPT_ZONE_DMA << __GFP_DMA * ZONES_SHIFT) 			\
-	| (OPT_ZONE_HIGHMEM << __GFP_HIGHMEM * ZONES_SHIFT)		\
-	| (OPT_ZONE_DMA32 << __GFP_DMA32 * ZONES_SHIFT)			\
-	| (ZONE_NORMAL << __GFP_MOVABLE * ZONES_SHIFT)			\
-	| (OPT_ZONE_DMA << (__GFP_MOVABLE | __GFP_DMA) * ZONES_SHIFT)	\
-	| (ZONE_MOVABLE << (__GFP_MOVABLE | __GFP_HIGHMEM) * ZONES_SHIFT)\
-	| (OPT_ZONE_DMA32 << (__GFP_MOVABLE | __GFP_DMA32) * ZONES_SHIFT)\
+	(ZONE_NORMAL << 0 * GFP_ZONES_SHIFT)				       \
+	| (OPT_ZONE_DMA << ___GFP_DMA * GFP_ZONES_SHIFT)		       \
+	| (OPT_ZONE_HIGHMEM << ___GFP_HIGHMEM * GFP_ZONES_SHIFT)	       \
+	| (OPT_ZONE_DMA32 << ___GFP_DMA32 * GFP_ZONES_SHIFT)		       \
+	| (ZONE_NORMAL << ___GFP_MOVABLE * GFP_ZONES_SHIFT)		       \
+	| (OPT_ZONE_DMA << (___GFP_MOVABLE | ___GFP_DMA) * GFP_ZONES_SHIFT)    \
+	| (ZONE_MOVABLE << (___GFP_MOVABLE | ___GFP_HIGHMEM) * GFP_ZONES_SHIFT)\
+	| (OPT_ZONE_DMA32 << (___GFP_MOVABLE | ___GFP_DMA32) * GFP_ZONES_SHIFT)\
 )
 
 /*
- * GFP_ZONE_BAD is a bitmap for all combination of __GFP_DMA, __GFP_DMA32
+ * GFP_ZONE_BAD is a bitmap for all combinations of __GFP_DMA, __GFP_DMA32
  * __GFP_HIGHMEM and __GFP_MOVABLE that are not permitted. One flag per
  * entry starting with bit 0. Bit is set if the combination is not
  * allowed.
  */
 #define GFP_ZONE_BAD ( \
-	1 << (__GFP_DMA | __GFP_HIGHMEM)				\
-	| 1 << (__GFP_DMA | __GFP_DMA32)				\
-	| 1 << (__GFP_DMA32 | __GFP_HIGHMEM)				\
-	| 1 << (__GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM)		\
-	| 1 << (__GFP_MOVABLE | __GFP_HIGHMEM | __GFP_DMA)		\
-	| 1 << (__GFP_MOVABLE | __GFP_DMA32 | __GFP_DMA)		\
-	| 1 << (__GFP_MOVABLE | __GFP_DMA32 | __GFP_HIGHMEM)		\
-	| 1 << (__GFP_MOVABLE | __GFP_DMA32 | __GFP_DMA | __GFP_HIGHMEM)\
+	1 << (___GFP_DMA | ___GFP_HIGHMEM)				      \
+	| 1 << (___GFP_DMA | ___GFP_DMA32)				      \
+	| 1 << (___GFP_DMA32 | ___GFP_HIGHMEM)				      \
+	| 1 << (___GFP_DMA | ___GFP_DMA32 | ___GFP_HIGHMEM)		      \
+	| 1 << (___GFP_MOVABLE | ___GFP_HIGHMEM | ___GFP_DMA)		      \
+	| 1 << (___GFP_MOVABLE | ___GFP_DMA32 | ___GFP_DMA)		      \
+	| 1 << (___GFP_MOVABLE | ___GFP_DMA32 | ___GFP_HIGHMEM)		      \
+	| 1 << (___GFP_MOVABLE | ___GFP_DMA32 | ___GFP_DMA | ___GFP_HIGHMEM)  \
 )
 
 static inline enum zone_type gfp_zone(gfp_t flags)
 {
 	enum zone_type z;
-	int bit = flags & GFP_ZONEMASK;
+	int bit = (__force int) (flags & GFP_ZONEMASK);
 
-	z = (GFP_ZONE_TABLE >> (bit * ZONES_SHIFT)) &
-					 ((1 << ZONES_SHIFT) - 1);
-
-	if (__builtin_constant_p(bit))
-		MAYBE_BUILD_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
-	else {
-#ifdef CONFIG_DEBUG_VM
-		BUG_ON((GFP_ZONE_BAD >> bit) & 1);
-#endif
-	}
+	z = (GFP_ZONE_TABLE >> (bit * GFP_ZONES_SHIFT)) &
+					 ((1 << GFP_ZONES_SHIFT) - 1);
+	VM_BUG_ON((GFP_ZONE_BAD >> bit) & 1);
 	return z;
 }
 
@@ -245,7 +294,7 @@ static inline enum zone_type gfp_zone(gfp_t flags)
 
 static inline int gfp_zonelist(gfp_t flags)
 {
-	if (NUMA_BUILD && unlikely(flags & __GFP_THISNODE))
+	if (IS_ENABLED(CONFIG_NUMA) && unlikely(flags & __GFP_THISNODE))
 		return 1;
 
 	return 0;
@@ -296,7 +345,7 @@ static inline struct page *alloc_pages_node(int nid, gfp_t gfp_mask,
 static inline struct page *alloc_pages_exact_node(int nid, gfp_t gfp_mask,
 						unsigned int order)
 {
-	VM_BUG_ON(nid < 0 || nid >= MAX_NUMNODES);
+	VM_BUG_ON(nid < 0 || nid >= MAX_NUMNODES || !node_online(nid));
 
 	return __alloc_pages(gfp_mask, order, node_zonelist(nid, gfp_mask));
 }
@@ -310,19 +359,23 @@ alloc_pages(gfp_t gfp_mask, unsigned int order)
 	return alloc_pages_current(gfp_mask, order);
 }
 extern struct page *alloc_pages_vma(gfp_t gfp_mask, int order,
-		    	struct vm_area_struct *vma, unsigned long addr,
-			int node);
+			struct vm_area_struct *vma, unsigned long addr,
+			int node, bool hugepage);
+#define alloc_hugepage_vma(gfp_mask, vma, addr, order)	\
+	alloc_pages_vma(gfp_mask, order, vma, addr, numa_node_id(), true)
 #else
 #define alloc_pages(gfp_mask, order) \
 		alloc_pages_node(numa_node_id(), gfp_mask, order)
-#define alloc_pages_vma(gfp_mask, order, vma, addr, node)	\
+#define alloc_pages_vma(gfp_mask, order, vma, addr, node, false)\
+	alloc_pages(gfp_mask, order)
+#define alloc_hugepage_vma(gfp_mask, vma, addr, order)	\
 	alloc_pages(gfp_mask, order)
 #endif
 #define alloc_page(gfp_mask) alloc_pages(gfp_mask, 0)
 #define alloc_page_vma(gfp_mask, vma, addr)			\
-	alloc_pages_vma(gfp_mask, 0, vma, addr, numa_node_id())
+	alloc_pages_vma(gfp_mask, 0, vma, addr, numa_node_id(), false)
 #define alloc_page_vma_node(gfp_mask, vma, addr, node)		\
-	alloc_pages_vma(gfp_mask, 0, vma, addr, node)
+	alloc_pages_vma(gfp_mask, 0, vma, addr, node, false)
 
 extern unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order);
 extern unsigned long get_zeroed_page(gfp_t gfp_mask);
@@ -333,26 +386,72 @@ void free_pages_exact(void *virt, size_t size);
 void *alloc_pages_exact_nid(int nid, size_t size, gfp_t gfp_mask);
 
 #define __get_free_page(gfp_mask) \
-		__get_free_pages((gfp_mask),0)
+		__get_free_pages((gfp_mask), 0)
 
 #define __get_dma_pages(gfp_mask, order) \
-		__get_free_pages((gfp_mask) | GFP_DMA,(order))
+		__get_free_pages((gfp_mask) | GFP_DMA, (order))
 
 extern void __free_pages(struct page *page, unsigned int order);
 extern void free_pages(unsigned long addr, unsigned int order);
-extern void free_hot_page(struct page *page);
+extern void free_hot_cold_page(struct page *page, bool cold);
+extern void free_hot_cold_page_list(struct list_head *list, bool cold);
+
+struct page_frag_cache;
+extern void __page_frag_cache_drain(struct page *page, unsigned int count);
+extern void *page_frag_alloc(struct page_frag_cache *nc,
+			     unsigned int fragsz, gfp_t gfp_mask);
+extern void page_frag_free(void *addr);
 
 #define __free_page(page) __free_pages((page), 0)
-#define free_page(addr) free_pages((addr),0)
+#define free_page(addr) free_pages((addr), 0)
 
 void page_alloc_init(void);
 void drain_zone_pages(struct zone *zone, struct per_cpu_pages *pcp);
 void drain_all_pages(void);
 void drain_local_pages(void *dummy);
 
+#ifdef CONFIG_DEFERRED_STRUCT_PAGE_INIT
+void page_alloc_init_late(void);
+#else
+static inline void page_alloc_init_late(void)
+{
+}
+#endif
+
+/*
+ * gfp_allowed_mask is set to GFP_BOOT_MASK during early boot to restrict what
+ * GFP flags are used before interrupts are enabled. Once interrupts are
+ * enabled, it is set to __GFP_BITS_MASK while the system is running. During
+ * hibernation, it is used by PM to avoid I/O during memory allocation while
+ * devices are suspended.
+ */
 extern gfp_t gfp_allowed_mask;
+
+/* Returns true if the gfp_mask allows use of ALLOC_NO_WATERMARK */
+bool gfp_pfmemalloc_allowed(gfp_t gfp_mask);
 
 extern void pm_restrict_gfp_mask(void);
 extern void pm_restore_gfp_mask(void);
+
+#ifdef CONFIG_PM_SLEEP
+extern bool pm_suspended_storage(void);
+#else
+static inline bool pm_suspended_storage(void)
+{
+	return false;
+}
+#endif /* CONFIG_PM_SLEEP */
+
+#if (defined(CONFIG_MEMORY_ISOLATION) && defined(CONFIG_COMPACTION)) || defined(CONFIG_CMA)
+/* The below functions must be run on a range from a single zone. */
+extern int alloc_contig_range(unsigned long start, unsigned long end,
+			      unsigned migratetype, gfp_t gfp_mask);
+extern void free_contig_range(unsigned long pfn, unsigned nr_pages);
+#endif
+
+#ifdef CONFIG_CMA
+/* CMA stuff */
+extern void init_cma_reserved_pageblock(struct page *page);
+#endif
 
 #endif /* __LINUX_GFP_H */

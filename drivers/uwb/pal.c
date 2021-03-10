@@ -18,6 +18,7 @@
 #include <linux/kernel.h>
 #include <linux/debugfs.h>
 #include <linux/uwb.h>
+#include <linux/export.h>
 
 #include "uwb-internal.h"
 
@@ -43,10 +44,12 @@ int uwb_pal_register(struct uwb_pal *pal)
 	int ret;
 
 	if (pal->device) {
+		/* create a link to the uwb_rc in the PAL device's directory. */
 		ret = sysfs_create_link(&pal->device->kobj,
 					&rc->uwb_dev.dev.kobj, "uwb_rc");
 		if (ret < 0)
 			return ret;
+		/* create a link to the PAL in the UWB device's directory. */
 		ret = sysfs_create_link(&rc->uwb_dev.dev.kobj,
 					&pal->device->kobj, pal->name);
 		if (ret < 0) {

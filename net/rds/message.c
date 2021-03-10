@@ -31,6 +31,8 @@
  *
  */
 #include <linux/kernel.h>
+#include <linux/slab.h>
+#include <linux/export.h>
 
 #include "rds.h"
 
@@ -39,6 +41,8 @@ static unsigned int	rds_exthdr_size[__RDS_EXTHDR_MAX] = {
 [RDS_EXTHDR_VERSION]	= sizeof(struct rds_ext_header_version),
 [RDS_EXTHDR_RDMA]	= sizeof(struct rds_ext_header_rdma),
 [RDS_EXTHDR_RDMA_DEST]	= sizeof(struct rds_ext_header_rdma_dest),
+[RDS_EXTHDR_NPATHS]	= sizeof(u16),
+[RDS_EXTHDR_GEN_NUM]	= sizeof(u32),
 };
 
 
@@ -112,8 +116,7 @@ int rds_message_add_extension(struct rds_header *hdr, unsigned int type,
 	if (hdr->h_exthdr[0] != RDS_EXTHDR_NONE)
 		return 0;
 
-	if (type >= __RDS_EXTHDR_MAX
-	 || len != rds_exthdr_size[type])
+	if (type >= __RDS_EXTHDR_MAX || len != rds_exthdr_size[type])
 		return 0;
 
 	if (ext_len >= RDS_HEADER_EXT_SPACE)

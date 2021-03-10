@@ -43,6 +43,8 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <linux/slab.h>
+
 #include "ehca_iverbs.h"
 #include "ehca_classes.h"
 #include "ehca_irq.h"
@@ -111,10 +113,12 @@ struct ehca_qp *ehca_cq_get_qp(struct ehca_cq *cq, int real_qp_num)
 	return ret;
 }
 
-struct ib_cq *ehca_create_cq(struct ib_device *device, int cqe, int comp_vector,
+struct ib_cq *ehca_create_cq(struct ib_device *device,
+			     const struct ib_cq_init_attr *attr,
 			     struct ib_ucontext *context,
 			     struct ib_udata *udata)
 {
+	int cqe = attr->cqe;
 	static const u32 additional_cqe = 20;
 	struct ib_cq *cq;
 	struct ehca_cq *my_cq;
@@ -126,8 +130,11 @@ struct ib_cq *ehca_create_cq(struct ib_device *device, int cqe, int comp_vector,
 	void *vpage;
 	u32 counter;
 	u64 rpage, cqx_fec, h_ret;
-	int ipz_rc, ret, i;
+	int rc, i;
 	unsigned long flags;
+
+	if (attr->flags)
+		return ERR_PTR(-EINVAL);
 
 	if (cqe >= 0xFFFFFFFF - 64 - additional_cqe)
 		return ERR_PTR(-EINVAL);
@@ -161,31 +168,19 @@ struct ib_cq *ehca_create_cq(struct ib_device *device, int cqe, int comp_vector,
 	adapter_handle = shca->ipz_hca_handle;
 	param.eq_handle = shca->eq.ipz_eq_handle;
 
-	do {
-		if (!idr_pre_get(&ehca_cq_idr, GFP_KERNEL)) {
-			cq = ERR_PTR(-ENOMEM);
-			ehca_err(device, "Can't reserve idr nr. device=%p",
-				 device);
-			goto create_cq_exit1;
-		}
+	idr_preload(GFP_KERNEL);
+	write_lock_irqsave(&ehca_cq_idr_lock, flags);
+	rc = idr_alloc(&ehca_cq_idr, my_cq, 0, 0x2000000, GFP_NOWAIT);
+	write_unlock_irqrestore(&ehca_cq_idr_lock, flags);
+	idr_preload_end();
 
-		write_lock_irqsave(&ehca_cq_idr_lock, flags);
-		ret = idr_get_new(&ehca_cq_idr, my_cq, &my_cq->token);
-		write_unlock_irqrestore(&ehca_cq_idr_lock, flags);
-	} while (ret == -EAGAIN);
-
-	if (ret) {
+	if (rc < 0) {
 		cq = ERR_PTR(-ENOMEM);
 		ehca_err(device, "Can't allocate new idr entry. device=%p",
 			 device);
 		goto create_cq_exit1;
 	}
-
-	if (my_cq->token > 0x1FFFFFF) {
-		cq = ERR_PTR(-ENOMEM);
-		ehca_err(device, "Invalid number of cq. device=%p", device);
-		goto create_cq_exit2;
-	}
+	my_cq->token = rc;
 
 	/*
 	 * CQs maximum depth is 4GB-64, but we need additional 20 as buffer
@@ -201,11 +196,11 @@ struct ib_cq *ehca_create_cq(struct ib_device *device, int cqe, int comp_vector,
 		goto create_cq_exit2;
 	}
 
-	ipz_rc = ipz_queue_ctor(NULL, &my_cq->ipz_queue, param.act_pages,
+	rc = ipz_queue_ctor(NULL, &my_cq->ipz_queue, param.act_pages,
 				EHCA_PAGESIZE, sizeof(struct ehca_cqe), 0, 0);
-	if (!ipz_rc) {
+	if (!rc) {
 		ehca_err(device, "ipz_queue_ctor() failed ipz_rc=%i device=%p",
-			 ipz_rc, device);
+			 rc, device);
 		cq = ERR_PTR(-EINVAL);
 		goto create_cq_exit3;
 	}
@@ -218,7 +213,7 @@ struct ib_cq *ehca_create_cq(struct ib_device *device, int cqe, int comp_vector,
 			cq = ERR_PTR(-EAGAIN);
 			goto create_cq_exit4;
 		}
-		rpage = virt_to_abs(vpage);
+		rpage = __pa(vpage);
 
 		h_ret = hipz_h_register_rpage_cq(adapter_handle,
 						 my_cq->ipz_cq_handle,

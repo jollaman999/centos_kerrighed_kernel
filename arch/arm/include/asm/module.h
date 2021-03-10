@@ -1,35 +1,47 @@
 #ifndef _ASM_ARM_MODULE_H
 #define _ASM_ARM_MODULE_H
 
-#define MODULES_ARE_ELF32
-#define Elf_Shdr	Elf32_Shdr
-#define Elf_Sym		Elf32_Sym
-#define Elf_Ehdr	Elf32_Ehdr
-#define Elf_Rel		Elf32_Rel
-#define Elf_Rela	Elf32_Rela
-#define ELF_R_TYPE(X)	ELF32_R_TYPE(X)
-#define ELF_R_SYM(X)	ELF32_R_SYM(X)
+#include <asm-generic/module.h>
 
 struct unwind_table;
 
-struct mod_arch_specific
-{
 #ifdef CONFIG_ARM_UNWIND
-	Elf_Shdr *unw_sec_init;
-	Elf_Shdr *unw_sec_devinit;
-	Elf_Shdr *unw_sec_core;
-	Elf_Shdr *sec_init_text;
-	Elf_Shdr *sec_devinit_text;
-	Elf_Shdr *sec_core_text;
-	struct unwind_table *unwind_init;
-	struct unwind_table *unwind_devinit;
-	struct unwind_table *unwind_core;
-#endif
+enum {
+	ARM_SEC_INIT,
+	ARM_SEC_DEVINIT,
+	ARM_SEC_CORE,
+	ARM_SEC_EXIT,
+	ARM_SEC_DEVEXIT,
+	ARM_SEC_MAX,
 };
 
+struct mod_arch_specific {
+	struct unwind_table *unwind[ARM_SEC_MAX];
+};
+#endif
+
 /*
- * Include the ARM architecture version.
+ * Add the ARM architecture version to the version magic string
  */
-#define MODULE_ARCH_VERMAGIC	"ARMv" __stringify(__LINUX_ARM_ARCH__) " "
+#define MODULE_ARCH_VERMAGIC_ARMVSN "ARMv" __stringify(__LINUX_ARM_ARCH__) " "
+
+/* Add __virt_to_phys patching state as well */
+#ifdef CONFIG_ARM_PATCH_PHYS_VIRT
+#define MODULE_ARCH_VERMAGIC_P2V "p2v8 "
+#else
+#define MODULE_ARCH_VERMAGIC_P2V ""
+#endif
+
+/* Add instruction set architecture tag to distinguish ARM/Thumb kernels */
+#ifdef CONFIG_THUMB2_KERNEL
+#define MODULE_ARCH_VERMAGIC_ARMTHUMB "thumb2 "
+#else
+#define MODULE_ARCH_VERMAGIC_ARMTHUMB ""
+#endif
+
+#define MODULE_ARCH_VERMAGIC \
+	MODULE_ARCH_VERMAGIC_ARMVSN \
+	MODULE_ARCH_VERMAGIC_ARMTHUMB \
+	MODULE_ARCH_VERMAGIC_P2V
 
 #endif /* _ASM_ARM_MODULE_H */

@@ -24,7 +24,6 @@
 #include <linux/rtnetlink.h>
 #include <linux/wireless.h>
 #include <linux/etherdevice.h>
-#include <linux/nospec.h>
 #include <net/net_namespace.h>
 #include <net/iw_handler.h>
 #include <net/lib80211.h>
@@ -227,7 +226,7 @@ int prism2_wds_del(local_info_t *local, u8 *remote_addr,
 
 	if (selected) {
 		if (do_not_remove)
-			eth_zero_addr(selected->u.wds.remote_addr);
+			memset(selected->u.wds.remote_addr, 0, ETH_ALEN);
 		else {
 			hostap_remove_interface(selected->dev, rtnl_locked, 0);
 			local->wds_connections--;
@@ -338,7 +337,6 @@ int hostap_set_encryption(local_info_t *local)
 	enum { NONE, WEP, OTHER } encrypt_type;
 
 	idx = local->crypt_info.tx_keyidx;
-	idx = array_index_nospec(idx, NUM_WEP_KEYS);
 	if (local->crypt_info.crypt[idx] == NULL ||
 	    local->crypt_info.crypt[idx]->ops == NULL)
 		encrypt_type = NONE;
@@ -856,7 +854,7 @@ void hostap_setup_dev(struct net_device *dev, local_info_t *local,
 
 	iface = netdev_priv(dev);
 	ether_setup(dev);
-	netdev_extended(dev)->ext_priv_flags &= ~IFF_TX_SKB_SHARING;
+	dev->priv_flags &= ~IFF_TX_SKB_SHARING;
 
 	/* kernel callbacks */
 	if (iface) {
@@ -1092,7 +1090,7 @@ int prism2_sta_deauth(local_info_t *local, u16 reason)
 
 	ret = prism2_sta_send_mgmt(local, local->bssid, IEEE80211_STYPE_DEAUTH,
 				   (u8 *) &val, 2);
-	eth_zero_addr(wrqu.ap_addr.sa_data);
+	memset(wrqu.ap_addr.sa_data, 0, ETH_ALEN);
 	wireless_send_event(local->dev, SIOCGIWAP, &wrqu, NULL);
 	return ret;
 }

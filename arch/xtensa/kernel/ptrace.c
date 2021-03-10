@@ -24,11 +24,21 @@
 
 #include <asm/pgtable.h>
 #include <asm/page.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <asm/ptrace.h>
 #include <asm/elf.h>
 #include <asm/coprocessor.h>
+
+
+void user_enable_single_step(struct task_struct *child)
+{
+	child->ptrace |= PT_SINGLESTEP;
+}
+
+void user_disable_single_step(struct task_struct *child)
+{
+	child->ptrace &= ~PT_SINGLESTEP;
+}
 
 /*
  * Called by kernel/ptrace.c when detaching to disable single stepping.
@@ -43,9 +53,8 @@ int ptrace_getregs(struct task_struct *child, void __user *uregs)
 {
 	struct pt_regs *regs = task_pt_regs(child);
 	xtensa_gregset_t __user *gregset = uregs;
-	unsigned long wm = regs->wmask;
 	unsigned long wb = regs->windowbase;
-	int live, i;
+	int i;
 
 	if (!access_ok(VERIFY_WRITE, uregs, sizeof(xtensa_gregset_t)))
 		return -EIO;
@@ -57,13 +66,11 @@ int ptrace_getregs(struct task_struct *child, void __user *uregs)
 	__put_user(regs->lcount, &gregset->lcount);
 	__put_user(regs->windowstart, &gregset->windowstart);
 	__put_user(regs->windowbase, &gregset->windowbase);
+	__put_user(regs->threadptr, &gregset->threadptr);
 
-	live = (wm & 2) ? 4 : (wm & 4) ? 8 : (wm & 8) ? 12 : 16;
-
-	for (i = 0; i < live; i++)
-		__put_user(regs->areg[i],gregset->a+((wb*4+i)%XCHAL_NUM_AREGS));
-	for (i = XCHAL_NUM_AREGS - (wm >> 4) * 4; i < XCHAL_NUM_AREGS; i++)
-		__put_user(regs->areg[i],gregset->a+((wb*4+i)%XCHAL_NUM_AREGS));
+	for (i = 0; i < XCHAL_NUM_AREGS; i++)
+		__put_user(regs->areg[i],
+				gregset->a + ((wb * 4 + i) % XCHAL_NUM_AREGS));
 
 	return 0;
 }
@@ -74,7 +81,7 @@ int ptrace_setregs(struct task_struct *child, void __user *uregs)
 	xtensa_gregset_t *gregset = uregs;
 	const unsigned long ps_mask = PS_CALLINC_MASK | PS_OWB_MASK;
 	unsigned long ps;
-	unsigned long wb;
+	unsigned long wb, ws;
 
 	if (!access_ok(VERIFY_WRITE, uregs, sizeof(xtensa_gregset_t)))
 		return -EIO;
@@ -84,21 +91,33 @@ int ptrace_setregs(struct task_struct *child, void __user *uregs)
 	__get_user(regs->lbeg, &gregset->lbeg);
 	__get_user(regs->lend, &gregset->lend);
 	__get_user(regs->lcount, &gregset->lcount);
-	__get_user(regs->windowstart, &gregset->windowstart);
+	__get_user(ws, &gregset->windowstart);
 	__get_user(wb, &gregset->windowbase);
+	__get_user(regs->threadptr, &gregset->threadptr);
 
 	regs->ps = (regs->ps & ~ps_mask) | (ps & ps_mask) | (1 << PS_EXCM_BIT);
 
 	if (wb >= XCHAL_NUM_AREGS / 4)
 		return -EFAULT;
 
-	regs->windowbase = wb;
+	if (wb != regs->windowbase || ws != regs->windowstart) {
+		unsigned long rotws, wmask;
+
+		rotws = (((ws | (ws << WSBITS)) >> wb) &
+				((1 << WSBITS) - 1)) & ~1;
+		wmask = ((rotws ? WSBITS + 1 - ffs(rotws) : 0) << 4) |
+			(rotws & 0xF) | 1;
+		regs->windowbase = wb;
+		regs->windowstart = ws;
+		regs->wmask = wmask;
+	}
 
 	if (wb != 0 &&  __copy_from_user(regs->areg + XCHAL_NUM_AREGS - wb * 4,
-					 gregset->a, wb * 16))
+				gregset->a, wb * 16))
 		return -EFAULT;
 
-	if (__copy_from_user(regs->areg, gregset->a + wb*4, (WSBITS-wb) * 16))
+	if (__copy_from_user(regs->areg, gregset->a + wb * 4,
+				(WSBITS - wb) * 16))
 		return -EFAULT;
 
 	return 0;
@@ -136,12 +155,15 @@ int ptrace_setxregs(struct task_struct *child, void __user *uregs)
 	elf_xtregs_t *xtregs = uregs;
 	int ret = 0;
 
+	if (!access_ok(VERIFY_READ, uregs, sizeof(elf_xtregs_t)))
+		return -EFAULT;
+
 #if XTENSA_HAVE_COPROCESSORS
 	/* Flush all coprocessors before we overwrite them. */
 	coprocessor_flush_all(ti);
 	coprocessor_release_all(ti);
 
-	ret |= __copy_from_user(&ti->xtregs_cp, &xtregs->cp0, 
+	ret |= __copy_from_user(&ti->xtregs_cp, &xtregs->cp0,
 				sizeof(xtregs_coprocessor_t));
 #endif
 	ret |= __copy_from_user(&regs->xtregs_opt, &xtregs->opt,
@@ -245,9 +267,11 @@ int ptrace_pokeusr(struct task_struct *child, long regno, long val)
 	return 0;
 }
 
-long arch_ptrace(struct task_struct *child, long request, long addr, long data)
+long arch_ptrace(struct task_struct *child, long request,
+		 unsigned long addr, unsigned long data)
 {
 	int ret = -EPERM;
+	void __user *datap = (void __user *) data;
 
 	switch (request) {
 	case PTRACE_PEEKTEXT:	/* read word at location addr. */
@@ -256,7 +280,7 @@ long arch_ptrace(struct task_struct *child, long request, long addr, long data)
 		break;
 
 	case PTRACE_PEEKUSR:	/* read register specified by addr. */
-		ret = ptrace_peekusr(child, addr, (void __user *) data);
+		ret = ptrace_peekusr(child, addr, datap);
 		break;
 
 	case PTRACE_POKETEXT:	/* write the word at location addr. */
@@ -268,65 +292,20 @@ long arch_ptrace(struct task_struct *child, long request, long addr, long data)
 		ret = ptrace_pokeusr(child, addr, data);
 		break;
 
-	/* continue and stop at next (return from) syscall */
-
-	case PTRACE_SYSCALL:
-	case PTRACE_CONT: /* restart after signal. */
-	{
-		ret = -EIO;
-		if (!valid_signal(data))
-			break;
-		if (request == PTRACE_SYSCALL)
-			set_tsk_thread_flag(child, TIF_SYSCALL_TRACE);
-		else
-			clear_tsk_thread_flag(child, TIF_SYSCALL_TRACE);
-		child->exit_code = data;
-		/* Make sure the single step bit is not set. */
-		child->ptrace &= ~PT_SINGLESTEP;
-		wake_up_process(child);
-		ret = 0;
-		break;
-	}
-
-	/*
-	 * make the child exit.  Best I can do is send it a sigkill.
-	 * perhaps it should be put in the status that it wants to
-	 * exit.
-	 */
-	case PTRACE_KILL:
-		ret = 0;
-		if (child->exit_state == EXIT_ZOMBIE)	/* already dead */
-			break;
-		child->exit_code = SIGKILL;
-		child->ptrace &= ~PT_SINGLESTEP;
-		wake_up_process(child);
-		break;
-
-	case PTRACE_SINGLESTEP:
-		ret = -EIO;
-		if (!valid_signal(data))
-			break;
-		clear_tsk_thread_flag(child, TIF_SYSCALL_TRACE);
-		child->ptrace |= PT_SINGLESTEP;
-		child->exit_code = data;
-		wake_up_process(child);
-		ret = 0;
-		break;
-
 	case PTRACE_GETREGS:
-		ret = ptrace_getregs(child, (void __user *) data);
+		ret = ptrace_getregs(child, datap);
 		break;
 
 	case PTRACE_SETREGS:
-		ret = ptrace_setregs(child, (void __user *) data);
+		ret = ptrace_setregs(child, datap);
 		break;
 
 	case PTRACE_GETXTREGS:
-		ret = ptrace_getxregs(child, (void __user *) data);
+		ret = ptrace_getxregs(child, datap);
 		break;
 
 	case PTRACE_SETXTREGS:
-		ret = ptrace_setxregs(child, (void __user *) data);
+		ret = ptrace_setxregs(child, datap);
 		break;
 
 	default:
@@ -363,8 +342,7 @@ void do_syscall_trace_enter(struct pt_regs *regs)
 		do_syscall_trace();
 
 #if 0
-	if (unlikely(current->audit_context))
-		audit_syscall_entry(current, AUDIT_ARCH_XTENSA..);
+	audit_syscall_entry(current, AUDIT_ARCH_XTENSA..);
 #endif
 }
 
@@ -374,4 +352,3 @@ void do_syscall_trace_leave(struct pt_regs *regs)
 			&& (current->ptrace & PT_PTRACED))
 		do_syscall_trace();
 }
-

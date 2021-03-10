@@ -323,12 +323,13 @@ error:
 
 static void bcm54xx_adjust_rxrefclk(struct phy_device *phydev)
 {
-	u32 val, orig;
+	u32 orig;
+	int val;
 	bool clk125en = true;
 
 	/* Abort if we are using an untested phy. */
-	if (BRCM_PHY_MODEL(phydev) != PHY_ID_BCM57780 ||
-	    BRCM_PHY_MODEL(phydev) != PHY_ID_BCM50610 ||
+	if (BRCM_PHY_MODEL(phydev) != PHY_ID_BCM57780 &&
+	    BRCM_PHY_MODEL(phydev) != PHY_ID_BCM50610 &&
 	    BRCM_PHY_MODEL(phydev) != PHY_ID_BCM50610M)
 		return;
 
@@ -354,8 +355,7 @@ static void bcm54xx_adjust_rxrefclk(struct phy_device *phydev)
 		}
 	}
 
-	if (clk125en == false ||
-	    (phydev->dev_flags & PHY_BRCM_AUTO_PWRDWN_ENABLE))
+	if (!clk125en || (phydev->dev_flags & PHY_BRCM_AUTO_PWRDWN_ENABLE))
 		val &= ~BCM54XX_SHD_SCR3_DLLAPD_DIS;
 	else
 		val |= BCM54XX_SHD_SCR3_DLLAPD_DIS;
@@ -372,8 +372,7 @@ static void bcm54xx_adjust_rxrefclk(struct phy_device *phydev)
 
 	orig = val;
 
-	if (clk125en == false ||
-	    (phydev->dev_flags & PHY_BRCM_AUTO_PWRDWN_ENABLE))
+	if (!clk125en || (phydev->dev_flags & PHY_BRCM_AUTO_PWRDWN_ENABLE))
 		val |= BCM54XX_SHD_APD_EN;
 	else
 		val &= ~BCM54XX_SHD_APD_EN;
@@ -552,7 +551,7 @@ static int bcm5481_config_aneg(struct phy_device *phydev)
 		/*
 		 * There is no BCM5481 specification available, so down
 		 * here is everything we know about "register 0x18". This
-		 * at least helps BCM5481 to successfuly receive packets
+		 * at least helps BCM5481 to successfully receive packets
 		 * on MPC8360E-RDK board. Peter Barada <peterb@logicpd.com>
 		 * says: "This sets delay between the RXD and RXC signals
 		 * instead of using trace lengths to achieve timing".
@@ -683,8 +682,9 @@ static int brcm_fet_config_intr(struct phy_device *phydev)
 	return err;
 }
 
-static struct phy_driver bcm5411_driver = {
-	.phy_id		= 0x00206070,
+static struct phy_driver broadcom_drivers[] = {
+{
+	.phy_id		= PHY_ID_BCM5411,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM5411",
 	.features	= PHY_GBIT_FEATURES |
@@ -696,10 +696,8 @@ static struct phy_driver bcm5411_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm5421_driver = {
-	.phy_id		= 0x002060e0,
+}, {
+	.phy_id		= PHY_ID_BCM5421,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM5421",
 	.features	= PHY_GBIT_FEATURES |
@@ -711,10 +709,8 @@ static struct phy_driver bcm5421_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm5461_driver = {
-	.phy_id		= 0x002060c0,
+}, {
+	.phy_id		= PHY_ID_BCM5461,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM5461",
 	.features	= PHY_GBIT_FEATURES |
@@ -726,10 +722,8 @@ static struct phy_driver bcm5461_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm5464_driver = {
-	.phy_id		= 0x002060b0,
+}, {
+	.phy_id		= PHY_ID_BCM5464,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM5464",
 	.features	= PHY_GBIT_FEATURES |
@@ -741,10 +735,8 @@ static struct phy_driver bcm5464_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm5481_driver = {
-	.phy_id		= 0x0143bca0,
+}, {
+	.phy_id		= PHY_ID_BCM5481,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM5481",
 	.features	= PHY_GBIT_FEATURES |
@@ -756,10 +748,8 @@ static struct phy_driver bcm5481_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm5482_driver = {
-	.phy_id		= 0x0143bcb0,
+}, {
+	.phy_id		= PHY_ID_BCM5482,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM5482",
 	.features	= PHY_GBIT_FEATURES |
@@ -771,9 +761,7 @@ static struct phy_driver bcm5482_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm50610_driver = {
+}, {
 	.phy_id		= PHY_ID_BCM50610,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM50610",
@@ -786,9 +774,7 @@ static struct phy_driver bcm50610_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm50610m_driver = {
+}, {
 	.phy_id		= PHY_ID_BCM50610M,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM50610M",
@@ -801,9 +787,7 @@ static struct phy_driver bcm50610m_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcm57780_driver = {
+}, {
 	.phy_id		= PHY_ID_BCM57780,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCM57780",
@@ -816,9 +800,7 @@ static struct phy_driver bcm57780_driver = {
 	.ack_interrupt	= bcm54xx_ack_interrupt,
 	.config_intr	= bcm54xx_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
-
-static struct phy_driver bcmac131_driver = {
+}, {
 	.phy_id		= PHY_ID_BCMAC131,
 	.phy_id_mask	= 0xfffffff0,
 	.name		= "Broadcom BCMAC131",
@@ -831,94 +813,48 @@ static struct phy_driver bcmac131_driver = {
 	.ack_interrupt	= brcm_fet_ack_interrupt,
 	.config_intr	= brcm_fet_config_intr,
 	.driver		= { .owner = THIS_MODULE },
-};
+}, {
+	.phy_id		= PHY_ID_BCM5241,
+	.phy_id_mask	= 0xfffffff0,
+	.name		= "Broadcom BCM5241",
+	.features	= PHY_BASIC_FEATURES |
+			  SUPPORTED_Pause | SUPPORTED_Asym_Pause,
+	.flags		= PHY_HAS_MAGICANEG | PHY_HAS_INTERRUPT,
+	.config_init	= brcm_fet_config_init,
+	.config_aneg	= genphy_config_aneg,
+	.read_status	= genphy_read_status,
+	.ack_interrupt	= brcm_fet_ack_interrupt,
+	.config_intr	= brcm_fet_config_intr,
+	.driver		= { .owner = THIS_MODULE },
+} };
 
 static int __init broadcom_init(void)
 {
-	int ret;
-
-	ret = phy_driver_register(&bcm5411_driver);
-	if (ret)
-		goto out_5411;
-	ret = phy_driver_register(&bcm5421_driver);
-	if (ret)
-		goto out_5421;
-	ret = phy_driver_register(&bcm5461_driver);
-	if (ret)
-		goto out_5461;
-	ret = phy_driver_register(&bcm5464_driver);
-	if (ret)
-		goto out_5464;
-	ret = phy_driver_register(&bcm5481_driver);
-	if (ret)
-		goto out_5481;
-	ret = phy_driver_register(&bcm5482_driver);
-	if (ret)
-		goto out_5482;
-	ret = phy_driver_register(&bcm50610_driver);
-	if (ret)
-		goto out_50610;
-	ret = phy_driver_register(&bcm50610m_driver);
-	if (ret)
-		goto out_50610m;
-	ret = phy_driver_register(&bcm57780_driver);
-	if (ret)
-		goto out_57780;
-	ret = phy_driver_register(&bcmac131_driver);
-	if (ret)
-		goto out_ac131;
-	return ret;
-
-out_ac131:
-	phy_driver_unregister(&bcm57780_driver);
-out_57780:
-	phy_driver_unregister(&bcm50610m_driver);
-out_50610m:
-	phy_driver_unregister(&bcm50610_driver);
-out_50610:
-	phy_driver_unregister(&bcm5482_driver);
-out_5482:
-	phy_driver_unregister(&bcm5481_driver);
-out_5481:
-	phy_driver_unregister(&bcm5464_driver);
-out_5464:
-	phy_driver_unregister(&bcm5461_driver);
-out_5461:
-	phy_driver_unregister(&bcm5421_driver);
-out_5421:
-	phy_driver_unregister(&bcm5411_driver);
-out_5411:
-	return ret;
+	return phy_drivers_register(broadcom_drivers,
+		ARRAY_SIZE(broadcom_drivers));
 }
 
 static void __exit broadcom_exit(void)
 {
-	phy_driver_unregister(&bcmac131_driver);
-	phy_driver_unregister(&bcm57780_driver);
-	phy_driver_unregister(&bcm50610m_driver);
-	phy_driver_unregister(&bcm50610_driver);
-	phy_driver_unregister(&bcm5482_driver);
-	phy_driver_unregister(&bcm5481_driver);
-	phy_driver_unregister(&bcm5464_driver);
-	phy_driver_unregister(&bcm5461_driver);
-	phy_driver_unregister(&bcm5421_driver);
-	phy_driver_unregister(&bcm5411_driver);
+	phy_drivers_unregister(broadcom_drivers,
+		ARRAY_SIZE(broadcom_drivers));
 }
 
 module_init(broadcom_init);
 module_exit(broadcom_exit);
 
-static struct mdio_device_id broadcom_tbl[] = {
-	{ 0x00206070, 0xfffffff0 },
-	{ 0x002060e0, 0xfffffff0 },
-	{ 0x002060c0, 0xfffffff0 },
-	{ 0x002060b0, 0xfffffff0 },
-	{ 0x0143bca0, 0xfffffff0 },
-	{ 0x0143bcb0, 0xfffffff0 },
+static struct mdio_device_id __maybe_unused broadcom_tbl[] = {
+	{ PHY_ID_BCM5411, 0xfffffff0 },
+	{ PHY_ID_BCM5421, 0xfffffff0 },
+	{ PHY_ID_BCM5461, 0xfffffff0 },
+	{ PHY_ID_BCM5464, 0xfffffff0 },
+	{ PHY_ID_BCM5482, 0xfffffff0 },
+	{ PHY_ID_BCM5482, 0xfffffff0 },
 	{ PHY_ID_BCM50610, 0xfffffff0 },
 	{ PHY_ID_BCM50610M, 0xfffffff0 },
 	{ PHY_ID_BCM57780, 0xfffffff0 },
 	{ PHY_ID_BCMAC131, 0xfffffff0 },
+	{ PHY_ID_BCM5241, 0xfffffff0 },
 	{ }
 };
 

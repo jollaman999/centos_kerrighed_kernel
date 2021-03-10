@@ -1,6 +1,4 @@
 /*
- *  include/asm-s390/etr.h
- *
  *  Copyright IBM Corp. 2006
  *  Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com)
  */
@@ -134,28 +132,28 @@ struct etr_irq_parm {
 /* Inline assembly helper functions */
 static inline int etr_setr(struct etr_eacr *ctrl)
 {
-	int rc = -ENOSYS;
+	int rc = -EOPNOTSUPP;
 
 	asm volatile(
-		"	.insn	s,0xb2160000,0(%2)\n"
+		"	.insn	s,0xb2160000,%1\n"
 		"0:	la	%0,0\n"
 		"1:\n"
 		EX_TABLE(0b,1b)
-		: "+d" (rc) : "m" (*ctrl), "a" (ctrl));
+		: "+d" (rc) : "Q" (*ctrl));
 	return rc;
 }
 
 /* Stores a format 1 aib with 64 bytes */
 static inline int etr_stetr(struct etr_aib *aib)
 {
-	int rc = -ENOSYS;
+	int rc = -EOPNOTSUPP;
 
 	asm volatile(
-		"	.insn	s,0xb2170000,0(%2)\n"
+		"	.insn	s,0xb2170000,%1\n"
 		"0:	la	%0,0\n"
 		"1:\n"
 		EX_TABLE(0b,1b)
-		: "+d" (rc) : "m" (*aib), "a" (aib));
+		: "+d" (rc) : "Q" (*aib));
 	return rc;
 }
 
@@ -163,14 +161,14 @@ static inline int etr_stetr(struct etr_aib *aib)
 static inline int etr_steai(struct etr_aib *aib, unsigned int func)
 {
 	register unsigned int reg0 asm("0") = func;
-	int rc = -ENOSYS;
+	int rc = -EOPNOTSUPP;
 
 	asm volatile(
-		"	.insn	s,0xb2b30000,0(%2)\n"
+		"	.insn	s,0xb2b30000,%1\n"
 		"0:	la	%0,0\n"
 		"1:\n"
 		EX_TABLE(0b,1b)
-		: "+d" (rc) : "m" (*aib), "a" (aib), "d" (reg0));
+		: "+d" (rc) : "Q" (*aib), "d" (reg0));
 	return rc;
 }
 

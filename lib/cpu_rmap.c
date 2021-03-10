@@ -11,7 +11,7 @@
 #ifdef CONFIG_GENERIC_HARDIRQS
 #include <linux/interrupt.h>
 #endif
-#include <linux/module.h>
+#include <linux/export.h>
 
 /*
  * These functions maintain a mapping from CPUs to some ordered set of
@@ -193,7 +193,7 @@ int cpu_rmap_update(struct cpu_rmap *rmap, u16 index,
 	/* Update distances based on topology */
 	for_each_cpu(cpu, update_mask) {
 		if (cpu_rmap_copy_neigh(rmap, cpu,
-					topology_thread_cpumask(cpu), 1))
+					topology_sibling_cpumask(cpu), 1))
 			continue;
 		if (cpu_rmap_copy_neigh(rmap, cpu,
 					topology_core_cpumask(cpu), 2))

@@ -1,9 +1,10 @@
 /*
  * Implement fast CRC32C with PCLMULQDQ instructions. (x86_64)
  *
- * The white paper on CRC32C calculations with PCLMULQDQ instruction can be
+ * The white papers on CRC32C calculations with PCLMULQDQ instruction can be
  * downloaded from:
- * http://download.intel.com/design/intarch/papers/323405.pdf
+ * http://www.intel.com/content/dam/www/public/us/en/documents/white-papers/crc-iscsi-polynomial-crc32-instruction-paper.pdf
+ * http://www.intel.com/content/dam/www/public/us/en/documents/white-papers/fast-crc-computation-paper.pdf
  *
  * Copyright (C) 2012 Intel Corporation.
  *
@@ -41,6 +42,9 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
+
+#include <asm/inst.h>
+#include <linux/linkage.h>
 #include <asm/nospec-branch.h>
 
 ## ISCSI CRC 32 Implementation with crc32 and pclmulqdq Instruction
@@ -69,8 +73,7 @@
 
 # unsigned int crc_pcl(u8 *buffer, int len, unsigned int crc_init);
 
-.global crc_pcl
-crc_pcl:
+ENTRY(crc_pcl)
 #define    bufp		%rdi
 #define    bufp_dw	%edi
 #define    bufp_w	%di
@@ -167,8 +170,8 @@ continue_block:
 	## branch into array
 	lea	jump_table(%rip), bufp
 	movzxw  (bufp, %rax, 2), len
-	offset=crc_array-jump_table
-	lea     offset(bufp, len, 1), bufp
+	lea	crc_array(%rip), bufp
+	lea     (bufp, len, 1), bufp
 	JMP_NOSPEC bufp
 
 	################################################################
@@ -225,10 +228,10 @@ LABEL crc_ %i
 	movdqa  (bufp), %xmm0			# 2 consts: K1:K2
 
 	movq    crc_init, %xmm1			# CRC for block 1
-	pclmulqdq $0x00,%xmm0,%xmm1		# Multiply by K2
+	PCLMULQDQ 0x00,%xmm0,%xmm1		# Multiply by K2
 
 	movq    crc1, %xmm2			# CRC for block 2
-	pclmulqdq $0x10, %xmm0, %xmm2		# Multiply by K1
+	PCLMULQDQ 0x10, %xmm0, %xmm2		# Multiply by K1
 
 	pxor    %xmm2,%xmm1
 	movq    %xmm1, %rax
@@ -311,7 +314,9 @@ do_return:
 	popq    %rdi
 	popq    %rbx
         ret
+ENDPROC(crc_pcl)
 
+.section	.rodata, "a", %progbits
         ################################################################
         ## jump table        Table is 129 entries x 2 bytes each
         ################################################################
@@ -324,11 +329,12 @@ JMPTBL_ENTRY %i
 .noaltmacro
 	i=i+1
 .endr
+
+
 	################################################################
 	## PCLMULQDQ tables
 	## Table is 128 entries x 2 quad words each
 	################################################################
-.data
 .align 64
 K_table:
         .quad 0x14cd00bd6,0x105ec76f0

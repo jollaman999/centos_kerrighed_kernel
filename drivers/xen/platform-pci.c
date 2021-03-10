@@ -21,9 +21,9 @@
  *
  */
 
-#include <asm/io.h>
 
 #include <linux/interrupt.h>
+#include <linux/io.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 
@@ -101,27 +101,23 @@ static int platform_pci_resume(struct pci_dev *pdev)
 	return 0;
 }
 
-static int __devinit platform_pci_init(struct pci_dev *pdev,
-				       const struct pci_device_id *ent)
+static int platform_pci_init(struct pci_dev *pdev,
+			     const struct pci_device_id *ent)
 {
 	int i, ret;
-	long ioaddr, iolen;
+	long ioaddr;
 	long mmio_addr, mmio_len;
 	unsigned int max_nr_gframes;
+	unsigned long grant_frames;
 
-	if (!xen_hvm_domain()) {
-		dev_info(&pdev->dev,
-			 "%s: Xen PV-on-HVM support not init'd ... exiting \n",
-			__FUNCTION__);
+	if (!xen_domain())
 		return -ENODEV;
-	}
 
 	i = pci_enable_device(pdev);
 	if (i)
 		return i;
 
 	ioaddr = pci_resource_start(pdev, 0);
-	iolen = pci_resource_len(pdev, 0);
 
 	mmio_addr = pci_resource_start(pdev, 1);
 	mmio_len = pci_resource_len(pdev, 1);
@@ -129,20 +125,16 @@ static int __devinit platform_pci_init(struct pci_dev *pdev,
 	if (mmio_addr == 0 || ioaddr == 0) {
 		dev_err(&pdev->dev, "no resources found\n");
 		ret = -ENOENT;
+		goto pci_out;
 	}
 
-	if (request_mem_region(mmio_addr, mmio_len, DRV_NAME) == NULL) {
-		dev_err(&pdev->dev, "MEM I/O resource 0x%lx @ 0x%lx busy\n",
-		       mmio_addr, mmio_len);
-		ret = -EBUSY;
-	}
+	ret = pci_request_region(pdev, 1, DRV_NAME);
+	if (ret < 0)
+		goto pci_out;
 
-	if (request_region(ioaddr, iolen, DRV_NAME) == NULL) {
-		dev_err(&pdev->dev, "I/O resource 0x%lx @ 0x%lx busy\n",
-		       iolen, ioaddr);
-		ret = -EBUSY;
-		goto out;
-	}
+	ret = pci_request_region(pdev, 0, DRV_NAME);
+	if (ret < 0)
+		goto mem_out;
 
 	platform_mmio = mmio_addr;
 	platform_mmiolen = mmio_len;
@@ -150,39 +142,39 @@ static int __devinit platform_pci_init(struct pci_dev *pdev,
 	if (!xen_have_vector_callback) {
 		ret = xen_allocate_irq(pdev);
 		if (ret) {
-			printk(KERN_WARNING "request_irq failed err=%d\n", ret);
+			dev_warn(&pdev->dev, "request_irq failed err=%d\n", ret);
 			goto out;
 		}
 		callback_via = get_callback_via(pdev);
 		ret = xen_set_callback_via(callback_via);
 		if (ret) {
-			printk(KERN_WARNING
-					"Unable to set the evtchn callback err=%d\n", ret);
+			dev_warn(&pdev->dev, "Unable to set the evtchn callback "
+					 "err=%d\n", ret);
 			goto out;
 		}
 	}
 
 	max_nr_gframes = gnttab_max_grant_frames();
-	xen_hvm_resume_frames = alloc_xen_mmio(PAGE_SIZE * max_nr_gframes);
+	grant_frames = alloc_xen_mmio(PAGE_SIZE * max_nr_gframes);
+	if (gnttab_setup_auto_xlat_frames(grant_frames))
+		goto out;
 	ret = gnttab_init();
 	if (ret)
-		goto out;
+		goto grant_out;
 	xenbus_probe(NULL);
-	ret = xen_setup_shutdown_event();
-	if (ret)
-		goto out;
-
+	return 0;
+grant_out:
+	gnttab_free_auto_xlat_frames();
 out:
-	if (ret) {
-		release_mem_region(mmio_addr, mmio_len);
-		release_region(ioaddr, iolen);
-		pci_disable_device(pdev);
-	}
-
+	pci_release_region(pdev, 0);
+mem_out:
+	pci_release_region(pdev, 1);
+pci_out:
+	pci_disable_device(pdev);
 	return ret;
 }
 
-static struct pci_device_id platform_pci_tbl[] __devinitdata = {
+static struct pci_device_id platform_pci_tbl[] = {
 	{PCI_VENDOR_ID_XEN, PCI_DEVICE_ID_XEN_PLATFORM,
 		PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0},
 	{0,}
@@ -201,16 +193,7 @@ static struct pci_driver platform_driver = {
 
 static int __init platform_pci_module_init(void)
 {
-	int rc;
-
-	rc = pci_register_driver(&platform_driver);
-	if (rc) {
-		printk(KERN_INFO DRV_NAME
-			": No platform pci device model found\n");
-		return rc;
-	}
-
-	return 0;
+	return pci_register_driver(&platform_driver);
 }
 
 module_init(platform_pci_module_init);

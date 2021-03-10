@@ -11,13 +11,18 @@
  *
 */
 
-		.macro	addruart,rx
-		mov	\rx, #0xe0000000
-		orr	\rx, \rx, #0x000003f8
+		.macro	addruart, rp, rv, tmp
+		mov	\rp, #0x3f8
+		orr	\rv, \rp, #0xfe000000
+		orr	\rv, \rv, #0x00e00000
+		orr	\rp, \rp, #0x40000000
 		.endm
 
 		.macro	senduart,rd,rx
 		strb	\rd, [\rx]
+		.endm
+
+		.macro waituart,rd,rx
 		.endm
 
 		.macro	busyuart,rd,rx

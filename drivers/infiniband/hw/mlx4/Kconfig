@@ -1,6 +1,9 @@
 config MLX4_INFINIBAND
 	tristate "Mellanox ConnectX HCA support"
-	depends on NETDEVICES && NETDEV_10000 && PCI && INET
+	depends on NETDEVICES && ETHERNET && PCI && INET
+	depends on INFINIBAND_USER_ACCESS || !INFINIBAND_USER_ACCESS
+	depends on MAY_USE_DEVLINK
+	select NET_VENDOR_MELLANOX
 	select MLX4_CORE
 	---help---
 	  This driver provides low-level InfiniBand support for

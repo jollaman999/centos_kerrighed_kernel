@@ -12,6 +12,7 @@
 #include <linux/interrupt.h>
 #include <linux/list.h>
 #include <linux/types.h>
+#include <linux/slab.h>
 #include <linux/err.h>
 #include <linux/reboot.h>
 
@@ -34,7 +35,6 @@ static struct raw3270_fn con3270_fn;
  */
 struct con3270 {
 	struct raw3270_view view;
-	spinlock_t lock;
 	struct list_head freemem;	/* list of free memory for strings. */
 
 	/* Output stuff. */
@@ -576,7 +576,6 @@ static struct console con3270 = {
 
 /*
  * 3270 console initialization code called from console_init().
- * NOTE: This is called before kmalloc is available.
  */
 static int __init
 con3270_init(void)

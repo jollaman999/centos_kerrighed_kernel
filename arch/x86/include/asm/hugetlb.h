@@ -2,9 +2,9 @@
 #define _ASM_X86_HUGETLB_H
 
 #include <asm/page.h>
+#include <asm-generic/hugetlb.h>
 #include <asm/mm_track.h>
 
-#define hugepages_supported() cpu_has_pse
 
 static inline int is_hugepage_only_range(struct mm_struct *mm,
 					 unsigned long addr,
@@ -92,6 +92,10 @@ static inline int arch_prepare_hugepage(struct page *page)
 }
 
 static inline void arch_release_hugepage(struct page *page)
+{
+}
+
+static inline void arch_clear_hugepage_flags(struct page *page)
 {
 }
 

@@ -9,6 +9,7 @@
 #include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/bio.h>
+#include <linux/dax.h>
 #include <linux/slab.h>
 #include <linux/device-mapper.h>
 
@@ -56,8 +57,9 @@ static int linear_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 		goto bad;
 	}
 
-	ti->num_flush_requests = 1;
-	ti->num_discard_requests = 1;
+	ti->num_flush_bios = 1;
+	ti->num_discard_bios = 1;
+	ti->num_write_same_bios = 1;
 	ti->private = lc;
 	return 0;
 
@@ -90,16 +92,15 @@ static void linear_map_bio(struct dm_target *ti, struct bio *bio)
 		bio->bi_sector = linear_map_sector(ti, bio->bi_sector);
 }
 
-static int linear_map(struct dm_target *ti, struct bio *bio,
-		      union map_info *map_context)
+static int linear_map(struct dm_target *ti, struct bio *bio)
 {
 	linear_map_bio(ti, bio);
 
 	return DM_MAPIO_REMAPPED;
 }
 
-static int linear_status(struct dm_target *ti, status_type_t type,
-			 char *result, unsigned int maxlen)
+static void linear_status(struct dm_target *ti, status_type_t type,
+			  unsigned status_flags, char *result, unsigned maxlen)
 {
 	struct linear_c *lc = (struct linear_c *) ti->private;
 
@@ -113,24 +114,22 @@ static int linear_status(struct dm_target *ti, status_type_t type,
 				(unsigned long long)lc->start);
 		break;
 	}
-	return 0;
 }
 
-static int linear_ioctl(struct dm_target *ti, unsigned int cmd,
-			unsigned long arg)
+static int linear_prepare_ioctl(struct dm_target *ti, struct block_device **bdev)
 {
 	struct linear_c *lc = (struct linear_c *) ti->private;
 	struct dm_dev *dev = lc->dev;
-	int r = 0;
+
+	*bdev = dev->bdev;
 
 	/*
 	 * Only pass ioctls through if the device sizes match exactly.
 	 */
 	if (lc->start ||
 	    ti->len != i_size_read(dev->bdev->bd_inode) >> SECTOR_SHIFT)
-		r = scsi_verify_blk_ioctl(NULL, cmd);
-
-	return r ? : __blkdev_driver_ioctl(dev->bdev, dev->mode, cmd, arg);
+		return 1;
+	return 0;
 }
 
 static int linear_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
@@ -156,17 +155,72 @@ static int linear_iterate_devices(struct dm_target *ti,
 	return fn(ti, lc->dev, lc->start, ti->len, data);
 }
 
+#if IS_ENABLED(CONFIG_DAX_DRIVER)
+static long linear_dax_direct_access(struct dm_target *ti, pgoff_t pgoff,
+		long nr_pages, void **kaddr, pfn_t *pfn)
+{
+	long ret;
+	struct linear_c *lc = ti->private;
+	struct block_device *bdev = lc->dev->bdev;
+	struct dax_device *dax_dev = lc->dev->dax_dev;
+	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
+
+	dev_sector = linear_map_sector(ti, sector);
+	ret = bdev_dax_pgoff(bdev, dev_sector, nr_pages * PAGE_SIZE, &pgoff);
+	if (ret)
+		return ret;
+	return dax_direct_access(dax_dev, pgoff, nr_pages, kaddr, pfn);
+}
+
+static int linear_dax_memcpy_fromiovecend(struct dm_target *ti, pgoff_t pgoff,
+					  void *addr, const struct iovec *iov,
+					  int offset, int len)
+{
+	struct linear_c *lc = ti->private;
+	struct block_device *bdev = lc->dev->bdev;
+	struct dax_device *dax_dev = lc->dev->dax_dev;
+	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
+
+	dev_sector = linear_map_sector(ti, sector);
+	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(len, PAGE_SIZE), &pgoff))
+		return 0;
+	return dax_memcpy_fromiovecend(dax_dev, pgoff, addr, iov, offset, len);
+}
+
+static int linear_dax_memcpy_toiovecend(struct dm_target *ti, pgoff_t pgoff,
+		const struct iovec *iov, void *addr, int offset, int len)
+{
+	struct linear_c *lc = ti->private;
+	struct block_device *bdev = lc->dev->bdev;
+	struct dax_device *dax_dev = lc->dev->dax_dev;
+	sector_t dev_sector, sector = pgoff * PAGE_SECTORS;
+
+	dev_sector = linear_map_sector(ti, sector);
+	if (bdev_dax_pgoff(bdev, dev_sector, ALIGN(len, PAGE_SIZE), &pgoff))
+		return 0;
+	return dax_memcpy_toiovecend(dax_dev, pgoff, iov, addr, offset, len);
+}
+
+#else
+#define linear_dax_direct_access NULL
+#define linear_dax_memcpy_fromiovecend NULL
+#define linear_dax_memcpy_toiovecend NULL
+#endif
+
 static struct target_type linear_target = {
 	.name   = "linear",
-	.version = {1, 1, 0},
+	.version = {1, 3, 0},
 	.module = THIS_MODULE,
 	.ctr    = linear_ctr,
 	.dtr    = linear_dtr,
 	.map    = linear_map,
 	.status = linear_status,
-	.ioctl  = linear_ioctl,
+	.prepare_ioctl = linear_prepare_ioctl,
 	.merge  = linear_merge,
 	.iterate_devices = linear_iterate_devices,
+	.direct_access = linear_dax_direct_access,
+	.dax_memcpy_fromiovecend = linear_dax_memcpy_fromiovecend,
+	.dax_memcpy_toiovecend = linear_dax_memcpy_toiovecend,
 };
 
 int __init dm_linear_init(void)

@@ -8,7 +8,7 @@ Copyright (C) 2004,2005  ADDI-DATA GmbH for the source code of this module.
 	D-77833 Ottersweier
 	Tel: +19(0)7223/9493-0
 	Fax: +49(0)7223/9493-92
-	http://www.addi-data-com
+	http://www.addi-data.com
 	info@addi-data.com
 
 This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
@@ -17,7 +17,7 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 
 You should have received a copy of the GNU General Public License along with this program; if not, write to the Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
-You shoud also find the complete GPL in the COPYING file accompanying this source code.
+You should also find the complete GPL in the COPYING file accompanying this source code.
 
 @endverbatim
 */
@@ -35,32 +35,25 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
   | Project manager: Eric Stolz   | Date     :  02/12/2002                |
   +-----------------------------------------------------------------------+
   | Description :   APCI-1710 SSI counter module                          |
-  |                                                                       |
-  |                                                                       |
   +-----------------------------------------------------------------------+
-  |                             UPDATES                                   |
-  +-----------------------------------------------------------------------+
-  |   Date   |   Author  |          Description of updates                |
-  +----------+-----------+------------------------------------------------+
-  | 13/05/98 | S. Weber  | SSI digital input / output implementation      |
-  |----------|-----------|------------------------------------------------|
-  | 22/03/00 | C.Guinot  | 0100/0226 -> 0200/0227                         |
-  |          |           | Änderung in InitSSI Funktion                   |
-  |          |           | b_SSIProfile >= 2 anstatt b_SSIProfile > 2     |
-  |          |           |                                                |
-  +-----------------------------------------------------------------------+
-  | 08/05/00 | Guinot C  | - 0400/0228 All Function in RING 0             |
-  |          |           |   available                                    |
+  | several changes done by S. Weber in 1998 and C. Guinot in 2000        |
   +-----------------------------------------------------------------------+
 */
 
-/*
-+----------------------------------------------------------------------------+
-|                               Included files                               |
-+----------------------------------------------------------------------------+
-*/
+#define APCI1710_30MHZ			30
+#define APCI1710_33MHZ			33
+#define APCI1710_40MHZ			40
 
-#include "APCI1710_Ssi.h"
+#define APCI1710_BINARY_MODE		0x1
+#define APCI1710_GRAY_MODE		0x0
+
+#define APCI1710_SSI_READ1VALUE		1
+#define APCI1710_SSI_READALLVALUE	2
+
+#define APCI1710_SSI_SET_CHANNELON	0
+#define APCI1710_SSI_SET_CHANNELOFF	1
+#define APCI1710_SSI_READ_1CHANNEL	2
+#define APCI1710_SSI_READ_ALLCHANNEL	3
 
 /*
 +----------------------------------------------------------------------------+
@@ -133,9 +126,12 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI1710_InsnConfigInitSSI(struct comedi_device *dev, struct comedi_subdevice *s,
-	struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnConfigInitSSI(struct comedi_device *dev,
+					struct comedi_subdevice *s,
+					struct comedi_insn *insn,
+					unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int ui_TimerValue;
 	unsigned char b_ModulNbr, b_SSIProfile, b_PositionTurnLength, b_TurnCptLength,
@@ -400,9 +396,12 @@ pul_Position	=	(unsigned int *) &data[0];
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI1710_InsnReadSSIValue(struct comedi_device *dev, struct comedi_subdevice *s,
-	struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnReadSSIValue(struct comedi_device *dev,
+				       struct comedi_subdevice *s,
+				       struct comedi_insn *insn,
+				       unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned char b_Cpt;
 	unsigned char b_Length;
@@ -705,9 +704,9 @@ int i_APCI1710_InsnReadSSIValue(struct comedi_device *dev, struct comedi_subdevi
 |                                        unsigned char *_   pb_ChannelStatus)          |
 +----------------------------------------------------------------------------+
 | Task              :
-					(0) Set the digital output from selected SSI moule         |
+					(0) Set the digital output from selected SSI module         |
 |                     (b_ModuleNbr) ON
-                    (1) Set the digital output from selected SSI moule         |
+                    (1) Set the digital output from selected SSI module         |
 |                     (b_ModuleNbr) OFF
 					(2)Read the status from selected SSI digital input        |
 |                     (b_InputChannel)
@@ -733,9 +732,12 @@ int i_APCI1710_InsnReadSSIValue(struct comedi_device *dev, struct comedi_subdevi
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI1710_InsnBitsSSIDigitalIO(struct comedi_device *dev, struct comedi_subdevice *s,
-	struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnBitsSSIDigitalIO(struct comedi_device *dev,
+					   struct comedi_subdevice *s,
+					   struct comedi_insn *insn,
+					   unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int dw_StatusReg;
 	unsigned char b_ModulNbr;
@@ -743,6 +745,7 @@ int i_APCI1710_InsnBitsSSIDigitalIO(struct comedi_device *dev, struct comedi_sub
 	unsigned char *pb_ChannelStatus;
 	unsigned char *pb_InputStatus;
 	unsigned char b_IOType;
+
 	i_ReturnValue = insn->n;
 	b_ModulNbr = (unsigned char) CR_AREF(insn->chanspec);
 	b_IOType = (unsigned char) data[0];

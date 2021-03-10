@@ -1,7 +1,5 @@
 /*
- * include/asm-s390/appldata.h
- *
- * Copyright (C) IBM Corp. 2006
+ * Copyright IBM Corp. 2006
  *
  * Author(s): Melissa Howland <melissah@us.ibm.com>
  */
@@ -9,6 +7,7 @@
 #ifndef _ASM_S390_APPLDATA_H
 #define _ASM_S390_APPLDATA_H
 
+#include <asm/diag.h>
 #include <asm/io.h>
 
 #ifndef CONFIG_64BIT
@@ -72,13 +71,14 @@ static inline int appldata_asm(struct appldata_product_id *id,
 	int ry;
 
 	if (!MACHINE_IS_VM)
-		return -ENOSYS;
+		return -EOPNOTSUPP;
 	parm_list.diag = 0xdc;
 	parm_list.function = fn;
 	parm_list.parlist_length = sizeof(parm_list);
 	parm_list.buffer_length = length;
 	parm_list.product_id_addr = (unsigned long) id;
 	parm_list.buffer_addr = virt_to_phys(buffer);
+	diag_stat_inc(DIAG_STAT_X0DC);
 	asm volatile(
 		"	diag	%1,%0,0xdc"
 		: "=d" (ry)

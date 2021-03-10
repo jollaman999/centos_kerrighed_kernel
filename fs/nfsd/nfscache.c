@@ -8,9 +8,8 @@
  * Copyright (C) 1995, 1996 Olaf Kirch <okir@monad.swb.de>
  */
 
-#include <linux/list.h>
 #include <linux/slab.h>
-#include <linux/sunrpc/clnt.h>
+#include <linux/sunrpc/addr.h>
 #include <linux/highmem.h>
 #include <linux/log2.h>
 #include <linux/hash.h>
@@ -66,7 +65,7 @@ static unsigned int		longest_chain_cachesize;
 static int	nfsd_cache_append(struct svc_rqst *rqstp, struct kvec *vec);
 static void	cache_cleaner_func(struct work_struct *unused);
 static int 	nfsd_reply_cache_shrink(struct shrinker *shrink,
-					int nr_to_scan, gfp_t gfp_mask);
+					struct shrink_control *sc);
 
 static struct shrinker nfsd_reply_cache_shrinker = {
 	.shrink	= nfsd_reply_cache_shrink,
@@ -211,10 +210,8 @@ void nfsd_reply_cache_shutdown(void)
 	drc_hashtbl = NULL;
 	drc_hashsize = 0;
 
-	if (drc_slab) {
-		kmem_cache_destroy(drc_slab);
-		drc_slab = NULL;
-	}
+	kmem_cache_destroy(drc_slab);
+	drc_slab = NULL;
 }
 
 /*
@@ -277,8 +274,8 @@ prune_cache_entries(void)
 	 * Conditionally rearm the job to run in RC_EXPIRE since we just
 	 * ran the pruner.
 	 */
-    if (!cancel)
-        mod_delayed_work(system_wq, &cache_cleaner, RC_EXPIRE);
+	if (!cancel)
+		mod_delayed_work(system_wq, &cache_cleaner, RC_EXPIRE);
 	return freed;
 }
 
@@ -289,8 +286,7 @@ cache_cleaner_func(struct work_struct *unused)
 }
 
 static int
-nfsd_reply_cache_shrink(struct shrinker *shrink, int nr_to_scan,
-			gfp_t gfp_mask)
+nfsd_reply_cache_shrink(struct shrinker *shrink, struct shrink_control *sc)
 {
 	return atomic_read(&num_drc_entries);
 }
@@ -483,7 +479,7 @@ found_entry:
 	/* From the hall of fame of impractical attacks:
 	 * Is this a user who tries to snoop on the cache? */
 	rtn = RC_DOIT;
-	if (!rqstp->rq_secure && rp->c_secure)
+	if (!test_bit(RQ_SECURE, &rqstp->rq_flags) && rp->c_secure)
 		goto out;
 
 	/* Compose RPC reply header */
@@ -572,7 +568,7 @@ nfsd_cache_update(struct svc_rqst *rqstp, int cachetype, __be32 *statp)
 	spin_lock(&b->cache_lock);
 	drc_mem_usage += bufsize;
 	lru_put_end(b, rp);
-	rp->c_secure = rqstp->rq_secure;
+	rp->c_secure = test_bit(RQ_SECURE, &rqstp->rq_flags);
 	rp->c_type = cachetype;
 	rp->c_state = RC_DONE;
 	spin_unlock(&b->cache_lock);

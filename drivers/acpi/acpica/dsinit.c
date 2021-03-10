@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -60,8 +60,8 @@ acpi_ds_init_one_object(acpi_handle obj_handle,
  * FUNCTION:    acpi_ds_init_one_object
  *
  * PARAMETERS:  obj_handle      - Node for the object
- *              Level           - Current nesting level
- *              Context         - Points to a init info struct
+ *              level           - Current nesting level
+ *              context         - Points to a init info struct
  *              return_value    - Not used
  *
  * RETURN:      Status
@@ -127,6 +127,7 @@ acpi_ds_init_one_object(acpi_handle obj_handle,
 		break;
 
 	default:
+
 		break;
 	}
 
@@ -171,12 +172,12 @@ acpi_ds_initialize_objects(u32 table_index,
 			  "**** Starting initialization of namespace objects ****\n"));
 	ACPI_DEBUG_PRINT_RAW((ACPI_DB_INIT, "Parsing all Control Methods:"));
 
-	info.method_count = 0;
-	info.op_region_count = 0;
-	info.object_count = 0;
-	info.device_count = 0;
-	info.table_index = table_index;
+	/* Set all init info to zero */
+
+	memset(&info, 0, sizeof(struct acpi_init_walk_info));
+
 	info.owner_id = owner_id;
+	info.table_index = table_index;
 
 	/* Walk entire namespace from the supplied root */
 
@@ -192,7 +193,7 @@ acpi_ds_initialize_objects(u32 table_index,
 	status =
 	    acpi_ns_walk_namespace(ACPI_TYPE_ANY, start_node, ACPI_UINT32_MAX,
 				   ACPI_NS_WALK_UNLOCK, acpi_ds_init_one_object,
-				   &info, NULL);
+				   NULL, &info, NULL);
 	if (ACPI_FAILURE(status)) {
 		ACPI_EXCEPTION((AE_INFO, status, "During WalkNamespace"));
 	}
@@ -204,13 +205,13 @@ acpi_ds_initialize_objects(u32 table_index,
 	}
 
 	ACPI_DEBUG_PRINT_RAW((ACPI_DB_INIT,
-			      "\nTable [%4.4s](id %4.4X) - %hd Objects with %hd Devices %hd Methods %hd Regions\n",
+			      "\nTable [%4.4s](id %4.4X) - %u Objects with %u Devices %u Methods %u Regions\n",
 			      table->signature, owner_id, info.object_count,
 			      info.device_count, info.method_count,
 			      info.op_region_count));
 
 	ACPI_DEBUG_PRINT((ACPI_DB_DISPATCH,
-			  "%hd Methods, %hd Regions\n", info.method_count,
+			  "%u Methods, %u Regions\n", info.method_count,
 			  info.op_region_count));
 
 	return_ACPI_STATUS(AE_OK);

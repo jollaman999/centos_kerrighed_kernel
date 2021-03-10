@@ -11,6 +11,7 @@
 #define _LINUX_DM_EXCEPTION_STORE
 
 #include <linux/blkdev.h>
+#include <linux/list_bl.h>
 #include <linux/device-mapper.h>
 
 /*
@@ -27,7 +28,7 @@ typedef sector_t chunk_t;
  * chunk within the device.
  */
 struct dm_exception {
-	struct list_head hash_list;
+	struct hlist_bl_node hash_list;
 
 	chunk_t old_chunk;
 	chunk_t new_chunk;
@@ -39,12 +40,10 @@ struct dm_exception {
  */
 struct dm_exception_store;
 struct dm_exception_store_type {
-	uint64_t features;	/* 3rd party driver must initialize to zero */
 	const char *name;
 	struct module *module;
 
-	int (*ctr) (struct dm_exception_store *store,
-		    unsigned argc, char **argv);
+	int (*ctr) (struct dm_exception_store *store, char *options);
 
 	/*
 	 * Destroys this object when you've finished with it.
@@ -124,6 +123,8 @@ struct dm_exception_store {
 	unsigned chunk_shift;
 
 	void *context;
+
+	bool userspace_supports_overflow;
 };
 
 /*

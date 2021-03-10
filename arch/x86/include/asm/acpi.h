@@ -29,55 +29,7 @@
 #include <asm/processor.h>
 #include <asm/mmu.h>
 #include <asm/mpspec.h>
-
-#define COMPILER_DEPENDENT_INT64   long long
-#define COMPILER_DEPENDENT_UINT64  unsigned long long
-
-/*
- * Calling conventions:
- *
- * ACPI_SYSTEM_XFACE        - Interfaces to host OS (handlers, threads)
- * ACPI_EXTERNAL_XFACE      - External ACPI interfaces
- * ACPI_INTERNAL_XFACE      - Internal ACPI interfaces
- * ACPI_INTERNAL_VAR_XFACE  - Internal variable-parameter list interfaces
- */
-#define ACPI_SYSTEM_XFACE
-#define ACPI_EXTERNAL_XFACE
-#define ACPI_INTERNAL_XFACE
-#define ACPI_INTERNAL_VAR_XFACE
-
-/* Asm macros */
-
-#define ACPI_ASM_MACROS
-#define BREAKPOINT3
-#define ACPI_DISABLE_IRQS() local_irq_disable()
-#define ACPI_ENABLE_IRQS()  local_irq_enable()
-#define ACPI_FLUSH_CPU_CACHE()	wbinvd()
-
-int __acpi_acquire_global_lock(unsigned int *lock);
-int __acpi_release_global_lock(unsigned int *lock);
-
-#define ACPI_ACQUIRE_GLOBAL_LOCK(facs, Acq) \
-	((Acq) = __acpi_acquire_global_lock(&facs->global_lock))
-
-#define ACPI_RELEASE_GLOBAL_LOCK(facs, Acq) \
-	((Acq) = __acpi_release_global_lock(&facs->global_lock))
-
-/*
- * Math helper asm macros
- */
-#define ACPI_DIV_64_BY_32(n_hi, n_lo, d32, q32, r32) \
-	asm("divl %2;"				     \
-	    : "=a"(q32), "=d"(r32)		     \
-	    : "r"(d32),				     \
-	     "0"(n_lo), "1"(n_hi))
-
-
-#define ACPI_SHIFT_RIGHT_64(n_hi, n_lo) \
-	asm("shrl   $1,%2	;"	\
-	    "rcrl   $1,%3;"		\
-	    : "=r"(n_hi), "=r"(n_lo)	\
-	    : "0"(n_hi), "1"(n_lo))
+#include <asm/realmode.h>
 
 #ifdef CONFIG_ACPI
 extern int acpi_lapic;
@@ -85,20 +37,22 @@ extern int acpi_ioapic;
 extern int acpi_noirq;
 extern int acpi_strict;
 extern int acpi_disabled;
-extern int acpi_ht;
 extern int acpi_pci_disabled;
 extern int acpi_skip_timer_override;
 extern int acpi_use_timer_override;
+extern int acpi_fix_pin2_polarity;
 extern int acpi_disable_cmcff;
 
 extern u8 acpi_sci_flags;
 extern int acpi_sci_override_gsi;
 void acpi_pic_sci_set_trigger(unsigned int, u16);
 
+extern int (*__acpi_register_gsi)(struct device *dev, u32 gsi,
+				  int trigger, int polarity);
+
 static inline void disable_acpi(void)
 {
 	acpi_disabled = 1;
-	acpi_ht = 0;
 	acpi_pci_disabled = 1;
 	acpi_noirq = 1;
 }
@@ -112,14 +66,11 @@ static inline void acpi_disable_pci(void)
 	acpi_noirq_set();
 }
 
-/* routines for saving/restoring kernel state */
-extern int acpi_save_state_mem(void);
-extern void acpi_restore_state_mem(void);
+/* Low-level suspend routine. */
+extern int (*acpi_suspend_lowlevel)(void);
 
-extern unsigned long acpi_wakeup_address;
-
-/* early initialization routine */
-extern void acpi_reserve_bootmem(void);
+/* Physical address to resume after wakeup */
+#define acpi_wakeup_address ((unsigned long)(real_mode_header->wakeup_start))
 
 /*
  * Check if the CPU can handle C2 and deeper
@@ -137,10 +88,36 @@ static inline unsigned int acpi_processor_cstate_check(unsigned int max_cstate)
 	    boot_cpu_data.x86_model <= 0x05 &&
 	    boot_cpu_data.x86_mask < 0x0A)
 		return 1;
-	else if (boot_cpu_has(X86_FEATURE_AMDC1E))
+	else if (amd_e400_c1e_detected)
 		return 1;
 	else
 		return max_cstate;
+}
+
+static inline bool arch_has_acpi_pdc(void)
+{
+	struct cpuinfo_x86 *c = &cpu_data(0);
+	return (c->x86_vendor == X86_VENDOR_INTEL ||
+		c->x86_vendor == X86_VENDOR_CENTAUR);
+}
+
+static inline void arch_acpi_set_pdc_bits(u32 *buf)
+{
+	struct cpuinfo_x86 *c = &cpu_data(0);
+
+	buf[2] |= ACPI_PDC_C_CAPABILITY_SMP;
+
+	if (cpu_has(c, X86_FEATURE_EST))
+		buf[2] |= ACPI_PDC_EST_CAPABILITY_SWSMP;
+
+	if (cpu_has(c, X86_FEATURE_ACPI))
+		buf[2] |= ACPI_PDC_T_FFH;
+
+	/*
+	 * If mwait/monitor is unsupported, C2/C3_FFH will be disabled
+	 */
+	if (!cpu_has(c, X86_FEATURE_MWAIT))
+		buf[2] &= ~(ACPI_PDC_C_C2C3_FFH);
 }
 
 #else /* !CONFIG_ACPI */
@@ -156,20 +133,10 @@ static inline void disable_acpi(void) { }
 
 #define ARCH_HAS_POWER_INIT	1
 
-struct bootnode;
-
 #ifdef CONFIG_ACPI_NUMA
 extern int acpi_numa;
-extern int acpi_scan_nodes(unsigned long start, unsigned long end);
-#define NR_NODE_MEMBLKS (MAX_NUMNODES*2)
-extern void acpi_fake_nodes(const struct bootnode *fake_nodes,
-				   int num_nodes);
-#else
-static inline void acpi_fake_nodes(const struct bootnode *fake_nodes,
-				   int num_nodes)
-{
-}
-#endif
+extern int x86_acpi_numa_init(void);
+#endif /* CONFIG_ACPI_NUMA */
 
 #define acpi_unlazy_tlb(x)	leave_mm(x)
 

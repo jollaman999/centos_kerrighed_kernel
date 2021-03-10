@@ -14,8 +14,8 @@
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include <linux/ctype.h>
-#include <linux/init.h>
 #include <linux/hardirq.h>
+#include <linux/module.h>
 #include <asm/smp.h>
 #include <asm/apic.h>
 #include <asm/ipi.h>
@@ -24,28 +24,15 @@
 #include <acpi/acpi_bus.h>
 #endif
 
+static struct apic apic_physflat;
+static struct apic apic_flat;
+
+struct apic __read_mostly *apic = &apic_flat;
+EXPORT_SYMBOL_GPL(apic);
+
 static int flat_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
 {
 	return 1;
-}
-
-static const struct cpumask *flat_target_cpus(void)
-{
-	return cpu_online_mask;
-}
-
-static void flat_vector_allocation_domain(int cpu, struct cpumask *retmask)
-{
-	/* Careful. Some cpus do not strictly honor the set of cpus
-	 * specified in the interrupt destination when using lowest
-	 * priority interrupt delivery mode.
-	 *
-	 * In particular there was a hyperthreading cpu observed to
-	 * deliver interrupts to the wrong hyperthread when only one
-	 * hyperthread was specified in the interrupt desitination.
-	 */
-	cpumask_clear(retmask);
-	cpumask_bits(retmask)[0] = APIC_ALL_CPUS;
 }
 
 /*
@@ -55,7 +42,7 @@ static void flat_vector_allocation_domain(int cpu, struct cpumask *retmask)
  * an APIC.  See e.g. "AP-388 82489DX User's Manual" (Intel
  * document number 292116).  So here it goes...
  */
-static void flat_init_apic_ldr(void)
+void flat_init_apic_ldr(void)
 {
 	unsigned long val;
 	unsigned long num, id;
@@ -85,7 +72,7 @@ static void flat_send_IPI_mask(const struct cpumask *cpumask, int vector)
 }
 
 static void
- flat_send_IPI_mask_allbutself(const struct cpumask *cpumask, int vector)
+flat_send_IPI_mask_allbutself(const struct cpumask *cpumask, int vector)
 {
 	unsigned long mask = cpumask_bits(cpumask)[0];
 	int cpu = smp_processor_id();
@@ -169,16 +156,17 @@ static int flat_probe(void)
 	return 1;
 }
 
-struct apic apic_flat =  {
+static struct apic apic_flat =  {
 	.name				= "flat",
 	.probe				= flat_probe,
 	.acpi_madt_oem_check		= flat_acpi_madt_oem_check,
+	.apic_id_valid			= default_apic_id_valid,
 	.apic_id_registered		= flat_apic_id_registered,
 
 	.irq_delivery_mode		= dest_LowestPrio,
 	.irq_dest_mode			= 1, /* logical */
 
-	.target_cpus			= flat_target_cpus,
+	.target_cpus			= online_target_cpus,
 	.disable_esr			= 0,
 	.dest_logical			= APIC_DEST_LOGICAL,
 	.check_apicid_used		= NULL,
@@ -190,8 +178,6 @@ struct apic apic_flat =  {
 	.ioapic_phys_id_map		= NULL,
 	.setup_apic_routing		= NULL,
 	.multi_timer_check		= NULL,
-	.apicid_to_node			= NULL,
-	.cpu_to_logical_apicid		= NULL,
 	.cpu_present_to_apicid		= default_cpu_present_to_apicid,
 	.apicid_to_cpu_present		= NULL,
 	.setup_portio_remap		= NULL,
@@ -204,8 +190,7 @@ struct apic apic_flat =  {
 	.set_apic_id			= set_apic_id,
 	.apic_id_mask			= 0xFFu << 24,
 
-	.cpu_mask_to_apicid		= default_cpu_mask_to_apicid,
-	.cpu_mask_to_apicid_and		= default_cpu_mask_to_apicid_and,
+	.cpu_mask_to_apicid_and		= flat_cpu_mask_to_apicid_and,
 
 	.send_IPI_mask			= flat_send_IPI_mask,
 	.send_IPI_mask_allbutself	= flat_send_IPI_mask_allbutself,
@@ -256,17 +241,6 @@ static int physflat_acpi_madt_oem_check(char *oem_id, char *oem_table_id)
 	return 0;
 }
 
-static const struct cpumask *physflat_target_cpus(void)
-{
-	return cpu_online_mask;
-}
-
-static void physflat_vector_allocation_domain(int cpu, struct cpumask *retmask)
-{
-	cpumask_clear(retmask);
-	cpumask_set_cpu(cpu, retmask);
-}
-
 static void physflat_send_IPI_mask(const struct cpumask *cpumask, int vector)
 {
 	default_send_IPI_mask_sequence_phys(cpumask, vector);
@@ -288,71 +262,39 @@ static void physflat_send_IPI_all(int vector)
 	physflat_send_IPI_mask(cpu_online_mask, vector);
 }
 
-static unsigned int physflat_cpu_mask_to_apicid(const struct cpumask *cpumask)
-{
-	int cpu;
-
-	/*
-	 * We're using fixed IRQ delivery, can only return one phys APIC ID.
-	 * May as well be the first.
-	 */
-	cpu = cpumask_first(cpumask);
-	if ((unsigned)cpu < nr_cpu_ids)
-		return per_cpu(x86_cpu_to_apicid, cpu);
-	else
-		return BAD_APICID;
-}
-
-static unsigned int
-physflat_cpu_mask_to_apicid_and(const struct cpumask *cpumask,
-				const struct cpumask *andmask)
-{
-	int cpu;
-
-	/*
-	 * We're using fixed IRQ delivery, can only return one phys APIC ID.
-	 * May as well be the first.
-	 */
-	for_each_cpu_and(cpu, cpumask, andmask) {
-		if (cpumask_test_cpu(cpu, cpu_online_mask))
-			break;
-	}
-	return per_cpu(x86_cpu_to_apicid, cpu);
-}
-
 static int physflat_probe(void)
 {
-	if (apic == &apic_physflat || num_possible_cpus() > 8)
+	if (apic == &apic_physflat ||
+	    (num_possible_cpus() + rh_invalid_cpus) > 8)
 		return 1;
 
 	return 0;
 }
 
-struct apic apic_physflat =  {
+static struct apic apic_physflat =  {
 
 	.name				= "physical flat",
 	.probe				= physflat_probe,
 	.acpi_madt_oem_check		= physflat_acpi_madt_oem_check,
+	.apic_id_valid			= default_apic_id_valid,
 	.apic_id_registered		= flat_apic_id_registered,
 
 	.irq_delivery_mode		= dest_Fixed,
 	.irq_dest_mode			= 0, /* physical */
 
-	.target_cpus			= physflat_target_cpus,
+	.target_cpus			= online_target_cpus,
 	.disable_esr			= 0,
 	.dest_logical			= 0,
 	.check_apicid_used		= NULL,
 	.check_apicid_present		= NULL,
 
-	.vector_allocation_domain	= physflat_vector_allocation_domain,
+	.vector_allocation_domain	= default_vector_allocation_domain,
 	/* not needed, but shouldn't hurt: */
 	.init_apic_ldr			= flat_init_apic_ldr,
 
 	.ioapic_phys_id_map		= NULL,
 	.setup_apic_routing		= NULL,
 	.multi_timer_check		= NULL,
-	.apicid_to_node			= NULL,
-	.cpu_to_logical_apicid		= NULL,
 	.cpu_present_to_apicid		= default_cpu_present_to_apicid,
 	.apicid_to_cpu_present		= NULL,
 	.setup_portio_remap		= NULL,
@@ -365,8 +307,7 @@ struct apic apic_physflat =  {
 	.set_apic_id			= set_apic_id,
 	.apic_id_mask			= 0xFFu << 24,
 
-	.cpu_mask_to_apicid		= physflat_cpu_mask_to_apicid,
-	.cpu_mask_to_apicid_and		= physflat_cpu_mask_to_apicid_and,
+	.cpu_mask_to_apicid_and		= default_cpu_mask_to_apicid_and,
 
 	.send_IPI_mask			= physflat_send_IPI_mask,
 	.send_IPI_mask_allbutself	= physflat_send_IPI_mask_allbutself,
@@ -388,3 +329,8 @@ struct apic apic_physflat =  {
 	.wait_icr_idle			= native_apic_wait_icr_idle,
 	.safe_wait_icr_idle		= native_safe_apic_wait_icr_idle,
 };
+
+/*
+ * We need to check for physflat first, so this order is important.
+ */
+apic_drivers(apic_physflat, apic_flat);

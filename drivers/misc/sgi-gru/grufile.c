@@ -108,9 +108,8 @@ static int gru_file_mmap(struct file *file, struct vm_area_struct *vma)
 				vma->vm_end & (GRU_GSEG_PAGESIZE - 1))
 		return -EINVAL;
 
-	vma->vm_flags |=
-	    (VM_IO | VM_DONTCOPY | VM_LOCKED | VM_DONTEXPAND | VM_PFNMAP |
-			VM_RESERVED);
+	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_LOCKED |
+			 VM_DONTCOPY | VM_DONTEXPAND | VM_DONTDUMP;
 	vma->vm_page_prot = PAGE_SHARED;
 	vma->vm_ops = &gru_vm_ops;
 
@@ -173,6 +172,7 @@ static long gru_get_config_info(unsigned long arg)
 		nodesperblade = 2;
 	else
 		nodesperblade = 1;
+	memset(&info, 0, sizeof(info));
 	info.cpus = num_online_cpus();
 	info.nodes = num_online_nodes();
 	info.blades = info.nodes / nodesperblade;
@@ -348,15 +348,15 @@ static unsigned long gru_chiplet_cpu_to_mmr(int chiplet, int cpu, int *corep)
 
 static int gru_irq_count[GRU_CHIPLETS_PER_BLADE];
 
-static void gru_noop(unsigned int irq)
+static void gru_noop(struct irq_data *d)
 {
 }
 
 static struct irq_chip gru_chip[GRU_CHIPLETS_PER_BLADE] = {
 	[0 ... GRU_CHIPLETS_PER_BLADE - 1] {
-		.mask		= gru_noop,
-		.unmask		= gru_noop,
-		.ack		= gru_noop
+		.irq_mask	= gru_noop,
+		.irq_unmask	= gru_noop,
+		.irq_ack	= gru_noop
 	}
 };
 
@@ -373,7 +373,7 @@ static int gru_chiplet_setup_tlb_irq(int chiplet, char *irq_name,
 
 	if (gru_irq_count[chiplet] == 0) {
 		gru_chip[chiplet].name = irq_name;
-		ret = set_irq_chip(irq, &gru_chip[chiplet]);
+		ret = irq_set_chip(irq, &gru_chip[chiplet]);
 		if (ret) {
 			printk(KERN_ERR "%s: set_irq_chip failed, errno=%d\n",
 			       GRU_DRIVER_ID_STR, -ret);
@@ -587,6 +587,7 @@ static const struct file_operations gru_fops = {
 	.owner		= THIS_MODULE,
 	.unlocked_ioctl	= gru_file_unlocked_ioctl,
 	.mmap		= gru_file_mmap,
+	.llseek		= noop_llseek,
 };
 
 static struct miscdevice gru_miscdev = {

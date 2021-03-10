@@ -36,7 +36,7 @@
 #include <linux/ioport.h>
 #include <linux/mm.h>
 #include <linux/slab.h>
-#include <linux/smp_lock.h>
+#include <linux/mutex.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/reboot.h>
@@ -54,6 +54,7 @@
 #define DAC960_GAM_MINOR	252
 
 
+static DEFINE_MUTEX(DAC960_mutex);
 static DAC960_Controller_T *DAC960_Controllers[DAC960_MaxControllers];
 static int DAC960_ControllerCount;
 static struct proc_dir_entry *DAC960_ProcDirectoryEntry;
@@ -79,23 +80,28 @@ static int DAC960_open(struct block_device *bdev, fmode_t mode)
 	struct gendisk *disk = bdev->bd_disk;
 	DAC960_Controller_T *p = disk->queue->queuedata;
 	int drive_nr = (long)disk->private_data;
+	int ret = -ENXIO;
 
+	mutex_lock(&DAC960_mutex);
 	if (p->FirmwareType == DAC960_V1_Controller) {
 		if (p->V1.LogicalDriveInformation[drive_nr].
 		    LogicalDriveState == DAC960_V1_LogicalDrive_Offline)
-			return -ENXIO;
+			goto out;
 	} else {
 		DAC960_V2_LogicalDeviceInfo_T *i =
 			p->V2.LogicalDeviceInformation[drive_nr];
 		if (!i || i->LogicalDeviceState == DAC960_V2_LogicalDevice_Offline)
-			return -ENXIO;
+			goto out;
 	}
 
 	check_disk_change(bdev);
 
 	if (!get_capacity(p->disks[drive_nr]))
-		return -ENXIO;
-	return 0;
+		goto out;
+	ret = 0;
+out:
+	mutex_unlock(&DAC960_mutex);
+	return ret;
 }
 
 static int DAC960_getgeo(struct block_device *bdev, struct hd_geometry *geo)
@@ -134,13 +140,14 @@ static int DAC960_getgeo(struct block_device *bdev, struct hd_geometry *geo)
 	return 0;
 }
 
-static int DAC960_media_changed(struct gendisk *disk)
+static unsigned int DAC960_check_events(struct gendisk *disk,
+					unsigned int clearing)
 {
 	DAC960_Controller_T *p = disk->queue->queuedata;
 	int drive_nr = (long)disk->private_data;
 
 	if (!p->LogicalDriveInitiallyAccessible[drive_nr])
-		return 1;
+		return DISK_EVENT_MEDIA_CHANGE;
 	return 0;
 }
 
@@ -157,7 +164,7 @@ static const struct block_device_operations DAC960_BlockDeviceOperations = {
 	.owner			= THIS_MODULE,
 	.open			= DAC960_open,
 	.getgeo			= DAC960_getgeo,
-	.media_changed		= DAC960_media_changed,
+	.check_events		= DAC960_check_events,
 	.revalidate_disk	= DAC960_revalidate_disk,
 };
 
@@ -1170,7 +1177,8 @@ static bool DAC960_V1_EnableMemoryMailboxInterface(DAC960_Controller_T
   int TimeoutCounter;
   int i;
 
-  
+  memset(&CommandMailbox, 0, sizeof(DAC960_V1_CommandMailbox_T));
+
   if (pci_set_dma_mask(Controller->PCIDevice, DMA_BIT_MASK(32)))
 	return DAC960_Failure(Controller, "DMA mask out of range");
   Controller->BounceBufferLimit = DMA_BIT_MASK(32);
@@ -1783,7 +1791,7 @@ static bool DAC960_V2_ReadControllerConfiguration(DAC960_Controller_T
   unsigned short LogicalDeviceNumber = 0;
   int ModelNameLength;
 
-  /* Get data into dma-able area, then copy into permanant location */
+  /* Get data into dma-able area, then copy into permanent location */
   if (!DAC960_V2_NewControllerInfo(Controller))
     return DAC960_Failure(Controller, "GET CONTROLLER INFO");
   memcpy(ControllerInfo, Controller->V2.NewControllerInformation,
@@ -4620,7 +4628,8 @@ static void DAC960_V2_ProcessCompletedCommand(DAC960_Command_T *Command)
   DAC960_Controller_T *Controller = Command->Controller;
   DAC960_CommandType_T CommandType = Command->CommandType;
   DAC960_V2_CommandMailbox_T *CommandMailbox = &Command->V2.CommandMailbox;
-  DAC960_V2_IOCTL_Opcode_T CommandOpcode = CommandMailbox->Common.IOCTL_Opcode;
+  DAC960_V2_IOCTL_Opcode_T IOCTLOpcode = CommandMailbox->Common.IOCTL_Opcode;
+  DAC960_V2_CommandOpcode_T CommandOpcode = CommandMailbox->SCSI_10.CommandOpcode;
   DAC960_V2_CommandStatus_T CommandStatus = Command->V2.CommandStatus;
 
   if (CommandType == DAC960_ReadCommand ||
@@ -4692,7 +4701,7 @@ static void DAC960_V2_ProcessCompletedCommand(DAC960_Command_T *Command)
     {
       if (Controller->ShutdownMonitoringTimer)
 	      return;
-      if (CommandOpcode == DAC960_V2_GetControllerInfo)
+      if (IOCTLOpcode == DAC960_V2_GetControllerInfo)
 	{
 	  DAC960_V2_ControllerInfo_T *NewControllerInfo =
 	    Controller->V2.NewControllerInformation;
@@ -4712,14 +4721,14 @@ static void DAC960_V2_ProcessCompletedCommand(DAC960_Command_T *Command)
 	  memcpy(ControllerInfo, NewControllerInfo,
 		 sizeof(DAC960_V2_ControllerInfo_T));
 	}
-      else if (CommandOpcode == DAC960_V2_GetEvent)
+      else if (IOCTLOpcode == DAC960_V2_GetEvent)
 	{
 	  if (CommandStatus == DAC960_V2_NormalCompletion) {
 	    DAC960_V2_ReportEvent(Controller, Controller->V2.Event);
 	  }
 	  Controller->V2.NextEventSequenceNumber++;
 	}
-      else if (CommandOpcode == DAC960_V2_GetPhysicalDeviceInfoValid &&
+      else if (IOCTLOpcode == DAC960_V2_GetPhysicalDeviceInfoValid &&
 	       CommandStatus == DAC960_V2_NormalCompletion)
 	{
 	  DAC960_V2_PhysicalDeviceInfo_T *NewPhysicalDeviceInfo =
@@ -4908,7 +4917,7 @@ static void DAC960_V2_ProcessCompletedCommand(DAC960_Command_T *Command)
 	  NewPhysicalDeviceInfo->LogicalUnit++;
 	  Controller->V2.PhysicalDeviceIndex++;
 	}
-      else if (CommandOpcode == DAC960_V2_GetPhysicalDeviceInfoValid)
+      else if (IOCTLOpcode == DAC960_V2_GetPhysicalDeviceInfoValid)
 	{
 	  unsigned int DeviceIndex;
 	  for (DeviceIndex = Controller->V2.PhysicalDeviceIndex;
@@ -4931,7 +4940,7 @@ static void DAC960_V2_ProcessCompletedCommand(DAC960_Command_T *Command)
 	    }
 	  Controller->V2.NeedPhysicalDeviceInformation = false;
 	}
-      else if (CommandOpcode == DAC960_V2_GetLogicalDeviceInfoValid &&
+      else if (IOCTLOpcode == DAC960_V2_GetLogicalDeviceInfoValid &&
 	       CommandStatus == DAC960_V2_NormalCompletion)
 	{
 	  DAC960_V2_LogicalDeviceInfo_T *NewLogicalDeviceInfo =
@@ -5058,7 +5067,7 @@ static void DAC960_V2_ProcessCompletedCommand(DAC960_Command_T *Command)
 			 [LogicalDeviceNumber] = true;
 	  NewLogicalDeviceInfo->LogicalDeviceNumber++;
 	}
-      else if (CommandOpcode == DAC960_V2_GetLogicalDeviceInfoValid)
+      else if (IOCTLOpcode == DAC960_V2_GetLogicalDeviceInfoValid)
 	{
 	  int LogicalDriveNumber;
 	  for (LogicalDriveNumber = 0;
@@ -6464,7 +6473,7 @@ static int dac960_initial_status_proc_show(struct seq_file *m, void *v)
 
 static int dac960_initial_status_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, dac960_initial_status_proc_show, PDE(inode)->data);
+	return single_open(file, dac960_initial_status_proc_show, PDE_DATA(inode));
 }
 
 static const struct file_operations dac960_initial_status_proc_fops = {
@@ -6510,7 +6519,7 @@ static int dac960_current_status_proc_show(struct seq_file *m, void *v)
 
 static int dac960_current_status_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, dac960_current_status_proc_show, PDE(inode)->data);
+	return single_open(file, dac960_current_status_proc_show, PDE_DATA(inode));
 }
 
 static const struct file_operations dac960_current_status_proc_fops = {
@@ -6531,14 +6540,14 @@ static int dac960_user_command_proc_show(struct seq_file *m, void *v)
 
 static int dac960_user_command_proc_open(struct inode *inode, struct file *file)
 {
-	return single_open(file, dac960_user_command_proc_show, PDE(inode)->data);
+	return single_open(file, dac960_user_command_proc_show, PDE_DATA(inode));
 }
 
 static ssize_t dac960_user_command_proc_write(struct file *file,
 				       const char __user *Buffer,
 				       size_t Count, loff_t *pos)
 {
-  DAC960_Controller_T *Controller = (DAC960_Controller_T *) PDE(file->f_path.dentry->d_inode)->data;
+  DAC960_Controller_T *Controller = PDE_DATA(file_inode(file));
   unsigned char CommandBuffer[80];
   int Length;
   if (Count > sizeof(CommandBuffer)-1) return -EINVAL;
@@ -6571,24 +6580,21 @@ static const struct file_operations dac960_user_command_proc_fops = {
 
 static void DAC960_CreateProcEntries(DAC960_Controller_T *Controller)
 {
-	struct proc_dir_entry *StatusProcEntry;
 	struct proc_dir_entry *ControllerProcEntry;
-	struct proc_dir_entry *UserCommandProcEntry;
 
 	if (DAC960_ProcDirectoryEntry == NULL) {
-  		DAC960_ProcDirectoryEntry = proc_mkdir("rd", NULL);
-  		StatusProcEntry = proc_create("status", 0,
-					   DAC960_ProcDirectoryEntry,
-					   &dac960_proc_fops);
+		DAC960_ProcDirectoryEntry = proc_mkdir("rd", NULL);
+		proc_create("status", 0, DAC960_ProcDirectoryEntry,
+			    &dac960_proc_fops);
 	}
 
-      sprintf(Controller->ControllerName, "c%d", Controller->ControllerNumber);
-      ControllerProcEntry = proc_mkdir(Controller->ControllerName,
-				       DAC960_ProcDirectoryEntry);
-      proc_create_data("initial_status", 0, ControllerProcEntry, &dac960_initial_status_proc_fops, Controller);
-      proc_create_data("current_status", 0, ControllerProcEntry, &dac960_current_status_proc_fops, Controller);
-      UserCommandProcEntry = proc_create_data("user_command", S_IWUSR | S_IRUSR, ControllerProcEntry, &dac960_user_command_proc_fops, Controller);
-      Controller->ControllerProcEntry = ControllerProcEntry;
+	sprintf(Controller->ControllerName, "c%d", Controller->ControllerNumber);
+	ControllerProcEntry = proc_mkdir(Controller->ControllerName,
+					 DAC960_ProcDirectoryEntry);
+	proc_create_data("initial_status", 0, ControllerProcEntry, &dac960_initial_status_proc_fops, Controller);
+	proc_create_data("current_status", 0, ControllerProcEntry, &dac960_current_status_proc_fops, Controller);
+	proc_create_data("user_command", S_IWUSR | S_IRUSR, ControllerProcEntry, &dac960_user_command_proc_fops, Controller);
+	Controller->ControllerProcEntry = ControllerProcEntry;
 }
 
 
@@ -6620,7 +6626,7 @@ static long DAC960_gam_ioctl(struct file *file, unsigned int Request,
   long ErrorCode = 0;
   if (!capable(CAP_SYS_ADMIN)) return -EACCES;
 
-  lock_kernel();
+  mutex_lock(&DAC960_mutex);
   switch (Request)
     {
     case DAC960_IOCTL_GET_CONTROLLER_COUNT:
@@ -7048,16 +7054,18 @@ static long DAC960_gam_ioctl(struct file *file, unsigned int Request,
 	else
 		ErrorCode =  0;
       }
+      break;
       default:
 	ErrorCode = -ENOTTY;
     }
-  unlock_kernel();
+  mutex_unlock(&DAC960_mutex);
   return ErrorCode;
 }
 
 static const struct file_operations DAC960_gam_fops = {
 	.owner		= THIS_MODULE,
-	.unlocked_ioctl	= DAC960_gam_ioctl
+	.unlocked_ioctl	= DAC960_gam_ioctl,
+	.llseek		= noop_llseek,
 };
 
 static struct miscdevice DAC960_gam_dev = {
@@ -7100,7 +7108,7 @@ static struct DAC960_privdata DAC960_BA_privdata = {
 
 static struct DAC960_privdata DAC960_LP_privdata = {
 	.HardwareType =		DAC960_LP_Controller,
-	.FirmwareType 	=	DAC960_LP_Controller,
+	.FirmwareType 	=	DAC960_V2_Controller,
 	.InterruptHandler =	DAC960_LP_InterruptHandler,
 	.MemoryWindowSize =	DAC960_LP_RegisterWindowSize,
 };
@@ -7133,7 +7141,7 @@ static struct DAC960_privdata DAC960_P_privdata = {
 	.MemoryWindowSize =	DAC960_PD_RegisterWindowSize,
 };
 
-static struct pci_device_id DAC960_id_table[] = {
+static const struct pci_device_id DAC960_id_table[] = {
 	{
 		.vendor 	= PCI_VENDOR_ID_MYLEX,
 		.device		= PCI_DEVICE_ID_MYLEX_DAC960_GEM,

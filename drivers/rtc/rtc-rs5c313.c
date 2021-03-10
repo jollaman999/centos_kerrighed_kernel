@@ -39,6 +39,8 @@
  *	1.13	Nobuhiro Iwamatsu: Updata driver.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
 #include <linux/err.h>
 #include <linux/rtc.h>
@@ -80,21 +82,21 @@
 /* SCSPTR1 data */
 unsigned char scsptr1_data;
 
-#define RS5C313_CEENABLE    ctrl_outb(RS5C313_CE_RTCCE, RS5C313_CE);
-#define RS5C313_CEDISABLE   ctrl_outb(0x00, RS5C313_CE)
-#define RS5C313_MISCOP      ctrl_outb(0x02, 0xB0000008)
+#define RS5C313_CEENABLE    __raw_writeb(RS5C313_CE_RTCCE, RS5C313_CE);
+#define RS5C313_CEDISABLE   __raw_writeb(0x00, RS5C313_CE)
+#define RS5C313_MISCOP      __raw_writeb(0x02, 0xB0000008)
 
 static void rs5c313_init_port(void)
 {
 	/* Set SCK as I/O port and Initialize SCSPTR1 data & I/O port. */
-	ctrl_outb(ctrl_inb(SCSMR1) & ~SCSMR1_CA, SCSMR1);
-	ctrl_outb(ctrl_inb(SCSCR1) & ~SCSCR1_CKE, SCSCR1);
+	__raw_writeb(__raw_readb(SCSMR1) & ~SCSMR1_CA, SCSMR1);
+	__raw_writeb(__raw_readb(SCSCR1) & ~SCSCR1_CKE, SCSCR1);
 
 	/* And Initialize SCL for RS5C313 clock */
-	scsptr1_data = ctrl_inb(SCSPTR1) | SCL;	/* SCL:H */
-	ctrl_outb(scsptr1_data, SCSPTR1);
-	scsptr1_data = ctrl_inb(SCSPTR1) | SCL_OEN;	/* SCL output enable */
-	ctrl_outb(scsptr1_data, SCSPTR1);
+	scsptr1_data = __raw_readb(SCSPTR1) | SCL;	/* SCL:H */
+	__raw_writeb(scsptr1_data, SCSPTR1);
+	scsptr1_data = __raw_readb(SCSPTR1) | SCL_OEN;	/* SCL output enable */
+	__raw_writeb(scsptr1_data, SCSPTR1);
 	RS5C313_CEDISABLE;	/* CE:L */
 }
 
@@ -106,21 +108,21 @@ static void rs5c313_write_data(unsigned char data)
 		/* SDA:Write Data */
 		scsptr1_data = (scsptr1_data & ~SDA) |
 				((((0x80 >> i) & data) >> (7 - i)) << 2);
-		ctrl_outb(scsptr1_data, SCSPTR1);
+		__raw_writeb(scsptr1_data, SCSPTR1);
 		if (i == 0) {
 			scsptr1_data |= SDA_OEN;	/* SDA:output enable */
-			ctrl_outb(scsptr1_data, SCSPTR1);
+			__raw_writeb(scsptr1_data, SCSPTR1);
 		}
 		ndelay(700);
 		scsptr1_data &= ~SCL;	/* SCL:L */
-		ctrl_outb(scsptr1_data, SCSPTR1);
+		__raw_writeb(scsptr1_data, SCSPTR1);
 		ndelay(700);
 		scsptr1_data |= SCL;	/* SCL:H */
-		ctrl_outb(scsptr1_data, SCSPTR1);
+		__raw_writeb(scsptr1_data, SCSPTR1);
 	}
 
 	scsptr1_data &= ~SDA_OEN;	/* SDA:output disable */
-	ctrl_outb(scsptr1_data, SCSPTR1);
+	__raw_writeb(scsptr1_data, SCSPTR1);
 }
 
 static unsigned char rs5c313_read_data(void)
@@ -131,12 +133,12 @@ static unsigned char rs5c313_read_data(void)
 	for (i = 0; i < 8; i++) {
 		ndelay(700);
 		/* SDA:Read Data */
-		data |= ((ctrl_inb(SCSPTR1) & SDA) >> 2) << (7 - i);
+		data |= ((__raw_readb(SCSPTR1) & SDA) >> 2) << (7 - i);
 		scsptr1_data &= ~SCL;	/* SCL:L */
-		ctrl_outb(scsptr1_data, SCSPTR1);
+		__raw_writeb(scsptr1_data, SCSPTR1);
 		ndelay(700);
 		scsptr1_data |= SCL;	/* SCL:H */
-		ctrl_outb(scsptr1_data, SCSPTR1);
+		__raw_writeb(scsptr1_data, SCSPTR1);
 	}
 	return data & 0x0F;
 }
@@ -352,8 +354,7 @@ static void rs5c313_check_xstp_bit(void)
 		tm.tm_year 	= 2000 - 1900;
 
 		rs5c313_rtc_set_time(NULL, &tm);
-		printk(KERN_ERR "RICHO RS5C313: invalid value, resetting to "
-				"1 Jan 2000\n");
+		pr_err("invalid value, resetting to 1 Jan 2000\n");
 	}
 	RS5C313_CEDISABLE;
 	ndelay(700);		/* CE:L */
@@ -366,7 +367,7 @@ static const struct rtc_class_ops rs5c313_rtc_ops = {
 
 static int rs5c313_rtc_probe(struct platform_device *pdev)
 {
-	struct rtc_device *rtc = rtc_device_register("rs5c313", &pdev->dev,
+	struct rtc_device *rtc = devm_rtc_device_register(&pdev->dev, "rs5c313",
 				&rs5c313_rtc_ops, THIS_MODULE);
 
 	if (IS_ERR(rtc))
@@ -377,12 +378,8 @@ static int rs5c313_rtc_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int __devexit rs5c313_rtc_remove(struct platform_device *pdev)
+static int rs5c313_rtc_remove(struct platform_device *pdev)
 {
-	struct rtc_device *rtc = platform_get_drvdata( pdev );
-
-	rtc_device_unregister(rtc);
-
 	return 0;
 }
 
@@ -392,7 +389,7 @@ static struct platform_driver rs5c313_rtc_platform_driver = {
 		.owner  = THIS_MODULE,
 	},
 	.probe 	= rs5c313_rtc_probe,
-	.remove = __devexit_p( rs5c313_rtc_remove ),
+	.remove = rs5c313_rtc_remove,
 };
 
 static int __init rs5c313_rtc_init(void)

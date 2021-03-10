@@ -25,6 +25,7 @@
 #include <linux/ip.h>
 #include <linux/icmp.h>
 #include <linux/netdevice.h>
+#include <linux/slab.h>
 #include <net/sock.h>
 #include <net/ip.h>
 #include <net/tcp.h>
@@ -38,16 +39,34 @@
 #include <net/route.h>
 #include <net/xfrm.h>
 
-static int ip_forward_finish(struct sk_buff *skb)
+static bool ip_may_fragment(const struct sk_buff *skb)
 {
-	struct ip_options * opt	= &(IPCB(skb)->opt);
+	return unlikely((ip_hdr(skb)->frag_off & htons(IP_DF)) == 0) ||
+		skb->ignore_df;
+}
+
+static bool ip_exceeds_mtu(const struct sk_buff *skb, unsigned int mtu)
+{
+	if (skb->len <= mtu)
+		return false;
+
+	if (skb_is_gso(skb) && skb_gso_validate_mtu(skb, mtu))
+		return false;
+
+	return true;
+}
+
+static int ip_forward_finish(struct sock *sk, struct sk_buff *skb)
+{
+	struct ip_options *opt	= &(IPCB(skb)->opt);
 
 	IP_INC_STATS_BH(dev_net(skb_dst(skb)->dev), IPSTATS_MIB_OUTFORWDATAGRAMS);
+	IP_ADD_STATS_BH(dev_net(skb_dst(skb)->dev), IPSTATS_MIB_OUTOCTETS, skb->len);
 
 	if (unlikely(opt->optlen))
 		ip_forward_options(skb);
 
-	return dst_output(skb);
+	return dst_output_sk(sk, skb);
 }
 
 int ip_forward(struct sk_buff *skb)
@@ -55,7 +74,14 @@ int ip_forward(struct sk_buff *skb)
 	u32 mtu;
 	struct iphdr *iph;	/* Our header */
 	struct rtable *rt;	/* Route we use */
-	struct ip_options * opt	= &(IPCB(skb)->opt);
+	struct ip_options *opt	= &(IPCB(skb)->opt);
+
+	/* that should never happen */
+	if (skb->pkt_type != PACKET_HOST)
+		goto drop;
+
+	if (unlikely(skb->sk))
+		goto drop;
 
 	if (skb_warn_if_lro(skb))
 		goto drop;
@@ -65,9 +91,6 @@ int ip_forward(struct sk_buff *skb)
 
 	if (IPCB(skb)->opt.router_alert && ip_call_ra_chain(skb))
 		return NET_RX_SUCCESS;
-
-	if (skb->pkt_type != PACKET_HOST)
-		goto drop;
 
 	skb_forward_csum(skb);
 
@@ -84,21 +107,20 @@ int ip_forward(struct sk_buff *skb)
 
 	rt = skb_rtable(skb);
 
-	if (opt->is_strictroute && rt->rt_dst != rt->rt_gateway)
+	if (opt->is_strictroute && rt->rt_uses_gateway)
 		goto sr_failed;
 
 	IPCB(skb)->flags |= IPSKB_FORWARDED;
-	mtu = ip_dst_mtu_maybe_forward(&rt->u.dst, true);
-	if (unlikely(skb->len > mtu && !skb_is_gso(skb) &&
-		     (ip_hdr(skb)->frag_off & htons(IP_DF))) && !skb->local_df) {
-		IP_INC_STATS(dev_net(rt->u.dst.dev), IPSTATS_MIB_FRAGFAILS);
+	mtu = ip_dst_mtu_maybe_forward(&rt->dst, true);
+	if (!ip_may_fragment(skb) && ip_exceeds_mtu(skb, mtu)) {
+		IP_INC_STATS(dev_net(rt->dst.dev), IPSTATS_MIB_FRAGFAILS);
 		icmp_send(skb, ICMP_DEST_UNREACH, ICMP_FRAG_NEEDED,
 			  htonl(mtu));
 		goto drop;
 	}
 
 	/* We are about to mangle packet. Copy it! */
-	if (skb_cow(skb, LL_RESERVED_SPACE(rt->u.dst.dev)+rt->u.dst.header_len))
+	if (skb_cow(skb, LL_RESERVED_SPACE(rt->dst.dev)+rt->dst.header_len))
 		goto drop;
 	iph = ip_hdr(skb);
 
@@ -109,13 +131,14 @@ int ip_forward(struct sk_buff *skb)
 	 *	We now generate an ICMP HOST REDIRECT giving the route
 	 *	we calculated.
 	 */
-	if (rt->rt_flags&RTCF_DOREDIRECT && !opt->srr && !skb_sec_path(skb))
+	if (IPCB(skb)->flags & IPSKB_DOREDIRECT && !opt->srr &&
+	    !skb_sec_path(skb))
 		ip_rt_send_redirect(skb);
 
 	skb->priority = rt_tos2priority(iph->tos);
 
-	return NF_HOOK(PF_INET, NF_INET_FORWARD, skb, skb->dev, rt->u.dst.dev,
-		       ip_forward_finish);
+	return NF_HOOK(NFPROTO_IPV4, NF_INET_FORWARD, NULL, skb,
+		       skb->dev, rt->dst.dev, ip_forward_finish);
 
 sr_failed:
 	/*

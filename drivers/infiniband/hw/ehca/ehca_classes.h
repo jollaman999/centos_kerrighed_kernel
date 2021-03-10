@@ -55,6 +55,7 @@ struct ehca_av;
 #include <linux/wait.h>
 #include <linux/mutex.h>
 
+#include <rdma/ib_mad.h>
 #include <rdma/ib_verbs.h>
 #include <rdma/ib_user_verbs.h>
 
@@ -112,7 +113,7 @@ struct ehca_sport {
 
 struct ehca_shca {
 	struct ib_device ib_device;
-	struct of_device *ofdev;
+	struct platform_device *ofdev;
 	u8 num_ports;
 	int hw_level;
 	struct list_head shca_list;
@@ -316,9 +317,8 @@ struct ehca_mr_pginfo {
 
 	union {
 		struct { /* type EHCA_MR_PGI_PHYS section */
-			int num_phys_buf;
-			struct ib_phys_buf *phys_buf_array;
-			u64 next_buf;
+			u64 addr;
+			u16 size;
 		} phy;
 		struct { /* type EHCA_MR_PGI_USER section */
 			struct ib_umem *region;
@@ -379,8 +379,8 @@ extern spinlock_t shca_list_lock;
 
 extern int ehca_static_rate;
 extern int ehca_port_act_time;
-extern int ehca_use_hp_mr;
-extern int ehca_scaling_code;
+extern bool ehca_use_hp_mr;
+extern bool ehca_scaling_code;
 extern int ehca_lock_hcalls;
 extern int ehca_nr_ports;
 extern int ehca_max_cq;

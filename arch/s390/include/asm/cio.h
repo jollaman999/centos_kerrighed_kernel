@@ -1,26 +1,25 @@
 /*
- *  include/asm-s390/cio.h
- *  include/asm-s390x/cio.h
- *
  * Common interface for I/O on S/390
  */
 #ifndef _ASM_S390_CIO_H_
 #define _ASM_S390_CIO_H_
 
 #include <linux/spinlock.h>
+#include <linux/bitops.h>
+#include <linux/genalloc.h>
 #include <asm/types.h>
-
-#ifdef __KERNEL__
 
 #define LPM_ANYPATH 0xff
 #define __MAX_CSSID 0
+#define __MAX_SUBCHANNEL 65535
+#define __MAX_SSID 3
 
 #include <asm/scsw.h>
 
 /**
  * struct ccw1 - channel command word
  * @cmd_code: command code
- * @flags: flags, like IDA adressing, etc.
+ * @flags: flags, like IDA addressing, etc.
  * @count: byte count
  * @cda: data address
  *
@@ -208,7 +207,7 @@ struct esw_eadm {
  * The irb that is handed to the device driver when an interrupt occurs. For
  * solicited interrupts, the common I/O layer already performs checks whether
  * a field is valid; a field not being valid is always passed as %0.
- * If a unit check occured, @ecw may contain sense data; this is retrieved
+ * If a unit check occurred, @ecw may contain sense data; this is retrieved
  * by the common I/O layer itself if the device doesn't support concurrent
  * sense (so that the device driver never needs to perform basic sene itself).
  * For unsolicited interrupts, the irb is passed as-is (expect for sense data,
@@ -299,23 +298,40 @@ static inline int ccw_dev_id_is_equal(struct ccw_dev_id *dev_id1,
 	return 0;
 }
 
-extern void wait_cons_dev(void);
+/**
+ * pathmask_to_pos() - find the position of the left-most bit in a pathmask
+ * @mask: pathmask with at least one bit set
+ */
+static inline u8 pathmask_to_pos(u8 mask)
+{
+	return 8 - ffs(mask);
+}
 
+void channel_subsystem_reinit(void);
 extern void css_schedule_reprobe(void);
 
 extern void reipl_ccw_dev(struct ccw_dev_id *id);
 
 struct cio_iplinfo {
+	u8 ssid;
 	u16 devno;
 	int is_qdio;
 };
 
 extern int cio_get_iplinfo(struct cio_iplinfo *iplinfo);
 
+extern void *cio_dma_zalloc(size_t size);
+extern void cio_dma_free(void *cpu_addr, size_t size);
+extern struct device *cio_get_dma_css_dev(void);
+
+void *cio_gp_dma_zalloc(struct gen_pool *gp_dma, struct device *dma_dev,
+			size_t size);
+void cio_gp_dma_free(struct gen_pool *gp_dma, void *cpu_addr, size_t size);
+void cio_gp_dma_destroy(struct gen_pool *gp_dma, struct device *dma_dev);
+struct gen_pool *cio_gp_dma_create(struct device *dma_dev, int nr_pages);
+
 /* Function from drivers/s390/cio/chsc.c */
 int chsc_sstpc(void *page, unsigned int op, u16 ctrl);
 int chsc_sstpi(void *page, void *result, size_t size);
-
-#endif
 
 #endif

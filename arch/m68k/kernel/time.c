@@ -28,23 +28,14 @@
 #include <linux/timex.h>
 #include <linux/profile.h>
 
-static inline int set_rtc_mmss(unsigned long nowtime)
-{
-  if (mach_set_clock_mmss)
-    return mach_set_clock_mmss (nowtime);
-  return -1;
-}
-
 /*
  * timer_interrupt() needs to keep up the real-time clock,
- * as well as call the "do_timer()" routine every clocktick
+ * as well as call the "xtime_update()" routine every clocktick
  */
 static irqreturn_t timer_interrupt(int irq, void *dummy)
 {
-	do_timer(1);
-#ifndef CONFIG_SMP
+	xtime_update(1);
 	update_process_times(user_mode(get_irq_regs()));
-#endif
 	profile_tick(CPU_PROFILING);
 
 #ifdef CONFIG_HEARTBEAT
@@ -73,28 +64,23 @@ static irqreturn_t timer_interrupt(int irq, void *dummy)
 	return IRQ_HANDLED;
 }
 
-void __init time_init(void)
+void read_persistent_clock(struct timespec *ts)
 {
 	struct rtc_time time;
+	ts->tv_sec = 0;
+	ts->tv_nsec = 0;
 
 	if (mach_hwclk) {
 		mach_hwclk(0, &time);
 
 		if ((time.tm_year += 1900) < 1970)
 			time.tm_year += 100;
-		xtime.tv_sec = mktime(time.tm_year, time.tm_mon, time.tm_mday,
+		ts->tv_sec = mktime(time.tm_year, time.tm_mon, time.tm_mday,
 				      time.tm_hour, time.tm_min, time.tm_sec);
-		xtime.tv_nsec = 0;
 	}
-	wall_to_monotonic.tv_sec = -xtime.tv_sec;
-
-	mach_sched_init(timer_interrupt);
 }
 
-u32 arch_gettimeoffset(void)
-{
-	return mach_gettimeoffset() * 1000;
-}
+#ifdef CONFIG_ARCH_USES_GETTIMEOFFSET
 
 static int __init rtc_init(void)
 {
@@ -104,10 +90,14 @@ static int __init rtc_init(void)
 		return -ENODEV;
 
 	pdev = platform_device_register_simple("rtc-generic", -1, NULL, 0);
-	if (IS_ERR(pdev))
-		return PTR_ERR(pdev);
-
-	return 0;
+	return PTR_RET(pdev);
 }
 
 module_init(rtc_init);
+
+#endif /* CONFIG_ARCH_USES_GETTIMEOFFSET */
+
+void __init time_init(void)
+{
+	mach_sched_init(timer_interrupt);
+}

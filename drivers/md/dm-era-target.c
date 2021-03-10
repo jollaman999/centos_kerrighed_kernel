@@ -254,7 +254,6 @@ static struct dm_block_validator sb_validator = {
  * Low level metadata handling
  *--------------------------------------------------------------*/
 #define DM_ERA_METADATA_BLOCK_SIZE 4096
-#define DM_ERA_METADATA_CACHE_SIZE 64
 #define ERA_MAX_CONCURRENT_LOCKS 5
 
 struct era_metadata {
@@ -615,7 +614,6 @@ static int create_persistent_data_objects(struct era_metadata *md,
 	int r;
 
 	md->bm = dm_block_manager_create(md->bdev, DM_ERA_METADATA_BLOCK_SIZE,
-					 DM_ERA_METADATA_CACHE_SIZE,
 					 ERA_MAX_CONCURRENT_LOCKS);
 	if (IS_ERR(md->bm)) {
 		DMERR("could not create block manager");
@@ -961,15 +959,15 @@ static int metadata_commit(struct era_metadata *md)
 		}
 	}
 
-	r = save_sm_root(md);
-	if (r) {
-		DMERR("%s: save_sm_root failed", __func__);
-		return r;
-	}
-
 	r = dm_tm_pre_commit(md->tm);
 	if (r) {
 		DMERR("%s: pre commit failed", __func__);
+		return r;
+	}
+
+	r = save_sm_root(md);
+	if (r) {
+		DMERR("%s: save_sm_root failed", __func__);
 		return r;
 	}
 
@@ -1390,7 +1388,8 @@ static int era_is_congested(struct dm_target_callbacks *cb, int bdi_bits)
 
 static void era_destroy(struct era *era)
 {
-	metadata_close(era->md);
+	if (era->md)
+		metadata_close(era->md);
 
 	if (era->wq)
 		destroy_workqueue(era->wq);
@@ -1511,11 +1510,10 @@ static int era_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	INIT_LIST_HEAD(&era->rpc_calls);
 
 	ti->private = era;
-	ti->num_flush_requests = 1;
+	ti->num_flush_bios = 1;
 	ti->flush_supported = true;
 
-	ti->num_discard_requests = 1;
-	ti->discards_supported = true;
+	ti->num_discard_bios = 1;
 	era->callbacks.congested_fn = era_is_congested;
 	dm_table_add_target_callbacks(ti->table, &era->callbacks);
 
@@ -1532,8 +1530,7 @@ static void era_dtr(struct dm_target *ti)
 	era_destroy(ti->private);
 }
 
-static int era_map(struct dm_target *ti, struct bio *bio,
-		   union map_info *map_context)
+static int era_map(struct dm_target *ti, struct bio *bio)
 {
 	struct era *era = ti->private;
 	dm_block_t block = get_block(era, bio);
@@ -1546,9 +1543,9 @@ static int era_map(struct dm_target *ti, struct bio *bio,
 	remap_to_origin(era, bio);
 
 	/*
-	 * BIO_FLUSH bios carry no data, so we're not interested in them.
+	 * REQ_FLUSH bios carry no data, so we're not interested in them.
 	 */
-	if (!(bio->bi_rw & BIO_FLUSH) &&
+	if (!(bio->bi_rw & REQ_FLUSH) &&
 	    (bio_data_dir(bio) == WRITE) &&
 	    !metadata_current_marked(era->md, block)) {
 		defer_bio(era, bio);
@@ -1603,8 +1600,8 @@ static int era_preresume(struct dm_target *ti)
  * <metadata block size> <#used metadata blocks>/<#total metadata blocks>
  * <current era> <held metadata root | '-'>
  */
-static int era_status(struct dm_target *ti, status_type_t type,
-		      unsigned status_flags, char *result, unsigned maxlen)
+static void era_status(struct dm_target *ti, status_type_t type,
+		       unsigned status_flags, char *result, unsigned maxlen)
 {
 	int r;
 	struct era *era = ti->private;
@@ -1638,11 +1635,10 @@ static int era_status(struct dm_target *ti, status_type_t type,
 		break;
 	}
 
-	return 0;
+	return;
 
 err:
 	DMEMIT("Error");
-	return 0;
 }
 
 static int era_message(struct dm_target *ti, unsigned argc, char **argv)
@@ -1714,7 +1710,6 @@ static void era_io_hints(struct dm_target *ti, struct queue_limits *limits)
 
 static struct target_type era_target = {
 	.name = "era",
-	.features = DM_TARGET_STATUS_WITH_FLAGS,
 	.version = {1, 0, 0},
 	.module = THIS_MODULE,
 	.ctr = era_ctr,
@@ -1722,7 +1717,7 @@ static struct target_type era_target = {
 	.map = era_map,
 	.postsuspend = era_postsuspend,
 	.preresume = era_preresume,
-	.status_with_flags = era_status,
+	.status = era_status,
 	.message = era_message,
 	.iterate_devices = era_iterate_devices,
 	.merge = era_merge,

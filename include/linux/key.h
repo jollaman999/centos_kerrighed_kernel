@@ -9,7 +9,7 @@
  * 2 of the License, or (at your option) any later version.
  *
  *
- * See Documentation/keys.txt for information on keys/keyrings.
+ * See Documentation/security/keys.txt for information on keys/keyrings.
  */
 
 #ifndef _LINUX_KEY_H
@@ -21,10 +21,11 @@
 #include <linux/rcupdate.h>
 #include <linux/sysctl.h>
 #include <linux/rwsem.h>
-#include <asm/atomic.h>
-#include <linux/time.h>
+#include <linux/atomic.h>
+#include <linux/assoc_array.h>
 
 #ifdef __KERNEL__
+#include <linux/uidgid.h>
 
 /* key handle serial number */
 typedef int32_t key_serial_t;
@@ -82,6 +83,12 @@ struct key_owner;
 struct keyring_list;
 struct keyring_name;
 
+struct keyring_index_key {
+	struct key_type		*type;
+	const char		*description;
+	size_t			desc_len;
+};
+
 /*****************************************************************************/
 /*
  * key reference with possession attribute handling
@@ -114,6 +121,12 @@ static inline bool is_key_possessed(const key_ref_t key_ref)
 	return (unsigned long) key_ref & 1UL;
 }
 
+
+enum key_state {
+	KEY_IS_UNINSTANTIATED,
+	KEY_IS_POSITIVE,		/* Positively instantiated */
+};
+
 /*****************************************************************************/
 /*
  * authentication token / access credential / keyring
@@ -125,15 +138,10 @@ static inline bool is_key_possessed(const key_ref_t key_ref)
 struct key {
 	atomic_t		usage;		/* number of references */
 	key_serial_t		serial;		/* key serial number */
-#ifndef __GENKSYMS__
 	union {
 		struct list_head graveyard_link;
 		struct rb_node	serial_node;
 	};
-#else
-	struct rb_node		serial_node;
-#endif
-	struct key_type		*type;		/* type of key */
 	struct rw_semaphore	sem;		/* change vs change sem */
 	struct key_user		*user;		/* owner of this key */
 	void			*security;	/* security data for this key */
@@ -141,8 +149,9 @@ struct key {
 		time_t		expiry;		/* time at which key expires (or 0) */
 		time_t		revoked_at;	/* time at which key was revoked */
 	};
-	uid_t			uid;
-	gid_t			gid;
+	time_t			last_used_at;	/* last time used for LRU keyring discard */
+	kuid_t			uid;
+	kgid_t			gid;
 	key_perm_t		perm;		/* access permissions */
 	unsigned short		quotalen;	/* length added to quota */
 	unsigned short		datalen;	/* payload data length
@@ -153,7 +162,6 @@ struct key {
 #ifdef KEY_DEBUGGING
 	unsigned		magic;
 #define KEY_DEBUG_MAGIC		0x18273645u
-#define KEY_DEBUG_MAGIC_X	0xf8e9dacbu
 #endif
 
 	unsigned long		flags;		/* status flags (change with bitops) */
@@ -165,15 +173,24 @@ struct key {
 #define KEY_FLAG_NEGATIVE	5	/* set if key is negative */
 #define KEY_FLAG_ROOT_CAN_CLEAR	6	/* set if key can be cleared by root without permission */
 #define KEY_FLAG_INVALIDATED	7	/* set if key has been invalidated */
+#define KEY_FLAG_TRUSTED	8	/* set if key is trusted */
+#define KEY_FLAG_TRUSTED_ONLY	9	/* set if keyring only accepts links to trusted keys */
+#define KEY_FLAG_BUILTIN	10	/* set if key is builtin */
 #define KEY_FLAG_ROOT_CAN_INVAL	11	/* set if key can be invalidated by root without permission */
 #define KEY_FLAG_UID_KEYRING	12	/* set if key is a user or user session keyring */
 
-	/* the description string
-	 * - this is used to match a key against search criteria
-	 * - this should be a printable string
+	/* the key type and key description string
+	 * - the desc is used to match a key against search criteria
+	 * - it should be a printable string
 	 * - eg: for krb5 AFS, this might be "afs@REDHAT.COM"
 	 */
-	char			*description;
+	union {
+		struct keyring_index_key index_key;
+		struct {
+			struct key_type	*type;		/* type of key */
+			char		*description;
+		};
+	};
 
 	/* type specific data
 	 * - this is used by the keyring type to index the name
@@ -182,6 +199,7 @@ struct key {
 		struct list_head	link;
 		unsigned long		x[2];
 		void			*p[2];
+		int			reject_error;
 	} type_data;
 
 	/* key data
@@ -189,18 +207,22 @@ struct key {
 	 *   whatever
 	 */
 	union {
-		unsigned long		value;
-		void			*data;
-		struct keyring_list	*subscriptions;
-	} payload;
+		union {
+			unsigned long		value;
+			void __rcu		*rcudata;
+			void			*data;
+			void			*data2[2];
+		} payload;
+		struct assoc_array keys;
+	};
 #ifndef __GENKSYMS__
-	time_t			last_used_at;	/* last time used for LRU keyring discard */
+	short state;		/* Key state (+) or rejection error (-) */
 #endif
 };
 
 extern struct key *key_alloc(struct key_type *type,
 			     const char *desc,
-			     uid_t uid, gid_t gid,
+			     kuid_t uid, kgid_t gid,
 			     const struct cred *cred,
 			     key_perm_t perm,
 			     unsigned long flags);
@@ -209,18 +231,22 @@ extern struct key *key_alloc(struct key_type *type,
 #define KEY_ALLOC_IN_QUOTA	0x0000	/* add to quota, reject if would overrun */
 #define KEY_ALLOC_QUOTA_OVERRUN	0x0001	/* add to quota, permit even if overrun */
 #define KEY_ALLOC_NOT_IN_QUOTA	0x0002	/* not in quota */
-#define KEY_ALLOC_UID_KEYRING		0x0010	/* allocating a user or user session keyring */
+#define KEY_ALLOC_TRUSTED	0x0004	/* Key should be flagged as trusted */
+#define KEY_ALLOC_UID_KEYRING	0x0080	/* allocating a user or user session keyring */
 
 extern void key_revoke(struct key *key);
 extern void key_invalidate(struct key *key);
-
 extern void key_put(struct key *key);
+
+static inline struct key *__key_get(struct key *key)
+{
+	atomic_inc(&key->usage);
+	return key;
+}
 
 static inline struct key *key_get(struct key *key)
 {
-	if (key)
-		atomic_inc(&key->usage);
-	return key;
+	return key ? __key_get(key) : key;
 }
 
 static inline void key_ref_put(key_ref_t key_ref)
@@ -271,7 +297,7 @@ extern int key_link(struct key *keyring,
 extern int key_unlink(struct key *keyring,
 		      struct key *key);
 
-extern struct key *keyring_alloc(const char *description, uid_t uid, gid_t gid,
+extern struct key *keyring_alloc(const char *description, kuid_t uid, kgid_t gid,
 				 const struct cred *cred,
 				 key_perm_t perm,
 				 unsigned long flags,
@@ -295,33 +321,52 @@ static inline key_serial_t key_serial(const struct key *key)
 
 extern void key_set_timeout(struct key *, unsigned);
 
+extern key_ref_t lookup_user_key(key_serial_t id, unsigned long flags,
+				 key_perm_t perm);
+
+static inline short key_read_state(const struct key *key)
+{
+	/* Barrier versus mark_key_instantiated(). */
+	return smp_load_acquire(&key->state);
+}
+
 /**
- * key_is_instantiated - Determine if a key has been positively instantiated
+ * key_is_positive - Determine if a key has been positively instantiated
  * @key: The key to check.
  *
  * Return true if the specified key has been positively instantiated, false
  * otherwise.
  */
-static inline bool key_is_instantiated(const struct key *key)
+static inline bool key_is_positive(const struct key *key)
 {
-	return test_bit(KEY_FLAG_INSTANTIATED, &key->flags) &&
-		!test_bit(KEY_FLAG_NEGATIVE, &key->flags);
+	return key_read_state(key) == KEY_IS_POSITIVE;
 }
 
+static inline bool key_is_negative(const struct key *key)
+{
+	return key_read_state(key) < 0;
+}
+
+/* rcu_dereference_key() is deprecated. */
 #define rcu_dereference_key(KEY)					\
-	(rcu_dereference((KEY)->payload.data))
+	(rcu_dereference_protected((KEY)->payload.rcudata,		\
+				   rwsem_is_locked(&((struct key *)(KEY))->sem)))
+
+#define dereference_key_rcu(KEY)					\
+	(rcu_dereference((KEY)->payload.rcudata))
+
+#define dereference_key_locked(KEY)					\
+	(rcu_dereference_protected((KEY)->payload.rcudata,		\
+				   rwsem_is_locked(&((struct key *)(KEY))->sem)))
 
 #define rcu_assign_keypointer(KEY, PAYLOAD)				\
 do {									\
-	rcu_assign_pointer((KEY)->payload.data, (PAYLOAD));		\
+	rcu_assign_pointer((KEY)->payload.rcudata, (PAYLOAD));		\
 } while (0)
 
 #ifdef CONFIG_SYSCTL
 extern ctl_table key_sysctls[];
 #endif
-
-extern void key_replace_session_keyring(void);
-
 /*
  * the userspace interface
  */
@@ -345,7 +390,6 @@ extern void key_init(void);
 #define key_fsuid_changed(t)		do { } while(0)
 #define key_fsgid_changed(t)		do { } while(0)
 #define key_init()			do { } while(0)
-#define key_replace_session_keyring()	do { } while(0)
 
 #endif /* CONFIG_KEYS */
 #endif /* __KERNEL__ */

@@ -32,7 +32,9 @@
 
 
 #include <linux/interrupt.h>
+#include <linux/slab.h>
 #include <linux/usb.h>
+#include <linux/moduleparam.h>
 #include <sound/core.h>
 #include <sound/info.h>
 #include <sound/pcm.h>
@@ -164,7 +166,7 @@ static int usX2Y_urb_play_prepare(struct snd_usX2Y_substream *subs,
 			/* set the buffer pointer */
 			urb->transfer_buffer = runtime->dma_area + subs->hwptr * usX2Y->stride;
 			if ((subs->hwptr += count) >= runtime->buffer_size)
-			subs->hwptr -= runtime->buffer_size;			
+				subs->hwptr -= runtime->buffer_size;
 		}
 	else
 		urb->transfer_buffer = subs->tmpbuf;
@@ -417,10 +419,8 @@ static int usX2Y_urbs_allocate(struct snd_usX2Y_substream *subs)
 
 	if (is_playback && NULL == subs->tmpbuf) {	/* allocate a temporary buffer for playback */
 		subs->tmpbuf = kcalloc(nr_of_packs(), subs->maxpacksize, GFP_KERNEL);
-		if (NULL == subs->tmpbuf) {
-			snd_printk(KERN_ERR "cannot malloc tmpbuf\n");
+		if (!subs->tmpbuf)
 			return -ENOMEM;
-		}
 	}
 	/* allocate and initialize data urbs */
 	for (i = 0; i < NRURBS; i++) {
@@ -436,7 +436,9 @@ static int usX2Y_urbs_allocate(struct snd_usX2Y_substream *subs)
 		}
 		if (!is_playback && !(*purb)->transfer_buffer) {
 			/* allocate a capture buffer per urb */
-			(*purb)->transfer_buffer = kmalloc(subs->maxpacksize * nr_of_packs(), GFP_KERNEL);
+			(*purb)->transfer_buffer =
+				kmalloc_array(subs->maxpacksize,
+					      nr_of_packs(), GFP_KERNEL);
 			if (NULL == (*purb)->transfer_buffer) {
 				usX2Y_urbs_release(subs);
 				return -ENOMEM;
@@ -484,7 +486,6 @@ static int usX2Y_urbs_start(struct snd_usX2Y_substream *subs)
 			if (0 == i)
 				atomic_set(&subs->state, state_STARTING3);
 			urb->dev = usX2Y->dev;
-			urb->transfer_flags = URB_ISO_ASAP;
 			for (pack = 0; pack < nr_of_packs(); pack++) {
 				urb->iso_frame_desc[pack].offset = subs->maxpacksize * pack;
 				urb->iso_frame_desc[pack].length = subs->maxpacksize;
@@ -663,7 +664,8 @@ static int usX2Y_rate_set(struct usX2Ydev *usX2Y, int rate)
 			err = -ENOMEM;
 			goto cleanup;
 		}
-		usbdata = kmalloc(sizeof(int) * NOOF_SETRATE_URBS, GFP_KERNEL);
+		usbdata = kmalloc_array(NOOF_SETRATE_URBS, sizeof(int),
+					GFP_KERNEL);
 		if (NULL == usbdata) {
 			err = -ENOMEM;
 			goto cleanup;
@@ -678,6 +680,9 @@ static int usX2Y_rate_set(struct usX2Ydev *usX2Y, int rate)
 			usb_fill_bulk_urb(us->urb[i], usX2Y->dev, usb_sndbulkpipe(usX2Y->dev, 4),
 					  usbdata + i, 2, i_usX2Y_04Int, usX2Y);
 		}
+		err = usb_urb_ep_type_check(us->urb[0]);
+		if (err < 0)
+			goto cleanup;
 		us->submitted =	0;
 		us->len =	NOOF_SETRATE_URBS;
 		usX2Y->US04 =	us;
@@ -906,7 +911,7 @@ static int snd_usX2Y_pcm_close(struct snd_pcm_substream *substream)
 }
 
 
-static struct snd_pcm_ops snd_usX2Y_pcm_ops = 
+static const struct snd_pcm_ops snd_usX2Y_pcm_ops =
 {
 	.open =		snd_usX2Y_pcm_open,
 	.close =	snd_usX2Y_pcm_close,
@@ -948,10 +953,9 @@ static int usX2Y_audio_stream_new(struct snd_card *card, int playback_endpoint, 
 	for (i = playback_endpoint ? SNDRV_PCM_STREAM_PLAYBACK : SNDRV_PCM_STREAM_CAPTURE;
 	     i <= SNDRV_PCM_STREAM_CAPTURE; ++i) {
 		usX2Y_substream[i] = kzalloc(sizeof(struct snd_usX2Y_substream), GFP_KERNEL);
-		if (NULL == usX2Y_substream[i]) {
-			snd_printk(KERN_ERR "cannot malloc\n");
+		if (!usX2Y_substream[i])
 			return -ENOMEM;
-		}
+
 		usX2Y_substream[i]->usX2Y = usX2Y(card);
 	}
 
@@ -977,18 +981,17 @@ static int usX2Y_audio_stream_new(struct snd_card *card, int playback_endpoint, 
 
 	sprintf(pcm->name, NAME_ALLCAPS" Audio #%d", usX2Y(card)->pcm_devs);
 
-	if ((playback_endpoint &&
-	     0 > (err = snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream,
-						     SNDRV_DMA_TYPE_CONTINUOUS,
-						     snd_dma_continuous_data(GFP_KERNEL),
-						     64*1024, 128*1024))) ||
-	    0 > (err = snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream,
-	    					     SNDRV_DMA_TYPE_CONTINUOUS,
-	    					     snd_dma_continuous_data(GFP_KERNEL),
-						     64*1024, 128*1024))) {
-		snd_usX2Y_pcm_private_free(pcm);
-		return err;
+	if (playback_endpoint) {
+		snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_PLAYBACK].substream,
+					      SNDRV_DMA_TYPE_CONTINUOUS,
+					      snd_dma_continuous_data(GFP_KERNEL),
+					      64*1024, 128*1024);
 	}
+
+	snd_pcm_lib_preallocate_pages(pcm->streams[SNDRV_PCM_STREAM_CAPTURE].substream,
+				      SNDRV_DMA_TYPE_CONTINUOUS,
+				      snd_dma_continuous_data(GFP_KERNEL),
+				      64*1024, 128*1024);
 	usX2Y(card)->pcm_devs++;
 
 	return 0;

@@ -17,6 +17,9 @@
 #include <linux/completion.h>
 #include <linux/interrupt.h>
 #include <linux/platform_device.h>
+#include <linux/pfn_t.h>
+#include <linux/socket.h> /* memcpy_fromiovecend */
+#include <linux/dax.h>
 #include <asm/extmem.h>
 #include <asm/io.h>
 
@@ -26,10 +29,10 @@
 #define DCSS_BUS_ID_SIZE 20
 
 static int dcssblk_open(struct block_device *bdev, fmode_t mode);
-static int dcssblk_release(struct gendisk *disk, fmode_t mode);
-static int dcssblk_make_request(struct request_queue *q, struct bio *bio);
-static int dcssblk_direct_access(struct block_device *bdev, sector_t secnum,
-				 void **kaddr, unsigned long *pfn);
+static void dcssblk_release(struct gendisk *disk, fmode_t mode);
+static void dcssblk_make_request(struct request_queue *q, struct bio *bio);
+static long dcssblk_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+		long nr_pages, void **kaddr, pfn_t *pfn);
 
 static char dcssblk_segments[DCSSBLK_PARM_LEN] = "\0";
 
@@ -38,7 +41,26 @@ static const struct block_device_operations dcssblk_devops = {
 	.owner   	= THIS_MODULE,
 	.open    	= dcssblk_open,
 	.release 	= dcssblk_release,
-	.direct_access 	= dcssblk_direct_access,
+};
+
+static int dcssblk_dax_memcpy_fromiovecend(struct dax_device *dax_dev,
+			pgoff_t pgoff, void *addr, const struct iovec *iov,
+			int offset, int len)
+{
+	return memcpy_fromiovecend_partial_flushcache(addr, iov, offset, len);
+}
+
+static int dcssblk_dax_memcpy_toiovecend(struct dax_device *dax_dev,
+		pgoff_t pgoff, const struct iovec *iov, void *addr,
+		int offset, int len)
+{
+	return memcpy_toiovecend_partial(iov, addr, offset, len);
+}
+
+static const struct dax_operations dcssblk_dax_ops = {
+	.direct_access = dcssblk_dax_direct_access,
+	.memcpy_fromiovecend = dcssblk_dax_memcpy_fromiovecend,
+	.memcpy_toiovecend = dcssblk_dax_memcpy_toiovecend,
 };
 
 struct dcssblk_dev_info {
@@ -55,6 +77,7 @@ struct dcssblk_dev_info {
 	struct request_queue *dcssblk_queue;
 	int num_of_segments;
 	struct list_head seg_list;
+	struct dax_device *dax_dev;
 };
 
 struct segment_info {
@@ -69,23 +92,9 @@ static ssize_t dcssblk_add_store(struct device * dev, struct device_attribute *a
 				  size_t count);
 static ssize_t dcssblk_remove_store(struct device * dev, struct device_attribute *attr, const char * buf,
 				  size_t count);
-static ssize_t dcssblk_save_store(struct device * dev, struct device_attribute *attr, const char * buf,
-				  size_t count);
-static ssize_t dcssblk_save_show(struct device *dev, struct device_attribute *attr, char *buf);
-static ssize_t dcssblk_shared_store(struct device * dev, struct device_attribute *attr, const char * buf,
-				  size_t count);
-static ssize_t dcssblk_shared_show(struct device *dev, struct device_attribute *attr, char *buf);
-static ssize_t dcssblk_seglist_show(struct device *dev,
-				struct device_attribute *attr,
-				char *buf);
 
 static DEVICE_ATTR(add, S_IWUSR, NULL, dcssblk_add_store);
 static DEVICE_ATTR(remove, S_IWUSR, NULL, dcssblk_remove_store);
-static DEVICE_ATTR(save, S_IWUSR | S_IRUSR, dcssblk_save_show,
-		   dcssblk_save_store);
-static DEVICE_ATTR(shared, S_IWUSR | S_IRUSR, dcssblk_shared_show,
-		   dcssblk_shared_store);
-static DEVICE_ATTR(seglist, S_IRUSR, dcssblk_seglist_show, NULL);
 
 static struct device *dcssblk_root_dev;
 
@@ -407,6 +416,8 @@ removeseg:
 	}
 	list_del(&dev_info->lh);
 
+	kill_dax(dev_info->dax_dev);
+	put_dax(dev_info->dax_dev);
 	del_gendisk(dev_info->gd);
 	blk_cleanup_queue(dev_info->dcssblk_queue);
 	dev_info->gd->queue = NULL;
@@ -416,6 +427,8 @@ out:
 	up_write(&dcssblk_devices_sem);
 	return rc;
 }
+static DEVICE_ATTR(shared, S_IWUSR | S_IRUSR, dcssblk_shared_show,
+		   dcssblk_shared_store);
 
 /*
  * device attribute for save operation on current copy
@@ -476,6 +489,8 @@ dcssblk_save_store(struct device *dev, struct device_attribute *attr, const char
 	up_write(&dcssblk_devices_sem);
 	return count;
 }
+static DEVICE_ATTR(save, S_IWUSR | S_IRUSR, dcssblk_save_show,
+		   dcssblk_save_store);
 
 /*
  * device attribute for showing all segments in a device
@@ -502,6 +517,21 @@ dcssblk_seglist_show(struct device *dev, struct device_attribute *attr,
 	up_read(&dcssblk_devices_sem);
 	return i;
 }
+static DEVICE_ATTR(seglist, S_IRUSR, dcssblk_seglist_show, NULL);
+
+static struct attribute *dcssblk_dev_attrs[] = {
+	&dev_attr_shared.attr,
+	&dev_attr_save.attr,
+	&dev_attr_seglist.attr,
+	NULL,
+};
+static struct attribute_group dcssblk_dev_attr_group = {
+	.attrs = dcssblk_dev_attrs,
+};
+static const struct attribute_group *dcssblk_dev_attr_groups[] = {
+	&dcssblk_dev_attr_group,
+	NULL,
+};
 
 /*
  * device attribute for adding devices
@@ -590,6 +620,7 @@ dcssblk_add_store(struct device *dev, struct device_attribute *attr, const char 
 
 	dev_set_name(&dev_info->dev, dev_info->segment_name);
 	dev_info->dev.release = dcssblk_release_segment;
+	dev_info->dev.groups = dcssblk_dev_attr_groups;
 	INIT_LIST_HEAD(&dev_info->lh);
 	dev_info->gd = alloc_disk(DCSSBLK_MINORS_PER_DISK);
 	if (dev_info->gd == NULL) {
@@ -604,6 +635,7 @@ dcssblk_add_store(struct device *dev, struct device_attribute *attr, const char 
 	dev_info->gd->driverfs_dev = &dev_info->dev;
 	blk_queue_make_request(dev_info->dcssblk_queue, dcssblk_make_request);
 	blk_queue_logical_block_size(dev_info->dcssblk_queue, 4096);
+	queue_flag_set_unlocked(QUEUE_FLAG_DAX, dev_info->dcssblk_queue);
 
 	seg_byte_size = (dev_info->end - dev_info->start + 1);
 	set_capacity(dev_info->gd, seg_byte_size >> 9); // size in sectors
@@ -637,21 +669,17 @@ dcssblk_add_store(struct device *dev, struct device_attribute *attr, const char 
 	 * register the device
 	 */
 	rc = device_register(&dev_info->dev);
-	if (rc) {
-		module_put(THIS_MODULE);
-		goto dev_list_del;
-	}
-	get_device(&dev_info->dev);
-	rc = device_create_file(&dev_info->dev, &dev_attr_shared);
 	if (rc)
-		goto unregister_dev;
-	rc = device_create_file(&dev_info->dev, &dev_attr_save);
-	if (rc)
-		goto unregister_dev;
-	rc = device_create_file(&dev_info->dev, &dev_attr_seglist);
-	if (rc)
-		goto unregister_dev;
+		goto put_dev;
 
+	dev_info->dax_dev = alloc_dax(dev_info, dev_info->gd->disk_name,
+			&dcssblk_dax_ops);
+	if (!dev_info->dax_dev) {
+		rc = -ENOMEM;
+		goto put_dev;
+	}
+
+	get_device(&dev_info->dev);
 	add_disk(dev_info->gd);
 
 	switch (dev_info->segment_type) {
@@ -668,12 +696,11 @@ dcssblk_add_store(struct device *dev, struct device_attribute *attr, const char 
 	rc = count;
 	goto out;
 
-unregister_dev:
+put_dev:
 	list_del(&dev_info->lh);
 	blk_cleanup_queue(dev_info->dcssblk_queue);
 	dev_info->gd->queue = NULL;
 	put_disk(dev_info->gd);
-	device_unregister(&dev_info->dev);
 	list_for_each_entry(seg_info, &dev_info->seg_list, lh) {
 		segment_unload(seg_info->segment_name);
 	}
@@ -750,6 +777,8 @@ dcssblk_remove_store(struct device *dev, struct device_attribute *attr, const ch
 	}
 
 	list_del(&dev_info->lh);
+	kill_dax(dev_info->dax_dev);
+	put_dax(dev_info->dax_dev);
 	del_gendisk(dev_info->gd);
 	blk_cleanup_queue(dev_info->dcssblk_queue);
 	dev_info->gd->queue = NULL;
@@ -787,16 +816,15 @@ out:
 	return rc;
 }
 
-static int
+static void
 dcssblk_release(struct gendisk *disk, fmode_t mode)
 {
 	struct dcssblk_dev_info *dev_info = disk->private_data;
 	struct segment_info *entry;
-	int rc;
 
 	if (!dev_info) {
-		rc = -ENODEV;
-		goto out;
+		WARN_ON(1);
+		return;
 	}
 	down_write(&dcssblk_devices_sem);
 	if (atomic_dec_and_test(&dev_info->use_count)
@@ -809,12 +837,9 @@ dcssblk_release(struct gendisk *disk, fmode_t mode)
 		dev_info->save_pending = 0;
 	}
 	up_write(&dcssblk_devices_sem);
-	rc = 0;
-out:
-	return rc;
 }
 
-static int
+static void
 dcssblk_make_request(struct request_queue *q, struct bio *bio)
 {
 	struct dcssblk_dev_info *dev_info;
@@ -832,8 +857,7 @@ dcssblk_make_request(struct request_queue *q, struct bio *bio)
 	if ((bio->bi_sector & 7) != 0 || (bio->bi_size & 4095) != 0)
 		/* Request is not page-aligned. */
 		goto fail;
-	if (((bio->bi_size >> 9) + bio->bi_sector)
-			> get_capacity(bio->bi_bdev->bd_disk)) {
+	if (bio_end_sector(bio) > get_capacity(bio->bi_bdev->bd_disk)) {
 		/* Request beyond end of DCSS segment. */
 		goto fail;
 	}
@@ -871,31 +895,33 @@ dcssblk_make_request(struct request_queue *q, struct bio *bio)
 		bytes_done += bvec->bv_len;
 	}
 	bio_endio(bio, 0);
-	return 0;
+	return;
 fail:
 	bio_io_error(bio);
-	return 0;
 }
 
-static int
-dcssblk_direct_access (struct block_device *bdev, sector_t secnum,
-			void **kaddr, unsigned long *pfn)
+static long
+__dcssblk_direct_access(struct dcssblk_dev_info *dev_info, pgoff_t pgoff,
+		long nr_pages, void **kaddr, pfn_t *pfn)
 {
-	struct dcssblk_dev_info *dev_info;
-	unsigned long pgoff;
+	resource_size_t offset = pgoff * PAGE_SIZE;
+	unsigned long dev_sz;
 
-	dev_info = bdev->bd_disk->private_data;
-	if (!dev_info)
-		return -ENODEV;
-	if (secnum % (PAGE_SIZE/512))
-		return -EINVAL;
-	pgoff = secnum / (PAGE_SIZE / 512);
-	if ((pgoff+1)*PAGE_SIZE-1 > dev_info->end - dev_info->start)
-		return -ERANGE;
-	*kaddr = (void *) (dev_info->start+pgoff*PAGE_SIZE);
-	*pfn = virt_to_phys(*kaddr) >> PAGE_SHIFT;
+	dev_sz = dev_info->end - dev_info->start + 1;
+	*kaddr = (void *) dev_info->start + offset;
+	*pfn = __pfn_to_pfn_t(PFN_DOWN(dev_info->start + offset),
+			PFN_DEV|PFN_SPECIAL);
 
-	return 0;
+	return (dev_sz - offset) / PAGE_SIZE;
+}
+
+static long
+dcssblk_dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff,
+		long nr_pages, void **kaddr, pfn_t *pfn)
+{
+	struct dcssblk_dev_info *dev_info = dax_get_private(dax_dev);
+
+	return __dcssblk_direct_access(dev_info, pgoff, nr_pages, kaddr, pfn);
 }
 
 static void
@@ -1005,7 +1031,7 @@ static int dcssblk_thaw(struct device *dev)
 	return 0;
 }
 
-static struct dev_pm_ops dcssblk_pm_ops = {
+static const struct dev_pm_ops dcssblk_pm_ops = {
 	.freeze		= dcssblk_freeze,
 	.thaw		= dcssblk_thaw,
 	.restore	= dcssblk_restore,

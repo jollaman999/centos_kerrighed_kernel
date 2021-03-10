@@ -25,20 +25,18 @@ which has been updated for the new released platforms.
 Intel TXT has been presented at various events over the past few
 years, some of which are:
       LinuxTAG 2008:
-          http://www.linuxtag.org/2008/en/conf/events/vp-donnerstag/
-          details.html?talkid=110
+          http://www.linuxtag.org/2008/en/conf/events/vp-donnerstag.html
       TRUST2008:
-          http://www.trust2008.eu/downloads/Keynote-Speakers/
+          http://www.trust-conference.eu/downloads/Keynote-Speakers/
           3_David-Grawrock_The-Front-Door-of-Trusted-Computing.pdf
-      IDF 2008, Shanghai:
-          http://inteldeveloperforum.com.edgesuite.net/shanghai_2008/
-          aep/PROS003/index.html
+      IDF, Shanghai:
+          http://www.prcidf.com.cn/index_en.html
       IDFs 2006, 2007 (I'm not sure if/where they are online)
 
 Trusted Boot Project Overview:
 =============================
 
-Trusted Boot (tboot) is an open source, pre- kernel/VMM module that
+Trusted Boot (tboot) is an open source, pre-kernel/VMM module that
 uses Intel TXT to perform a measured and verified launch of an OS
 kernel/VMM.
 
@@ -126,7 +124,7 @@ o  Tboot then applies an (optional) user-defined launch policy to
 o  Tboot adjusts the e820 table provided by the bootloader to reserve
    its own location in memory as well as to reserve certain other
    TXT-related regions.
-o  As part of it's launch, tboot DMA protects all of RAM (using the
+o  As part of its launch, tboot DMA protects all of RAM (using the
    VT-d PMRs).  Thus, the kernel must be booted with 'intel_iommu=on'
    in order to remove this blanket protection and use VT-d's
    page-level protection.
@@ -194,7 +192,7 @@ grub.conf needs to be modified as follows:
 
 The kernel option for enabling Intel TXT support is found under the
 Security top-level menu and is called "Enable Intel(R) Trusted
-Execution Technology (TXT)".  It is marked as EXPERIMENTAL and
+Execution Technology (TXT)".  It is considered EXPERIMENTAL and
 depends on the generic x86 support (to allow maximum flexibility in
 kernel build options), since the tboot code will detect whether the
 platform actually supports Intel TXT and thus whether any of the

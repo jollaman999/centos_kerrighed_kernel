@@ -15,11 +15,9 @@
 #include <linux/debugfs.h>
 #include <linux/mm.h>
 #include <linux/module.h>
-#include <linux/sched.h>
 #include <linux/seq_file.h>
 
 #include <asm/pgtable.h>
-#include <asm/io.h>
 
 /*
  * The dumper groups pagetable entries of the same type into one, and for
@@ -32,6 +30,7 @@ struct pg_state {
 	unsigned long start_address;
 	unsigned long current_address;
 	const struct addr_marker *marker;
+	bool to_dmesg;
 };
 
 struct addr_marker {
@@ -39,14 +38,39 @@ struct addr_marker {
 	const char *name;
 };
 
+/* indices for address_markers; keep sync'd w/ address_markers below */
+enum address_markers_idx {
+	USER_SPACE_NR = 0,
+#ifdef CONFIG_X86_64
+	KERNEL_SPACE_NR,
+	LOW_KERNEL_NR,
+	VMALLOC_START_NR,
+	VMEMMAP_START_NR,
+	HIGH_KERNEL_NR,
+	MODULES_VADDR_NR,
+	MODULES_END_NR,
+#else
+	KERNEL_SPACE_NR,
+	VMALLOC_START_NR,
+	VMALLOC_END_NR,
+# ifdef CONFIG_HIGHMEM
+	PKMAP_BASE_NR,
+# endif
+	FIXADDR_START_NR,
+#endif
+};
+
 /* Address space markers hints */
 static struct addr_marker address_markers[] = {
 	{ 0, "User Space" },
 #ifdef CONFIG_X86_64
 	{ 0x8000000000000000UL, "Kernel Space" },
-	{ PAGE_OFFSET,		"Low Kernel Mapping" },
-	{ VMALLOC_START,        "vmalloc() Area" },
-	{ VMEMMAP_START,        "Vmemmap" },
+	{ 0/* PAGE_OFFSET */,   "Low Kernel Mapping" },
+	{ 0/* VMALLOC_START */, "vmalloc() Area" },
+	{ 0/* VMEMMAP_START */, "Vmemmap" },
+# ifdef CONFIG_EFI
+	{ EFI_VA_END,		"EFI Runtime Services" },
+# endif
 	{ __START_KERNEL_map,   "High Kernel Mapping" },
 	{ MODULES_VADDR,        "Modules" },
 	{ MODULES_END,          "End Modules" },
@@ -68,28 +92,28 @@ static struct addr_marker address_markers[] = {
 #define PUD_LEVEL_MULT (PTRS_PER_PMD * PMD_LEVEL_MULT)
 #define PGD_LEVEL_MULT (PTRS_PER_PUD * PUD_LEVEL_MULT)
 
-#define PGPROT_HIMEM	((pgprotval_t)-1)
-#ifdef CONFIG_HIGHMEM
-/*
- * Return true if a kernel page table entry point to an address in the
- * high memory area.
- */
-static inline bool page_in_himem(pmdval_t val)
-{
-	return ((val & PTE_PFN_MASK) + (pteval_t)PAGE_OFFSET) >=
-			VMALLOC_START;
-}
-#else
-static inline bool page_in_himem(pmdval_t val)
-{
-	return false;
-}
-#endif
+#define pt_dump_seq_printf(m, to_dmesg, fmt, args...)		\
+({								\
+	if (to_dmesg)					\
+		printk(KERN_INFO fmt, ##args);			\
+	else							\
+		if (m)						\
+			seq_printf(m, fmt, ##args);		\
+})
+
+#define pt_dump_cont_printf(m, to_dmesg, fmt, args...)		\
+({								\
+	if (to_dmesg)					\
+		printk(KERN_CONT fmt, ##args);			\
+	else							\
+		if (m)						\
+			seq_printf(m, fmt, ##args);		\
+})
 
 /*
  * Print a readable form of a pgprot_t to the seq_file
  */
-static void printk_prot(struct seq_file *m, pgprot_t prot, int level)
+static void printk_prot(struct seq_file *m, pgprot_t prot, int level, bool dmsg)
 {
 	pgprotval_t pr = pgprot_val(prot);
 	static const char * const level_name[] =
@@ -97,50 +121,47 @@ static void printk_prot(struct seq_file *m, pgprot_t prot, int level)
 
 	if (!pgprot_val(prot)) {
 		/* Not present */
-		seq_printf(m, "                          ");
-	} else if (pgprot_val(prot) == PGPROT_HIMEM) {
-		/* In high memory */
-		seq_printf(m, "         [HIMEM]          ");
+		pt_dump_cont_printf(m, dmsg, "                          ");
 	} else {
 		if (pr & _PAGE_USER)
-			seq_printf(m, "USR ");
+			pt_dump_cont_printf(m, dmsg, "USR ");
 		else
-			seq_printf(m, "    ");
+			pt_dump_cont_printf(m, dmsg, "    ");
 		if (pr & _PAGE_RW)
-			seq_printf(m, "RW ");
+			pt_dump_cont_printf(m, dmsg, "RW ");
 		else
-			seq_printf(m, "ro ");
+			pt_dump_cont_printf(m, dmsg, "ro ");
 		if (pr & _PAGE_PWT)
-			seq_printf(m, "PWT ");
+			pt_dump_cont_printf(m, dmsg, "PWT ");
 		else
-			seq_printf(m, "    ");
+			pt_dump_cont_printf(m, dmsg, "    ");
 		if (pr & _PAGE_PCD)
-			seq_printf(m, "PCD ");
+			pt_dump_cont_printf(m, dmsg, "PCD ");
 		else
-			seq_printf(m, "    ");
+			pt_dump_cont_printf(m, dmsg, "    ");
 
 		/* Bit 9 has a different meaning on level 3 vs 4 */
 		if (level <= 3) {
 			if (pr & _PAGE_PSE)
-				seq_printf(m, "PSE ");
+				pt_dump_cont_printf(m, dmsg, "PSE ");
 			else
-				seq_printf(m, "    ");
+				pt_dump_cont_printf(m, dmsg, "    ");
 		} else {
 			if (pr & _PAGE_PAT)
-				seq_printf(m, "pat ");
+				pt_dump_cont_printf(m, dmsg, "pat ");
 			else
-				seq_printf(m, "    ");
+				pt_dump_cont_printf(m, dmsg, "    ");
 		}
 		if (pr & _PAGE_GLOBAL)
-			seq_printf(m, "GLB ");
+			pt_dump_cont_printf(m, dmsg, "GLB ");
 		else
-			seq_printf(m, "    ");
+			pt_dump_cont_printf(m, dmsg, "    ");
 		if (pr & _PAGE_NX)
-			seq_printf(m, "NX ");
+			pt_dump_cont_printf(m, dmsg, "NX ");
 		else
-			seq_printf(m, "x  ");
+			pt_dump_cont_printf(m, dmsg, "x  ");
 	}
-	seq_printf(m, "%s\n", level_name[level]);
+	pt_dump_cont_printf(m, dmsg, "%s\n", level_name[level]);
 }
 
 /*
@@ -179,7 +200,8 @@ static void note_page(struct seq_file *m, struct pg_state *st,
 		st->current_prot = new_prot;
 		st->level = level;
 		st->marker = address_markers;
-		seq_printf(m, "---[ %s ]---\n", st->marker->name);
+		pt_dump_seq_printf(m, st->to_dmesg, "---[ %s ]---\n",
+				   st->marker->name);
 	} else if (prot != cur || level != st->level ||
 		   st->current_address >= st->marker[1].start_address) {
 		const char *unit = units;
@@ -189,17 +211,17 @@ static void note_page(struct seq_file *m, struct pg_state *st,
 		/*
 		 * Now print the actual finished series
 		 */
-		seq_printf(m, "0x%0*lx-0x%0*lx   ",
-			   width, st->start_address,
-			   width, st->current_address);
+		pt_dump_seq_printf(m, st->to_dmesg,  "0x%0*lx-0x%0*lx   ",
+				   width, st->start_address,
+				   width, st->current_address);
 
 		delta = (st->current_address - st->start_address) >> 10;
 		while (!(delta & 1023) && unit[1]) {
 			delta >>= 10;
 			unit++;
 		}
-		seq_printf(m, "%9lu%c ", delta, *unit);
-		printk_prot(m, st->current_prot, st->level);
+		pt_dump_cont_printf(m, st->to_dmesg, "%9lu%c ", delta, *unit);
+		printk_prot(m, st->current_prot, st->level, st->to_dmesg);
 
 		/*
 		 * We print markers for special areas of address space,
@@ -208,7 +230,8 @@ static void note_page(struct seq_file *m, struct pg_state *st,
 		 */
 		if (st->current_address >= st->marker[1].start_address) {
 			st->marker++;
-			seq_printf(m, "---[ %s ]---\n", st->marker->name);
+			pt_dump_seq_printf(m, st->to_dmesg, "---[ %s ]---\n",
+					   st->marker->name);
 		}
 
 		st->start_address = st->current_address;
@@ -223,10 +246,6 @@ static void walk_pte_level(struct seq_file *m, struct pg_state *st, pmd_t addr,
 	int i;
 	pte_t *start;
 
-	if (page_in_himem(pmd_val(addr))) {
-		note_page(m, st, __pgprot(PGPROT_HIMEM), 3);
-		return;
-	}
 	start = (pte_t *) pmd_page_vaddr(addr);
 	for (i = 0; i < PTRS_PER_PTE; i++) {
 		pgprot_t prot = pte_pgprot(*start);
@@ -245,10 +264,6 @@ static void walk_pmd_level(struct seq_file *m, struct pg_state *st, pud_t addr,
 	int i;
 	pmd_t *start;
 
-	if (page_in_himem((pmdval_t)pud_val(addr))) {
-		note_page(m, st, __pgprot(PGPROT_HIMEM), 2);
-		return;
-	}
 	start = (pmd_t *) pud_page_vaddr(addr);
 	for (i = 0; i < PTRS_PER_PMD; i++) {
 		st->current_address = normalize_addr(P + i * PMD_LEVEL_MULT);
@@ -305,35 +320,35 @@ static void walk_pud_level(struct seq_file *m, struct pg_state *st, pgd_t addr,
 #define pgd_none(a)  pud_none(__pud(pgd_val(a)))
 #endif
 
-static void walk_pgd_level(struct seq_file *m, pgd_t *pgd)
+void ptdump_walk_pgd_level(struct seq_file *m, pgd_t *pgd)
 {
-	int i;
-	struct pg_state st;
-
-	if (!pgd) {
 #ifdef CONFIG_X86_64
-		pgd = (pgd_t *) &init_level4_pgt;
+	pgd_t *start = (pgd_t *) &init_level4_pgt;
 #else
-		pgd = swapper_pg_dir;
+	pgd_t *start = swapper_pg_dir;
 #endif
-	}
+	int i;
+	struct pg_state st = {};
 
-	memset(&st, 0, sizeof(st));
+	if (pgd) {
+		start = pgd;
+		st.to_dmesg = true;
+	}
 
 	for (i = 0; i < PTRS_PER_PGD; i++) {
 		st.current_address = normalize_addr(i * PGD_LEVEL_MULT);
-		if (!pgd_none(*pgd)) {
-			pgprotval_t prot = pgd_val(*pgd) & PTE_FLAGS_MASK;
+		if (!pgd_none(*start)) {
+			pgprotval_t prot = pgd_val(*start) & PTE_FLAGS_MASK;
 
-			if (pgd_large(*pgd) || !pgd_present(*pgd))
+			if (pgd_large(*start) || !pgd_present(*start))
 				note_page(m, &st, __pgprot(prot), 1);
 			else
-				walk_pud_level(m, &st, *pgd,
+				walk_pud_level(m, &st, *start,
 					       i * PGD_LEVEL_MULT);
 		} else
 			note_page(m, &st, __pgprot(0), 1);
 
-		pgd++;
+		start++;
 	}
 
 	/* Flush out the last page */
@@ -343,7 +358,7 @@ static void walk_pgd_level(struct seq_file *m, pgd_t *pgd)
 
 static int ptdump_show(struct seq_file *m, void *v)
 {
-	walk_pgd_level(m, NULL);
+	ptdump_walk_pgd_level(m, NULL);
 	return 0;
 }
 
@@ -359,159 +374,34 @@ static const struct file_operations ptdump_fops = {
 	.release	= single_release,
 };
 
-static int ptdump_show_curknl(struct seq_file *m, void *v)
-{
-	if (current->mm->pgd) {
-		down_read(&current->mm->mmap_sem);
-		walk_pgd_level(m, current->mm->pgd);
-		up_read(&current->mm->mmap_sem);
-	}
-	return 0;
-}
-
-static int ptdump_open_curknl(struct inode *inode, struct file *filp)
-{
-	return single_open(filp, ptdump_show_curknl, NULL);
-}
-
-static const struct file_operations ptdump_curknl_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ptdump_open_curknl,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
-static int ptdump_show_curusr(struct seq_file *m, void *v)
-{
-	if (current->mm->pgd) {
-		down_read(&current->mm->mmap_sem);
-		walk_pgd_level(m, kernel_to_shadow_pgdp(current->mm->pgd));
-		up_read(&current->mm->mmap_sem);
-	}
-	return 0;
-}
-
-static int ptdump_open_curusr(struct inode *inode, struct file *filp)
-{
-	return single_open(filp, ptdump_show_curusr, NULL);
-}
-
-static const struct file_operations ptdump_curusr_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ptdump_open_curusr,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-#endif
-
-/*
- * Check to see if L1 terminal fault is properly mitigated.
- */
-static int ptcheck_show_l1tf(struct seq_file *m, void *v)
-{
-	u32 *page0;
-	int i, j;
-	bool print_page0 = false;
-
-	/*
-	 * Check the content of physical page 0 as the content of this
-	 * page may be exposed.
-	 *
-	 * Page 0 is marked as "BIOS data page" and is not used by the kernel.
-	 * The first 1k is Real Mode interrupt vector table. The next 256
-	 * bytes is BIOS data area. The rests may probably be used in the
-	 * bootup process.
-	 */
-	page0 = (u32 *)phys_to_virt(0);
-	for (i = 0; i < PAGE_SIZE/sizeof(u32); i += 8) {
-		for (j = 0; j < 8; j++)
-			if (page0[i + j])
-				break;
-		if (j == 8)
-			continue;
-
-		if (!print_page0) {
-			print_page0 = true;
-			seq_printf(m, "Page 0 non-zero content\n"
-				      "-----------------------\n");
-		}
-
-		/*
-		 * Print out the line with non-zero values.
-		 */
-		seq_printf(m, "%04x:", i * (int)sizeof(u32));
-		for (j = 0; j < 8; j++)
-			seq_printf(m, " %08x", page0[i + j]);
-		seq_printf(m, "\n");
-	}
-	if (print_page0)
-		seq_printf(m, "-----------------------\n");
-
-	return 0;
-}
-
-static int ptcheck_open_l1tf(struct inode *inode, struct file *filp)
-{
-	return single_open(filp, ptcheck_show_l1tf, NULL);
-}
-
-static const struct file_operations ptcheck_l1tf_fops = {
-	.owner		= THIS_MODULE,
-	.open		= ptcheck_open_l1tf,
-	.read		= seq_read,
-	.llseek		= seq_lseek,
-	.release	= single_release,
-};
-
 static int pt_dump_init(void)
 {
-static struct dentry *dir, *pe_knl, *pe_curknl, *pe_l1tf;
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
-static struct dentry *pe_curusr;
-#endif
+	struct dentry *pe;
 
+	/*
+	 * Various markers are not compile-time constants, so assign them
+	 * here.
+	 */
+#ifdef CONFIG_X86_64
+	address_markers[LOW_KERNEL_NR].start_address = PAGE_OFFSET;
+	address_markers[VMALLOC_START_NR].start_address = VMALLOC_START;
+	address_markers[VMEMMAP_START_NR].start_address = VMEMMAP_START;
+#endif
 #ifdef CONFIG_X86_32
-	/* Not a compile-time constant on x86-32 */
-	address_markers[2].start_address = VMALLOC_START;
-	address_markers[3].start_address = VMALLOC_END;
+	address_markers[VMALLOC_START_NR].start_address = VMALLOC_START;
+	address_markers[VMALLOC_END_NR].start_address = VMALLOC_END;
 # ifdef CONFIG_HIGHMEM
-	address_markers[4].start_address = PKMAP_BASE;
-	address_markers[5].start_address = FIXADDR_START;
-# else
-	address_markers[4].start_address = FIXADDR_START;
+	address_markers[PKMAP_BASE_NR].start_address = PKMAP_BASE;
 # endif
+	address_markers[FIXADDR_START_NR].start_address = FIXADDR_START;
 #endif
 
-	dir = debugfs_create_dir("page_tables", NULL);
-	if (!dir)
+	pe = debugfs_create_file("kernel_page_tables", 0600, NULL, NULL,
+				 &ptdump_fops);
+	if (!pe)
 		return -ENOMEM;
 
-	pe_knl = debugfs_create_file("kernel", 0400, dir, NULL, &ptdump_fops);
-	if (!pe_knl)
-		goto err;
-
-	pe_curknl =  debugfs_create_file("current_kernel", 0400,
-					 dir, NULL, &ptdump_curknl_fops);
-	if (!pe_curknl)
-		goto err;
-
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
-	pe_curusr =  debugfs_create_file("current_user", 0400,
-					 dir, NULL, &ptdump_curusr_fops);
-	if (!pe_curusr)
-		goto err;
-#endif
-
-	pe_l1tf = debugfs_create_file("check_l1tf", 0400,
-				      dir, NULL, &ptcheck_l1tf_fops);
-
 	return 0;
-err:
-	debugfs_remove_recursive(dir);
-	return -ENOMEM;
 }
 
 __initcall(pt_dump_init);

@@ -14,6 +14,7 @@
  */
 
 #include <linux/firmware.h>
+#include <linux/module.h>
 #include <linux/bitrev.h>
 #include <linux/kernel.h>
 
@@ -49,7 +50,7 @@ struct ihex_record {
 	u16 address;
 	u8 len;
 	u8 data[256];
-	char error; /* true if an error occured parsing this record */
+	char error; /* true if an error occurred parsing this record */
 
 	u8 max_len; /* maximum record length in whole ihex */
 
@@ -78,7 +79,7 @@ static u8 usb6fire_fw_ihex_hex(const u8 *data, u8 *crc)
 
 /*
  * returns true if record is available, false otherwise.
- * iff an error occured, false will be returned and record->error will be true.
+ * iff an error occurred, false will be returned and record->error will be true.
  */
 static bool usb6fire_fw_ihex_next_record(struct ihex_record *record)
 {
@@ -349,7 +350,7 @@ static int usb6fire_fw_check(struct usb_interface *intf, const u8 *version)
 		if (!memcmp(version, known_fw_versions + i, 2))
 			return 0;
 
-	dev_err(&intf->dev, "invalid fimware version in device: %4ph. "
+	dev_err(&intf->dev, "invalid firmware version in device: %4ph. "
 			"please reconnect to power. if this failure "
 			"still happens, check your firmware installation.",
 			version);

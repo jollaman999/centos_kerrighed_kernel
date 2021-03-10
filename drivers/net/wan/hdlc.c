@@ -22,6 +22,8 @@
  * - proto->start() and stop() are called with spin_lock_irq held.
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/errno.h>
 #include <linux/hdlc.h>
 #include <linux/if_arp.h>
@@ -57,7 +59,7 @@ static int hdlc_rcv(struct sk_buff *skb, struct net_device *dev,
 {
 	struct hdlc_device *hdlc = dev_to_hdlc(dev);
 
-	if (dev_net(dev) != &init_net) {
+	if (!net_eq(dev_net(dev), &init_net)) {
 		kfree_skb(skb);
 		return 0;
 	}
@@ -97,19 +99,19 @@ static inline void hdlc_proto_stop(struct net_device *dev)
 static int hdlc_device_event(struct notifier_block *this, unsigned long event,
 			     void *ptr)
 {
-	struct net_device *dev = ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 	hdlc_device *hdlc;
 	unsigned long flags;
 	int on;
 
-	if (dev_net(dev) != &init_net)
+	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
 
 	if (!(dev->priv_flags & IFF_WAN_HDLC))
 		return NOTIFY_DONE; /* not an HDLC device */
 
 	if (event != NETDEV_CHANGE)
-		return NOTIFY_DONE; /* Only interrested in carrier changes */
+		return NOTIFY_DONE; /* Only interested in carrier changes */
 
 	on = netif_carrier_ok(dev);
 
@@ -130,10 +132,10 @@ static int hdlc_device_event(struct notifier_block *this, unsigned long event,
 		goto carrier_exit;
 
 	if (hdlc->carrier) {
-		printk(KERN_INFO "%s: Carrier detected\n", dev->name);
+		netdev_info(dev, "Carrier detected\n");
 		hdlc_proto_start(dev);
 	} else {
-		printk(KERN_INFO "%s: Carrier lost\n", dev->name);
+		netdev_info(dev, "Carrier lost\n");
 		hdlc_proto_stop(dev);
 	}
 
@@ -165,10 +167,10 @@ int hdlc_open(struct net_device *dev)
 	spin_lock_irq(&hdlc->state_lock);
 
 	if (hdlc->carrier) {
-		printk(KERN_INFO "%s: Carrier detected\n", dev->name);
+		netdev_info(dev, "Carrier detected\n");
 		hdlc_proto_start(dev);
 	} else
-		printk(KERN_INFO "%s: No carrier\n", dev->name);
+		netdev_info(dev, "No carrier\n");
 
 	hdlc->open = 1;
 
@@ -278,14 +280,13 @@ int attach_hdlc_protocol(struct net_device *dev, struct hdlc_proto *proto,
 	if (!try_module_get(proto->module))
 		return -ENOSYS;
 
-	if (size)
-		if ((dev_to_hdlc(dev)->state = kmalloc(size,
-						       GFP_KERNEL)) == NULL) {
-			printk(KERN_WARNING "Memory squeeze on"
-			       " hdlc_proto_attach()\n");
+	if (size) {
+		dev_to_hdlc(dev)->state = kmalloc(size, GFP_KERNEL);
+		if (dev_to_hdlc(dev)->state == NULL) {
 			module_put(proto->module);
 			return -ENOBUFS;
 		}
+	}
 	dev_to_hdlc(dev)->proto = proto;
 	return 0;
 }
@@ -363,8 +364,8 @@ static int __init hdlc_module_init(void)
 {
 	int result;
 
-	printk(KERN_INFO "%s\n", version);
-	if ((result = register_netdevice_notifier(&hdlc_notifier)) != 0)
+	pr_info("%s\n", version);
+	if ((result = register_netdevice_notifier_rh(&hdlc_notifier)) != 0)
 		return result;
 	dev_add_pack(&hdlc_packet_type);
 	return 0;
@@ -375,7 +376,7 @@ static int __init hdlc_module_init(void)
 static void __exit hdlc_module_exit(void)
 {
 	dev_remove_pack(&hdlc_packet_type);
-	unregister_netdevice_notifier(&hdlc_notifier);
+	unregister_netdevice_notifier_rh(&hdlc_notifier);
 }
 
 

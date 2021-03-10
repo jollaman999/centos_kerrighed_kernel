@@ -17,7 +17,9 @@
 
 #ifndef MULTI_CPU
 EXPORT_SYMBOL(cpu_dcache_clean_area);
+#ifdef CONFIG_MMU
 EXPORT_SYMBOL(cpu_set_pte_ext);
+#endif
 #else
 EXPORT_SYMBOL(processor);
 #endif
@@ -27,8 +29,7 @@ EXPORT_SYMBOL(__cpuc_flush_kern_all);
 EXPORT_SYMBOL(__cpuc_flush_user_all);
 EXPORT_SYMBOL(__cpuc_flush_user_range);
 EXPORT_SYMBOL(__cpuc_coherent_kern_range);
-EXPORT_SYMBOL(__cpuc_flush_dcache_page);
-EXPORT_SYMBOL(dmac_inv_range);  /* because of flush_ioremap_region() */
+EXPORT_SYMBOL(__cpuc_flush_dcache_area);
 #else
 EXPORT_SYMBOL(cpu_cache);
 #endif

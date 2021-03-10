@@ -28,7 +28,7 @@ static struct buffer_head *bfs_find_entry(struct inode *dir,
 
 static int bfs_readdir(struct file *f, void *dirent, filldir_t filldir)
 {
-	struct inode *dir = f->f_path.dentry->d_inode;
+	struct inode *dir = file_inode(f);
 	struct buffer_head *bh;
 	struct bfs_dirent *de;
 	struct bfs_sb_info *info = BFS_SB(dir->i_sb);
@@ -78,14 +78,14 @@ static int bfs_readdir(struct file *f, void *dirent, filldir_t filldir)
 const struct file_operations bfs_dir_operations = {
 	.read		= generic_read_dir,
 	.readdir	= bfs_readdir,
-	.fsync		= simple_fsync,
+	.fsync		= generic_file_fsync,
 	.llseek		= generic_file_llseek,
 };
 
 extern void dump_imap(const char *, struct super_block *);
 
-static int bfs_create(struct inode *dir, struct dentry *dentry, int mode,
-						struct nameidata *nd)
+static int bfs_create(struct inode *dir, struct dentry *dentry, umode_t mode,
+						bool excl)
 {
 	int err;
 	struct inode *inode;
@@ -97,7 +97,7 @@ static int bfs_create(struct inode *dir, struct dentry *dentry, int mode,
 	if (!inode)
 		return -ENOSPC;
 	mutex_lock(&info->bfs_lock);
-	ino = find_first_zero_bit(info->si_imap, info->si_lasti);
+	ino = find_first_zero_bit(info->si_imap, info->si_lasti + 1);
 	if (ino > info->si_lasti) {
 		mutex_unlock(&info->bfs_lock);
 		iput(inode);
@@ -105,14 +105,12 @@ static int bfs_create(struct inode *dir, struct dentry *dentry, int mode,
 	}
 	set_bit(ino, info->si_imap);
 	info->si_freei--;
-	inode->i_uid = current_fsuid();
-	inode->i_gid = (dir->i_mode & S_ISGID) ? dir->i_gid : current_fsgid();
+	inode_init_owner(inode, dir, mode);
 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME_SEC;
 	inode->i_blocks = 0;
 	inode->i_op = &bfs_file_inops;
 	inode->i_fop = &bfs_file_operations;
 	inode->i_mapping->a_ops = &bfs_aops;
-	inode->i_mode = mode;
 	inode->i_ino = ino;
 	BFS_I(inode)->i_dsk_ino = ino;
 	BFS_I(inode)->i_sblock = 0;
@@ -135,7 +133,7 @@ static int bfs_create(struct inode *dir, struct dentry *dentry, int mode,
 }
 
 static struct dentry *bfs_lookup(struct inode *dir, struct dentry *dentry,
-						struct nameidata *nd)
+						unsigned int flags)
 {
 	struct inode *inode = NULL;
 	struct buffer_head *bh;
@@ -178,7 +176,7 @@ static int bfs_link(struct dentry *old, struct inode *dir,
 	inc_nlink(inode);
 	inode->i_ctime = CURRENT_TIME_SEC;
 	mark_inode_dirty(inode);
-	atomic_inc(&inode->i_count);
+	ihold(inode);
 	d_instantiate(new, inode);
 	mutex_unlock(&info->bfs_lock);
 	return 0;
@@ -201,7 +199,7 @@ static int bfs_unlink(struct inode *dir, struct dentry *dentry)
 		printf("unlinking non-existent file %s:%lu (nlink=%d)\n",
 					inode->i_sb->s_id, inode->i_ino,
 					inode->i_nlink);
-		inode->i_nlink = 1;
+		set_nlink(inode, 1);
 	}
 	de->ino = 0;
 	mark_buffer_dirty_inode(bh, dir);

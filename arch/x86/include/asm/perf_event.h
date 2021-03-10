@@ -6,7 +6,7 @@
  */
 
 #define INTEL_PMC_MAX_GENERIC				       32
-#define INTEL_PMC_MAX_FIXED					3
+#define INTEL_PMC_MAX_FIXED					4
 #define INTEL_PMC_IDX_FIXED				       32
 
 #define X86_PMC_IDX_MAX					       64
@@ -29,16 +29,18 @@
 #define ARCH_PERFMON_EVENTSEL_INV			(1ULL << 23)
 #define ARCH_PERFMON_EVENTSEL_CMASK			0xFF000000ULL
 
+#define HSW_IN_TX					(1ULL << 32)
+#define HSW_IN_TX_CHECKPOINTED				(1ULL << 33)
+#define ICL_EVENTSEL_ADAPTIVE				(1ULL << 34)
+#define ICL_FIXED_0_ADAPTIVE				(1ULL << 32)
+
 #define AMD64_EVENTSEL_INT_CORE_ENABLE			(1ULL << 36)
-#define AMD_PERFMON_EVENTSEL_GUESTONLY			(1ULL << 40)
-#define AMD_PERFMON_EVENTSEL_HOSTONLY			(1ULL << 41)
+#define AMD64_EVENTSEL_GUESTONLY			(1ULL << 40)
+#define AMD64_EVENTSEL_HOSTONLY				(1ULL << 41)
 
 #define AMD64_EVENTSEL_INT_CORE_SEL_SHIFT		37
 #define AMD64_EVENTSEL_INT_CORE_SEL_MASK		\
 	(0xFULL << AMD64_EVENTSEL_INT_CORE_SEL_SHIFT)
-
-#define HSW_IN_TX					(1ULL << 32)
-#define HSW_IN_TX_CHECKPOINTED				(1ULL << 33)
 
 #define AMD64_EVENTSEL_EVENT	\
 	(ARCH_PERFMON_EVENTSEL_EVENT | (0x0FULL << 32))
@@ -65,9 +67,9 @@
 #define AMD64_RAW_EVENT_MASK_NB		\
 	(AMD64_EVENTSEL_EVENT        |  \
 	 ARCH_PERFMON_EVENTSEL_UMASK)
-#define AMD64_NUM_COUNTERS_NB				4
 #define AMD64_NUM_COUNTERS				4
 #define AMD64_NUM_COUNTERS_CORE				6
+#define AMD64_NUM_COUNTERS_NB				4
 
 #define ARCH_PERFMON_UNHALTED_CORE_CYCLES_SEL		0x3c
 #define ARCH_PERFMON_UNHALTED_CORE_CYCLES_UMASK		(0x00 << 8)
@@ -76,7 +78,13 @@
 		(1 << (ARCH_PERFMON_UNHALTED_CORE_CYCLES_INDEX))
 
 #define ARCH_PERFMON_BRANCH_MISSES_RETIRED		6
-#define ARCH_PERFMON_EVENTS_COUNT				 7
+#define ARCH_PERFMON_EVENTS_COUNT			7
+
+#define PEBS_DATACFG_MEMINFO	BIT_ULL(0)
+#define PEBS_DATACFG_GP	BIT_ULL(1)
+#define PEBS_DATACFG_XMMS	BIT_ULL(2)
+#define PEBS_DATACFG_LBRS	BIT_ULL(3)
+#define PEBS_DATACFG_LBR_SHIFT	24
 
 /*
  * Intel "Architectural Performance Monitoring" CPUID
@@ -115,13 +123,13 @@ union cpuid10_edx {
 };
 
 struct x86_pmu_capability {
-	int version;
-	int num_counters_gp;
-	int num_counters_fixed;
-	int bit_width_gp;
-	int bit_width_fixed;
-	unsigned int events_mask;
-	int events_mask_len;
+	int		version;
+	int		num_counters_gp;
+	int		num_counters_fixed;
+	int		bit_width_gp;
+	int		bit_width_fixed;
+	unsigned int	events_mask;
+	int		events_mask_len;
 };
 
 /*
@@ -165,6 +173,42 @@ struct x86_pmu_capability {
 #define GLOBAL_STATUS_ASIF				BIT_ULL(60)
 #define GLOBAL_STATUS_COUNTERS_FROZEN			BIT_ULL(59)
 #define GLOBAL_STATUS_LBRS_FROZEN			BIT_ULL(58)
+#define GLOBAL_STATUS_TRACE_TOPAPMI			BIT_ULL(55)
+
+/*
+ * Adaptive PEBS v4
+ */
+
+struct pebs_basic {
+	u64 format_size;
+	u64 ip;
+	u64 applicable_counters;
+	u64 tsc;
+};
+
+struct pebs_meminfo {
+	u64 address;
+	u64 aux;
+	u64 latency;
+	u64 tsx_tuning;
+};
+
+struct pebs_gprs {
+	u64 flags, ip, ax, cx, dx, bx, sp, bp, si, di;
+	u64 r8, r9, r10, r11, r12, r13, r14, r15;
+};
+
+struct pebs_xmm {
+	u64 xmm[16*2];	/* two entries for each register */
+};
+
+struct pebs_lbr_entry {
+	u64 from, to, info;
+};
+
+struct pebs_lbr {
+	struct pebs_lbr_entry lbr[0]; /* Variable length */
+};
 
 /*
  * IBS cpuid feature detection
@@ -183,6 +227,10 @@ struct x86_pmu_capability {
 #define IBS_CAPS_OPCNT			(1U<<4)
 #define IBS_CAPS_BRNTRGT		(1U<<5)
 #define IBS_CAPS_OPCNTEXT		(1U<<6)
+#define IBS_CAPS_RIPINVALIDCHK		(1U<<7)
+#define IBS_CAPS_OPBRNFUSE		(1U<<8)
+#define IBS_CAPS_FETCHCTLEXTD		(1U<<9)
+#define IBS_CAPS_OPDATA4		(1U<<10)
 
 #define IBS_CAPS_DEFAULT		(IBS_CAPS_AVAIL		\
 					 | IBS_CAPS_FETCHSAM	\
@@ -195,12 +243,22 @@ struct x86_pmu_capability {
 #define IBSCTL_LVT_OFFSET_VALID		(1ULL<<8)
 #define IBSCTL_LVT_OFFSET_MASK		0x0F
 
-/*
- * IBS randomization macros
- */
-#define IBS_RANDOM_BITS			12
-#define IBS_RANDOM_MASK			((1ULL << IBS_RANDOM_BITS) - 1)
-#define IBS_RANDOM_MAXCNT_OFFSET	(1ULL << (IBS_RANDOM_BITS - 5))
+/* ibs fetch bits/masks */
+#define IBS_FETCH_RAND_EN	(1ULL<<57)
+#define IBS_FETCH_VAL		(1ULL<<49)
+#define IBS_FETCH_ENABLE	(1ULL<<48)
+#define IBS_FETCH_CNT		0xFFFF0000ULL
+#define IBS_FETCH_MAX_CNT	0x0000FFFFULL
+
+/* ibs op bits/masks */
+/* lower 4 bits of the current count are ignored: */
+#define IBS_OP_CUR_CNT		(0xFFFF0ULL<<32)
+#define IBS_OP_CNT_CTL		(1ULL<<19)
+#define IBS_OP_VAL		(1ULL<<18)
+#define IBS_OP_ENABLE		(1ULL<<17)
+#define IBS_OP_MAX_CNT		0x0000FFFFULL
+#define IBS_OP_MAX_CNT_EXT	0x007FFFFFULL	/* not a register bit mask */
+#define IBS_RIP_INVALID		(1ULL<<38)
 
 #ifdef CONFIG_X86_LOCAL_APIC
 extern u32 get_ibs_caps(void);
@@ -208,31 +266,27 @@ extern u32 get_ibs_caps(void);
 static inline u32 get_ibs_caps(void) { return 0; }
 #endif
 
-/* IbsFetchCtl bits/masks */
-#define IBS_FETCH_RAND_EN	(1ULL<<57)
-#define IBS_FETCH_VAL		(1ULL<<49)
-#define IBS_FETCH_ENABLE	(1ULL<<48)
-#define IBS_FETCH_CNT		0xFFFF0000ULL
-#define IBS_FETCH_MAX_CNT	0x0000FFFFULL
-
-/* IbsOpCtl bits */
-#define IBS_OP_CNT_CTL		(1ULL<<19)
-#define IBS_OP_VAL		(1ULL<<18)
-#define IBS_OP_ENABLE		(1ULL<<17)
-#define IBS_OP_MAX_CNT		0x0000FFFFULL
-#define IBS_OP_MAX_CNT_EXT	0x007FFFFFULL	/* not a register bit mask */
-
 #ifdef CONFIG_PERF_EVENTS
 extern void perf_events_lapic_init(void);
 
 /*
- * Abuse bit 3 of the cpu eflags register to indicate proper PEBS IP fixups.
- * This flag is otherwise unused and ABI specified to be 0, so nobody should
- * care what we do with it.
+ * Abuse bits {3,5} of the cpu eflags register. These flags are otherwise
+ * unused and ABI specified to be 0, so nobody should care what we do with
+ * them.
+ *
+ * EXACT - the IP points to the exact instruction that triggered the
+ *         event (HW bugs exempt).
+ * VM    - original X86_VM_MASK; see set_linear_ip().
  */
 #define PERF_EFLAGS_EXACT	(1UL << 3)
+#define PERF_EFLAGS_VM		(1UL << 5)
 
 struct pt_regs;
+struct x86_perf_regs {
+	struct pt_regs	regs;
+	u64		*xmm_regs;
+};
+
 extern unsigned long perf_instruction_pointer(struct pt_regs *regs);
 extern unsigned long perf_misc_flags(struct pt_regs *regs);
 #define perf_misc_flags(regs)	perf_misc_flags(regs)
@@ -264,7 +318,7 @@ extern struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr);
 extern void perf_get_x86_pmu_capability(struct x86_pmu_capability *cap);
 extern void perf_check_microcode(void);
 #else
-static inline perf_guest_switch_msr *perf_guest_get_msrs(int *nr)
+static inline struct perf_guest_switch_msr *perf_guest_get_msrs(int *nr)
 {
 	*nr = 0;
 	return NULL;
@@ -277,6 +331,10 @@ static inline void perf_get_x86_pmu_capability(struct x86_pmu_capability *cap)
 
 static inline void perf_events_lapic_init(void)	{ }
 static inline void perf_check_microcode(void) { }
+#endif
+
+#ifdef CONFIG_CPU_SUP_INTEL
+ extern void intel_pt_handle_vmx(int on);
 #endif
 
 #if defined(CONFIG_PERF_EVENTS) && defined(CONFIG_CPU_SUP_AMD)

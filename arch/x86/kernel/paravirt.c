@@ -26,6 +26,7 @@
 
 #include <asm/bug.h>
 #include <asm/paravirt.h>
+#include <asm/debugreg.h>
 #include <asm/desc.h>
 #include <asm/setup.h>
 #include <asm/pgtable.h>
@@ -37,11 +38,20 @@
 #include <asm/apic.h>
 #include <asm/tlbflush.h>
 #include <asm/timer.h>
+#include <asm/special_insns.h>
 
-/* nop stub */
-void notrace _paravirt_nop(void)
-{
-}
+/*
+ * nop stub, which must not clobber anything *including the stack* to
+ * avoid confusing the entry prologues.
+ */
+extern void _paravirt_nop(void);
+asm (".pushsection .entry.text, \"ax\"\n"
+     ".global _paravirt_nop\n"
+     "_paravirt_nop:\n\t"
+     "ret\n\t"
+     ".size _paravirt_nop, . - _paravirt_nop\n\t"
+     ".type _paravirt_nop, @function\n\t"
+     ".popsection");
 
 /* identity function, which can be inlined */
 u32 notrace _paravirt_ident_32(u32 x)
@@ -91,10 +101,12 @@ unsigned paravirt_patch_call(void *insnbuf,
 	struct branch *b = insnbuf;
 	unsigned long delta = (unsigned long)target - (addr+5);
 
-	if (tgt_clobbers & ~site_clobbers)
-		return len;	/* target would clobber too much for this site */
-	if (len < 5)
+	if (len < 5) {
+#ifdef CONFIG_RETPOLINE
+		WARN_ONCE(1, "Failing to patch indirect CALL in %ps\n", (void *)addr);
+#endif
 		return len;	/* call too long for patch site */
+	}
 
 	b->opcode = 0xe8; /* call */
 	b->delta = delta;
@@ -109,8 +121,12 @@ unsigned paravirt_patch_jmp(void *insnbuf, const void *target,
 	struct branch *b = insnbuf;
 	unsigned long delta = (unsigned long)target - (addr+5);
 
-	if (len < 5)
+	if (len < 5) {
+#ifdef CONFIG_RETPOLINE
+		WARN_ONCE(1, "Failing to patch indirect JMP in %ps\n", (void *)addr);
+#endif
 		return len;	/* call too long for patch site */
+	}
 
 	b->opcode = 0xe9;	/* jmp */
 	b->delta = delta;
@@ -202,7 +218,8 @@ static void native_flush_tlb_single(unsigned long addr)
 	__native_flush_tlb_single(addr);
 }
 
-bool paravirt_steal_enabled;
+struct static_key paravirt_steal_enabled;
+struct static_key paravirt_steal_rq_enabled;
 
 static u64 native_steal_clock(int cpu)
 {
@@ -238,22 +255,16 @@ static DEFINE_PER_CPU(enum paravirt_lazy_mode, paravirt_lazy_mode) = PARAVIRT_LA
 
 static inline void enter_lazy(enum paravirt_lazy_mode mode)
 {
-	if (in_interrupt())
-		return;
+	BUG_ON(this_cpu_read(paravirt_lazy_mode) != PARAVIRT_LAZY_NONE);
 
-	BUG_ON(percpu_read(paravirt_lazy_mode) != PARAVIRT_LAZY_NONE);
-
-	percpu_write(paravirt_lazy_mode, mode);
+	this_cpu_write(paravirt_lazy_mode, mode);
 }
 
 static void leave_lazy(enum paravirt_lazy_mode mode)
 {
-	if (in_interrupt())
-		return;
+	BUG_ON(this_cpu_read(paravirt_lazy_mode) != mode);
 
-	BUG_ON(percpu_read(paravirt_lazy_mode) != mode);
-
-	percpu_write(paravirt_lazy_mode, PARAVIRT_LAZY_NONE);
+	this_cpu_write(paravirt_lazy_mode, PARAVIRT_LAZY_NONE);
 }
 
 void paravirt_enter_lazy_mmu(void)
@@ -266,11 +277,23 @@ void paravirt_leave_lazy_mmu(void)
 	leave_lazy(PARAVIRT_LAZY_MMU);
 }
 
+void paravirt_flush_lazy_mmu(void)
+{
+	preempt_disable();
+
+	if (paravirt_get_lazy_mode() == PARAVIRT_LAZY_MMU) {
+		arch_leave_lazy_mmu_mode();
+		arch_enter_lazy_mmu_mode();
+	}
+
+	preempt_enable();
+}
+
 void paravirt_start_context_switch(struct task_struct *prev)
 {
 	BUG_ON(preemptible());
 
-	if (percpu_read(paravirt_lazy_mode) == PARAVIRT_LAZY_MMU) {
+	if (this_cpu_read(paravirt_lazy_mode) == PARAVIRT_LAZY_MMU) {
 		arch_leave_lazy_mmu_mode();
 		set_ti_thread_flag(task_thread_info(prev), TIF_LAZY_MMU_UPDATES);
 	}
@@ -292,19 +315,7 @@ enum paravirt_lazy_mode paravirt_get_lazy_mode(void)
 	if (in_interrupt())
 		return PARAVIRT_LAZY_NONE;
 
-	return percpu_read(paravirt_lazy_mode);
-}
-
-void arch_flush_lazy_mmu_mode(void)
-{
-	preempt_disable();
-
-	if (paravirt_get_lazy_mode() == PARAVIRT_LAZY_MMU) {
-		arch_leave_lazy_mmu_mode();
-		arch_enter_lazy_mmu_mode();
-	}
-
-	preempt_enable();
+	return this_cpu_read(paravirt_lazy_mode);
 }
 
 struct pv_info pv_info = {
@@ -312,6 +323,10 @@ struct pv_info pv_info = {
 	.paravirt_enabled = 0,
 	.kernel_rpl = 0,
 	.shared_kernel_pmd = 1,	/* Only used when CONFIG_X86_PAE is set */
+
+#ifdef CONFIG_X86_64
+	.extra_user_64bit_cs = __USER_CS,
+#endif
 };
 
 struct pv_init_ops pv_init_ops = {
@@ -351,20 +366,13 @@ struct pv_cpu_ops pv_cpu_ops = {
 #endif
 	.wbinvd = native_wbinvd,
 	.read_msr = native_read_msr_safe,
-	.rdmsr_regs = native_rdmsr_safe_regs,
 	.write_msr = native_write_msr_safe,
-	.wrmsr_regs = native_wrmsr_safe_regs,
 	.read_tsc = native_read_tsc,
 	.read_pmc = native_read_pmc,
-	.read_tscp = native_read_tscp,
 	.load_tr_desc = native_load_tr_desc,
 	.set_ldt = native_set_ldt,
-#ifdef CONFIG_X86_32
-	.load_user_cs_desc = native_load_user_cs_desc,
-#endif /*CONFIG_X86_32*/
 	.load_gdt = native_load_gdt,
 	.load_idt = native_load_idt,
-	.store_gdt = native_store_gdt,
 	.store_idt = native_store_idt,
 	.store_tr = native_store_tr,
 	.load_tls = native_load_tls,
@@ -430,7 +438,6 @@ struct pv_mmu_ops pv_mmu_ops = {
 
 	.alloc_pte = paravirt_nop,
 	.alloc_pmd = paravirt_nop,
-	.alloc_pmd_clone = paravirt_nop,
 	.alloc_pud = paravirt_nop,
 	.release_pte = paravirt_nop,
 	.release_pmd = paravirt_nop,
@@ -441,9 +448,6 @@ struct pv_mmu_ops pv_mmu_ops = {
 	.set_pmd = native_set_pmd,
 	.set_pmd_at = native_set_pmd_at,
 	.pte_update = paravirt_nop,
-	.pte_update_defer = paravirt_nop,
-	.pmd_update = paravirt_nop,
-	.pmd_update_defer = paravirt_nop,
 
 	.ptep_modify_prot_start = __ptep_modify_prot_start,
 	.ptep_modify_prot_commit = __ptep_modify_prot_commit,
@@ -480,6 +484,7 @@ struct pv_mmu_ops pv_mmu_ops = {
 	.lazy_mode = {
 		.enter = paravirt_nop,
 		.leave = paravirt_nop,
+		.flush = paravirt_nop,
 	},
 
 	.set_fixmap = native_set_fixmap,

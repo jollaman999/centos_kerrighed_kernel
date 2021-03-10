@@ -137,7 +137,7 @@ nvkm_hwsq_wait_vblank(struct nvkm_hwsq *hwsq)
 	struct nvkm_subdev *subdev = hwsq->subdev;
 	struct nvkm_device *device = subdev->device;
 	u32 heads, x, y, px = 0;
-	int i, head_sync = 0;
+	int i, head_sync;
 
 	heads = nvkm_rd32(device, 0x610050);
 	for (i = 0; i < 2; i++) {

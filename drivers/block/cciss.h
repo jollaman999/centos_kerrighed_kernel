@@ -25,7 +25,7 @@ struct access_method {
 	void (*submit_command)(ctlr_info_t *h, CommandList_struct *c);
 	void (*set_intr_mask)(ctlr_info_t *h, unsigned long val);
 	unsigned long (*fifo_full)(ctlr_info_t *h);
-	unsigned long (*intr_pending)(ctlr_info_t *h);
+	bool (*intr_pending)(ctlr_info_t *h);
 	unsigned long (*command_completed)(ctlr_info_t *h);
 };
 typedef struct _drive_info_struct
@@ -55,12 +55,12 @@ typedef struct _drive_info_struct
 	char device_initialized;     /* indicates whether dev is initialized */
 } drive_info_struct;
 
-struct ctlr_info 
+struct ctlr_info
 {
 	int	ctlr;
 	char	devname[8];
 	char    *product_name;
-	char	firm_ver[4]; // Firmware version 
+	char	firm_ver[4]; /* Firmware version */
 	struct pci_dev *pdev;
 	__u32	board_id;
 	void __iomem *vaddr;
@@ -98,7 +98,7 @@ struct ctlr_info
 	BYTE	cciss_write;
 	BYTE	cciss_read_capacity;
 
-	// information about each logical volume
+	/* information about each logical volume */
 	drive_info_struct *drv[CISS_MAX_LUN];
 
 	struct access_method access;
@@ -111,7 +111,7 @@ struct ctlr_info
 	unsigned int maxSG;
 	spinlock_t lock;
 
-	//* pointers to command and error info pool */ 
+	/* pointers to command and error info pool */
 	CommandList_struct 	*cmd_pool;
 	dma_addr_t		cmd_pool_dhandle; 
 	ErrorInfo_struct 	*errinfo_pool;
@@ -129,7 +129,7 @@ struct ctlr_info
 	*/
 	int			next_to_run;
 
-	// Disk structures we need to pass back
+	/* Disk structures we need to pass back */
 	struct gendisk   *gendisk[CISS_MAX_LUN];
 #ifdef CONFIG_CISS_SCSI_TAPE
 	struct cciss_scsi_adapter_data_t *scsi_ctlr;
@@ -157,8 +157,8 @@ struct ctlr_info
 	u32 *blockFetchTable;
 };
 
-/*  Defining the diffent access_menthods */
-/*
+/*  Defining the diffent access_methods
+ *
  * Memory mapped FIFO interface (SMART 53xx cards)
  */
 #define SA5_DOORBELL	0x20
@@ -186,23 +186,23 @@ struct ctlr_info
 #define SA5_OUTDB_CLEAR_PERF_BIT        0x01
 #define SA5_OUTDB_STATUS        0x9C
 
+
 #define  CISS_ERROR_BIT		0x02
 
 #define CCISS_INTR_ON 	1 
 #define CCISS_INTR_OFF	0
 
+
 /* CCISS_BOARD_READY_WAIT_SECS is how long to wait for a board
  * to become ready, in seconds, before giving up on it.
  * CCISS_BOARD_READY_POLL_INTERVAL_MSECS * is how long to wait
  * between polling the board to see if it is ready, in
- * milliseconds.  CCISS_BOARD_READY_POLL_INTERVAL and
- * CCISS_BOARD_READY_ITERATIONS are derived from those.
+ * milliseconds.  CCISS_BOARD_READY_ITERATIONS is derived
+ * the above.
  */
 #define CCISS_BOARD_READY_WAIT_SECS (120)
 #define CCISS_BOARD_NOT_READY_WAIT_SECS (100)
 #define CCISS_BOARD_READY_POLL_INTERVAL_MSECS (100)
-#define CCISS_BOARD_READY_POLL_INTERVAL \
-	((CCISS_BOARD_READY_POLL_INTERVAL_MSECS * HZ) / 1000)
 #define CCISS_BOARD_READY_ITERATIONS \
 	((CCISS_BOARD_READY_WAIT_SECS * 1000) / \
 		CCISS_BOARD_READY_POLL_INTERVAL_MSECS)
@@ -222,11 +222,11 @@ static void SA5_submit_command( ctlr_info_t *h, CommandList_struct *c)
 #ifdef CCISS_DEBUG
 	printk(KERN_WARNING "cciss%d: Sending %08x - down to controller\n",
 			h->ctlr, c->busaddr);
-#endif /* CCISS_DEBUG */ 
-	writel(c->busaddr, h->vaddr + SA5_REQUEST_PORT_OFFSET);
+#endif /* CCISS_DEBUG */
+         writel(c->busaddr, h->vaddr + SA5_REQUEST_PORT_OFFSET);
 	readl(h->vaddr + SA5_SCRATCHPAD_OFFSET);
-	h->commands_outstanding++;
-	if (h->commands_outstanding > h->max_outstanding)
+	 h->commands_outstanding++;
+	 if ( h->commands_outstanding > h->max_outstanding)
 		h->max_outstanding = h->commands_outstanding;
 }
 
@@ -356,11 +356,10 @@ static unsigned long SA5_performant_completed(ctlr_info_t *h)
 
 	return register_value;
 }
-
 /*
  *	Returns true if an interrupt is pending.. 
  */
-static unsigned long SA5_intr_pending(ctlr_info_t *h)
+static bool SA5_intr_pending(ctlr_info_t *h)
 {
 	unsigned long register_value  = 
 		readl(h->vaddr + SA5_INTR_STATUS);
@@ -375,7 +374,7 @@ static unsigned long SA5_intr_pending(ctlr_info_t *h)
 /*
  *      Returns true if an interrupt is pending..
  */
-static unsigned long SA5B_intr_pending(ctlr_info_t *h)
+static bool SA5B_intr_pending(ctlr_info_t *h)
 {
         unsigned long register_value  =
                 readl(h->vaddr + SA5_INTR_STATUS);
@@ -387,15 +386,15 @@ static unsigned long SA5B_intr_pending(ctlr_info_t *h)
         return 0 ;
 }
 
-static unsigned long SA5_performant_intr_pending(ctlr_info_t *h)
+static bool SA5_performant_intr_pending(ctlr_info_t *h)
 {
 	unsigned long register_value = readl(h->vaddr + SA5_INTR_STATUS);
 
 	if (!register_value)
-		return 0;
+		return false;
 
 	if (h->msi_vector || h->msix_vector)
-		return 1;
+		return true;
 
 	/* Read outbound doorbell to flush */
 	register_value = readl(h->vaddr + SA5_OUTDB_STATUS);
@@ -434,4 +433,3 @@ struct board_type {
 };
 
 #endif /* CCISS_H */
-

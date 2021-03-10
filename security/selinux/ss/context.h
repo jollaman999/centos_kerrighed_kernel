@@ -41,9 +41,6 @@ static inline int mls_context_cpy(struct context *dst, struct context *src)
 {
 	int rc;
 
-	if (!selinux_mls_enabled)
-		return 0;
-
 	dst->range.level[0].sens = src->range.level[0].sens;
 	rc = ebitmap_cpy(&dst->range.level[0].cat, &src->range.level[0].cat);
 	if (rc)
@@ -64,9 +61,6 @@ static inline int mls_context_cpy_low(struct context *dst, struct context *src)
 {
 	int rc;
 
-	if (!selinux_mls_enabled)
-		return 0;
-
 	dst->range.level[0].sens = src->range.level[0].sens;
 	rc = ebitmap_cpy(&dst->range.level[0].cat, &src->range.level[0].cat);
 	if (rc)
@@ -80,11 +74,28 @@ out:
 	return rc;
 }
 
+/*
+ * Sets both levels in the MLS range of 'dst' to the high level of 'src'.
+ */
+static inline int mls_context_cpy_high(struct context *dst, struct context *src)
+{
+	int rc;
+
+	dst->range.level[0].sens = src->range.level[1].sens;
+	rc = ebitmap_cpy(&dst->range.level[0].cat, &src->range.level[1].cat);
+	if (rc)
+		goto out;
+
+	dst->range.level[1].sens = src->range.level[1].sens;
+	rc = ebitmap_cpy(&dst->range.level[1].cat, &src->range.level[1].cat);
+	if (rc)
+		ebitmap_destroy(&dst->range.level[0].cat);
+out:
+	return rc;
+}
+
 static inline int mls_context_cmp(struct context *c1, struct context *c2)
 {
-	if (!selinux_mls_enabled)
-		return 1;
-
 	return ((c1->range.level[0].sens == c2->range.level[0].sens) &&
 		ebitmap_cmp(&c1->range.level[0].cat, &c2->range.level[0].cat) &&
 		(c1->range.level[1].sens == c2->range.level[1].sens) &&
@@ -93,9 +104,6 @@ static inline int mls_context_cmp(struct context *c1, struct context *c2)
 
 static inline void mls_context_destroy(struct context *c)
 {
-	if (!selinux_mls_enabled)
-		return;
-
 	ebitmap_destroy(&c->range.level[0].cat);
 	ebitmap_destroy(&c->range.level[1].cat);
 	mls_context_init(c);

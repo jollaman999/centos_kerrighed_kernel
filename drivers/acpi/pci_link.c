@@ -29,22 +29,21 @@
  *	   for IRQ management (e.g. start()->_SRS).
  */
 
-#include <linux/sysdev.h>
+#include <linux/syscore_ops.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/types.h>
-#include <linux/proc_fs.h>
 #include <linux/spinlock.h>
 #include <linux/pm.h>
 #include <linux/pci.h>
 #include <linux/mutex.h>
-#include <linux/nospec.h>
+#include <linux/slab.h>
 
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
 
-#define PREFIX "ACPI: "
+#include "internal.h"
 
 #define _COMPONENT			ACPI_PCI_COMPONENT
 ACPI_MODULE_NAME("pci_link");
@@ -54,23 +53,19 @@ ACPI_MODULE_NAME("pci_link");
 #define ACPI_PCI_LINK_FILE_STATUS	"state"
 #define ACPI_PCI_LINK_MAX_POSSIBLE	16
 
-static int acpi_pci_link_add(struct acpi_device *device);
-static int acpi_pci_link_remove(struct acpi_device *device, int type);
+static int acpi_pci_link_add(struct acpi_device *device,
+			     const struct acpi_device_id *not_used);
+static void acpi_pci_link_remove(struct acpi_device *device);
 
-static struct acpi_device_id link_device_ids[] = {
+static const struct acpi_device_id link_device_ids[] = {
 	{"PNP0C0F", 0},
 	{"", 0},
 };
-MODULE_DEVICE_TABLE(acpi, link_device_ids);
 
-static struct acpi_driver acpi_pci_link_driver = {
-	.name = "pci_link",
-	.class = ACPI_PCI_LINK_CLASS,
+static struct acpi_scan_handler pci_link_handler = {
 	.ids = link_device_ids,
-	.ops = {
-		.add = acpi_pci_link_add,
-		.remove = acpi_pci_link_remove,
-	},
+	.attach = acpi_pci_link_add,
+	.detach = acpi_pci_link_remove,
 };
 
 /*
@@ -182,8 +177,8 @@ static int acpi_pci_link_get_possible(struct acpi_pci_link *link)
 	status = acpi_walk_resources(link->device->handle, METHOD_NAME__PRS,
 				     acpi_pci_link_check_possible, link);
 	if (ACPI_FAILURE(status)) {
-		ACPI_EXCEPTION((AE_INFO, status, "Evaluating _PRS"));
-		return -ENODEV;
+		acpi_handle_debug(link->device->handle, "_PRS not present or invalid");
+		return 0;
 	}
 
 	ACPI_DEBUG_PRINT((ACPI_DB_INFO,
@@ -359,6 +354,7 @@ static int acpi_pci_link_set(struct acpi_pci_link *link, int irq)
 
 	}
 	resource->end.type = ACPI_RESOURCE_TYPE_END_TAG;
+	resource->end.length = sizeof(struct acpi_resource);
 
 	/* Attempt to set the resource */
 	status = acpi_set_current_resources(link->device->handle, &buffer);
@@ -693,7 +689,8 @@ int acpi_pci_link_free_irq(acpi_handle handle)
                                  Driver Interface
    -------------------------------------------------------------------------- */
 
-static int acpi_pci_link_add(struct acpi_device *device)
+static int acpi_pci_link_add(struct acpi_device *device,
+			     const struct acpi_device_id *not_used)
 {
 	int result;
 	struct acpi_pci_link *link;
@@ -721,21 +718,21 @@ static int acpi_pci_link_add(struct acpi_device *device)
 	       acpi_device_bid(device));
 	for (i = 0; i < link->irq.possible_count; i++) {
 		if (link->irq.active == link->irq.possible[i]) {
-			printk(" *%d", link->irq.possible[i]);
+			printk(KERN_CONT " *%d", link->irq.possible[i]);
 			found = 1;
 		} else
-			printk(" %d", link->irq.possible[i]);
+			printk(KERN_CONT " %d", link->irq.possible[i]);
 	}
 
-	printk(")");
+	printk(KERN_CONT ")");
 
 	if (!found)
-		printk(" *%d", link->irq.active);
+		printk(KERN_CONT " *%d", link->irq.active);
 
 	if (!link->device->status.enabled)
-		printk(", disabled.");
+		printk(KERN_CONT ", disabled.");
 
-	printk("\n");
+	printk(KERN_CONT "\n");
 
 	list_add_tail(&link->list, &acpi_link_list);
 
@@ -747,7 +744,7 @@ static int acpi_pci_link_add(struct acpi_device *device)
 	if (result)
 		kfree(link);
 
-	return result;
+	return result < 0 ? result : 1;
 }
 
 static int acpi_pci_link_resume(struct acpi_pci_link *link)
@@ -758,17 +755,16 @@ static int acpi_pci_link_resume(struct acpi_pci_link *link)
 	return 0;
 }
 
-static int irqrouter_resume(struct sys_device *dev)
+static void irqrouter_resume(void)
 {
 	struct acpi_pci_link *link;
 
 	list_for_each_entry(link, &acpi_link_list, list) {
 		acpi_pci_link_resume(link);
 	}
-	return 0;
 }
 
-static int acpi_pci_link_remove(struct acpi_device *device, int type)
+static void acpi_pci_link_remove(struct acpi_device *device)
 {
 	struct acpi_pci_link *link;
 
@@ -779,7 +775,6 @@ static int acpi_pci_link_remove(struct acpi_device *device, int type)
 	mutex_unlock(&acpi_link_lock);
 
 	kfree(link);
-	return 0;
 }
 
 /*
@@ -803,7 +798,6 @@ static int __init acpi_irq_penalty_update(char *str, int used)
 
 		if (irq >= ARRAY_SIZE(acpi_irq_penalty))
 			continue;
-		irq = array_index_nospec(irq, ARRAY_SIZE(acpi_irq_penalty));
 
 		if (used)
 			acpi_irq_penalty[irq] += PIRQ_PENALTY_ISA_USED;
@@ -873,37 +867,14 @@ static int __init acpi_irq_balance_set(char *str)
 
 __setup("acpi_irq_balance", acpi_irq_balance_set);
 
-/* FIXME: we will remove this interface after all drivers call pci_disable_device */
-static struct sysdev_class irqrouter_sysdev_class = {
-	.name = "irqrouter",
+static struct syscore_ops irqrouter_syscore_ops = {
 	.resume = irqrouter_resume,
 };
 
-static struct sys_device device_irqrouter = {
-	.id = 0,
-	.cls = &irqrouter_sysdev_class,
-};
-
-static int __init irqrouter_init_sysfs(void)
-{
-	int error;
-
-	if (acpi_disabled || acpi_noirq)
-		return 0;
-
-	error = sysdev_class_register(&irqrouter_sysdev_class);
-	if (!error)
-		error = sysdev_register(&device_irqrouter);
-
-	return error;
-}
-
-device_initcall(irqrouter_init_sysfs);
-
-static int __init acpi_pci_link_init(void)
+void __init acpi_pci_link_init(void)
 {
 	if (acpi_noirq)
-		return 0;
+		return;
 
 	if (acpi_irq_balance == -1) {
 		/* no command line switch: enable balancing in IOAPIC mode */
@@ -912,11 +883,6 @@ static int __init acpi_pci_link_init(void)
 		else
 			acpi_irq_balance = 0;
 	}
-
-	if (acpi_bus_register_driver(&acpi_pci_link_driver) < 0)
-		return -ENODEV;
-
-	return 0;
+	register_syscore_ops(&irqrouter_syscore_ops);
+	acpi_scan_add_handler(&pci_link_handler);
 }
-
-subsys_initcall(acpi_pci_link_init);

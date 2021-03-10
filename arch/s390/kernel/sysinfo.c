@@ -11,25 +11,65 @@
 #include <linux/init.h>
 #include <linux/delay.h>
 #include <linux/module.h>
+#include <linux/slab.h>
 #include <asm/ebcdic.h>
 #include <asm/sysinfo.h>
 #include <asm/cpcmd.h>
+#include <asm/topology.h>
 
 /* Sigh, math-emu. Don't ask. */
 #include <asm/sfp-util.h>
 #include <math-emu/soft-fp.h>
 #include <math-emu/single.h>
 
-static inline int stsi_0(void)
-{
-	int rc = stsi(NULL, 0, 0, 0);
+int topology_max_mnest;
 
-	return rc == -ENOSYS ? rc : (((unsigned int) rc) >> 28);
+/*
+ * stsi - store system information
+ *
+ * Returns the current configuration level if function code 0 was specified.
+ * Otherwise returns 0 on success or a negative value on error.
+ */
+int stsi(void *sysinfo, int fc, int sel1, int sel2)
+{
+	register int r0 asm("0") = (fc << 28) | sel1;
+	register int r1 asm("1") = sel2;
+	int rc = 0;
+
+	asm volatile(
+		"	stsi	0(%3)\n"
+		"0:	jz	2f\n"
+		"1:	lhi	%1,%4\n"
+		"2:\n"
+		EX_TABLE(0b, 1b)
+		: "+d" (r0), "+d" (rc)
+		: "d" (r1), "a" (sysinfo), "K" (-EOPNOTSUPP)
+		: "cc", "memory");
+	if (rc)
+		return rc;
+	return fc ? 0 : ((unsigned int) r0) >> 28;
+}
+EXPORT_SYMBOL(stsi);
+
+static bool convert_ext_name(unsigned char encoding, char *name, size_t len)
+{
+	switch (encoding) {
+	case 1: /* EBCDIC */
+		EBCASC(name, len);
+		break;
+	case 2:	/* UTF-8 */
+		break;
+	default:
+		return false;
+	}
+	return true;
 }
 
 static void stsi_1_1_1(struct seq_file *m, struct sysinfo_1_1_1 *info)
 {
-	if (stsi(info, 1, 1, 1) == -ENOSYS)
+	int i;
+
+	if (stsi(info, 1, 1, 1))
 		return;
 	EBCASC(info->manufacturer, sizeof(info->manufacturer));
 	EBCASC(info->type, sizeof(info->type));
@@ -55,19 +95,55 @@ static void stsi_1_1_1(struct seq_file *m, struct sysinfo_1_1_1 *info)
 	seq_printf(m, "Sequence Code:        %-16.16s\n", info->sequence);
 	seq_printf(m, "Plant:                %-4.4s\n", info->plant);
 	seq_printf(m, "Model Capacity:       %-16.16s %08u\n",
-		   info->model_capacity, *(u32 *) info->model_cap_rating);
-	if (info->model_perm_cap[0] != '\0')
+		   info->model_capacity, info->model_cap_rating);
+	if (info->model_perm_cap_rating)
 		seq_printf(m, "Model Perm. Capacity: %-16.16s %08u\n",
 			   info->model_perm_cap,
-			   *(u32 *) info->model_perm_cap_rating);
-	if (info->model_temp_cap[0] != '\0')
+			   info->model_perm_cap_rating);
+	if (info->model_temp_cap_rating)
 		seq_printf(m, "Model Temp. Capacity: %-16.16s %08u\n",
 			   info->model_temp_cap,
-			   *(u32 *) info->model_temp_cap_rating);
+			   info->model_temp_cap_rating);
+	if (info->ncr)
+		seq_printf(m, "Nominal Cap. Rating:  %08u\n", info->ncr);
+	if (info->npr)
+		seq_printf(m, "Nominal Perm. Rating: %08u\n", info->npr);
+	if (info->ntr)
+		seq_printf(m, "Nominal Temp. Rating: %08u\n", info->ntr);
 	if (info->cai) {
 		seq_printf(m, "Capacity Adj. Ind.:   %d\n", info->cai);
 		seq_printf(m, "Capacity Ch. Reason:  %d\n", info->ccr);
+		seq_printf(m, "Capacity Transient:   %d\n", info->t);
 	}
+	if (info->p) {
+		for (i = 1; i <= ARRAY_SIZE(info->typepct); i++) {
+			seq_printf(m, "Type %d Percentage:    %d\n",
+				   i, info->typepct[i - 1]);
+		}
+	}
+}
+
+static void stsi_15_1_x(struct seq_file *m, struct sysinfo_15_1_x *info)
+{
+	static int max_mnest;
+	int i, rc;
+
+	seq_putc(m, '\n');
+	if (!MACHINE_HAS_TOPOLOGY)
+		return;
+	if (stsi(info, 15, 1, topology_max_mnest))
+		return;
+	seq_printf(m, "CPU Topology HW:     ");
+	for (i = 0; i < TOPOLOGY_NR_MAG; i++)
+		seq_printf(m, " %d", info->mag[i]);
+	seq_putc(m, '\n');
+#ifdef CONFIG_SCHED_MC
+	store_topology(info);
+	seq_printf(m, "CPU Topology SW:     ");
+	for (i = 0; i < TOPOLOGY_NR_MAG; i++)
+		seq_printf(m, " %d", info->mag[i]);
+	seq_putc(m, '\n');
+#endif
 }
 
 static void stsi_1_2_2(struct seq_file *m, struct sysinfo_1_2_2 *info)
@@ -75,11 +151,10 @@ static void stsi_1_2_2(struct seq_file *m, struct sysinfo_1_2_2 *info)
 	struct sysinfo_1_2_2_extension *ext;
 	int i;
 
-	if (stsi(info, 1, 2, 2) == -ENOSYS)
+	if (stsi(info, 1, 2, 2))
 		return;
 	ext = (struct sysinfo_1_2_2_extension *)
 		((unsigned long) info + info->acc_offset);
-	seq_putc(m, '\n');
 	seq_printf(m, "CPUs Total:           %d\n", info->cpus_total);
 	seq_printf(m, "CPUs Configured:      %d\n", info->cpus_configured);
 	seq_printf(m, "CPUs Standby:         %d\n", info->cpus_standby);
@@ -97,6 +172,10 @@ static void stsi_1_2_2(struct seq_file *m, struct sysinfo_1_2_2 *info)
 	if (info->format == 1)
 		seq_printf(m, " %u", ext->alt_capability);
 	seq_putc(m, '\n');
+	if (info->nominal_cap)
+		seq_printf(m, "Nominal Capability:   %d\n", info->nominal_cap);
+	if (info->secondary_cap)
+		seq_printf(m, "Secondary Capability: %d\n", info->secondary_cap);
 	for (i = 2; i <= info->cpus_total; i++) {
 		seq_printf(m, "Adjustment %02d-way:    %u",
 			   i, info->adjustment[i-2]);
@@ -104,14 +183,11 @@ static void stsi_1_2_2(struct seq_file *m, struct sysinfo_1_2_2 *info)
 			seq_printf(m, " %u", ext->alt_adjustment[i-2]);
 		seq_putc(m, '\n');
 	}
-	if (info->secondary_capability)
-		seq_printf(m, "Secondary Capability: %d\n",
-			   info->secondary_capability);
 }
 
 static void stsi_2_2_2(struct seq_file *m, struct sysinfo_2_2_2 *info)
 {
-	if (stsi(info, 2, 2, 2) == -ENOSYS)
+	if (stsi(info, 2, 2, 2))
 		return;
 	EBCASC(info->name, sizeof(info->name));
 	seq_putc(m, '\n');
@@ -132,13 +208,43 @@ static void stsi_2_2_2(struct seq_file *m, struct sysinfo_2_2_2 *info)
 	seq_printf(m, "LPAR CPUs Reserved:   %d\n", info->cpus_reserved);
 	seq_printf(m, "LPAR CPUs Dedicated:  %d\n", info->cpus_dedicated);
 	seq_printf(m, "LPAR CPUs Shared:     %d\n", info->cpus_shared);
+	if (info->mt_installed & 0x80) {
+		seq_printf(m, "LPAR CPUs G-MTID:     %d\n",
+			   info->mt_general & 0x1f);
+		seq_printf(m, "LPAR CPUs S-MTID:     %d\n",
+			   info->mt_installed & 0x1f);
+		seq_printf(m, "LPAR CPUs PS-MTID:    %d\n",
+			   info->mt_psmtid & 0x1f);
+	}
+	if (convert_ext_name(info->vsne, info->ext_name, sizeof(info->ext_name))) {
+		seq_printf(m, "LPAR Extended Name:   %-.256s\n", info->ext_name);
+		seq_printf(m, "LPAR UUID:            %pUb\n", &info->uuid);
+	}
+}
+
+static void print_ext_name(struct seq_file *m, int lvl,
+			   struct sysinfo_3_2_2 *info)
+{
+	size_t len = sizeof(info->ext_names[lvl]);
+
+	if (!convert_ext_name(info->vm[lvl].evmne, info->ext_names[lvl], len))
+		return;
+	seq_printf(m, "VM%02d Extended Name:   %-.256s\n", lvl,
+		   info->ext_names[lvl]);
+}
+
+static void print_uuid(struct seq_file *m, int i, struct sysinfo_3_2_2 *info)
+{
+	if (!memcmp(&info->vm[i].uuid, &NULL_UUID_BE, sizeof(uuid_be)))
+		return;
+	seq_printf(m, "VM%02d UUID:            %pUb\n", i, &info->vm[i].uuid);
 }
 
 static void stsi_3_2_2(struct seq_file *m, struct sysinfo_3_2_2 *info)
 {
 	int i;
 
-	if (stsi(info, 3, 2, 2) == -ENOSYS)
+	if (stsi(info, 3, 2, 2))
 		return;
 	for (i = 0; i < info->count; i++) {
 		EBCASC(info->vm[i].name, sizeof(info->vm[i].name));
@@ -151,6 +257,8 @@ static void stsi_3_2_2(struct seq_file *m, struct sysinfo_3_2_2 *info)
 		seq_printf(m, "VM%02d CPUs Configured: %d\n", i, info->vm[i].cpus_configured);
 		seq_printf(m, "VM%02d CPUs Standby:    %d\n", i, info->vm[i].cpus_standby);
 		seq_printf(m, "VM%02d CPUs Reserved:   %d\n", i, info->vm[i].cpus_reserved);
+		print_ext_name(m, i, info);
+		print_uuid(m, i, info);
 	}
 }
 
@@ -161,9 +269,11 @@ static int sysinfo_show(struct seq_file *m, void *v)
 
 	if (!info)
 		return 0;
-	level = stsi_0();
+	level = stsi(NULL, 0, 0, 0);
 	if (level >= 1)
 		stsi_1_1_1(m, info);
+	if (level >= 1)
+		stsi_15_1_x(m, info);
 	if (level >= 1)
 		stsi_1_2_2(m, info);
 	if (level >= 2)
@@ -308,27 +418,6 @@ static __init int create_proc_service_level(void)
 subsys_initcall(create_proc_service_level);
 
 /*
- * Bogomips calculation based on cpu capability.
- */
-int get_cpu_capability(unsigned int *capability)
-{
-	struct sysinfo_1_2_2 *info;
-	int rc;
-
-	info = (void *) get_zeroed_page(GFP_KERNEL);
-	if (!info)
-		return -ENOMEM;
-	rc = stsi(info, 1, 2, 2);
-	if (rc == -ENOSYS)
-		goto out;
-	rc = 0;
-	*capability = info->capability;
-out:
-	free_page((unsigned long) info);
-	return rc;
-}
-
-/*
  * CPU capability might have changed. Therefore recalculate loops_per_jiffy.
  */
 void s390_adjust_jiffies(void)
@@ -343,7 +432,7 @@ void s390_adjust_jiffies(void)
 	if (!info)
 		return;
 
-	if (stsi(info, 1, 2, 2) != -ENOSYS) {
+	if (stsi(info, 1, 2, 2) == 0) {
 		/*
 		 * Major sigh. The cpu capability encoding is "special".
 		 * If the first 9 bits of info->capability are 0 then it
@@ -357,7 +446,7 @@ void s390_adjust_jiffies(void)
 		 */
 		FP_UNPACK_SP(SA, &fmil);
 		if ((info->capability >> 23) == 0)
-			FP_FROM_INT_S(SB, info->capability, 32, int);
+			FP_FROM_INT_S(SB, (long) info->capability, 64, long);
 		else
 			FP_UNPACK_SP(SB, &info->capability);
 		FP_DIV_S(SR, SA, SB);
@@ -375,7 +464,7 @@ void s390_adjust_jiffies(void)
 /*
  * calibrate the delay loop
  */
-void __cpuinit calibrate_delay(void)
+void calibrate_delay(void)
 {
 	s390_adjust_jiffies();
 	/* Print the good old Bogomips line .. */

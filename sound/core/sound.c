@@ -21,19 +21,16 @@
 
 #include <linux/init.h>
 #include <linux/slab.h>
-#include <linux/smp_lock.h>
 #include <linux/time.h>
 #include <linux/device.h>
-#include <linux/moduleparam.h>
+#include <linux/module.h>
 #include <sound/core.h>
 #include <sound/minors.h>
 #include <sound/info.h>
-#include <sound/version.h>
 #include <sound/control.h>
 #include <sound/initval.h>
 #include <linux/kmod.h>
 #include <linux/mutex.h>
-#include <linux/nospec.h>
 
 static int major = CONFIG_SND_MAJOR;
 int snd_major;
@@ -77,7 +74,6 @@ void snd_request_card(int card)
 		return;
 	request_module("snd-card-%i", card);
 }
-
 EXPORT_SYMBOL(snd_request_card);
 
 static void snd_request_other(int minor)
@@ -101,6 +97,13 @@ static void snd_request_other(int minor)
  *
  * Checks that a minor device with the specified type is registered, and returns
  * its user data pointer.
+ *
+ * This function increments the reference counter of the card instance
+ * if an associated instance with the given minor number and type is found.
+ * The caller must call snd_card_unref() appropriately later.
+ *
+ * Return: The user data pointer if the specified device is found. %NULL
+ * otherwise.
  */
 void *snd_lookup_minor_data(unsigned int minor, int type)
 {
@@ -109,78 +112,71 @@ void *snd_lookup_minor_data(unsigned int minor, int type)
 
 	if (minor >= ARRAY_SIZE(snd_minors))
 		return NULL;
-	minor = array_index_nospec(minor, ARRAY_SIZE(snd_minors));
-
 	mutex_lock(&sound_mutex);
 	mreg = snd_minors[minor];
-	if (mreg && mreg->type == type)
+	if (mreg && mreg->type == type) {
 		private_data = mreg->private_data;
-	else
+		if (private_data && mreg->card_ptr)
+			get_device(&mreg->card_ptr->card_dev);
+	} else
 		private_data = NULL;
 	mutex_unlock(&sound_mutex);
 	return private_data;
 }
-
 EXPORT_SYMBOL(snd_lookup_minor_data);
 
-static int __snd_open(struct inode *inode, struct file *file)
+#ifdef CONFIG_MODULES
+static struct snd_minor *autoload_device(unsigned int minor)
+{
+	int dev;
+	mutex_unlock(&sound_mutex); /* release lock temporarily */
+	dev = SNDRV_MINOR_DEVICE(minor);
+	if (dev == SNDRV_MINOR_CONTROL) {
+		/* /dev/aloadC? */
+		int card = SNDRV_MINOR_CARD(minor);
+		struct snd_card *ref = snd_card_ref(card);
+		if (!ref)
+			snd_request_card(card);
+		else
+			snd_card_unref(ref);
+	} else if (dev == SNDRV_MINOR_GLOBAL) {
+		/* /dev/aloadSEQ */
+		snd_request_other(minor);
+	}
+	mutex_lock(&sound_mutex); /* reacuire lock */
+	return snd_minors[minor];
+}
+#else /* !CONFIG_MODULES */
+#define autoload_device(minor)	NULL
+#endif /* CONFIG_MODULES */
+
+static int snd_open(struct inode *inode, struct file *file)
 {
 	unsigned int minor = iminor(inode);
 	struct snd_minor *mptr = NULL;
-	const struct file_operations *old_fops;
+	const struct file_operations *new_fops;
 	int err = 0;
 
 	if (minor >= ARRAY_SIZE(snd_minors))
 		return -ENODEV;
-	minor = array_index_nospec(minor, ARRAY_SIZE(snd_minors));
-
+	mutex_lock(&sound_mutex);
 	mptr = snd_minors[minor];
 	if (mptr == NULL) {
-#ifdef CONFIG_MODULES
-		int dev = SNDRV_MINOR_DEVICE(minor);
-		if (dev == SNDRV_MINOR_CONTROL) {
-			/* /dev/aloadC? */
-			int card = SNDRV_MINOR_CARD(minor);
-			if (snd_cards[card] == NULL)
-				snd_request_card(card);
-		} else if (dev == SNDRV_MINOR_GLOBAL) {
-			/* /dev/aloadSEQ */
-			snd_request_other(minor);
-		}
-#ifndef CONFIG_SND_DYNAMIC_MINORS
-		/* /dev/snd/{controlC?,seq} */
-		mptr = snd_minors[minor];
-		if (mptr == NULL)
-#endif
-#endif
+		mptr = autoload_device(minor);
+		if (!mptr) {
+			mutex_unlock(&sound_mutex);
 			return -ENODEV;
+		}
 	}
-	old_fops = file->f_op;
-	file->f_op = fops_get(mptr->f_ops);
-	if (file->f_op == NULL) {
-		file->f_op = old_fops;
+	new_fops = fops_get(mptr->f_ops);
+	mutex_unlock(&sound_mutex);
+	if (!new_fops)
 		return -ENODEV;
-	}
+	replace_fops(file, new_fops);
+
 	if (file->f_op->open)
 		err = file->f_op->open(inode, file);
-	if (err) {
-		fops_put(file->f_op);
-		file->f_op = fops_get(old_fops);
-	}
-	fops_put(old_fops);
 	return err;
-}
-
-
-/* BKL pushdown: nasty #ifdef avoidance wrapper */
-static int snd_open(struct inode *inode, struct file *file)
-{
-	int ret;
-
-	lock_kernel();
-	ret = __snd_open(inode, file);
-	unlock_kernel();
-	return ret;
 }
 
 static const struct file_operations snd_fops =
@@ -191,14 +187,22 @@ static const struct file_operations snd_fops =
 };
 
 #ifdef CONFIG_SND_DYNAMIC_MINORS
-static int snd_find_free_minor(void)
+static int snd_find_free_minor(int type, struct snd_card *card, int dev)
 {
 	int minor;
 
+	/* static minors for module auto loading */
+	if (type == SNDRV_DEVICE_TYPE_SEQUENCER)
+		return SNDRV_MINOR_SEQUENCER;
+	if (type == SNDRV_DEVICE_TYPE_TIMER)
+		return SNDRV_MINOR_TIMER;
+
 	for (minor = 0; minor < ARRAY_SIZE(snd_minors); ++minor) {
-		/* skip minors still used statically for autoloading devices */
-		if (SNDRV_MINOR_DEVICE(minor) == SNDRV_MINOR_CONTROL ||
-		    minor == SNDRV_MINOR_SEQUENCER)
+		/* skip static minors still used for module auto loading */
+		if (SNDRV_MINOR_DEVICE(minor) == SNDRV_MINOR_CONTROL)
+			continue;
+		if (minor == SNDRV_MINOR_SEQUENCER ||
+		    minor == SNDRV_MINOR_TIMER)
 			continue;
 		if (!snd_minors[minor])
 			return minor;
@@ -206,7 +210,7 @@ static int snd_find_free_minor(void)
 	return -EBUSY;
 }
 #else
-static int snd_kernel_minor(int type, struct snd_card *card, int dev)
+static int snd_find_free_minor(int type, struct snd_card *card, int dev)
 {
 	int minor;
 
@@ -224,6 +228,7 @@ static int snd_kernel_minor(int type, struct snd_card *card, int dev)
 	case SNDRV_DEVICE_TYPE_RAWMIDI:
 	case SNDRV_DEVICE_TYPE_PCM_PLAYBACK:
 	case SNDRV_DEVICE_TYPE_PCM_CAPTURE:
+	case SNDRV_DEVICE_TYPE_COMPRESS:
 		if (snd_BUG_ON(!card))
 			return -EINVAL;
 		minor = SNDRV_MINOR(card->number, type + dev);
@@ -233,35 +238,37 @@ static int snd_kernel_minor(int type, struct snd_card *card, int dev)
 	}
 	if (snd_BUG_ON(minor < 0 || minor >= SNDRV_OS_MINORS))
 		return -EINVAL;
+	if (snd_minors[minor])
+		return -EBUSY;
 	return minor;
 }
 #endif
 
 /**
- * snd_register_device_for_dev - Register the ALSA device file for the card
+ * snd_register_device - Register the ALSA device file for the card
  * @type: the device type, SNDRV_DEVICE_TYPE_XXX
  * @card: the card instance
  * @dev: the device index
  * @f_ops: the file operations
  * @private_data: user pointer for f_ops->open()
- * @name: the device file name
- * @device: the &struct device to link this new device to
+ * @device: the device to register
  *
  * Registers an ALSA device file for the given card.
  * The operators have to be set in reg parameter.
  *
- * Returns zero if successful, or a negative error code on failure.
+ * Return: Zero if successful, or a negative error code on failure.
  */
-int snd_register_device_for_dev(int type, struct snd_card *card, int dev,
-				const struct file_operations *f_ops,
-				void *private_data,
-				const char *name, struct device *device)
+int snd_register_device(int type, struct snd_card *card, int dev,
+			const struct file_operations *f_ops,
+			void *private_data, struct device *device)
 {
 	int minor;
+	int err = 0;
 	struct snd_minor *preg;
 
-	if (snd_BUG_ON(!name))
+	if (snd_BUG_ON(!device))
 		return -EINVAL;
+
 	preg = kmalloc(sizeof *preg, GFP_KERNEL);
 	if (preg == NULL)
 		return -ENOMEM;
@@ -270,113 +277,64 @@ int snd_register_device_for_dev(int type, struct snd_card *card, int dev,
 	preg->device = dev;
 	preg->f_ops = f_ops;
 	preg->private_data = private_data;
+	preg->card_ptr = card;
 	mutex_lock(&sound_mutex);
-#ifdef CONFIG_SND_DYNAMIC_MINORS
-	minor = snd_find_free_minor();
-#else
-	minor = snd_kernel_minor(type, card, dev);
-	if (minor >= 0 && snd_minors[minor])
-		minor = -EBUSY;
-#endif
+	minor = snd_find_free_minor(type, card, dev);
 	if (minor < 0) {
-		mutex_unlock(&sound_mutex);
-		kfree(preg);
-		return minor;
+		err = minor;
+		goto error;
 	}
+
+	preg->dev = device;
+	device->devt = MKDEV(major, minor);
+	err = device_add(device);
+	if (err < 0)
+		goto error;
+
 	snd_minors[minor] = preg;
-	preg->dev = device_create(sound_class, device, MKDEV(major, minor),
-				  private_data, "%s", name);
-	if (IS_ERR(preg->dev)) {
-		snd_minors[minor] = NULL;
-		mutex_unlock(&sound_mutex);
-		minor = PTR_ERR(preg->dev);
-		kfree(preg);
-		return minor;
-	}
-
+ error:
 	mutex_unlock(&sound_mutex);
-	return 0;
+	if (err < 0)
+		kfree(preg);
+	return err;
 }
-
-EXPORT_SYMBOL(snd_register_device_for_dev);
-
-/* find the matching minor record
- * return the index of snd_minor, or -1 if not found
- */
-static int find_snd_minor(int type, struct snd_card *card, int dev)
-{
-	int cardnum, minor;
-	struct snd_minor *mptr;
-
-	cardnum = card ? card->number : -1;
-	for (minor = 0; minor < ARRAY_SIZE(snd_minors); ++minor)
-		if ((mptr = snd_minors[minor]) != NULL &&
-		    mptr->type == type &&
-		    mptr->card == cardnum &&
-		    mptr->device == dev)
-			return minor;
-	return -1;
-}
+EXPORT_SYMBOL(snd_register_device);
 
 /**
  * snd_unregister_device - unregister the device on the given card
- * @type: the device type, SNDRV_DEVICE_TYPE_XXX
- * @card: the card instance
- * @dev: the device index
+ * @dev: the device instance
  *
  * Unregisters the device file already registered via
  * snd_register_device().
  *
- * Returns zero if sucecessful, or a negative error code on failure
+ * Return: Zero if successful, or a negative error code on failure.
  */
-int snd_unregister_device(int type, struct snd_card *card, int dev)
+int snd_unregister_device(struct device *dev)
 {
 	int minor;
+	struct snd_minor *preg;
 
 	mutex_lock(&sound_mutex);
-	minor = find_snd_minor(type, card, dev);
-	if (minor < 0) {
-		mutex_unlock(&sound_mutex);
-		return -EINVAL;
+	for (minor = 0; minor < ARRAY_SIZE(snd_minors); ++minor) {
+		preg = snd_minors[minor];
+		if (preg && preg->dev == dev) {
+			snd_minors[minor] = NULL;
+			device_del(dev);
+			kfree(preg);
+			break;
+		}
 	}
-
-	device_destroy(sound_class, MKDEV(major, minor));
-
-	kfree(snd_minors[minor]);
-	snd_minors[minor] = NULL;
 	mutex_unlock(&sound_mutex);
+	if (minor >= ARRAY_SIZE(snd_minors))
+		return -ENOENT;
 	return 0;
 }
-
 EXPORT_SYMBOL(snd_unregister_device);
 
-/* get the assigned device to the given type and device number;
- * the caller needs to release it via put_device() after using it
- */
-struct device *snd_get_device(int type, struct snd_card *card, int dev)
-{
-	int minor;
-	struct device *d = NULL;
-
-	mutex_lock(&sound_mutex);
-	minor = find_snd_minor(type, card, dev);
-	if (minor >= 0) {
-		d = snd_minors[minor]->dev;
-		if (d)
-			get_device(d);
-	}
-	mutex_unlock(&sound_mutex);
-	return d;
-}
-EXPORT_SYMBOL(snd_get_device);
-
-#ifdef CONFIG_PROC_FS
+#ifdef CONFIG_SND_PROC_FS
 /*
  *  INFO PART
  */
-
-static struct snd_info_entry *snd_minor_info_entry;
-
 static const char *snd_device_type_name(int type)
 {
 	switch (type) {
@@ -429,23 +387,12 @@ int __init snd_minor_info_init(void)
 	struct snd_info_entry *entry;
 
 	entry = snd_info_create_module_entry(THIS_MODULE, "devices", NULL);
-	if (entry) {
-		entry->c.text.read = snd_minor_info_read;
-		if (snd_info_register(entry) < 0) {
-			snd_info_free_entry(entry);
-			entry = NULL;
-		}
-	}
-	snd_minor_info_entry = entry;
-	return 0;
+	if (!entry)
+		return -ENOMEM;
+	entry->c.text.read = snd_minor_info_read;
+	return snd_info_register(entry); /* freed in error path */
 }
-
-int __exit snd_minor_info_done(void)
-{
-	snd_info_free_entry(snd_minor_info_entry);
-	return 0;
-}
-#endif /* CONFIG_PROC_FS */
+#endif /* CONFIG_SND_PROC_FS */
 
 /*
  *  INIT PART
@@ -463,7 +410,6 @@ static int __init alsa_sound_init(void)
 		unregister_chrdev(major, "alsa");
 		return -ENOMEM;
 	}
-	snd_info_minor_register();
 #ifndef MODULE
 	pr_info("Advanced Linux Sound Architecture Driver Initialized.\n");
 #endif
@@ -472,10 +418,9 @@ static int __init alsa_sound_init(void)
 
 static void __exit alsa_sound_exit(void)
 {
-	snd_info_minor_unregister();
 	snd_info_done();
 	unregister_chrdev(major, "alsa");
 }
 
-module_init(alsa_sound_init)
-module_exit(alsa_sound_exit)
+subsys_initcall(alsa_sound_init);
+module_exit(alsa_sound_exit);

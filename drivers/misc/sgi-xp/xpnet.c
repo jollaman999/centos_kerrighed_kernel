@@ -20,10 +20,10 @@
  *
  */
 
+#include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
-#include <linux/nospec.h>
 #include "xp.h"
 
 /*
@@ -476,7 +476,7 @@ xpnet_dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 	if (skb->data[0] == 0xff) {
 		/* we are being asked to broadcast to all partitions */
-		for_each_bit(dest_partid, xpnet_broadcast_partitions,
+		for_each_set_bit(dest_partid, xpnet_broadcast_partitions,
 			     xp_max_npartitions) {
 
 			xpnet_send(skb, queued_msg, start_addr, end_addr,
@@ -488,24 +488,20 @@ xpnet_dev_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
 
 		if (dest_partid >= 0 &&
 		    dest_partid < xp_max_npartitions &&
-		    test_bit(array_index_nospec(dest_partid, xp_max_npartitions),
-			     xpnet_broadcast_partitions) != 0) {
-
-			dest_partid = array_index_nospec(dest_partid,
-							 xp_max_npartitions);
+		    test_bit(dest_partid, xpnet_broadcast_partitions) != 0) {
 
 			xpnet_send(skb, queued_msg, start_addr, end_addr,
 				   embedded_bytes, dest_partid);
 		}
 	}
 
+	dev->stats.tx_packets++;
+	dev->stats.tx_bytes += skb->len;
+
 	if (atomic_dec_return(&queued_msg->use_count) == 0) {
 		dev_kfree_skb(skb);
 		kfree(queued_msg);
 	}
-
-	dev->stats.tx_packets++;
-	dev->stats.tx_bytes += skb->len;
 
 	return NETDEV_TX_OK;
 }
@@ -523,7 +519,7 @@ static const struct net_device_ops xpnet_netdev_ops = {
 	.ndo_open		= xpnet_dev_open,
 	.ndo_stop		= xpnet_dev_stop,
 	.ndo_start_xmit		= xpnet_dev_hard_start_xmit,
-	.ndo_change_mtu		= xpnet_dev_change_mtu,
+	.ndo_change_mtu_rh74	= xpnet_dev_change_mtu,
 	.ndo_tx_timeout		= xpnet_dev_tx_timeout,
 	.ndo_set_mac_address 	= eth_mac_addr,
 	.ndo_validate_addr	= eth_validate_addr,

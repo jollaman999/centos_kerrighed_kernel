@@ -1,16 +1,22 @@
-snd-soc-core-objs := soc-core.o soc-dapm.o soc-jack.o soc-cache.o
+# SPDX-License-Identifier: GPL-2.0
+snd-soc-core-objs := soc-core.o soc-dapm.o soc-jack.o soc-cache.o soc-utils.o
+snd-soc-core-objs += soc-pcm.o soc-io.o soc-devres.o soc-ops.o
+snd-soc-core-$(CONFIG_SND_SOC_COMPRESS) += soc-compress.o
+
+ifneq ($(CONFIG_SND_SOC_TOPOLOGY),)
+snd-soc-core-objs += soc-topology.o
+endif
+
+ifneq ($(CONFIG_SND_SOC_GENERIC_DMAENGINE_PCM),)
+snd-soc-core-objs += soc-generic-dmaengine-pcm.o
+endif
+
+ifneq ($(CONFIG_SND_SOC_ACPI),)
+snd-soc-acpi-objs := soc-acpi.o
+endif
+
+obj-$(CONFIG_SND_SOC_ACPI) += snd-soc-acpi.o
 
 obj-$(CONFIG_SND_SOC)	+= snd-soc-core.o
 obj-$(CONFIG_SND_SOC)	+= codecs/
-obj-$(CONFIG_SND_SOC)	+= atmel/
-obj-$(CONFIG_SND_SOC)	+= au1x/
-obj-$(CONFIG_SND_SOC)	+= blackfin/
-obj-$(CONFIG_SND_SOC)	+= davinci/
-obj-$(CONFIG_SND_SOC)	+= fsl/
-obj-$(CONFIG_SND_SOC)   += imx/
-obj-$(CONFIG_SND_SOC)	+= omap/
-obj-$(CONFIG_SND_SOC)	+= pxa/
-obj-$(CONFIG_SND_SOC)	+= s3c24xx/
-obj-$(CONFIG_SND_SOC)	+= s6000/
-obj-$(CONFIG_SND_SOC)	+= sh/
-obj-$(CONFIG_SND_SOC)	+= txx9/
+obj-$(CONFIG_SND_SOC)	+= intel/

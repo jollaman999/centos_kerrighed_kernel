@@ -1,11 +1,10 @@
 /*
- * File...........: linux/drivers/s390/block/dasd_genhd.c
  * Author(s)......: Holger Smolinski <Holger.Smolinski@de.ibm.com>
  *		    Horst Hummel <Horst.Hummel@de.ibm.com>
  *		    Carsten Otte <Cotte@de.ibm.com>
  *		    Martin Schwidefsky <schwidefsky@de.ibm.com>
  * Bugreports.to..: <Linux390@de.ibm.com>
- * (C) IBM Corporation, IBM Deutschland Entwicklung GmbH, 1999-2001
+ * Copyright IBM Corp. 1999, 2001
  *
  * gendisk related functions for the dasd driver.
  *
@@ -101,9 +100,8 @@ void dasd_gendisk_free(struct dasd_block *block)
 int dasd_scan_partitions(struct dasd_block *block)
 {
 	struct block_device *bdev;
-	int retry, rc;
+	int rc;
 
-	retry = 5;
 	bdev = bdget_disk(block->gdp, 0);
 	if (!bdev) {
 		DBF_DEV_EVENT(DBF_ERR, block->base, "%s",
@@ -111,26 +109,18 @@ int dasd_scan_partitions(struct dasd_block *block)
 		return -ENODEV;
 	}
 
-	rc = blkdev_get(bdev, FMODE_READ);
+	rc = blkdev_get(bdev, FMODE_READ, NULL);
 	if (rc < 0) {
 		DBF_DEV_EVENT(DBF_ERR, block->base,
 			      "scan partitions error, blkdev_get returned %d",
 			      rc);
 		return -ENODEV;
 	}
-	/*
-	 * See fs/partition/check.c:register_disk,rescan_partitions
-	 * Can't call rescan_partitions directly. Use ioctl.
-	 */
-	rc = ioctl_by_bdev(bdev, BLKRRPART, 0);
-	while (rc == -EBUSY && retry > 0) {
-		schedule();
-		rc = ioctl_by_bdev(bdev, BLKRRPART, 0);
-		retry--;
+
+	rc = blkdev_reread_part(bdev);
+	if (rc)
 		DBF_DEV_EVENT(DBF_ERR, block->base,
-			      "scan partitions error, retry %d rc %d",
-			      retry, rc);
-	}
+				"scan partitions error, rc %d", rc);
 
 	/*
 	 * Since the matching blkdev_put call to the blkdev_get in

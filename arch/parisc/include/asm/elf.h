@@ -247,7 +247,7 @@ typedef unsigned long elf_greg_t;
 #define ELF_PLATFORM  ("PARISC\0")
 
 #define SET_PERSONALITY(ex) \
-	current->personality = PER_LINUX; \
+	set_personality((current->personality & ~PER_MASK) | PER_LINUX); \
 	current->thread.map_base = DEFAULT_MAP_BASE; \
 	current->thread.task_size = DEFAULT_TASK_SIZE \
 
@@ -328,7 +328,6 @@ struct pt_regs;	/* forward declaration... */
    such function.  */
 #define ELF_PLAT_INIT(_r, load_addr)       _r->gr[23] = 0
 
-#define USE_ELF_CORE_DUMP
 #define ELF_EXEC_PAGESIZE	4096
 
 /* This is the location that an ET_DYN program is loaded if exec'ed.  Typical

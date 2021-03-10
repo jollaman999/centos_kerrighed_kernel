@@ -40,18 +40,6 @@
 
 static int numdummies = 1;
 
-static int dummy_set_address(struct net_device *dev, void *p)
-{
-	struct sockaddr *sa = p;
-
-	if (!is_valid_ether_addr(sa->sa_data))
-		return -EADDRNOTAVAIL;
-
-	dev->addr_assign_type = NET_ADDR_PERM;
-	memcpy(dev->dev_addr, sa->sa_data, ETH_ALEN);
-	return 0;
-}
-
 /* fake multicast ability */
 static void set_multicast_list(struct net_device *dev)
 {
@@ -63,8 +51,8 @@ struct pcpu_dstats {
 	struct u64_stats_sync	syncp;
 };
 
-static struct rtnl_link_stats64 *dummy_get_stats64(struct net_device *dev,
-						   struct rtnl_link_stats64 *stats)
+static void dummy_get_stats64(struct net_device *dev,
+			      struct rtnl_link_stats64 *stats)
 {
 	int i;
 
@@ -73,7 +61,7 @@ static struct rtnl_link_stats64 *dummy_get_stats64(struct net_device *dev,
 		u64 tbytes, tpackets;
 		unsigned int start;
 
-		dstats = per_cpu_ptr((void __percpu __force *)dev->ml_priv, i);
+		dstats = per_cpu_ptr(dev->dstats, i);
 		do {
 			start = u64_stats_fetch_begin_irq(&dstats->syncp);
 			tbytes = dstats->tx_bytes;
@@ -82,13 +70,11 @@ static struct rtnl_link_stats64 *dummy_get_stats64(struct net_device *dev,
 		stats->tx_bytes += tbytes;
 		stats->tx_packets += tpackets;
 	}
-	return stats;
 }
 
 static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	struct pcpu_dstats *dstats =
-		this_cpu_ptr((void __percpu __force *)dev->ml_priv);
+	struct pcpu_dstats *dstats = this_cpu_ptr(dev->dstats);
 
 	u64_stats_update_begin(&dstats->syncp);
 	dstats->tx_packets++;
@@ -101,30 +87,36 @@ static netdev_tx_t dummy_xmit(struct sk_buff *skb, struct net_device *dev)
 
 static int dummy_dev_init(struct net_device *dev)
 {
-	dev->ml_priv = (void __force *)alloc_percpu(struct pcpu_dstats);
-	if (!dev->ml_priv)
+	dev->dstats = alloc_percpu(struct pcpu_dstats);
+	if (!dev->dstats)
 		return -ENOMEM;
 
 	return 0;
 }
 
-static void dummy_dev_free(struct net_device *dev)
+static void dummy_dev_uninit(struct net_device *dev)
 {
-	free_percpu((void __percpu __force *)dev->ml_priv);
-	free_netdev(dev);
+	free_percpu(dev->dstats);
+}
+
+static int dummy_change_carrier(struct net_device *dev, bool new_carrier)
+{
+	if (new_carrier)
+		netif_carrier_on(dev);
+	else
+		netif_carrier_off(dev);
+	return 0;
 }
 
 static const struct net_device_ops dummy_netdev_ops = {
 	.ndo_init		= dummy_dev_init,
+	.ndo_uninit		= dummy_dev_uninit,
 	.ndo_start_xmit		= dummy_xmit,
 	.ndo_validate_addr	= eth_validate_addr,
-	.ndo_set_multicast_list = set_multicast_list,
-	.ndo_set_mac_address	= dummy_set_address,
-};
-
-static const struct net_device_ops_ext dummy_netdev_ops_ext = {
-	.size			= sizeof(struct net_device_ops_ext),
+	.ndo_set_rx_mode	= set_multicast_list,
+	.ndo_set_mac_address	= eth_mac_addr,
 	.ndo_get_stats64	= dummy_get_stats64,
+	.ndo_change_carrier	= dummy_change_carrier,
 };
 
 static void dummy_setup(struct net_device *dev)
@@ -133,16 +125,18 @@ static void dummy_setup(struct net_device *dev)
 
 	/* Initialize the device structure. */
 	dev->netdev_ops = &dummy_netdev_ops;
-	set_netdev_ops_ext(dev, &dummy_netdev_ops_ext);
-	dev->destructor = dummy_dev_free;
+	dev->extended->needs_free_netdev = true;
 
 	/* Fill in device structure with ethernet-generic values. */
-	dev->tx_queue_len = 0;
 	dev->flags |= IFF_NOARP;
 	dev->flags &= ~IFF_MULTICAST;
+	dev->priv_flags |= IFF_LIVE_ADDR_CHANGE | IFF_NO_QUEUE;
 	dev->features	|= NETIF_F_SG | NETIF_F_FRAGLIST | NETIF_F_TSO;
 	dev->features	|= NETIF_F_HW_CSUM | NETIF_F_HIGHDMA | NETIF_F_LLTX;
 	eth_hw_addr_random(dev);
+
+	dev->extended->min_mtu = 0;
+	dev->extended->max_mtu = 0;
 }
 
 static int dummy_validate(struct nlattr *tb[], struct nlattr *data[])
@@ -175,10 +169,6 @@ static int __init dummy_init_one(void)
 	if (!dev_dummy)
 		return -ENOMEM;
 
-	err = dev_alloc_name(dev_dummy, dev_dummy->name);
-	if (err < 0)
-		goto err;
-
 	dev_dummy->rtnl_link_ops = &dummy_link_ops;
 	err = register_netdevice(dev_dummy);
 	if (err < 0)
@@ -196,6 +186,8 @@ static int __init dummy_init_module(void)
 
 	rtnl_lock();
 	err = __rtnl_link_register(&dummy_link_ops);
+	if (err < 0)
+		goto out;
 
 	for (i = 0; i < numdummies && !err; i++) {
 		err = dummy_init_one();
@@ -203,6 +195,8 @@ static int __init dummy_init_module(void)
 	}
 	if (err < 0)
 		__rtnl_link_unregister(&dummy_link_ops);
+
+out:
 	rtnl_unlock();
 
 	return err;

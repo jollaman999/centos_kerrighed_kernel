@@ -28,6 +28,7 @@
 #include <linux/rtc-v3020.h>
 #include <linux/delay.h>
 #include <linux/gpio.h>
+#include <linux/slab.h>
 
 #include <linux/io.h>
 
@@ -304,12 +305,11 @@ static int rtc_probe(struct platform_device *pdev)
 {
 	struct v3020_platform_data *pdata = pdev->dev.platform_data;
 	struct v3020 *chip;
-	struct rtc_device *rtc;
 	int retval = -EBUSY;
 	int i;
 	int temp;
 
-	chip = kzalloc(sizeof *chip, GFP_KERNEL);
+	chip = devm_kzalloc(&pdev->dev, sizeof(*chip), GFP_KERNEL);
 	if (!chip)
 		return -ENOMEM;
 
@@ -335,7 +335,7 @@ static int rtc_probe(struct platform_device *pdev)
 		goto err_io;
 	}
 
-	/* Make sure frequency measurment mode, test modes, and lock
+	/* Make sure frequency measurement mode, test modes, and lock
 	 * are all disabled */
 	v3020_set_reg(chip, V3020_STATUS_0, 0x0);
 
@@ -353,34 +353,26 @@ static int rtc_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, chip);
 
-	rtc = rtc_device_register("v3020",
-				&pdev->dev, &v3020_rtc_ops, THIS_MODULE);
-	if (IS_ERR(rtc)) {
-		retval = PTR_ERR(rtc);
+	chip->rtc = devm_rtc_device_register(&pdev->dev, "v3020",
+					&v3020_rtc_ops, THIS_MODULE);
+	if (IS_ERR(chip->rtc)) {
+		retval = PTR_ERR(chip->rtc);
 		goto err_io;
 	}
-	chip->rtc = rtc;
 
 	return 0;
 
 err_io:
 	chip->ops->unmap_io(chip);
 err_chip:
-	kfree(chip);
-
 	return retval;
 }
 
 static int rtc_remove(struct platform_device *dev)
 {
 	struct v3020 *chip = platform_get_drvdata(dev);
-	struct rtc_device *rtc = chip->rtc;
-
-	if (rtc)
-		rtc_device_unregister(rtc);
 
 	chip->ops->unmap_io(chip);
-	kfree(chip);
 
 	return 0;
 }
@@ -394,18 +386,7 @@ static struct platform_driver rtc_device_driver = {
 	},
 };
 
-static __init int v3020_init(void)
-{
-	return platform_driver_register(&rtc_device_driver);
-}
-
-static __exit void v3020_exit(void)
-{
-	platform_driver_unregister(&rtc_device_driver);
-}
-
-module_init(v3020_init);
-module_exit(v3020_exit);
+module_platform_driver(rtc_device_driver);
 
 MODULE_DESCRIPTION("V3020 RTC");
 MODULE_AUTHOR("Raphael Assenat");

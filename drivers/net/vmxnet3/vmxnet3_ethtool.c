@@ -33,40 +33,6 @@ struct vmxnet3_stat_desc {
 };
 
 
-static u32
-vmxnet3_get_rx_csum(struct net_device *netdev)
-{
-	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
-	return adapter->rxcsum;
-}
-
-
-static int
-vmxnet3_set_rx_csum(struct net_device *netdev, u32 val)
-{
-	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
-	unsigned long flags;
-
-	if (adapter->rxcsum != val) {
-		adapter->rxcsum = val;
-		if (netif_running(netdev)) {
-			if (val)
-				adapter->shared->devRead.misc.uptFeatures |=
-				UPT1_F_RXCSUM;
-			else
-				adapter->shared->devRead.misc.uptFeatures &=
-				~UPT1_F_RXCSUM;
-
-			spin_lock_irqsave(&adapter->cmd_lock, flags);
-			VMXNET3_WRITE_BAR1_REG(adapter, VMXNET3_REG_CMD,
-					       VMXNET3_CMD_UPDATE_FEATURE);
-			spin_unlock_irqrestore(&adapter->cmd_lock, flags);
-		}
-	}
-	return 0;
-}
-
-
 /* per tq stats maintained by the device */
 static const struct vmxnet3_stat_desc
 vmxnet3_tq_dev_stats[] = {
@@ -147,7 +113,7 @@ vmxnet3_global_stats[] = {
 };
 
 
-struct rtnl_link_stats64 *
+void
 vmxnet3_get_stats64(struct net_device *netdev,
 		   struct rtnl_link_stats64 *stats)
 {
@@ -194,8 +160,6 @@ vmxnet3_get_stats64(struct net_device *netdev,
 		stats->rx_dropped += drvRxStats->drop_total;
 		stats->multicast +=  devRxStats->mcastPktsRxOK;
 	}
-
-	return stats;
 }
 
 static int
@@ -293,28 +257,50 @@ vmxnet3_get_strings(struct net_device *netdev, u32 stringset, u8 *buf)
 	}
 }
 
-static int
-vmxnet3_set_flags(struct net_device *netdev, u32 data) {
+netdev_features_t vmxnet3_fix_features(struct net_device *netdev,
+				       netdev_features_t features)
+{
+	/* If Rx checksum is disabled, then LRO should also be disabled */
+	if (!(features & NETIF_F_RXCSUM))
+		features &= ~NETIF_F_LRO;
+
+	return features;
+}
+
+int vmxnet3_set_features(struct net_device *netdev, netdev_features_t features)
+{
 	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
-	u8 lro_requested = (data & ETH_FLAG_LRO) == 0 ? 0 : 1;
-	u8 lro_present = (netdev->features & NETIF_F_LRO) == 0 ? 0 : 1;
- 
-	if (lro_requested ^ lro_present) {
-		/* toggle the LRO feature*/
-		netdev->features ^= NETIF_F_LRO;
+	unsigned long flags;
+	netdev_features_t changed = features ^ netdev->features;
 
-		/* Update private LRO flag */
-		adapter->lro = lro_requested;
-
-		/* update hardware LRO capability accordingly */
-		if (lro_requested)
+	if (changed & (NETIF_F_RXCSUM | NETIF_F_LRO |
+		       NETIF_F_HW_VLAN_CTAG_RX)) {
+		if (features & NETIF_F_RXCSUM)
 			adapter->shared->devRead.misc.uptFeatures |=
-						cpu_to_le64(UPT1_F_LRO);
+			UPT1_F_RXCSUM;
 		else
 			adapter->shared->devRead.misc.uptFeatures &=
-						cpu_to_le64(~UPT1_F_LRO);
+			~UPT1_F_RXCSUM;
+
+		/* update hardware LRO capability accordingly */
+		if (features & NETIF_F_LRO)
+			adapter->shared->devRead.misc.uptFeatures |=
+							UPT1_F_LRO;
+		else
+			adapter->shared->devRead.misc.uptFeatures &=
+							~UPT1_F_LRO;
+
+		if (features & NETIF_F_HW_VLAN_CTAG_RX)
+			adapter->shared->devRead.misc.uptFeatures |=
+			UPT1_F_RXVLAN;
+		else
+			adapter->shared->devRead.misc.uptFeatures &=
+			~UPT1_F_RXVLAN;
+
+		spin_lock_irqsave(&adapter->cmd_lock, flags);
 		VMXNET3_WRITE_BAR1_REG(adapter, VMXNET3_REG_CMD,
 				       VMXNET3_CMD_UPDATE_FEATURE);
+		spin_unlock_irqrestore(&adapter->cmd_lock, flags);
 	}
 	return 0;
 }
@@ -621,7 +607,7 @@ vmxnet3_set_ringparam(struct net_device *netdev,
 	 * completion.
 	 */
 	while (test_and_set_bit(VMXNET3_STATE_BIT_RESETTING, &adapter->state))
-		msleep(1);
+		usleep_range(1000, 2000);
 
 	if (netif_running(netdev)) {
 		vmxnet3_quiesce_dev(adapter);
@@ -681,7 +667,7 @@ out:
 
 static int
 vmxnet3_get_rxnfc(struct net_device *netdev, struct ethtool_rxnfc *info,
-		  void *rules)
+		  u32 *rules)
 {
 	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
 	switch (info->cmd) {
@@ -747,162 +733,6 @@ vmxnet3_set_rss(struct net_device *netdev, const u32 *p, const u8 *key,
 }
 #endif
 
-static int
-vmxnet3_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
-{
-	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
-
-	if (!VMXNET3_VERSION_GE_3(adapter))
-		return -EOPNOTSUPP;
-
-	switch (adapter->coal_conf->coalMode) {
-	case VMXNET3_COALESCE_DISABLED:
-		/* struct ethtool_coalesce is already initialized to 0 */
-		break;
-	case VMXNET3_COALESCE_ADAPT:
-		ec->use_adaptive_rx_coalesce = true;
-		break;
-	case VMXNET3_COALESCE_STATIC:
-		ec->tx_max_coalesced_frames =
-			adapter->coal_conf->coalPara.coalStatic.tx_comp_depth;
-		ec->rx_max_coalesced_frames =
-			adapter->coal_conf->coalPara.coalStatic.rx_depth;
-		break;
-	case VMXNET3_COALESCE_RBC: {
-		u32 rbc_rate;
-
-		rbc_rate = adapter->coal_conf->coalPara.coalRbc.rbc_rate;
-		ec->rx_coalesce_usecs = VMXNET3_COAL_RBC_USECS(rbc_rate);
-	}
-		break;
-	default:
-		return -EOPNOTSUPP;
-	}
-
-	return 0;
-}
-
-static int
-vmxnet3_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
-{
-	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
-	struct Vmxnet3_DriverShared *shared = adapter->shared;
-	union Vmxnet3_CmdInfo *cmdInfo = &shared->cu.cmdInfo;
-	unsigned long flags;
-
-	if (!VMXNET3_VERSION_GE_3(adapter))
-		return -EOPNOTSUPP;
-
-	if (ec->rx_coalesce_usecs_irq ||
-	    ec->rx_max_coalesced_frames_irq ||
-	    ec->tx_coalesce_usecs ||
-	    ec->tx_coalesce_usecs_irq ||
-	    ec->tx_max_coalesced_frames_irq ||
-	    ec->stats_block_coalesce_usecs ||
-	    ec->use_adaptive_tx_coalesce ||
-	    ec->pkt_rate_low ||
-	    ec->rx_coalesce_usecs_low ||
-	    ec->rx_max_coalesced_frames_low ||
-	    ec->tx_coalesce_usecs_low ||
-	    ec->tx_max_coalesced_frames_low ||
-	    ec->pkt_rate_high ||
-	    ec->rx_coalesce_usecs_high ||
-	    ec->rx_max_coalesced_frames_high ||
-	    ec->tx_coalesce_usecs_high ||
-	    ec->tx_max_coalesced_frames_high ||
-	    ec->rate_sample_interval) {
-		return -EINVAL;
-	}
-
-	if ((ec->rx_coalesce_usecs == 0) &&
-	    (ec->use_adaptive_rx_coalesce == 0) &&
-	    (ec->tx_max_coalesced_frames == 0) &&
-	    (ec->rx_max_coalesced_frames == 0)) {
-		memset(adapter->coal_conf, 0, sizeof(*adapter->coal_conf));
-		adapter->coal_conf->coalMode = VMXNET3_COALESCE_DISABLED;
-		goto done;
-	}
-
-	if (ec->rx_coalesce_usecs != 0) {
-		u32 rbc_rate;
-
-		if ((ec->use_adaptive_rx_coalesce != 0) ||
-		    (ec->tx_max_coalesced_frames != 0) ||
-		    (ec->rx_max_coalesced_frames != 0)) {
-			return -EINVAL;
-		}
-
-		rbc_rate = VMXNET3_COAL_RBC_RATE(ec->rx_coalesce_usecs);
-		if (rbc_rate < VMXNET3_COAL_RBC_MIN_RATE ||
-		    rbc_rate > VMXNET3_COAL_RBC_MAX_RATE) {
-			return -EINVAL;
-		}
-
-		memset(adapter->coal_conf, 0, sizeof(*adapter->coal_conf));
-		adapter->coal_conf->coalMode = VMXNET3_COALESCE_RBC;
-		adapter->coal_conf->coalPara.coalRbc.rbc_rate = rbc_rate;
-		goto done;
-	}
-
-	if (ec->use_adaptive_rx_coalesce != 0) {
-		if ((ec->rx_coalesce_usecs != 0) ||
-		    (ec->tx_max_coalesced_frames != 0) ||
-		    (ec->rx_max_coalesced_frames != 0)) {
-			return -EINVAL;
-		}
-		memset(adapter->coal_conf, 0, sizeof(*adapter->coal_conf));
-		adapter->coal_conf->coalMode = VMXNET3_COALESCE_ADAPT;
-		goto done;
-	}
-
-	if ((ec->tx_max_coalesced_frames != 0) ||
-	    (ec->rx_max_coalesced_frames != 0)) {
-		if ((ec->rx_coalesce_usecs != 0) ||
-		    (ec->use_adaptive_rx_coalesce != 0)) {
-			return -EINVAL;
-		}
-
-		if ((ec->tx_max_coalesced_frames >
-		    VMXNET3_COAL_STATIC_MAX_DEPTH) ||
-		    (ec->rx_max_coalesced_frames >
-		     VMXNET3_COAL_STATIC_MAX_DEPTH)) {
-			return -EINVAL;
-		}
-
-		memset(adapter->coal_conf, 0, sizeof(*adapter->coal_conf));
-		adapter->coal_conf->coalMode = VMXNET3_COALESCE_STATIC;
-
-		adapter->coal_conf->coalPara.coalStatic.tx_comp_depth =
-			(ec->tx_max_coalesced_frames ?
-			 ec->tx_max_coalesced_frames :
-			 VMXNET3_COAL_STATIC_DEFAULT_DEPTH);
-
-		adapter->coal_conf->coalPara.coalStatic.rx_depth =
-			(ec->rx_max_coalesced_frames ?
-			 ec->rx_max_coalesced_frames :
-			 VMXNET3_COAL_STATIC_DEFAULT_DEPTH);
-
-		adapter->coal_conf->coalPara.coalStatic.tx_depth =
-			 VMXNET3_COAL_STATIC_DEFAULT_DEPTH;
-		goto done;
-	}
-
-done:
-	adapter->default_coal_mode = false;
-	if (netif_running(netdev)) {
-		spin_lock_irqsave(&adapter->cmd_lock, flags);
-		cmdInfo->varConf.confVer = 1;
-		cmdInfo->varConf.confLen =
-			cpu_to_le32(sizeof(*adapter->coal_conf));
-		cmdInfo->varConf.confPA  = cpu_to_le64(adapter->coal_conf_pa);
-		VMXNET3_WRITE_BAR1_REG(adapter, VMXNET3_REG_CMD,
-				       VMXNET3_CMD_SET_COALESCE);
-		spin_unlock_irqrestore(&adapter->cmd_lock, flags);
-	}
-
-	return 0;
-}
-
 static const struct ethtool_ops vmxnet3_ethtool_ops = {
 	.get_settings      = vmxnet3_get_settings,
 	.get_drvinfo       = vmxnet3_get_drvinfo,
@@ -911,28 +741,12 @@ static const struct ethtool_ops vmxnet3_ethtool_ops = {
 	.get_wol           = vmxnet3_get_wol,
 	.set_wol           = vmxnet3_set_wol,
 	.get_link          = ethtool_op_get_link,
-	.get_rx_csum       = vmxnet3_get_rx_csum,
-	.set_rx_csum       = vmxnet3_set_rx_csum,
-	.get_tx_csum       = ethtool_op_get_tx_csum,
-	.set_tx_csum       = ethtool_op_set_tx_hw_csum,
-	.get_sg            = ethtool_op_get_sg,
-	.set_sg            = ethtool_op_set_sg,
-	.get_tso           = ethtool_op_get_tso,
-	.set_tso           = ethtool_op_set_tso,
-	.get_coalesce      = vmxnet3_get_coalesce,
-	.set_coalesce      = vmxnet3_set_coalesce,
 	.get_strings       = vmxnet3_get_strings,
-	.get_flags	   = ethtool_op_get_flags,
-	.set_flags	   = vmxnet3_set_flags,
 	.get_sset_count	   = vmxnet3_get_sset_count,
 	.get_ethtool_stats = vmxnet3_get_ethtool_stats,
 	.get_ringparam     = vmxnet3_get_ringparam,
 	.set_ringparam     = vmxnet3_set_ringparam,
 	.get_rxnfc         = vmxnet3_get_rxnfc,
-};
-
-static const struct ethtool_ops_ext vmxnet3_ethtool_ops_ext = {
-        .size                   = sizeof(struct ethtool_ops_ext),
 #ifdef VMXNET3_RSS
 	.get_rxfh_indir_size = vmxnet3_get_rss_indir_size,
 	.get_rxfh          = vmxnet3_get_rss,
@@ -942,6 +756,5 @@ static const struct ethtool_ops_ext vmxnet3_ethtool_ops_ext = {
 
 void vmxnet3_set_ethtool_ops(struct net_device *netdev)
 {
-	SET_ETHTOOL_OPS(netdev, &vmxnet3_ethtool_ops);
-	set_ethtool_ops_ext(netdev, &vmxnet3_ethtool_ops_ext);
+	netdev->ethtool_ops = &vmxnet3_ethtool_ops;
 }

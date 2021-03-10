@@ -10,8 +10,10 @@
 #include <asm/paravirt_types.h>
 
 #ifndef __ASSEMBLY__
+#include <linux/bug.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
+#include <asm/frame.h>
 
 static inline int paravirt_enabled(void)
 {
@@ -105,7 +107,7 @@ static inline void write_cr8(unsigned long x)
 }
 #endif
 
-static inline void raw_safe_halt(void)
+static inline void arch_safe_halt(void)
 {
 	PVOP_VCALL0(pv_irq_ops.safe_halt);
 }
@@ -127,19 +129,9 @@ static inline u64 paravirt_read_msr(unsigned msr, int *err)
 	return PVOP_CALL2(u64, pv_cpu_ops.read_msr, msr, err);
 }
 
-static inline int paravirt_rdmsr_regs(u32 *regs)
-{
-	return PVOP_CALL1(int, pv_cpu_ops.rdmsr_regs, regs);
-}
-
 static inline int paravirt_write_msr(unsigned msr, unsigned low, unsigned high)
 {
 	return PVOP_CALL3(int, pv_cpu_ops.write_msr, msr, low, high);
-}
-
-static inline int paravirt_wrmsr_regs(u32 *regs)
-{
-	return PVOP_CALL1(int, pv_cpu_ops.wrmsr_regs, regs);
 }
 
 /* These should all do BUG_ON(_err), but our headers are too tangled. */
@@ -175,9 +167,6 @@ do {						\
 	_err;					\
 })
 
-#define rdmsr_safe_regs(regs)	paravirt_rdmsr_regs(regs)
-#define wrmsr_safe_regs(regs)	paravirt_wrmsr_regs(regs)
-
 static inline int rdmsrl_safe(unsigned msr, unsigned long long *p)
 {
 	int err;
@@ -185,52 +174,15 @@ static inline int rdmsrl_safe(unsigned msr, unsigned long long *p)
 	*p = paravirt_read_msr(msr, &err);
 	return err;
 }
-static inline int rdmsrl_amd_safe(unsigned msr, unsigned long long *p)
-{
-	u32 gprs[8] = { 0 };
-	int err;
-
-	gprs[1] = msr;
-	gprs[7] = 0x9c5a203a;
-
-	err = paravirt_rdmsr_regs(gprs);
-
-	*p = gprs[0] | ((u64)gprs[2] << 32);
-
-	return err;
-}
-
-static inline int wrmsrl_amd_safe(unsigned msr, unsigned long long val)
-{
-	u32 gprs[8] = { 0 };
-
-	gprs[0] = (u32)val;
-	gprs[1] = msr;
-	gprs[2] = val >> 32;
-	gprs[7] = 0x9c5a203a;
-
-	return paravirt_wrmsr_regs(gprs);
-}
-
-static inline u64 paravirt_read_tsc(void)
-{
-	return PVOP_CALL0(u64, pv_cpu_ops.read_tsc);
-}
-
-#define rdtscl(low)				\
-do {						\
-	u64 _l = paravirt_read_tsc();		\
-	low = (int)_l;				\
-} while (0)
-
-#define rdtscll(val) (val = paravirt_read_tsc())
 
 static inline unsigned long long paravirt_sched_clock(void)
 {
 	return PVOP_CALL0(unsigned long long, pv_time_ops.sched_clock);
 }
 
-extern bool paravirt_steal_enabled;
+struct static_key;
+extern struct static_key paravirt_steal_enabled;
+extern struct static_key paravirt_steal_rq_enabled;
 
 static inline u64 paravirt_steal_clock(int cpu)
 {
@@ -250,27 +202,6 @@ do {						\
 } while (0)
 
 #define rdpmcl(counter, val) ((val) = paravirt_read_pmc(counter))
-
-static inline unsigned long long paravirt_rdtscp(unsigned int *aux)
-{
-	return PVOP_CALL1(u64, pv_cpu_ops.read_tscp, aux);
-}
-
-#define rdtscp(low, high, aux)				\
-do {							\
-	int __aux;					\
-	unsigned long __val = paravirt_rdtscp(&__aux);	\
-	(low) = (u32)__val;				\
-	(high) = (u32)(__val >> 32);			\
-	(aux) = __aux;					\
-} while (0)
-
-#define rdtscpll(val, aux)				\
-do {							\
-	unsigned long __aux; 				\
-	val = paravirt_rdtscp(&__aux);			\
-	(aux) = __aux;					\
-} while (0)
 
 static inline void paravirt_alloc_ldt(struct desc_struct *ldt, unsigned entries)
 {
@@ -297,16 +228,6 @@ static inline void load_idt(const struct desc_ptr *dtr)
 static inline void set_ldt(const void *addr, unsigned entries)
 {
 	PVOP_VCALL2(pv_cpu_ops.set_ldt, addr, entries);
-}
-#ifdef CONFIG_X86_32
-static inline void load_user_cs_desc(unsigned int cpu, struct mm_struct *mm)
-{
-	PVOP_VCALL2(pv_cpu_ops.load_user_cs_desc, cpu, mm);
-}
-#endif /*CONFIG_X86_32*/
-static inline void store_gdt(struct desc_ptr *dtr)
-{
-	PVOP_VCALL1(pv_cpu_ops.store_gdt, dtr);
 }
 static inline void store_idt(struct desc_ptr *dtr)
 {
@@ -376,13 +297,13 @@ static inline void paravirt_activate_mm(struct mm_struct *prev,
 	PVOP_VCALL2(pv_mmu_ops.activate_mm, prev, next);
 }
 
-static inline void arch_dup_mmap(struct mm_struct *oldmm,
-				 struct mm_struct *mm)
+static inline void paravirt_arch_dup_mmap(struct mm_struct *oldmm,
+					  struct mm_struct *mm)
 {
 	PVOP_VCALL2(pv_mmu_ops.dup_mmap, oldmm, mm);
 }
 
-static inline void arch_exit_mmap(struct mm_struct *mm)
+static inline void paravirt_arch_exit_mmap(struct mm_struct *mm)
 {
 	PVOP_VCALL1(pv_mmu_ops.exit_mmap, mm);
 }
@@ -402,9 +323,10 @@ static inline void __flush_tlb_single(unsigned long addr)
 
 static inline void flush_tlb_others(const struct cpumask *cpumask,
 				    struct mm_struct *mm,
-				    unsigned long va)
+				    unsigned long start,
+				    unsigned long end)
 {
-	PVOP_VCALL3(pv_mmu_ops.flush_tlb_others, cpumask, mm, va);
+	PVOP_VCALL4(pv_mmu_ops.flush_tlb_others, cpumask, mm, start, end);
 }
 
 static inline int paravirt_pgd_alloc(struct mm_struct *mm)
@@ -431,11 +353,6 @@ static inline void paravirt_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 	PVOP_VCALL2(pv_mmu_ops.alloc_pmd, mm, pfn);
 }
 
-static inline void paravirt_alloc_pmd_clone(unsigned long pfn, unsigned long clonepfn,
-					    unsigned long start, unsigned long count)
-{
-	PVOP_VCALL4(pv_mmu_ops.alloc_pmd_clone, pfn, clonepfn, start, count);
-}
 static inline void paravirt_release_pmd(unsigned long pfn)
 {
 	PVOP_VCALL1(pv_mmu_ops.release_pmd, pfn);
@@ -454,23 +371,6 @@ static inline void pte_update(struct mm_struct *mm, unsigned long addr,
 			      pte_t *ptep)
 {
 	PVOP_VCALL3(pv_mmu_ops.pte_update, mm, addr, ptep);
-}
-static inline void pmd_update(struct mm_struct *mm, unsigned long addr,
-			      pmd_t *pmdp)
-{
-	PVOP_VCALL3(pv_mmu_ops.pmd_update, mm, addr, pmdp);
-}
-
-static inline void pte_update_defer(struct mm_struct *mm, unsigned long addr,
-				    pte_t *ptep)
-{
-	PVOP_VCALL3(pv_mmu_ops.pte_update_defer, mm, addr, ptep);
-}
-
-static inline void pmd_update_defer(struct mm_struct *mm, unsigned long addr,
-				    pmd_t *pmdp)
-{
-	PVOP_VCALL3(pv_mmu_ops.pmd_update_defer, mm, addr, pmdp);
 }
 
 static inline pte_t __pte(pteval_t val)
@@ -574,7 +474,6 @@ static inline void set_pte_at(struct mm_struct *mm, unsigned long addr,
 		PVOP_VCALL4(pv_mmu_ops.set_pte_at, mm, addr, ptep, pte.pte);
 }
 
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
 			      pmd_t *pmdp, pmd_t pmd)
 {
@@ -582,9 +481,9 @@ static inline void set_pmd_at(struct mm_struct *mm, unsigned long addr,
 		/* 5 arg words */
 		pv_mmu_ops.set_pmd_at(mm, addr, pmdp, pmd);
 	else
-		PVOP_VCALL4(pv_mmu_ops.set_pmd_at, mm, addr, pmdp, pmd.pmd);
+		PVOP_VCALL4(pv_mmu_ops.set_pmd_at, mm, addr, pmdp,
+			    native_pmd_val(pmd));
 }
-#endif
 
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
@@ -750,7 +649,10 @@ static inline void arch_leave_lazy_mmu_mode(void)
 	PVOP_VCALL0(pv_mmu_ops.lazy_mode.leave);
 }
 
-void arch_flush_lazy_mmu_mode(void);
+static inline void arch_flush_lazy_mmu_mode(void)
+{
+	PVOP_VCALL0(pv_mmu_ops.lazy_mode.flush);
+}
 
 static inline void __set_fixmap(unsigned /* enum fixed_addresses */ idx,
 				phys_addr_t phys, pgprot_t flags)
@@ -760,39 +662,46 @@ static inline void __set_fixmap(unsigned /* enum fixed_addresses */ idx,
 
 #if defined(CONFIG_SMP) && defined(CONFIG_PARAVIRT_SPINLOCKS)
 
-static inline int __raw_spin_is_locked(struct raw_spinlock *lock)
+#ifdef CONFIG_QUEUED_SPINLOCKS
+
+static __always_inline void pv_queued_spin_lock_slowpath(struct qspinlock *lock,
+							u32 val)
 {
-	return PVOP_CALL1(int, pv_lock_ops.spin_is_locked, lock);
+	PVOP_VCALL2(pv_lock_ops.queued_spin_lock_slowpath, lock, val);
 }
 
-static inline int __raw_spin_is_contended(struct raw_spinlock *lock)
+static __always_inline void pv_queued_spin_unlock(struct qspinlock *lock)
 {
-	return PVOP_CALL1(int, pv_lock_ops.spin_is_contended, lock);
-}
-#define __raw_spin_is_contended	__raw_spin_is_contended
-
-static __always_inline void __raw_spin_lock(struct raw_spinlock *lock)
-{
-	PVOP_VCALL1(pv_lock_ops.spin_lock, lock);
+	PVOP_VCALLEE1(pv_lock_ops.queued_spin_unlock, lock);
 }
 
-static __always_inline void __raw_spin_lock_flags(struct raw_spinlock *lock,
-						  unsigned long flags)
+static __always_inline void pv_wait(u8 *ptr, u8 val)
 {
-	PVOP_VCALL2(pv_lock_ops.spin_lock_flags, lock, flags);
+	PVOP_VCALL2(pv_lock_ops.wait, ptr, val);
 }
 
-static __always_inline int __raw_spin_trylock(struct raw_spinlock *lock)
+static __always_inline void pv_kick(int cpu)
 {
-	return PVOP_CALL1(int, pv_lock_ops.spin_trylock, lock);
+	PVOP_VCALL1(pv_lock_ops.kick, cpu);
 }
 
-static __always_inline void __raw_spin_unlock(struct raw_spinlock *lock)
+#else /* !CONFIG_QUEUED_SPINLOCKS */
+
+static __always_inline void __ticket_lock_spinning(struct arch_spinlock *lock,
+							__ticket_t ticket)
 {
-	PVOP_VCALL1(pv_lock_ops.spin_unlock, lock);
+	PVOP_VCALLEE2(pv_lock_ops.lock_spinning, lock, ticket);
 }
 
-#endif
+static __always_inline void __ticket_unlock_kick(struct arch_spinlock *lock,
+							__ticket_t ticket)
+{
+	PVOP_VCALL2(pv_lock_ops.unlock_kick, lock, ticket);
+}
+
+#endif /* CONFIG_QUEUED_SPINLOCKS */
+
+#endif /* SMP && PARAVIRT_SPINLOCKS */
 
 #ifdef CONFIG_X86_32
 #define PV_SAVE_REGS "pushl %ecx; pushl %edx;"
@@ -847,15 +756,19 @@ static __always_inline void __raw_spin_unlock(struct raw_spinlock *lock)
  * call. The return value in rax/eax will not be saved, even for void
  * functions.
  */
+#define PV_THUNK_NAME(func) "__raw_callee_save_" #func
 #define PV_CALLEE_SAVE_REGS_THUNK(func)					\
 	extern typeof(func) __raw_callee_save_##func;			\
-	static void *__##func##__ __used = func;			\
 									\
 	asm(".pushsection .text;"					\
-	    "__raw_callee_save_" #func ": "				\
+	    ".globl " PV_THUNK_NAME(func) ";"				\
+	    ".type " PV_THUNK_NAME(func) ", @function;"			\
+	    PV_THUNK_NAME(func) ":"					\
+	    FRAME_BEGIN							\
 	    PV_SAVE_ALL_CALLER_REGS					\
 	    "call " #func ";"						\
 	    PV_RESTORE_ALL_CALLER_REGS					\
+	    FRAME_END							\
 	    "ret;"							\
 	    ".popsection")
 
@@ -867,32 +780,32 @@ static __always_inline void __raw_spin_unlock(struct raw_spinlock *lock)
 #define __PV_IS_CALLEE_SAVE(func)			\
 	((struct paravirt_callee_save) { func })
 
-static inline unsigned long __raw_local_save_flags(void)
+static inline notrace unsigned long arch_local_save_flags(void)
 {
 	return PVOP_CALLEE0(unsigned long, pv_irq_ops.save_fl);
 }
 
-static inline void raw_local_irq_restore(unsigned long f)
+static inline notrace void arch_local_irq_restore(unsigned long f)
 {
 	PVOP_VCALLEE1(pv_irq_ops.restore_fl, f);
 }
 
-static inline void raw_local_irq_disable(void)
+static inline notrace void arch_local_irq_disable(void)
 {
 	PVOP_VCALLEE0(pv_irq_ops.irq_disable);
 }
 
-static inline void raw_local_irq_enable(void)
+static inline notrace void arch_local_irq_enable(void)
 {
 	PVOP_VCALLEE0(pv_irq_ops.irq_enable);
 }
 
-static inline unsigned long __raw_local_irq_save(void)
+static inline notrace unsigned long arch_local_irq_save(void)
 {
 	unsigned long f;
 
-	f = __raw_local_save_flags();
-	raw_local_irq_disable();
+	f = arch_local_save_flags();
+	arch_local_irq_disable();
 	return f;
 }
 
@@ -1032,10 +945,8 @@ extern void default_banner(void);
 		  call PARA_INDIRECT(pv_cpu_ops+PV_CPU_swapgs)		\
 		 )
 
-#define GET_CR2_INTO_RCX				\
-	call PARA_INDIRECT(pv_mmu_ops+PV_MMU_read_cr2);	\
-	movq %rax, %rcx;				\
-	xorq %rax, %rax;
+#define GET_CR2_INTO_RAX				\
+	call PARA_INDIRECT(pv_mmu_ops+PV_MMU_read_cr2)
 
 #define PARAVIRT_ADJUST_EXCEPTION_FRAME					\
 	PARA_SITE(PARA_PATCH(pv_irq_ops, PV_IRQ_adjust_exception_frame), \
@@ -1056,5 +967,15 @@ extern void default_banner(void);
 #endif /* __ASSEMBLY__ */
 #else  /* CONFIG_PARAVIRT */
 # define default_banner x86_init_noop
+#ifndef __ASSEMBLY__
+static inline void paravirt_arch_dup_mmap(struct mm_struct *oldmm,
+					  struct mm_struct *mm)
+{
+}
+
+static inline void paravirt_arch_exit_mmap(struct mm_struct *mm)
+{
+}
+#endif /* __ASSEMBLY__ */
 #endif /* !CONFIG_PARAVIRT */
 #endif /* _ASM_X86_PARAVIRT_H */

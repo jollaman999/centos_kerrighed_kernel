@@ -12,14 +12,17 @@
  *
  */
 
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <crypto/internal/rng.h>
 #include <linux/err.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/random.h>
 #include <linux/seq_file.h>
+#include <linux/slab.h>
 #include <linux/string.h>
+#include <linux/cryptouser.h>
+#include <net/netlink.h>
 
 static DEFINE_MUTEX(crypto_default_rng_lock);
 struct crypto_rng *crypto_default_rng;
@@ -42,7 +45,7 @@ static int rngapi_reset(struct crypto_rng *tfm, u8 *seed, unsigned int slen)
 
 	err = crypto_rng_alg(tfm)->rng_reset(tfm, seed, slen);
 
-	kfree(buf);
+	kzfree(buf);
 	return err;
 }
 
@@ -56,6 +59,30 @@ static int crypto_init_rng_ops(struct crypto_tfm *tfm, u32 type, u32 mask)
 
 	return 0;
 }
+
+#ifdef CONFIG_NET
+static int crypto_rng_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	struct crypto_report_rng rrng;
+
+	strncpy(rrng.type, "rng", sizeof(rrng.type));
+
+	rrng.seedsize = alg->cra_rng.seedsize;
+
+	if (nla_put(skb, CRYPTOCFGA_REPORT_RNG,
+		    sizeof(struct crypto_report_rng), &rrng))
+		goto nla_put_failure;
+	return 0;
+
+nla_put_failure:
+	return -EMSGSIZE;
+}
+#else
+static int crypto_rng_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	return -ENOSYS;
+}
+#endif
 
 static void crypto_rng_show(struct seq_file *m, struct crypto_alg *alg)
 	__attribute__ ((unused));
@@ -77,6 +104,7 @@ const struct crypto_type crypto_rng_type = {
 #ifdef CONFIG_PROC_FS
 	.show = crypto_rng_show,
 #endif
+	.report = crypto_rng_report,
 };
 EXPORT_SYMBOL_GPL(crypto_rng_type);
 

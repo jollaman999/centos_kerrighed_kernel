@@ -1,9 +1,10 @@
+# SPDX-License-Identifier: GPL-2.0
 #
 # Makefile for ALSA
 #
 
 obj-$(CONFIG_SND_ARMAACI)	+= snd-aaci.o
-snd-aaci-objs			:= aaci.o devdma.o
+snd-aaci-objs			:= aaci.o
 
 obj-$(CONFIG_SND_PXA2XX_PCM)	+= snd-pxa2xx-pcm.o
 snd-pxa2xx-pcm-objs		:= pxa2xx-pcm.o

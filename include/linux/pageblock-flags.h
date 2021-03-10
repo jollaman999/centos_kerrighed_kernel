@@ -67,21 +67,23 @@ unsigned long get_pageblock_flags_group(struct page *page,
 					int start_bitidx, int end_bitidx);
 void set_pageblock_flags_group(struct page *page, unsigned long flags,
 					int start_bitidx, int end_bitidx);
+
 #ifdef CONFIG_COMPACTION
 #define get_pageblock_skip(page) \
-			get_pageblock_flags_group(page, PB_migrate_skip,	\
+			get_pageblock_flags_group(page, PB_migrate_skip,     \
 							PB_migrate_skip)
 #define clear_pageblock_skip(page) \
-			set_pageblock_flags_group(page, 0, PB_migrate_skip,	\
+			set_pageblock_flags_group(page, 0, PB_migrate_skip,  \
 							PB_migrate_skip)
 #define set_pageblock_skip(page) \
-			set_pageblock_flags_group(page, 1, PB_migrate_skip,	\
+			set_pageblock_flags_group(page, 1, PB_migrate_skip,  \
 							PB_migrate_skip)
 #endif /* CONFIG_COMPACTION */
 
 #define get_pageblock_flags(page) \
 			get_pageblock_flags_group(page, 0, PB_migrate_end)
-#define set_pageblock_flags(page) \
-			set_pageblock_flags_group(page, 0, PB_migrate_end)
+#define set_pageblock_flags(page, flags) \
+			set_pageblock_flags_group(page, flags,	\
+						  0, PB_migrate_end)
 
 #endif	/* PAGEBLOCK_FLAGS_H */

@@ -36,8 +36,8 @@ static void __wrmsr_on_cpu(void *info)
 	 */
 	if (unlikely((rv->msr_no == MSR_IA32_SPEC_CTRL) &&
 		     (reg->l == SPEC_CTRL_MSR_REFRESH)))
-		wrmsr(rv->msr_no, percpu_read(spec_ctrl_pcp.entry),
-				  percpu_read(spec_ctrl_pcp.hi32));
+		wrmsr(rv->msr_no, this_cpu_read(spec_ctrl_pcp.entry),
+				  this_cpu_read(spec_ctrl_pcp.hi32));
 	else
 		wrmsr(rv->msr_no, reg->l, reg->h);
 }

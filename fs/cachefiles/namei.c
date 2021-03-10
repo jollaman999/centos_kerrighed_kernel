@@ -19,6 +19,7 @@
 #include <linux/mount.h>
 #include <linux/namei.h>
 #include <linux/security.h>
+#include <linux/slab.h>
 #include "internal.h"
 
 #define CACHEFILES_KEYBUF_SIZE 512
@@ -35,9 +36,9 @@ void __cachefiles_printk_object(struct cachefiles_object *object,
 	unsigned keylen, loop;
 
 	pr_err("%sobject: OBJ%x\n", prefix, object->fscache.debug_id);
-	pr_err("%sobjstate=%s fl=%lx swfl=%lx ev=%lx[%lx]\n",
+	pr_err("%sobjstate=%s fl=%lx wbusy=%x ev=%lx[%lx]\n",
 	       prefix, object->fscache.state->name,
-	       object->fscache.flags, object->fscache.work.flags,
+	       object->fscache.flags, work_busy(&object->fscache.work),
 	       object->fscache.events, object->fscache.event_mask);
 	pr_err("%sops=%u inp=%u exc=%u\n",
 	       prefix, object->fscache.n_ops, object->fscache.n_in_progress,
@@ -190,11 +191,12 @@ try_again:
 	/* an old object from a previous incarnation is hogging the slot - we
 	 * need to wait for it to be destroyed */
 wait_for_old_object:
+	clear_bit(CACHEFILES_OBJECT_ACTIVE, &object->flags);
+
 	if (fscache_object_is_live(&xobject->fscache)) {
 		pr_err("\n");
 		pr_err("Error: Unexpected object collision\n");
 		cachefiles_printk_object(object, xobject);
-		BUG();
 	}
 	atomic_inc(&xobject->usage);
 	write_unlock(&cache->active_lock);
@@ -208,7 +210,7 @@ wait_for_old_object:
 
 		/* if the object we're waiting for is queued for processing,
 		 * then just put ourselves on the queue behind it */
-		if (slow_work_is_queued(&xobject->fscache.work)) {
+		if (work_pending(&xobject->fscache.work)) {
 			_debug("queue OBJ%x behind OBJ%x immediately",
 			       object->fscache.debug_id,
 			       xobject->fscache.debug_id);
@@ -216,8 +218,7 @@ wait_for_old_object:
 		}
 
 		/* otherwise we sleep until either the object we're waiting for
-		 * is done, or the slow-work facility wants the thread back to
-		 * do other work */
+		 * is done, or the fscache_object is congested */
 		wq = bit_waitqueue(&xobject->flags, CACHEFILES_OBJECT_ACTIVE);
 		init_wait(&wait);
 		requeue = false;
@@ -225,8 +226,8 @@ wait_for_old_object:
 			prepare_to_wait(wq, &wait, TASK_UNINTERRUPTIBLE);
 			if (!test_bit(CACHEFILES_OBJECT_ACTIVE, &xobject->flags))
 				break;
-			requeue = slow_work_sleep_till_thread_needed(
-				&object->fscache.work, &timeout);
+
+			requeue = fscache_object_sleep_till_congested(&timeout);
 		} while (timeout > 0 && !requeue);
 		finish_wait(wq, &wait);
 
@@ -252,7 +253,6 @@ wait_for_old_object:
 	goto try_again;
 
 requeue:
-	clear_bit(CACHEFILES_OBJECT_ACTIVE, &object->flags);
 	cache->cache.ops->put_object(&xobject->fscache);
 	_leave(" = -ETIMEDOUT");
 	return -ETIMEDOUT;
@@ -294,6 +294,7 @@ static int cachefiles_bury_object(struct cachefiles_cache *cache,
 				  enum fscache_why_object_killed why)
 {
 	struct dentry *grave, *trap;
+	struct path path, path_to_graveyard;
 	char nbuffer[8 + 8 + 1];
 	int ret;
 
@@ -306,10 +307,18 @@ static int cachefiles_bury_object(struct cachefiles_cache *cache,
 	/* non-directories can just be unlinked */
 	if (!S_ISDIR(rep->d_inode->i_mode)) {
 		_debug("unlink stale object");
-		ret = vfs_unlink(dir->d_inode, rep);
 
-		if (preemptive)
-			cachefiles_mark_object_buried(cache, rep, why);
+		path.mnt = cache->mnt;
+		path.dentry = dir;
+		ret = security_path_unlink(&path, rep);
+		if (ret < 0) {
+			cachefiles_io_error(cache, "Unlink security error");
+		} else {
+			ret = vfs_unlink(dir->d_inode, rep, NULL);
+
+			if (preemptive)
+				cachefiles_mark_object_buried(cache, rep, why);
+		}
 
 		mutex_unlock(&dir->d_inode->i_mutex);
 
@@ -398,12 +407,23 @@ try_again:
 	}
 
 	/* attempt the rename */
-	ret = vfs_rename(dir->d_inode, rep, cache->graveyard->d_inode, grave);
-	if (ret != 0 && ret != -ENOMEM)
-		cachefiles_io_error(cache, "Rename failed with error %d", ret);
+	path.mnt = cache->mnt;
+	path.dentry = dir;
+	path_to_graveyard.mnt = cache->mnt;
+	path_to_graveyard.dentry = cache->graveyard;
+	ret = security_path_rename(&path, rep, &path_to_graveyard, grave, 0);
+	if (ret < 0) {
+		cachefiles_io_error(cache, "Rename security error %d", ret);
+	} else {
+		ret = vfs_rename(dir->d_inode, rep,
+				 cache->graveyard->d_inode, grave, NULL, 0);
+		if (ret != 0 && ret != -ENOMEM)
+			cachefiles_io_error(cache,
+					    "Rename failed with error %d", ret);
 
-	if (preemptive)
-		cachefiles_mark_object_buried(cache, rep, why);
+		if (preemptive)
+			cachefiles_mark_object_buried(cache, rep, why);
+	}
 
 	unlock_rename(cache->graveyard, dir);
 	dput(grave);
@@ -468,6 +488,7 @@ int cachefiles_walk_to_object(struct cachefiles_object *parent,
 {
 	struct cachefiles_cache *cache;
 	struct dentry *dir, *next = NULL;
+	struct path path;
 	unsigned long start;
 	const char *name;
 	int ret, nlen;
@@ -478,6 +499,7 @@ int cachefiles_walk_to_object(struct cachefiles_object *parent,
 
 	cache = container_of(parent->fscache.cache,
 			     struct cachefiles_cache, cache);
+	path.mnt = cache->mnt;
 
 	ASSERT(parent->dentry);
 	ASSERT(parent->dentry->d_inode);
@@ -531,6 +553,10 @@ lookup_again:
 			if (ret < 0)
 				goto no_space_error;
 
+			path.dentry = dir;
+			ret = security_path_mkdir(&path, next, 0);
+			if (ret < 0)
+				goto create_error;
 			start = jiffies;
 			ret = vfs_mkdir(dir->d_inode, next, 0);
 			cachefiles_hist(cachefiles_mkdir_histogram, start);
@@ -556,8 +582,12 @@ lookup_again:
 			if (ret < 0)
 				goto no_space_error;
 
+			path.dentry = dir;
+			ret = security_path_mknod(&path, next, S_IFREG, 0);
+			if (ret < 0)
+				goto create_error;
 			start = jiffies;
-			ret = vfs_create(dir->d_inode, next, S_IFREG, NULL);
+			ret = vfs_create(dir->d_inode, next, S_IFREG, true);
 			cachefiles_hist(cachefiles_create_histogram, start);
 			if (ret < 0)
 				goto create_error;
@@ -638,7 +668,8 @@ lookup_again:
 		 * (this is used to keep track of culling, and atimes are only
 		 * updated by read, write and readdir but not lookup or
 		 * open) */
-		touch_atime(cache->mnt, next);
+		path.dentry = next;
+		touch_atime(&path);
 	}
 
 	/* open a file interface onto a data file */
@@ -680,7 +711,7 @@ mark_active_timed_out:
 check_error:
 	_debug("check error %d", ret);
 	cachefiles_mark_object_inactive(
-		cache, object, object->dentry->d_inode->i_blocks);
+		cache, object, d_backing_inode(object->dentry)->i_blocks);
 release_dentry:
 	dput(object->dentry);
 	object->dentry = NULL;
@@ -715,6 +746,7 @@ struct dentry *cachefiles_get_directory(struct cachefiles_cache *cache,
 {
 	struct dentry *subdir;
 	unsigned long start;
+	struct path path;
 	int ret;
 
 	_enter(",,%s", dirname);
@@ -742,6 +774,11 @@ struct dentry *cachefiles_get_directory(struct cachefiles_cache *cache,
 
 		_debug("attempt mkdir");
 
+		path.mnt = cache->mnt;
+		path.dentry = dir;
+		ret = security_path_mkdir(&path, subdir, 0700);
+		if (ret < 0)
+			goto mkdir_error;
 		ret = vfs_mkdir(dir->d_inode, subdir, 0700);
 		if (ret < 0)
 			goto mkdir_error;

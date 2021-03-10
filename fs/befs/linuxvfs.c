@@ -15,6 +15,7 @@
 #include <linux/vfs.h>
 #include <linux/parser.h>
 #include <linux/namei.h>
+#include <linux/sched.h>
 
 #include "befs.h"
 #include "btree.h"
@@ -34,7 +35,7 @@ static int befs_readdir(struct file *, void *, filldir_t);
 static int befs_get_block(struct inode *, sector_t, struct buffer_head *, int);
 static int befs_readpage(struct file *file, struct page *page);
 static sector_t befs_bmap(struct address_space *mapping, sector_t block);
-static struct dentry *befs_lookup(struct inode *, struct dentry *, struct nameidata *);
+static struct dentry *befs_lookup(struct inode *, struct dentry *, unsigned int);
 static struct inode *befs_iget(struct super_block *, unsigned long);
 static struct inode *befs_alloc_inode(struct super_block *sb);
 static void befs_destroy_inode(struct inode *inode);
@@ -75,7 +76,6 @@ static const struct inode_operations befs_dir_inode_operations = {
 
 static const struct address_space_operations befs_aops = {
 	.readpage	= befs_readpage,
-	.sync_page	= block_sync_page,
 	.bmap		= befs_bmap,
 };
 
@@ -160,7 +160,7 @@ befs_get_block(struct inode *inode, sector_t block,
 }
 
 static struct dentry *
-befs_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *nd)
+befs_lookup(struct inode *dir, struct dentry *dentry, unsigned int flags)
 {
 	struct inode *inode = NULL;
 	struct super_block *sb = dir->i_sb;
@@ -213,7 +213,7 @@ befs_lookup(struct inode *dir, struct dentry *dentry, struct nameidata *nd)
 static int
 befs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 {
-	struct inode *inode = filp->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 	struct super_block *sb = inode->i_sb;
 	befs_data_stream *ds = &BEFS_I(inode)->i_data.ds;
 	befs_off_t value;
@@ -265,8 +265,8 @@ befs_readdir(struct file *filp, void *dirent, filldir_t filldir)
 		result = filldir(dirent, keybuf, keysize, filp->f_pos,
 				 (ino_t) value, d_type);
 	}
-
-	filp->f_pos++;
+	if (!result)
+		filp->f_pos++;
 
 	befs_debug(sb, "<--- befs_readdir() filp->f_pos %Ld", filp->f_pos);
 
@@ -284,10 +284,15 @@ befs_alloc_inode(struct super_block *sb)
         return &bi->vfs_inode;
 }
 
-static void
-befs_destroy_inode(struct inode *inode)
+static void befs_i_callback(struct rcu_head *head)
 {
+	struct inode *inode = container_of(head, struct inode, i_rcu);
         kmem_cache_free(befs_inode_cachep, BEFS_I(inode));
+}
+
+static void befs_destroy_inode(struct inode *inode)
+{
+	call_rcu(&inode->i_rcu, befs_i_callback);
 }
 
 static void init_once(void *foo)
@@ -348,11 +353,13 @@ static struct inode *befs_iget(struct super_block *sb, unsigned long ino)
 	 */   
 
 	inode->i_uid = befs_sb->mount_opts.use_uid ?
-	    befs_sb->mount_opts.uid : (uid_t) fs32_to_cpu(sb, raw_inode->uid);
+		befs_sb->mount_opts.uid :
+		make_kuid(&init_user_ns, fs32_to_cpu(sb, raw_inode->uid));
 	inode->i_gid = befs_sb->mount_opts.use_gid ?
-	    befs_sb->mount_opts.gid : (gid_t) fs32_to_cpu(sb, raw_inode->gid);
+		befs_sb->mount_opts.gid :
+		make_kgid(&init_user_ns, fs32_to_cpu(sb, raw_inode->gid));
 
-	inode->i_nlink = 1;
+	set_nlink(inode, 1);
 
 	/*
 	 * BEFS's time is 64 bits, but current VFS is 32 bits...
@@ -384,7 +391,7 @@ static struct inode *befs_iget(struct super_block *sb, unsigned long ino)
 		int num_blks;
 
 		befs_ino->i_data.ds =
-		    fsds_to_cpu(sb, raw_inode->data.datastream);
+		    fsds_to_cpu(sb, &raw_inode->data.datastream);
 
 		num_blks = befs_count_blocks(sb, &befs_ino->i_data.ds);
 		inode->i_blocks =
@@ -436,7 +443,7 @@ befs_init_inodecache(void)
 					      init_once);
 	if (befs_inode_cachep == NULL) {
 		printk(KERN_ERR "befs_init_inodecache: "
-		       "Couldn't initalize inode slabcache\n");
+		       "Couldn't initialize inode slabcache\n");
 		return -ENOMEM;
 	}
 
@@ -450,6 +457,11 @@ befs_init_inodecache(void)
 static void
 befs_destroy_inodecache(void)
 {
+	/*
+	 * Make sure all delayed rcu free inodes are flushed before we
+	 * destroy cache.
+	 */
+	rcu_barrier();
 	kmem_cache_destroy(befs_inode_cachep);
 }
 
@@ -469,17 +481,22 @@ befs_follow_link(struct dentry *dentry, struct nameidata *nd)
 		befs_data_stream *data = &befs_ino->i_data.ds;
 		befs_off_t len = data->size;
 
-		befs_debug(sb, "Follow long symlink");
-
-		link = kmalloc(len, GFP_NOFS);
-		if (!link) {
-			link = ERR_PTR(-ENOMEM);
-		} else if (befs_read_lsymlink(sb, data, link, len) != len) {
-			kfree(link);
-			befs_error(sb, "Failed to read entire long symlink");
+		if (len == 0) {
+			befs_error(sb, "Long symlink with illegal length");
 			link = ERR_PTR(-EIO);
 		} else {
-			link[len - 1] = '\0';
+			befs_debug(sb, "Follow long symlink");
+
+			link = kmalloc(len, GFP_NOFS);
+			if (!link) {
+				link = ERR_PTR(-ENOMEM);
+			} else if (befs_read_lsymlink(sb, data, link, len) != len) {
+				kfree(link);
+				befs_error(sb, "Failed to read entire long symlink");
+				link = ERR_PTR(-EIO);
+			} else {
+				link[len - 1] = '\0';
+			}
 		}
 	} else {
 		link = befs_ino->i_data.symlink;
@@ -665,10 +682,12 @@ parse_options(char *options, befs_mount_options * opts)
 	char *p;
 	substring_t args[MAX_OPT_ARGS];
 	int option;
+	kuid_t uid;
+	kgid_t gid;
 
 	/* Initialize options */
-	opts->uid = 0;
-	opts->gid = 0;
+	opts->uid = GLOBAL_ROOT_UID;
+	opts->gid = GLOBAL_ROOT_GID;
 	opts->use_uid = 0;
 	opts->use_gid = 0;
 	opts->iocharset = NULL;
@@ -687,23 +706,29 @@ parse_options(char *options, befs_mount_options * opts)
 		case Opt_uid:
 			if (match_int(&args[0], &option))
 				return 0;
-			if (option < 0) {
+			uid = INVALID_UID;
+			if (option >= 0)
+				uid = make_kuid(current_user_ns(), option);
+			if (!uid_valid(uid)) {
 				printk(KERN_ERR "BeFS: Invalid uid %d, "
 						"using default\n", option);
 				break;
 			}
-			opts->uid = option;
+			opts->uid = uid;
 			opts->use_uid = 1;
 			break;
 		case Opt_gid:
 			if (match_int(&args[0], &option))
 				return 0;
-			if (option < 0) {
+			gid = INVALID_GID;
+			if (option >= 0)
+				gid = make_kgid(current_user_ns(), option);
+			if (!gid_valid(gid)) {
 				printk(KERN_ERR "BeFS: Invalid gid %d, "
 						"using default\n", option);
 				break;
 			}
-			opts->gid = option;
+			opts->gid = gid;
 			opts->use_gid = 1;
 			break;
 		case Opt_charset:
@@ -729,7 +754,7 @@ parse_options(char *options, befs_mount_options * opts)
 
 /* This function has the responsibiltiy of getting the
  * filesystem ready for unmounting. 
- * Basicly, we free everything that we allocated in
+ * Basically, we free everything that we allocated in
  * befs_read_inode
  */
 static void
@@ -843,9 +868,8 @@ befs_fill_super(struct super_block *sb, void *data, int silent)
 		ret = PTR_ERR(root);
 		goto unacquire_priv_sbp;
 	}
-	sb->s_root = d_alloc_root(root);
+	sb->s_root = d_make_root(root);
 	if (!sb->s_root) {
-		iput(root);
 		befs_error(sb, "get root inode failed");
 		goto unacquire_priv_sbp;
 	}
@@ -873,6 +897,7 @@ befs_fill_super(struct super_block *sb, void *data, int silent)
 	brelse(bh);
 
       unacquire_priv_sbp:
+	kfree(befs_sb->mount_opts.iocharset);
 	kfree(sb->s_fs_info);
 
       unacquire_none:
@@ -912,21 +937,21 @@ befs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	return 0;
 }
 
-static int
-befs_get_sb(struct file_system_type *fs_type, int flags, const char *dev_name,
-	    void *data, struct vfsmount *mnt)
+static struct dentry *
+befs_mount(struct file_system_type *fs_type, int flags, const char *dev_name,
+	    void *data)
 {
-	return get_sb_bdev(fs_type, flags, dev_name, data, befs_fill_super,
-			   mnt);
+	return mount_bdev(fs_type, flags, dev_name, data, befs_fill_super);
 }
 
 static struct file_system_type befs_fs_type = {
 	.owner		= THIS_MODULE,
 	.name		= "befs",
-	.get_sb		= befs_get_sb,
+	.mount		= befs_mount,
 	.kill_sb	= kill_block_super,
 	.fs_flags	= FS_REQUIRES_DEV,	
 };
+MODULE_ALIAS_FS("befs");
 
 static int __init
 init_befs_fs(void)

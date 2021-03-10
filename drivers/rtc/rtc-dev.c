@@ -11,6 +11,8 @@
  * published by the Free Software Foundation.
 */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
 #include <linux/rtc.h>
 #include <linux/sched.h>
@@ -76,7 +78,7 @@ static void rtc_uie_task(struct work_struct *work)
 	}
 	spin_unlock_irq(&rtc->irq_lock);
 	if (num)
-		rtc_update_irq(rtc, num, RTC_UF | RTC_IRQF);
+		rtc_handle_legacy_irq(rtc, num, RTC_UF);
 }
 static void rtc_uie_timer(unsigned long data)
 {
@@ -253,19 +255,7 @@ static long rtc_dev_ioctl(struct file *file,
 	if (err)
 		goto done;
 
-	/* try the driver's ioctl interface */
-	if (ops->ioctl) {
-		err = ops->ioctl(rtc->dev.parent, cmd, arg);
-		if (err != -ENOIOCTLCMD) {
-			mutex_unlock(&rtc->ops_lock);
-			return err;
-		}
-	}
-
-	/* if the driver does not provide the ioctl interface
-	 * or if that particular ioctl was not implemented
-	 * (-ENOIOCTLCMD), we will try to emulate here.
-	 *
+	/*
 	 * Drivers *SHOULD NOT* provide ioctl implementations
 	 * for these requests.  Instead, provide methods to
 	 * support the following code, so that the RTC's main
@@ -391,25 +381,6 @@ static long rtc_dev_ioctl(struct file *file,
 		err = put_user(rtc->irq_freq, (unsigned long __user *)uarg);
 		break;
 
-#if 0
-	case RTC_EPOCH_SET:
-#ifndef rtc_epoch
-		/*
-		 * There were no RTC clocks before 1900.
-		 */
-		if (arg < 1900) {
-			err = -EINVAL;
-			break;
-		}
-		rtc_epoch = arg;
-		err = 0;
-#endif
-		break;
-
-	case RTC_EPOCH_READ:
-		err = put_user(rtc_epoch, (unsigned long __user *)uarg);
-		break;
-#endif
 	case RTC_WKALM_SET:
 		mutex_unlock(&rtc->ops_lock);
 		if (copy_from_user(&alarm, uarg, sizeof(alarm)))
@@ -428,7 +399,13 @@ static long rtc_dev_ioctl(struct file *file,
 		return err;
 
 	default:
-		err = -ENOTTY;
+		/* Finally try the driver's ioctl interface */
+		if (ops->ioctl) {
+			err = ops->ioctl(rtc->dev.parent, cmd, arg);
+			if (err == -ENOIOCTLCMD)
+				err = -ENOTTY;
+		} else
+			err = -ENOTTY;
 		break;
 	}
 
@@ -487,7 +464,7 @@ void rtc_dev_prepare(struct rtc_device *rtc)
 		return;
 
 	if (rtc->id >= RTC_DEV_MAX) {
-		pr_debug("%s: too many RTC devices\n", rtc->name);
+		dev_dbg(&rtc->dev, "%s: too many RTC devices\n", rtc->name);
 		return;
 	}
 
@@ -505,10 +482,10 @@ void rtc_dev_prepare(struct rtc_device *rtc)
 void rtc_dev_add_device(struct rtc_device *rtc)
 {
 	if (cdev_add(&rtc->char_dev, rtc->dev.devt, 1))
-		printk(KERN_WARNING "%s: failed to add char device %d:%d\n",
+		dev_warn(&rtc->dev, "%s: failed to add char device %d:%d\n",
 			rtc->name, MAJOR(rtc_devt), rtc->id);
 	else
-		pr_debug("%s: dev (%d:%d)\n", rtc->name,
+		dev_dbg(&rtc->dev, "%s: dev (%d:%d)\n", rtc->name,
 			MAJOR(rtc_devt), rtc->id);
 }
 
@@ -524,8 +501,7 @@ void __init rtc_dev_init(void)
 
 	err = alloc_chrdev_region(&rtc_devt, 0, RTC_DEV_MAX, "rtc");
 	if (err < 0)
-		printk(KERN_ERR "%s: failed to allocate char dev region\n",
-			__FILE__);
+		pr_err("failed to allocate char dev region\n");
 }
 
 void __exit rtc_dev_exit(void)

@@ -13,28 +13,25 @@ enum die_val {
 	DIE_PANIC,
 	DIE_NMI,
 	DIE_DIE,
-	DIE_NMIWATCHDOG,
 	DIE_KERNELDEBUG,
 	DIE_TRAP,
 	DIE_GPF,
 	DIE_CALL,
-	DIE_NMI_IPI,
 	DIE_PAGE_FAULT,
 	DIE_NMIUNKNOWN,
-	DIE_NMIMEMPARITY,
-	DIE_NMIIOCHECK,
 };
 
-extern void printk_address(unsigned long address, int reliable);
+extern void printk_address(unsigned long address);
 extern void die(const char *, struct pt_regs *,long);
 extern int __must_check __die(const char *, struct pt_regs *, long);
-extern void show_registers(struct pt_regs *regs);
-extern void show_trace(struct task_struct *t, struct pt_regs *regs,
-		       unsigned long *sp);
 extern void __show_regs(struct pt_regs *regs, int all);
-extern void show_regs(struct pt_regs *regs);
 extern unsigned long oops_begin(void);
 extern void oops_end(unsigned long, struct pt_regs *, int signr);
+#ifdef CONFIG_KEXEC_CORE
 extern int in_crash_kexec;
+#else
+/* no crash dump is ever in progress if no crash kernel can be kexec'd */
+#define in_crash_kexec 0
+#endif
 
 #endif /* _ASM_X86_KDEBUG_H */

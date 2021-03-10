@@ -1,19 +1,15 @@
 /*
  * Range add and subtract
  */
-#include <linux/module.h>
+#include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/sort.h>
-
+#include <linux/string.h>
 #include <linux/range.h>
-
-#ifndef ARRAY_SIZE
-#define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
-#endif
 
 int add_range(struct range *range, int az, int nr_range, u64 start, u64 end)
 {
-	if (start > end)
+	if (start >= end)
 		return nr_range;
 
 	/* Out of slots: */
@@ -33,12 +29,11 @@ int add_range_with_merge(struct range *range, int az, int nr_range,
 {
 	int i;
 
-	if (start > end)
+	if (start >= end)
 		return nr_range;
 
-	/* Try to merge it with old one: */
+	/* get new start/end: */
 	for (i = 0; i < nr_range; i++) {
-		u64 final_start, final_end;
 		u64 common_start, common_end;
 
 		if (!range[i].end)
@@ -46,15 +41,19 @@ int add_range_with_merge(struct range *range, int az, int nr_range,
 
 		common_start = max(range[i].start, start);
 		common_end = min(range[i].end, end);
-		if (common_start > common_end + 1)
+		if (common_start > common_end)
 			continue;
 
-		final_start = min(range[i].start, start);
-		final_end = max(range[i].end, end);
+		/* new start/end, will add it back at last */
+		start = min(range[i].start, start);
+		end = max(range[i].end, end);
 
-		range[i].start = final_start;
-		range[i].end =  final_end;
-		return nr_range;
+		memmove(&range[i], &range[i + 1],
+			(nr_range - (i + 1)) * sizeof(range[i]));
+		range[nr_range - 1].start = 0;
+		range[nr_range - 1].end   = 0;
+		nr_range--;
+		i--;
 	}
 
 	/* Need to add it: */
@@ -65,7 +64,7 @@ void subtract_range(struct range *range, int az, u64 start, u64 end)
 {
 	int i, j;
 
-	if (start > end)
+	if (start >= end)
 		return;
 
 	for (j = 0; j < az; j++) {
@@ -79,15 +78,15 @@ void subtract_range(struct range *range, int az, u64 start, u64 end)
 		}
 
 		if (start <= range[j].start && end < range[j].end &&
-		    range[j].start < end + 1) {
-			range[j].start = end + 1;
+		    range[j].start < end) {
+			range[j].start = end;
 			continue;
 		}
 
 
 		if (start > range[j].start && end >= range[j].end &&
-		    range[j].end > start - 1) {
-			range[j].end = start - 1;
+		    range[j].end > start) {
+			range[j].end = start;
 			continue;
 		}
 
@@ -99,11 +98,12 @@ void subtract_range(struct range *range, int az, u64 start, u64 end)
 			}
 			if (i < az) {
 				range[i].end = range[j].end;
-				range[i].start = end + 1;
+				range[i].start = end;
 			} else {
-				printk(KERN_ERR "run of slot in ranges\n");
+				pr_err("%s: run out of slot in ranges\n",
+					__func__);
 			}
-			range[j].end = start - 1;
+			range[j].end = start;
 			continue;
 		}
 	}
@@ -123,7 +123,7 @@ static int cmp_range(const void *x1, const void *x2)
 
 int clean_sort_range(struct range *range, int az)
 {
-	int i, j, k = az - 1, nr_range = 0;
+	int i, j, k = az - 1, nr_range = az;
 
 	for (i = 0; i < k; i++) {
 		if (range[i].end)

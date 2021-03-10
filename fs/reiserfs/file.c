@@ -3,9 +3,9 @@
  */
 
 #include <linux/time.h>
-#include <linux/reiserfs_fs.h>
-#include <linux/reiserfs_acl.h>
-#include <linux/reiserfs_xattr.h>
+#include "reiserfs.h"
+#include "acl.h"
+#include "xattr.h"
 #include <asm/uaccess.h>
 #include <linux/pagemap.h>
 #include <linux/swap.h>
@@ -38,19 +38,23 @@ static int reiserfs_file_release(struct inode *inode, struct file *filp)
 
 	BUG_ON(!S_ISREG(inode->i_mode));
 
-	/* fast out for when nothing needs to be done */
-	if ((atomic_read(&inode->i_count) > 1 ||
-	     !(REISERFS_I(inode)->i_flags & i_pack_on_close_mask) ||
-	     !tail_has_to_be_packed(inode)) &&
-	    REISERFS_I(inode)->i_prealloc_count <= 0) {
+        if (atomic_add_unless(&REISERFS_I(inode)->openers, -1, 1))
+		return 0;
+
+	mutex_lock(&(REISERFS_I(inode)->tailpack));
+
+        if (!atomic_dec_and_test(&REISERFS_I(inode)->openers)) {
+		mutex_unlock(&(REISERFS_I(inode)->tailpack));
 		return 0;
 	}
 
-	mutex_lock(&inode->i_mutex);
-
-	mutex_lock(&(REISERFS_I(inode)->i_mmap));
-	if (REISERFS_I(inode)->i_flags & i_ever_mapped)
-		REISERFS_I(inode)->i_flags &= ~i_pack_on_close_mask;
+	/* fast out for when nothing needs to be done */
+	if ((!(REISERFS_I(inode)->i_flags & i_pack_on_close_mask) ||
+	     !tail_has_to_be_packed(inode)) &&
+	    REISERFS_I(inode)->i_prealloc_count <= 0) {
+		mutex_unlock(&(REISERFS_I(inode)->tailpack));
+		return 0;
+	}
 
 	reiserfs_write_lock(inode->i_sb);
 	/* freeing preallocation only involves relogging blocks that
@@ -94,9 +98,10 @@ static int reiserfs_file_release(struct inode *inode, struct file *filp)
 	if (!err)
 		err = jbegin_failure;
 
-	if (!err && atomic_read(&inode->i_count) <= 1 &&
+	if (!err &&
 	    (REISERFS_I(inode)->i_flags & i_pack_on_close_mask) &&
 	    tail_has_to_be_packed(inode)) {
+
 		/* if regular file is released by last holder and it has been
 		   appended (we append by unformatted node only) or its direct
 		   item(s) had to be converted, then it may have to be
@@ -104,27 +109,28 @@ static int reiserfs_file_release(struct inode *inode, struct file *filp)
 		err = reiserfs_truncate_file(inode, 0);
 	}
       out:
-	mutex_unlock(&(REISERFS_I(inode)->i_mmap));
-	mutex_unlock(&inode->i_mutex);
 	reiserfs_write_unlock(inode->i_sb);
+	mutex_unlock(&(REISERFS_I(inode)->tailpack));
 	return err;
 }
 
-static int reiserfs_file_mmap(struct file *file, struct vm_area_struct *vma)
+static int reiserfs_file_open(struct inode *inode, struct file *file)
 {
-	struct inode *inode;
-
-	inode = file->f_path.dentry->d_inode;
-	mutex_lock(&(REISERFS_I(inode)->i_mmap));
-	REISERFS_I(inode)->i_flags |= i_ever_mapped;
-	mutex_unlock(&(REISERFS_I(inode)->i_mmap));
-
-	return generic_file_mmap(file, vma);
+	int err = dquot_file_open(inode, file);
+        if (!atomic_inc_not_zero(&REISERFS_I(inode)->openers)) {
+		/* somebody might be tailpacking on final close; wait for it */
+		mutex_lock(&(REISERFS_I(inode)->tailpack));
+		atomic_inc(&REISERFS_I(inode)->openers);
+		mutex_unlock(&(REISERFS_I(inode)->tailpack));
+	}
+	return err;
 }
 
-static void reiserfs_vfs_truncate_file(struct inode *inode)
+void reiserfs_vfs_truncate_file(struct inode *inode)
 {
+	mutex_lock(&(REISERFS_I(inode)->tailpack));
 	reiserfs_truncate_file(inode, 1);
+	mutex_unlock(&(REISERFS_I(inode)->tailpack));
 }
 
 /* Sync a reiserfs file. */
@@ -134,20 +140,26 @@ static void reiserfs_vfs_truncate_file(struct inode *inode)
  * be removed...
  */
 
-static int reiserfs_sync_file(struct file *filp,
-			      struct dentry *dentry, int datasync)
+static int reiserfs_sync_file(struct file *filp, loff_t start, loff_t end,
+			      int datasync)
 {
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = filp->f_mapping->host;
 	int err;
 	int barrier_done;
 
+	err = filemap_write_and_wait_range(inode->i_mapping, start, end);
+	if (err)
+		return err;
+
+	mutex_lock(&inode->i_mutex);
 	BUG_ON(!S_ISREG(inode->i_mode));
 	err = sync_mapping_buffers(inode->i_mapping);
 	reiserfs_write_lock(inode->i_sb);
 	barrier_done = reiserfs_commit_for_inode(inode);
 	reiserfs_write_unlock(inode->i_sb);
 	if (barrier_done != 1 && reiserfs_barrier_flush(inode->i_sb))
-		blkdev_issue_flush(inode->i_sb->s_bdev, NULL);
+		blkdev_issue_flush(inode->i_sb->s_bdev, GFP_KERNEL, NULL);
+	mutex_unlock(&inode->i_mutex);
 	if (barrier_done < 0)
 		return barrier_done;
 	return (err < 0) ? -EIO : 0;
@@ -222,74 +234,15 @@ int reiserfs_commit_page(struct inode *inode, struct page *page,
 	return ret;
 }
 
-/* Write @count bytes at position @ppos in a file indicated by @file
-   from the buffer @buf.
-
-   generic_file_write() is only appropriate for filesystems that are not seeking to optimize performance and want
-   something simple that works.  It is not for serious use by general purpose filesystems, excepting the one that it was
-   written for (ext2/3).  This is for several reasons:
-
-   * It has no understanding of any filesystem specific optimizations.
-
-   * It enters the filesystem repeatedly for each page that is written.
-
-   * It depends on reiserfs_get_block() function which if implemented by reiserfs performs costly search_by_key
-   * operation for each page it is supplied with. By contrast reiserfs_file_write() feeds as much as possible at a time
-   * to reiserfs which allows for fewer tree traversals.
-
-   * Each indirect pointer insertion takes a lot of cpu, because it involves memory moves inside of blocks.
-
-   * Asking the block allocation code for blocks one at a time is slightly less efficient.
-
-   All of these reasons for not using only generic file write were understood back when reiserfs was first miscoded to
-   use it, but we were in a hurry to make code freeze, and so it couldn't be revised then.  This new code should make
-   things right finally.
-
-   Future Features: providing search_by_key with hints.
-
-*/
-static ssize_t reiserfs_file_write(struct file *file,	/* the file we are going to write into */
-				   const char __user * buf,	/*  pointer to user supplied data
-								   (in userspace) */
-				   size_t count,	/* amount of bytes to write */
-				   loff_t * ppos	/* pointer to position in file that we start writing at. Should be updated to
-							 * new current position before returning. */
-				   )
-{
-	struct inode *inode = file->f_path.dentry->d_inode;	// Inode of the file that we are writing to.
-	/* To simplify coding at this time, we store
-	   locked pages in array for now */
-	struct reiserfs_transaction_handle th;
-	th.t_trans_id = 0;
-
-	/* If a filesystem is converted from 3.5 to 3.6, we'll have v3.5 items
-	* lying around (most of the disk, in fact). Despite the filesystem
-	* now being a v3.6 format, the old items still can't support large
-	* file sizes. Catch this case here, as the rest of the VFS layer is
-	* oblivious to the different limitations between old and new items.
-	* reiserfs_setattr catches this for truncates. This chunk is lifted
-	* from generic_write_checks. */
-	if (get_inode_item_key_version (inode) == KEY_FORMAT_3_5 &&
-	    *ppos + count > MAX_NON_LFS) {
-		if (*ppos >= MAX_NON_LFS) {
-			return -EFBIG;
-		}
-		if (count > MAX_NON_LFS - (unsigned long)*ppos)
-			count = MAX_NON_LFS - (unsigned long)*ppos;
-	}
-
-	return do_sync_write(file, buf, count, ppos);
-}
-
 const struct file_operations reiserfs_file_operations = {
 	.read = do_sync_read,
-	.write = reiserfs_file_write,
-	.ioctl = reiserfs_ioctl,
+	.write = do_sync_write,
+	.unlocked_ioctl = reiserfs_ioctl,
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = reiserfs_compat_ioctl,
 #endif
-	.mmap = reiserfs_file_mmap,
-	.open = generic_file_open,
+	.mmap = generic_file_mmap,
+	.open = reiserfs_file_open,
 	.release = reiserfs_file_release,
 	.fsync = reiserfs_sync_file,
 	.aio_read = generic_file_aio_read,
@@ -300,11 +253,11 @@ const struct file_operations reiserfs_file_operations = {
 };
 
 const struct inode_operations reiserfs_file_inode_operations = {
-	.truncate = reiserfs_vfs_truncate_file,
 	.setattr = reiserfs_setattr,
 	.setxattr = reiserfs_setxattr,
 	.getxattr = reiserfs_getxattr,
 	.listxattr = reiserfs_listxattr,
 	.removexattr = reiserfs_removexattr,
 	.permission = reiserfs_permission,
+	.get_acl = reiserfs_get_acl,
 };

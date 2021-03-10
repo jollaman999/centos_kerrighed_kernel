@@ -6,8 +6,6 @@
 
 #include <linux/types.h>
 
-extern int nobp_flag;
-extern int gmb_flag;
 extern int nospec_disable;
 
 void nospec_init_branches(void);

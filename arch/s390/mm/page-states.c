@@ -10,6 +10,7 @@
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/mm.h>
+#include <linux/gfp.h>
 #include <linux/init.h>
 #include <asm/setup.h>
 #include <asm/ipl.h>

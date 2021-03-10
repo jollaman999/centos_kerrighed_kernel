@@ -20,19 +20,20 @@
 static int efs_statfs(struct dentry *dentry, struct kstatfs *buf);
 static int efs_fill_super(struct super_block *s, void *d, int silent);
 
-static int efs_get_sb(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
+static struct dentry *efs_mount(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data)
 {
-	return get_sb_bdev(fs_type, flags, dev_name, data, efs_fill_super, mnt);
+	return mount_bdev(fs_type, flags, dev_name, data, efs_fill_super);
 }
 
 static struct file_system_type efs_fs_type = {
 	.owner		= THIS_MODULE,
 	.name		= "efs",
-	.get_sb		= efs_get_sb,
+	.mount		= efs_mount,
 	.kill_sb	= kill_block_super,
 	.fs_flags	= FS_REQUIRES_DEV,
 };
+MODULE_ALIAS_FS("efs");
 
 static struct pt_types sgi_pt_types[] = {
 	{0x00,		"SGI vh"},
@@ -65,9 +66,15 @@ static struct inode *efs_alloc_inode(struct super_block *sb)
 	return &ei->vfs_inode;
 }
 
+static void efs_i_callback(struct rcu_head *head)
+{
+	struct inode *inode = container_of(head, struct inode, i_rcu);
+	kmem_cache_free(efs_inode_cachep, INODE_INFO(inode));
+}
+
 static void efs_destroy_inode(struct inode *inode)
 {
-	kmem_cache_free(efs_inode_cachep, INODE_INFO(inode));
+	call_rcu(&inode->i_rcu, efs_i_callback);
 }
 
 static void init_once(void *foo)
@@ -81,8 +88,8 @@ static int init_inodecache(void)
 {
 	efs_inode_cachep = kmem_cache_create("efs_inode_cache",
 				sizeof(struct efs_inode_info),
-				0, SLAB_RECLAIM_ACCOUNT|SLAB_MEM_SPREAD,
-				init_once);
+				0, SLAB_RECLAIM_ACCOUNT|SLAB_MEM_SPREAD|
+				SLAB_ACCOUNT, init_once);
 	if (efs_inode_cachep == NULL)
 		return -ENOMEM;
 	return 0;
@@ -90,6 +97,11 @@ static int init_inodecache(void)
 
 static void destroy_inodecache(void)
 {
+	/*
+	 * Make sure all delayed rcu free inodes are flushed before we
+	 * destroy cache.
+	 */
+	rcu_barrier();
 	kmem_cache_destroy(efs_inode_cachep);
 }
 
@@ -311,10 +323,9 @@ static int efs_fill_super(struct super_block *s, void *d, int silent)
 		goto out_no_fs;
 	}
 
-	s->s_root = d_alloc_root(root);
+	s->s_root = d_make_root(root);
 	if (!(s->s_root)) {
 		printk(KERN_ERR "EFS: get root dentry failed\n");
-		iput(root);
 		ret = -ENOMEM;
 		goto out_no_fs;
 	}

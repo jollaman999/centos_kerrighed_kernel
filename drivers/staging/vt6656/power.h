@@ -18,7 +18,7 @@
  *
  * File: power.h
  *
- * Purpose: Handles 802.11 power managment  functions
+ * Purpose: Handles 802.11 power management  functions
  *
  * Author: Lyndon Chen
  *
@@ -29,56 +29,19 @@
 #ifndef __POWER_H__
 #define __POWER_H__
 
-
-/*---------------------  Export Definitions -------------------------*/
 #define     C_PWBT                   1000      // micro sec. power up before TBTT
 #define     PS_FAST_INTERVAL         1         // Fast power saving listen interval
 #define     PS_MAX_INTERVAL          4         // MAX power saving listen interval
 
-/*---------------------  Export Classes  ----------------------------*/
+/*  PSDevice pDevice */
+/*  PSDevice hDeviceContext */
 
-/*---------------------  Export Variables  --------------------------*/
+int PSbConsiderPowerDown(struct vnt_private *, int bCheckRxDMA,
+	int bCheckCountToWakeUp);
+void PSvDisablePowerSaving(struct vnt_private *);
+void PSvEnablePowerSaving(struct vnt_private *, u16 wListenInterval);
+void PSvSendPSPOLL(struct vnt_private *);
+int PSbSendNullPacket(struct vnt_private *);
+int PSbIsNextTBTTWakeUp(struct vnt_private *);
 
-
-/*---------------------  Export Types  ------------------------------*/
-
-
-/*---------------------  Export Functions  --------------------------*/
-
-// IN PSDevice pDevice
-// IN PSDevice hDeviceContext
-
-BOOL
-PSbConsiderPowerDown(
-    IN HANDLE hDeviceContext,
-    IN BOOL bCheckRxDMA,
-    IN BOOL bCheckCountToWakeUp
-    );
-
-VOID
-PSvDisablePowerSaving(
-    IN HANDLE hDeviceContext
-    );
-
-VOID
-PSvEnablePowerSaving(
-    IN HANDLE hDeviceContext,
-    IN WORD wListenInterval
-    );
-
-VOID
-PSvSendPSPOLL(
-    IN HANDLE hDeviceContext
-    );
-
-BOOL
-PSbSendNullPacket(
-    IN HANDLE hDeviceContext
-    );
-
-BOOL
-PSbIsNextTBTTWakeUp(
-    IN HANDLE hDeviceContext
-    );
-
-#endif //__POWER_H__
+#endif /* __POWER_H__ */

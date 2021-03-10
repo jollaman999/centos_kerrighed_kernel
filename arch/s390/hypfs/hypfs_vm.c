@@ -1,7 +1,7 @@
 /*
  *    Hypervisor filesystem for Linux on s390. z/VM implementation.
  *
- *    Copyright (C) IBM Corp. 2006
+ *    Copyright IBM Corp. 2006
  *    Author(s): Michael Holzheu <holzheu@de.ibm.com>
  */
 
@@ -9,6 +9,7 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/vmalloc.h>
+#include <asm/diag.h>
 #include <asm/ebcdic.h>
 #include <asm/timex.h>
 #include "hypfs.h"
@@ -66,6 +67,7 @@ static int diag2fc(int size, char* query, void *addr)
 	memset(parm_list.aci_grp, 0x40, NAME_LEN);
 	rc = -1;
 
+	diag_stat_inc(DIAG_STAT_X2FC);
 	asm volatile(
 		"	diag    %0,%1,0x2fc\n"
 		"0:\n"
@@ -227,7 +229,7 @@ failed:
 struct dbfs_d2fc_hdr {
 	u64	len;		/* Length of d2fc buffer without header */
 	u16	version;	/* Version of header */
-	char	tod_ext[16];	/* TOD clock for d2fc */
+	char	tod_ext[STORE_CLOCK_EXT_SIZE]; /* TOD clock for d2fc */
 	u64	count;		/* Number of VM guests in d2fc buffer */
 	char	reserved[30];
 } __attribute__ ((packed));
@@ -245,7 +247,7 @@ static int dbfs_diag2fc_create(void **data, void **data_free_ptr, size_t *size)
 	d2fc = diag2fc_store(guest_query, &count, sizeof(d2fc->hdr));
 	if (IS_ERR(d2fc))
 		return PTR_ERR(d2fc);
-	get_clock_ext(d2fc->hdr.tod_ext);
+	get_tod_clock_ext(d2fc->hdr.tod_ext);
 	d2fc->hdr.len = count * sizeof(struct diag2fc_data);
 	d2fc->hdr.version = DBFS_D2FC_HDR_VERSION;
 	d2fc->hdr.count = count;

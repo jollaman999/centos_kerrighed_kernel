@@ -29,12 +29,11 @@
  * General Public License for more details.
  *
  * Documentation:
- *	Not publically available.
+ *	Not publicly available.
  */
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <scsi/scsi_host.h>
@@ -90,48 +89,12 @@ static void cs5520_set_timings(struct ata_port *ap, struct ata_device *adev, int
 }
 
 /**
- *	cs5520_enable_dma	-	turn on DMA bits
- *
- *	Turn on the DMA bits for this disk. Needed because the BIOS probably
- *	has not done the work for us. Belongs in the core SATA code.
- */
-
-static void cs5520_enable_dma(struct ata_port *ap, struct ata_device *adev)
-{
-	/* Set the DMA enable/disable flag */
-	u8 reg = ioread8(ap->ioaddr.bmdma_addr + 0x02);
-	reg |= 1<<(adev->devno + 5);
-	iowrite8(reg, ap->ioaddr.bmdma_addr + 0x02);
-}
-
-/**
- *	cs5520_set_dmamode	-	program DMA timings
- *	@ap: ATA port
- *	@adev: ATA device
- *
- *	Program the DMA mode timings for the controller according to the pio
- *	clocking table. Note that this device sets the DMA timings to PIO
- *	mode values. This may seem bizarre but the 5520 architecture talks
- *	PIO mode to the disk and DMA mode to the controller so the underlying
- *	transfers are PIO timed.
- */
-
-static void cs5520_set_dmamode(struct ata_port *ap, struct ata_device *adev)
-{
-	static const int dma_xlate[3] = { XFER_PIO_0, XFER_PIO_3, XFER_PIO_4 };
-	cs5520_set_timings(ap, adev, dma_xlate[adev->dma_mode]);
-	cs5520_enable_dma(ap, adev);
-}
-
-/**
  *	cs5520_set_piomode	-	program PIO timings
  *	@ap: ATA port
  *	@adev: ATA device
  *
  *	Program the PIO mode timings for the controller according to the pio
- *	clocking table. We know pio_mode will equal dma_mode because of the
- *	CS5520 architecture. At least once we turned DMA on and wrote a
- *	mode setter.
+ *	clocking table.
  */
 
 static void cs5520_set_piomode(struct ata_port *ap, struct ata_device *adev)
@@ -146,13 +109,12 @@ static struct scsi_host_template cs5520_sht = {
 
 static struct ata_port_operations cs5520_port_ops = {
 	.inherits		= &ata_bmdma_port_ops,
-	.qc_prep		= ata_sff_dumb_qc_prep,
+	.qc_prep		= ata_bmdma_dumb_qc_prep,
 	.cable_detect		= ata_cable_40wire,
 	.set_piomode		= cs5520_set_piomode,
-	.set_dmamode		= cs5520_set_dmamode,
 };
 
-static int __devinit cs5520_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+static int cs5520_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	static const unsigned int cmd_port[] = { 0x1F0, 0x170 };
 	static const unsigned int ctl_port[] = { 0x3F6, 0x376 };
@@ -186,8 +148,7 @@ static int __devinit cs5520_init_one(struct pci_dev *pdev, const struct pci_devi
 		ppi[1] = &pi;
 
 	if ((pcicfg & 0x40) == 0) {
-		dev_printk(KERN_WARNING, &pdev->dev,
-			   "DMA mode disabled. Enabling.\n");
+		dev_warn(&pdev->dev, "DMA mode disabled. Enabling.\n");
 		pci_write_config_byte(pdev, 0x60, pcicfg | 0x40);
 	}
 
@@ -258,7 +219,7 @@ static int __devinit cs5520_init_one(struct pci_dev *pdev, const struct pci_devi
 			continue;
 
 		rc = devm_request_irq(&pdev->dev, irq[ap->port_no],
-				      ata_sff_interrupt, 0, DRV_NAME, host);
+				      ata_bmdma_interrupt, 0, DRV_NAME, host);
 		if (rc)
 			return rc;
 
@@ -340,22 +301,10 @@ static struct pci_driver cs5520_pci_driver = {
 #endif
 };
 
-static int __init cs5520_init(void)
-{
-	return pci_register_driver(&cs5520_pci_driver);
-}
-
-static void __exit cs5520_exit(void)
-{
-	pci_unregister_driver(&cs5520_pci_driver);
-}
+module_pci_driver(cs5520_pci_driver);
 
 MODULE_AUTHOR("Alan Cox");
 MODULE_DESCRIPTION("low-level driver for Cyrix CS5510/5520");
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, pata_cs5520);
 MODULE_VERSION(DRV_VERSION);
-
-module_init(cs5520_init);
-module_exit(cs5520_exit);
-

@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -45,9 +45,70 @@
 #include "accommon.h"
 #include "acdispat.h"
 #include "acinterp.h"
+#include "amlcode.h"
 
 #define _COMPONENT          ACPI_EXECUTER
 ACPI_MODULE_NAME("exfield")
+
+/* Local prototypes */
+static u32
+acpi_ex_get_serial_access_length(u32 accessor_type, u32 access_length);
+
+/*******************************************************************************
+ *
+ * FUNCTION:    acpi_get_serial_access_bytes
+ *
+ * PARAMETERS:  accessor_type   - The type of the protocol indicated by region
+ *                                field access attributes
+ *              access_length   - The access length of the region field
+ *
+ * RETURN:      Decoded access length
+ *
+ * DESCRIPTION: This routine returns the length of the generic_serial_bus
+ *              protocol bytes
+ *
+ ******************************************************************************/
+
+static u32
+acpi_ex_get_serial_access_length(u32 accessor_type, u32 access_length)
+{
+	u32 length;
+
+	switch (accessor_type) {
+	case AML_FIELD_ATTRIB_QUICK:
+
+		length = 0;
+		break;
+
+	case AML_FIELD_ATTRIB_SEND_RCV:
+	case AML_FIELD_ATTRIB_BYTE:
+
+		length = 1;
+		break;
+
+	case AML_FIELD_ATTRIB_WORD:
+	case AML_FIELD_ATTRIB_WORD_CALL:
+
+		length = 2;
+		break;
+
+	case AML_FIELD_ATTRIB_MULTIBYTE:
+	case AML_FIELD_ATTRIB_RAW_BYTES:
+	case AML_FIELD_ATTRIB_RAW_PROCESS:
+
+		length = access_length;
+		break;
+
+	case AML_FIELD_ATTRIB_BLOCK:
+	case AML_FIELD_ATTRIB_BLOCK_CALL:
+	default:
+
+		length = ACPI_GSBUS_BUFFER_SIZE;
+		break;
+	}
+
+	return (length);
+}
 
 /*******************************************************************************
  *
@@ -59,12 +120,13 @@ ACPI_MODULE_NAME("exfield")
  *
  * RETURN:      Status
  *
- * DESCRIPTION: Read from a named field.  Returns either an Integer or a
+ * DESCRIPTION: Read from a named field. Returns either an Integer or a
  *              Buffer, depending on the size of the field.
  *
  ******************************************************************************/
+
 acpi_status
-acpi_ex_read_data_from_field(struct acpi_walk_state *walk_state,
+acpi_ex_read_data_from_field(struct acpi_walk_state * walk_state,
 			     union acpi_operand_object *obj_desc,
 			     union acpi_operand_object **ret_buffer_desc)
 {
@@ -73,6 +135,7 @@ acpi_ex_read_data_from_field(struct acpi_walk_state *walk_state,
 	acpi_size length;
 	void *buffer;
 	u32 function;
+	u16 accessor_type;
 
 	ACPI_FUNCTION_TRACE_PTR(ex_read_data_from_field, obj_desc);
 
@@ -100,18 +163,38 @@ acpi_ex_read_data_from_field(struct acpi_walk_state *walk_state,
 		   (obj_desc->field.region_obj->region.space_id ==
 		    ACPI_ADR_SPACE_SMBUS
 		    || obj_desc->field.region_obj->region.space_id ==
+		    ACPI_ADR_SPACE_GSBUS
+		    || obj_desc->field.region_obj->region.space_id ==
 		    ACPI_ADR_SPACE_IPMI)) {
 		/*
-		 * This is an SMBus or IPMI read. We must create a buffer to hold
+		 * This is an SMBus, GSBus or IPMI read. We must create a buffer to hold
 		 * the data and then directly access the region handler.
 		 *
-		 * Note: Smbus protocol value is passed in upper 16-bits of Function
+		 * Note: SMBus and GSBus protocol value is passed in upper 16-bits of Function
 		 */
 		if (obj_desc->field.region_obj->region.space_id ==
 		    ACPI_ADR_SPACE_SMBUS) {
 			length = ACPI_SMBUS_BUFFER_SIZE;
 			function =
 			    ACPI_READ | (obj_desc->field.attribute << 16);
+		} else if (obj_desc->field.region_obj->region.space_id ==
+			   ACPI_ADR_SPACE_GSBUS) {
+			accessor_type = obj_desc->field.attribute;
+			length = acpi_ex_get_serial_access_length(accessor_type,
+								  obj_desc->
+								  field.
+								  access_length);
+
+			/*
+			 * Add additional 2 bytes for modeled generic_serial_bus data buffer:
+			 * typedef struct {
+			 *     BYTEStatus; // Byte 0 of the data buffer
+			 *     BYTELength; // Byte 1 of the data buffer
+			 *     BYTE[x-1]Data; // Bytes 2-x of the arbitrary length data buffer,
+			 * }
+			 */
+			length += 2;
+			function = ACPI_READ | (accessor_type << 16);
 		} else {	/* IPMI */
 
 			length = ACPI_IPMI_BUFFER_SIZE;
@@ -130,7 +213,7 @@ acpi_ex_read_data_from_field(struct acpi_walk_state *walk_state,
 		/* Call the region handler for the read */
 
 		status = acpi_ex_access_region(obj_desc, 0,
-					       ACPI_CAST_PTR(acpi_integer,
+					       ACPI_CAST_PTR(u64,
 							     buffer_desc->
 							     buffer.pointer),
 					       function);
@@ -141,8 +224,8 @@ acpi_ex_read_data_from_field(struct acpi_walk_state *walk_state,
 	/*
 	 * Allocate a buffer for the contents of the field.
 	 *
-	 * If the field is larger than the size of an acpi_integer, create
-	 * a BUFFER to hold it.  Otherwise, use an INTEGER.  This allows
+	 * If the field is larger than the current integer width, create
+	 * a BUFFER to hold it. Otherwise, use an INTEGER. This allows
 	 * the use of arithmetic operators on the returned value if the
 	 * field size is equal or smaller than an Integer.
 	 *
@@ -162,13 +245,12 @@ acpi_ex_read_data_from_field(struct acpi_walk_state *walk_state,
 	} else {
 		/* Field will fit within an Integer (normal case) */
 
-		buffer_desc = acpi_ut_create_internal_object(ACPI_TYPE_INTEGER);
+		buffer_desc = acpi_ut_create_integer_object((u64) 0);
 		if (!buffer_desc) {
 			return_ACPI_STATUS(AE_NO_MEMORY);
 		}
 
 		length = acpi_gbl_integer_byte_width;
-		buffer_desc->integer.value = 0;
 		buffer = &buffer_desc->integer.value;
 	}
 
@@ -225,6 +307,7 @@ acpi_ex_write_data_to_field(union acpi_operand_object *source_desc,
 	void *buffer;
 	union acpi_operand_object *buffer_desc;
 	u32 function;
+	u16 accessor_type;
 
 	ACPI_FUNCTION_TRACE_PTR(ex_write_data_to_field, obj_desc);
 
@@ -249,21 +332,23 @@ acpi_ex_write_data_to_field(union acpi_operand_object *source_desc,
 		   (obj_desc->field.region_obj->region.space_id ==
 		    ACPI_ADR_SPACE_SMBUS
 		    || obj_desc->field.region_obj->region.space_id ==
+		    ACPI_ADR_SPACE_GSBUS
+		    || obj_desc->field.region_obj->region.space_id ==
 		    ACPI_ADR_SPACE_IPMI)) {
 		/*
-		 * This is an SMBus or IPMI write. We will bypass the entire field
+		 * This is an SMBus, GSBus or IPMI write. We will bypass the entire field
 		 * mechanism and handoff the buffer directly to the handler. For
 		 * these address spaces, the buffer is bi-directional; on a write,
 		 * return data is returned in the same buffer.
 		 *
 		 * Source must be a buffer of sufficient size:
-		 * ACPI_SMBUS_BUFFER_SIZE or ACPI_IPMI_BUFFER_SIZE.
+		 * ACPI_SMBUS_BUFFER_SIZE, ACPI_GSBUS_BUFFER_SIZE, or ACPI_IPMI_BUFFER_SIZE.
 		 *
-		 * Note: SMBus protocol type is passed in upper 16-bits of Function
+		 * Note: SMBus and GSBus protocol type is passed in upper 16-bits of Function
 		 */
 		if (source_desc->common.type != ACPI_TYPE_BUFFER) {
 			ACPI_ERROR((AE_INFO,
-				    "SMBus or IPMI write requires Buffer, found type %s",
+				    "SMBus/IPMI/GenericSerialBus write requires Buffer, found type %s",
 				    acpi_ut_get_object_type_name(source_desc)));
 
 			return_ACPI_STATUS(AE_AML_OPERAND_TYPE);
@@ -274,6 +359,24 @@ acpi_ex_write_data_to_field(union acpi_operand_object *source_desc,
 			length = ACPI_SMBUS_BUFFER_SIZE;
 			function =
 			    ACPI_WRITE | (obj_desc->field.attribute << 16);
+		} else if (obj_desc->field.region_obj->region.space_id ==
+			   ACPI_ADR_SPACE_GSBUS) {
+			accessor_type = obj_desc->field.attribute;
+			length = acpi_ex_get_serial_access_length(accessor_type,
+								  obj_desc->
+								  field.
+								  access_length);
+
+			/*
+			 * Add additional 2 bytes for modeled generic_serial_bus data buffer:
+			 * typedef struct {
+			 *     BYTEStatus; // Byte 0 of the data buffer
+			 *     BYTELength; // Byte 1 of the data buffer
+			 *     BYTE[x-1]Data; // Bytes 2-x of the arbitrary length data buffer,
+			 * }
+			 */
+			length += 2;
+			function = ACPI_WRITE | (accessor_type << 16);
 		} else {	/* IPMI */
 
 			length = ACPI_IPMI_BUFFER_SIZE;
@@ -282,7 +385,7 @@ acpi_ex_write_data_to_field(union acpi_operand_object *source_desc,
 
 		if (source_desc->buffer.length < length) {
 			ACPI_ERROR((AE_INFO,
-				    "SMBus or IPMI write requires Buffer of length %u, found length %u",
+				    "SMBus/IPMI/GenericSerialBus write requires Buffer of length %u, found length %u",
 				    length, source_desc->buffer.length));
 
 			return_ACPI_STATUS(AE_AML_BUFFER_LIMIT);
@@ -296,7 +399,7 @@ acpi_ex_write_data_to_field(union acpi_operand_object *source_desc,
 		}
 
 		buffer = buffer_desc->buffer.pointer;
-		ACPI_MEMCPY(buffer, source_desc->buffer.pointer, length);
+		memcpy(buffer, source_desc->buffer.pointer, length);
 
 		/* Lock entire transaction if requested */
 
@@ -307,8 +410,7 @@ acpi_ex_write_data_to_field(union acpi_operand_object *source_desc,
 		 * same buffer)
 		 */
 		status = acpi_ex_access_region(obj_desc, 0,
-					       (acpi_integer *) buffer,
-					       function);
+					       (u64 *) buffer, function);
 		acpi_ex_release_global_lock(obj_desc->common_field.field_flags);
 
 		*result_desc = buffer_desc;
@@ -319,21 +421,25 @@ acpi_ex_write_data_to_field(union acpi_operand_object *source_desc,
 
 	switch (source_desc->common.type) {
 	case ACPI_TYPE_INTEGER:
+
 		buffer = &source_desc->integer.value;
 		length = sizeof(source_desc->integer.value);
 		break;
 
 	case ACPI_TYPE_BUFFER:
+
 		buffer = source_desc->buffer.pointer;
 		length = source_desc->buffer.length;
 		break;
 
 	case ACPI_TYPE_STRING:
+
 		buffer = source_desc->string.pointer;
 		length = source_desc->string.length;
 		break;
 
 	default:
+
 		return_ACPI_STATUS(AE_AML_OPERAND_TYPE);
 	}
 

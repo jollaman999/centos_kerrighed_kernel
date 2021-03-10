@@ -3,33 +3,24 @@
 #ifdef __KERNEL__
 
 
-struct sys_device;
+struct device;
 struct device_node;
 
 #ifdef CONFIG_NUMA
 
 /*
- * Before going off node we want the VM to try and reclaim from the local
- * node. It does this if the remote distance is larger than RECLAIM_DISTANCE.
- * With the default REMOTE_DISTANCE of 20 and the default RECLAIM_DISTANCE of
- * 20, we never reclaim and go off node straight away.
- *
- * To fix this we choose a smaller value of RECLAIM_DISTANCE.
+ * If zone_reclaim_mode is enabled, a RECLAIM_DISTANCE of 10 will mean that
+ * all zones on all nodes will be eligible for zone_reclaim().
  */
 #define RECLAIM_DISTANCE 10
 
 #include <asm/mmzone.h>
 
-static inline int cpu_to_node(int cpu)
-{
-	return numa_cpu_lookup_table[cpu];
-}
-
 #define parent_node(node)	(node)
 
-#define cpumask_of_node(node) (&numa_cpumask_lookup_table[node])
-
-int of_node_to_nid(struct device_node *device);
+#define cpumask_of_node(node) ((node) == -1 ?				\
+			       cpu_all_mask :				\
+			       node_to_cpumask_map[node])
 
 struct pci_bus;
 #ifdef CONFIG_PCI
@@ -45,43 +36,44 @@ static inline int pcibus_to_node(struct pci_bus *bus)
 				 cpu_all_mask :				\
 				 cpumask_of_node(pcibus_to_node(bus)))
 
-/* sched_domains SD_NODE_INIT for PPC64 machines */
-#define SD_NODE_INIT (struct sched_domain) {		\
-	.parent			= NULL,			\
-	.child			= NULL,			\
-	.groups			= NULL,			\
-	.min_interval		= 8,			\
-	.max_interval		= 32,			\
-	.busy_factor		= 32,			\
-	.imbalance_pct		= 125,			\
-	.cache_nice_tries	= 1,			\
-	.busy_idx		= 3,			\
-	.idle_idx		= 1,			\
-	.newidle_idx		= 0,			\
-	.wake_idx		= 0,			\
-	.flags			= SD_LOAD_BALANCE	\
-				| SD_BALANCE_EXEC	\
-				| SD_BALANCE_FORK	\
-				| SD_BALANCE_NEWIDLE	\
-				| SD_SERIALIZE,		\
-	.last_balance		= jiffies,		\
-	.balance_interval	= 1,			\
-	.nr_balance_failed	= 0,			\
-	.max_newidle_lb_cost	= 0,			\
-	.next_decay_max_lb_cost	= jiffies,		\
-}
-
 extern int __node_distance(int, int);
 #define node_distance(a, b) __node_distance(a, b)
 
 extern void __init dump_numa_cpu_topology(void);
 
-extern int sysfs_add_device_to_node(struct sys_device *dev, int nid);
-extern void sysfs_remove_device_from_node(struct sys_device *dev, int nid);
+extern int sysfs_add_device_to_node(struct device *dev, int nid);
+extern void sysfs_remove_device_from_node(struct device *dev, int nid);
 
-#ifdef CONFIG_PPC_SPLPAR
+static inline void update_numa_cpu_lookup_table(unsigned int cpu, int node)
+{
+	numa_cpu_lookup_table[cpu] = node;
+}
+
+#else
+
+static inline void dump_numa_cpu_topology(void) {}
+
+static inline int sysfs_add_device_to_node(struct device *dev, int nid)
+{
+	return 0;
+}
+
+static inline void sysfs_remove_device_from_node(struct device *dev,
+						int nid)
+{
+}
+
+static inline void update_numa_cpu_lookup_table(unsigned int cpu, int node) {}
+
+#endif /* CONFIG_NUMA */
+
+#if defined(CONFIG_NUMA) && defined(CONFIG_PPC_SPLPAR)
 extern int start_topology_update(void);
 extern int stop_topology_update(void);
+extern int prrn_is_enabled(void);
+extern int find_and_online_cpu_nid(int cpu);
+extern int timed_topology_update(int nsecs);
+extern void __init shared_proc_topology_init(void);
 #else
 static inline int start_topology_update(void)
 {
@@ -91,26 +83,23 @@ static inline int stop_topology_update(void)
 {
 	return 0;
 }
-#endif /* CONFIG_PPC_SPLPAR */
-#else
-
-static inline int of_node_to_nid(struct device_node *device)
+static inline int prrn_is_enabled(void)
+{
+	return 0;
+}
+static inline int find_and_online_cpu_nid(int cpu)
+{
+	return 0;
+}
+static inline int timed_topology_update(int nsecs)
 {
 	return 0;
 }
 
-static inline void dump_numa_cpu_topology(void) {}
-
-static inline int sysfs_add_device_to_node(struct sys_device *dev, int nid)
-{
-	return 0;
-}
-
-static inline void sysfs_remove_device_from_node(struct sys_device *dev,
-						int nid)
-{
-}
-#endif /* CONFIG_NUMA */
+#ifdef CONFIG_SMP
+static inline void shared_proc_topology_init(void) {}
+#endif
+#endif /* CONFIG_NUMA && CONFIG_PPC_SPLPAR */
 
 #include <asm-generic/topology.h>
 
@@ -121,8 +110,15 @@ static inline void sysfs_remove_device_from_node(struct sys_device *dev,
 #ifdef CONFIG_PPC64
 #include <asm/smp.h>
 
-#define topology_thread_cpumask(cpu)	(&per_cpu(cpu_sibling_map, cpu))
-#define topology_core_cpumask(cpu)	(&per_cpu(cpu_core_map, cpu))
+#ifdef CONFIG_PPC_SPLPAR
+int get_physical_package_id(int cpu);
+#define topology_physical_package_id(cpu)	(get_physical_package_id(cpu))
+#else
+#define topology_physical_package_id(cpu)	(cpu_to_chip_id(cpu))
+#endif
+
+#define topology_sibling_cpumask(cpu)	(per_cpu(cpu_sibling_map, cpu))
+#define topology_core_cpumask(cpu)	(per_cpu(cpu_core_map, cpu))
 #define topology_core_id(cpu)		(cpu_to_core_id(cpu))
 #endif
 #endif

@@ -1321,21 +1321,19 @@ static void adm8211_bss_info_changed(struct ieee80211_hw *dev,
 }
 
 static u64 adm8211_prepare_multicast(struct ieee80211_hw *hw,
-				     int mc_count, struct dev_addr_list *ha)
+				     struct netdev_hw_addr_list *mc_list)
 {
-	unsigned int bit_nr, i;
+	unsigned int bit_nr;
 	u32 mc_filter[2];
+	struct netdev_hw_addr *ha;
 
 	mc_filter[1] = mc_filter[0] = 0;
 
-	for (i = 0; i < mc_count; i++) {
-		if (!ha)
-			break;
-		bit_nr = ether_crc(ETH_ALEN, ha->dmi_addr) >> 26;
+	netdev_hw_addr_list_for_each(ha, mc_list) {
+		bit_nr = ether_crc(ETH_ALEN, ha->addr) >> 26;
 
 		bit_nr &= 0x3F;
 		mc_filter[bit_nr >> 5] |= 1 << (bit_nr & 31);
-		ha = ha->next;
 	}
 
 	return mc_filter[0] | ((u64)(mc_filter[1]) << 32);
@@ -1377,9 +1375,9 @@ static void adm8211_configure_filter(struct ieee80211_hw *dev,
 	ADM8211_CSR_READ(NAR);
 
 	if (priv->nar & ADM8211_NAR_PR)
-		ieee80211_hw_set(dev, RX_INCLUDES_FCS);
+		dev->flags |= IEEE80211_HW_RX_INCLUDES_FCS;
 	else
-		__clear_bit(IEEE80211_HW_RX_INCLUDES_FCS, dev->flags);
+		dev->flags &= ~IEEE80211_HW_RX_INCLUDES_FCS;
 
 	if (*total_flags & FIF_BCN_PRBRESP_PROMISC)
 		adm8211_set_bssid(dev, bcast);
@@ -1743,8 +1741,7 @@ static int adm8211_alloc_rings(struct ieee80211_hw *dev)
 		return -ENOMEM;
 	}
 
-	priv->tx_ring = (struct adm8211_desc *)(priv->rx_ring +
-						priv->rx_ring_size);
+	priv->tx_ring = priv->rx_ring + priv->rx_ring_size;
 	priv->tx_ring_dma = priv->rx_ring_dma +
 			    sizeof(struct adm8211_desc) * priv->rx_ring_size;
 
@@ -1765,7 +1762,7 @@ static const struct ieee80211_ops adm8211_ops = {
 	.get_tsf		= adm8211_get_tsft
 };
 
-static int __devinit adm8211_probe(struct pci_dev *pdev,
+static int adm8211_probe(struct pci_dev *pdev,
 				   const struct pci_device_id *id)
 {
 	struct ieee80211_hw *dev;
@@ -1860,15 +1857,16 @@ static int __devinit adm8211_probe(struct pci_dev *pdev,
 	if (!is_valid_ether_addr(perm_addr)) {
 		printk(KERN_WARNING "%s (adm8211): Invalid hwaddr in EEPROM!\n",
 		       pci_name(pdev));
-		random_ether_addr(perm_addr);
+		eth_random_addr(perm_addr);
 	}
 	SET_IEEE80211_PERM_ADDR(dev, perm_addr);
 
 	dev->extra_tx_headroom = sizeof(struct adm8211_tx_hdr);
-	/* dev->flags = RX_INCLUDES_FCS in promisc mode */
-	ieee80211_hw_set(dev, SIGNAL_UNSPEC);
+	/* dev->flags = IEEE80211_HW_RX_INCLUDES_FCS in promisc mode */
+	dev->flags = IEEE80211_HW_SIGNAL_UNSPEC;
 	dev->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
 
+	dev->channel_change_time = 1000;
 	dev->max_signal = 100;    /* FIXME: find better value */
 
 	dev->queues = 1; /* ADM8211C supports more, maybe ADM8211B too */
@@ -1938,7 +1936,7 @@ static int __devinit adm8211_probe(struct pci_dev *pdev,
 }
 
 
-static void __devexit adm8211_remove(struct pci_dev *pdev)
+static void adm8211_remove(struct pci_dev *pdev)
 {
 	struct ieee80211_hw *dev = pci_get_drvdata(pdev);
 	struct adm8211_priv *priv;
@@ -1988,26 +1986,11 @@ static struct pci_driver adm8211_driver = {
 	.name		= "adm8211",
 	.id_table	= adm8211_pci_id_table,
 	.probe		= adm8211_probe,
-	.remove		= __devexit_p(adm8211_remove),
+	.remove		= adm8211_remove,
 #ifdef CONFIG_PM
 	.suspend	= adm8211_suspend,
 	.resume		= adm8211_resume,
 #endif /* CONFIG_PM */
 };
 
-
-
-static int __init adm8211_init(void)
-{
-	return pci_register_driver(&adm8211_driver);
-}
-
-
-static void __exit adm8211_exit(void)
-{
-	pci_unregister_driver(&adm8211_driver);
-}
-
-
-module_init(adm8211_init);
-module_exit(adm8211_exit);
+module_pci_driver(adm8211_driver);

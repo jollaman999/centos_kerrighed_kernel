@@ -18,7 +18,7 @@
 #include <linux/input.h>
 #include <linux/slab.h>
 #include <linux/device.h>
-#include <linux/nospec.h>
+#include <linux/module.h>
 #include "rc-core-priv.h"
 
 /* Sizes are in bytes, 256 bytes allows for 32 entries on x64 */
@@ -256,7 +256,7 @@ static unsigned int ir_update_mapping(struct rc_dev *dev,
  * @rc_map:	scancode table to be searched
  * @scancode:	the desired scancode
  * @resize:	controls whether we allowed to resize the table to
- *		accomodate not yet present scancodes
+ *		accommodate not yet present scancodes
  * @return:	index of the mapping containing scancode in question
  *		or -1U in case of failure.
  *
@@ -319,23 +319,37 @@ static unsigned int ir_establish_scancode(struct rc_dev *dev,
  * This routine is used to handle evdev EVIOCSKEY ioctl.
  */
 static int ir_setkeycode(struct input_dev *idev,
-			 int scancode, int keycode)
+			 const struct input_keymap_entry *ke,
+			 unsigned int *old_keycode)
 {
 	struct rc_dev *rdev = input_get_drvdata(idev);
 	struct rc_map *rc_map = &rdev->rc_map;
 	unsigned int index;
+	unsigned int scancode;
 	int retval = 0;
 	unsigned long flags;
 
 	spin_lock_irqsave(&rc_map->lock, flags);
 
-	index = ir_establish_scancode(rdev, rc_map, scancode, true);
-	if (index >= rc_map->len) {
-		retval = -ENOMEM;
-		goto out;
+	if (ke->flags & INPUT_KEYMAP_BY_INDEX) {
+		index = ke->index;
+		if (index >= rc_map->len) {
+			retval = -EINVAL;
+			goto out;
+		}
+	} else {
+		retval = input_scancode_to_scalar(ke, &scancode);
+		if (retval)
+			goto out;
+
+		index = ir_establish_scancode(rdev, rc_map, scancode, true);
+		if (index >= rc_map->len) {
+			retval = -ENOMEM;
+			goto out;
+		}
 	}
 
-	ir_update_mapping(rdev, rc_map, index, keycode);
+	*old_keycode = ir_update_mapping(rdev, rc_map, index, ke->keycode);
 
 out:
 	spin_unlock_irqrestore(&rc_map->lock, flags);
@@ -423,26 +437,48 @@ static unsigned int ir_lookup_by_scancode(const struct rc_map *rc_map,
  * This routine is used to handle evdev EVIOCGKEY ioctl.
  */
 static int ir_getkeycode(struct input_dev *idev,
-			 int scancode, int *keycode)
+			 struct input_keymap_entry *ke)
 {
 	struct rc_dev *rdev = input_get_drvdata(idev);
 	struct rc_map *rc_map = &rdev->rc_map;
+	struct rc_map_table *entry;
 	unsigned long flags;
 	unsigned int index;
+	unsigned int scancode;
 	int retval;
 
 	spin_lock_irqsave(&rc_map->lock, flags);
 
-	index = ir_lookup_by_scancode(rc_map, scancode);
+	if (ke->flags & INPUT_KEYMAP_BY_INDEX) {
+		index = ke->index;
+	} else {
+		retval = input_scancode_to_scalar(ke, &scancode);
+		if (retval)
+			goto out;
 
-	if (index >= rc_map->len) {
-		*keycode = KEY_RESERVED;
-		retval = 0;
+		index = ir_lookup_by_scancode(rc_map, scancode);
+	}
+
+	if (index < rc_map->len) {
+		entry = &rc_map->scan[index];
+
+		ke->index = index;
+		ke->keycode = entry->keycode;
+		ke->len = sizeof(entry->scancode);
+		memcpy(ke->scancode, &entry->scancode, sizeof(entry->scancode));
+
+	} else if (!(ke->flags & INPUT_KEYMAP_BY_INDEX)) {
+		/*
+		 * We do not really know the valid range of scancodes
+		 * so let's respond with KEY_RESERVED to anything we
+		 * do not have mapping for [yet].
+		 */
+		ke->index = index;
+		ke->keycode = KEY_RESERVED;
+	} else {
+		retval = -EINVAL;
 		goto out;
 	}
-	index = array_index_nospec(index, rc_map->len);
-
-	*keycode = rc_map->scan[index].keycode;
 
 	retval = 0;
 
@@ -487,18 +523,20 @@ EXPORT_SYMBOL_GPL(rc_g_keycode_from_table);
 /**
  * ir_do_keyup() - internal function to signal the release of a keypress
  * @dev:	the struct rc_dev descriptor of the device
+ * @sync:	whether or not to call input_sync
  *
  * This function is used internally to release a keypress, it must be
  * called with keylock held.
  */
-static void ir_do_keyup(struct rc_dev *dev)
+static void ir_do_keyup(struct rc_dev *dev, bool sync)
 {
 	if (!dev->keypressed)
 		return;
 
 	IR_dprintk(1, "keyup key 0x%04x\n", dev->last_keycode);
 	input_report_key(dev->input_dev, dev->last_keycode, 0);
-	input_sync(dev->input_dev);
+	if (sync)
+		input_sync(dev->input_dev);
 	dev->keypressed = false;
 }
 
@@ -514,7 +552,7 @@ void rc_keyup(struct rc_dev *dev)
 	unsigned long flags;
 
 	spin_lock_irqsave(&dev->keylock, flags);
-	ir_do_keyup(dev);
+	ir_do_keyup(dev, true);
 	spin_unlock_irqrestore(&dev->keylock, flags);
 }
 EXPORT_SYMBOL_GPL(rc_keyup);
@@ -543,7 +581,7 @@ static void ir_timer_keyup(unsigned long cookie)
 	 */
 	spin_lock_irqsave(&dev->keylock, flags);
 	if (time_is_before_eq_jiffies(dev->keyup_jiffies))
-		ir_do_keyup(dev);
+		ir_do_keyup(dev, true);
 	spin_unlock_irqrestore(&dev->keylock, flags);
 }
 
@@ -562,6 +600,7 @@ void rc_repeat(struct rc_dev *dev)
 	spin_lock_irqsave(&dev->keylock, flags);
 
 	input_event(dev->input_dev, EV_MSC, MSC_SCAN, dev->last_scancode);
+	input_sync(dev->input_dev);
 
 	if (!dev->keypressed)
 		goto out;
@@ -587,29 +626,28 @@ EXPORT_SYMBOL_GPL(rc_repeat);
 static void ir_do_keydown(struct rc_dev *dev, int scancode,
 			  u32 keycode, u8 toggle)
 {
+	bool new_event = !dev->keypressed ||
+			 dev->last_scancode != scancode ||
+			 dev->last_toggle != toggle;
+
+	if (new_event && dev->keypressed)
+		ir_do_keyup(dev, false);
+
 	input_event(dev->input_dev, EV_MSC, MSC_SCAN, scancode);
 
-	/* Repeat event? */
-	if (dev->keypressed &&
-	    dev->last_scancode == scancode &&
-	    dev->last_toggle == toggle)
-		return;
+	if (new_event && keycode != KEY_RESERVED) {
+		/* Register a keypress */
+		dev->keypressed = true;
+		dev->last_scancode = scancode;
+		dev->last_toggle = toggle;
+		dev->last_keycode = keycode;
 
-	/* Release old keypress */
-	ir_do_keyup(dev);
+		IR_dprintk(1, "%s: key down event, "
+			   "key 0x%04x, scancode 0x%04x\n",
+			   dev->input_name, keycode, scancode);
+		input_report_key(dev->input_dev, keycode, 1);
+	}
 
-	dev->last_scancode = scancode;
-	dev->last_toggle = toggle;
-	dev->last_keycode = keycode;
-
-	if (keycode == KEY_RESERVED)
-		return;
-
-	/* Register a keypress */
-	dev->keypressed = true;
-	IR_dprintk(1, "%s: key down event, key 0x%04x, scancode 0x%04x\n",
-		   dev->input_name, keycode, scancode);
-	input_report_key(dev->input_dev, dev->last_keycode, 1);
 	input_sync(dev->input_dev);
 }
 
@@ -672,35 +710,50 @@ static void ir_close(struct input_dev *idev)
 {
 	struct rc_dev *rdev = input_get_drvdata(idev);
 
-	rdev->close(rdev);
+	 if (rdev)
+		rdev->close(rdev);
 }
 
 /* class for /sys/class/rc */
-static char *ir_devnode(struct device *dev, mode_t *mode)
+static char *rc_devnode(struct device *dev, umode_t *mode)
 {
 	return kasprintf(GFP_KERNEL, "rc/%s", dev_name(dev));
 }
 
-static struct class ir_input_class = {
+static struct class rc_class = {
 	.name		= "rc",
-	.devnode	= ir_devnode,
+	.devnode	= rc_devnode,
 };
 
+/*
+ * These are the protocol textual descriptions that are
+ * used by the sysfs protocols file. Note that the order
+ * of the entries is relevant.
+ */
 static struct {
 	u64	type;
 	char	*name;
 } proto_names[] = {
-	{ RC_TYPE_UNKNOWN,	"unknown"	},
-	{ RC_TYPE_RC5,		"rc-5"		},
-	{ RC_TYPE_NEC,		"nec"		},
-	{ RC_TYPE_RC6,		"rc-6"		},
-	{ RC_TYPE_JVC,		"jvc"		},
-	{ RC_TYPE_SONY,		"sony"		},
-	{ RC_TYPE_RC5_SZ,	"rc-5-sz"	},
-	{ RC_TYPE_LIRC,		"lirc"		},
+	{ RC_BIT_NONE,		"none"		},
+	{ RC_BIT_OTHER,		"other"		},
+	{ RC_BIT_UNKNOWN,	"unknown"	},
+	{ RC_BIT_RC5 |
+	  RC_BIT_RC5X,		"rc-5"		},
+	{ RC_BIT_NEC,		"nec"		},
+	{ RC_BIT_RC6_0 |
+	  RC_BIT_RC6_6A_20 |
+	  RC_BIT_RC6_6A_24 |
+	  RC_BIT_RC6_6A_32 |
+	  RC_BIT_RC6_MCE,	"rc-6"		},
+	{ RC_BIT_JVC,		"jvc"		},
+	{ RC_BIT_SONY12 |
+	  RC_BIT_SONY15 |
+	  RC_BIT_SONY20,	"sony"		},
+	{ RC_BIT_RC5_SZ,	"rc-5-sz"	},
+	{ RC_BIT_SANYO,		"sanyo"		},
+	{ RC_BIT_MCE_KBD,	"mce_kbd"	},
+	{ RC_BIT_LIRC,		"lirc"		},
 };
-
-#define PROTO_NONE	"none"
 
 /**
  * show_protocols() - shows the current IR protocol(s)
@@ -712,6 +765,9 @@ static struct {
  * it is trigged by reading /sys/class/rc/rc?/protocols.
  * It returns the protocol names of supported protocols.
  * Enabled protocols are printed in brackets.
+ *
+ * dev->lock is taken to guard against races between device
+ * registration, store_protocols and show_protocols.
  */
 static ssize_t show_protocols(struct device *device,
 			      struct device_attribute *mattr, char *buf)
@@ -725,12 +781,16 @@ static ssize_t show_protocols(struct device *device,
 	if (!dev)
 		return -EINVAL;
 
-	if (dev->driver_type == RC_DRIVER_SCANCODE) {
-		enabled = dev->rc_map.rc_type;
+	mutex_lock(&dev->lock);
+
+	enabled = dev->enabled_protocols;
+	if (dev->driver_type == RC_DRIVER_SCANCODE)
 		allowed = dev->allowed_protos;
-	} else {
-		enabled = dev->raw->enabled_protocols;
+	else if (dev->raw)
 		allowed = ir_raw_get_allowed_protocols();
+	else {
+		mutex_unlock(&dev->lock);
+		return -ENODEV;
 	}
 
 	IR_dprintk(1, "allowed - 0x%llx, enabled - 0x%llx\n",
@@ -742,11 +802,17 @@ static ssize_t show_protocols(struct device *device,
 			tmp += sprintf(tmp, "[%s] ", proto_names[i].name);
 		else if (allowed & proto_names[i].type)
 			tmp += sprintf(tmp, "%s ", proto_names[i].name);
+
+		if (allowed & proto_names[i].type)
+			allowed &= ~proto_names[i].type;
 	}
 
 	if (tmp != buf)
 		tmp--;
 	*tmp = '\n';
+
+	mutex_unlock(&dev->lock);
+
 	return tmp + 1 - buf;
 }
 
@@ -765,6 +831,9 @@ static ssize_t show_protocols(struct device *device,
  * Writing "none" will disable all protocols.
  * Returns -EINVAL if an invalid protocol combination or unknown protocol name
  * is used, otherwise @len.
+ *
+ * dev->lock is taken to guard against races between device
+ * registration, store_protocols and show_protocols.
  */
 static ssize_t store_protocols(struct device *device,
 			       struct device_attribute *mattr,
@@ -777,20 +846,20 @@ static ssize_t store_protocols(struct device *device,
 	u64 type;
 	u64 mask;
 	int rc, i, count = 0;
-	unsigned long flags;
+	ssize_t ret;
 
 	/* Device is being removed */
 	if (!dev)
 		return -EINVAL;
 
-	if (dev->driver_type == RC_DRIVER_SCANCODE)
-		type = dev->rc_map.rc_type;
-	else if (dev->raw)
-		type = dev->raw->enabled_protocols;
-	else {
+	mutex_lock(&dev->lock);
+
+	if (dev->driver_type != RC_DRIVER_SCANCODE && !dev->raw) {
 		IR_dprintk(1, "Protocol switching not supported\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
+	type = dev->enabled_protocols;
 
 	while ((tmp = strsep((char **) &data, " \n")) != NULL) {
 		if (!*tmp)
@@ -809,24 +878,20 @@ static ssize_t store_protocols(struct device *device,
 			disable = false;
 		}
 
-		if (!enable && !disable && !strncasecmp(tmp, PROTO_NONE, sizeof(PROTO_NONE))) {
-			tmp += sizeof(PROTO_NONE);
-			mask = 0;
-			count++;
-		} else {
-			for (i = 0; i < ARRAY_SIZE(proto_names); i++) {
-				if (!strcasecmp(tmp, proto_names[i].name)) {
-					tmp += strlen(proto_names[i].name);
-					mask = proto_names[i].type;
-					break;
-				}
+		for (i = 0; i < ARRAY_SIZE(proto_names); i++) {
+			if (!strcasecmp(tmp, proto_names[i].name)) {
+				mask = proto_names[i].type;
+				break;
 			}
-			if (i == ARRAY_SIZE(proto_names)) {
-				IR_dprintk(1, "Unknown protocol: '%s'\n", tmp);
-				return -EINVAL;
-			}
-			count++;
 		}
+
+		if (i == ARRAY_SIZE(proto_names)) {
+			IR_dprintk(1, "Unknown protocol: '%s'\n", tmp);
+			ret = -EINVAL;
+			goto out;
+		}
+
+		count++;
 
 		if (enable)
 			type |= mask;
@@ -838,38 +903,33 @@ static ssize_t store_protocols(struct device *device,
 
 	if (!count) {
 		IR_dprintk(1, "Protocol not specified\n");
-		return -EINVAL;
+		ret = -EINVAL;
+		goto out;
 	}
 
 	if (dev->change_protocol) {
-		rc = dev->change_protocol(dev, type);
+		rc = dev->change_protocol(dev, &type);
 		if (rc < 0) {
 			IR_dprintk(1, "Error setting protocols to 0x%llx\n",
 				   (long long)type);
-			return -EINVAL;
+			ret = -EINVAL;
+			goto out;
 		}
 	}
 
-	if (dev->driver_type == RC_DRIVER_SCANCODE) {
-		spin_lock_irqsave(&dev->rc_map.lock, flags);
-		dev->rc_map.rc_type = type;
-		spin_unlock_irqrestore(&dev->rc_map.lock, flags);
-	} else {
-		dev->raw->enabled_protocols = type;
-	}
-
+	dev->enabled_protocols = type;
 	IR_dprintk(1, "Current protocol(s): 0x%llx\n",
 		   (long long)type);
 
-	return len;
+	ret = len;
+
+out:
+	mutex_unlock(&dev->lock);
+	return ret;
 }
 
 static void rc_dev_release(struct device *device)
 {
-	struct rc_dev *dev = to_rc_dev(device);
-
-	kfree(dev);
-	module_put(THIS_MODULE);
 }
 
 #define ADD_HOTPLUG_VAR(fmt, val...)					\
@@ -882,6 +942,9 @@ static void rc_dev_release(struct device *device)
 static int rc_dev_uevent(struct device *device, struct kobj_uevent_env *env)
 {
 	struct rc_dev *dev = to_rc_dev(device);
+
+	if (!dev || !dev->input_dev)
+		return -ENODEV;
 
 	if (dev->rc_map.name)
 		ADD_HOTPLUG_VAR("NAME=%s", dev->rc_map.name);
@@ -937,10 +1000,11 @@ struct rc_dev *rc_allocate_device(void)
 
 	spin_lock_init(&dev->rc_map.lock);
 	spin_lock_init(&dev->keylock);
+	mutex_init(&dev->lock);
 	setup_timer(&dev->timer_keyup, ir_timer_keyup, (unsigned long)dev);
 
 	dev->dev.type = &rc_dev_type;
-	dev->dev.class = &ir_input_class;
+	dev->dev.class = &rc_class;
 	device_initialize(&dev->dev);
 
 	__module_get(THIS_MODULE);
@@ -950,15 +1014,22 @@ EXPORT_SYMBOL_GPL(rc_allocate_device);
 
 void rc_free_device(struct rc_dev *dev)
 {
-	if (dev) {
+	if (!dev)
+		return;
+
+	if (dev->input_dev)
 		input_free_device(dev->input_dev);
-		put_device(&dev->dev);
-	}
+
+	put_device(&dev->dev);
+
+	kfree(dev);
+	module_put(THIS_MODULE);
 }
 EXPORT_SYMBOL_GPL(rc_free_device);
 
 int rc_register_device(struct rc_dev *dev)
 {
+	static bool raw_init = false; /* raw decoders loaded? */
 	static atomic_t devno = ATOMIC_INIT(0);
 	struct rc_map *rc_map;
 	const char *path;
@@ -982,12 +1053,20 @@ int rc_register_device(struct rc_dev *dev)
 	if (dev->close)
 		dev->input_dev->close = ir_close;
 
+	/*
+	 * Take the lock here, as the device sysfs node will appear
+	 * when device_add() is called, which may trigger an ir-keytable udev
+	 * rule, which will in turn call show_protocols and access
+	 * dev->enabled_protocols before it has been initialized.
+	 */
+	mutex_lock(&dev->lock);
+
 	dev->devno = (unsigned long)(atomic_inc_return(&devno) - 1);
 	dev_set_name(&dev->dev, "rc%ld", dev->devno);
 	dev_set_drvdata(&dev->dev, dev);
 	rc = device_add(&dev->dev);
 	if (rc)
-		return rc;
+		goto out_unlock;
 
 	rc = ir_setkeytable(dev, rc_map);
 	if (rc)
@@ -1002,12 +1081,19 @@ int rc_register_device(struct rc_dev *dev)
 		goto out_table;
 
 	/*
-	 * Default delay of 250ms is too short for some protocols, expecially
+	 * Default delay of 250ms is too short for some protocols, especially
 	 * since the timeout is currently set to 250ms. Increase it to 500ms,
 	 * to avoid wrong repetition of the keycodes. Note that this must be
 	 * set after the call to input_register_device().
 	 */
 	dev->input_dev->rep[REP_DELAY] = 500;
+
+	/*
+	 * As a repeat event on protocols like RC-5 and NEC take as long as
+	 * 110/114ms, using 33ms as a repeat period is not the right thing
+	 * to do.
+	 */
+	dev->input_dev->rep[REP_PERIOD] = 125;
 
 	path = kobject_get_path(&dev->dev.kobj, GFP_KERNEL);
 	printk(KERN_INFO "%s: %s as %s\n",
@@ -1017,16 +1103,26 @@ int rc_register_device(struct rc_dev *dev)
 	kfree(path);
 
 	if (dev->driver_type == RC_DRIVER_IR_RAW) {
+		/* Load raw decoders, if they aren't already */
+		if (!raw_init) {
+			IR_dprintk(1, "Loading raw decoders\n");
+			ir_raw_init();
+			raw_init = true;
+		}
 		rc = ir_raw_event_register(dev);
 		if (rc < 0)
 			goto out_input;
 	}
 
 	if (dev->change_protocol) {
-		rc = dev->change_protocol(dev, rc_map->rc_type);
+		u64 rc_type = (1 << rc_map->rc_type);
+		rc = dev->change_protocol(dev, &rc_type);
 		if (rc < 0)
 			goto out_raw;
+		dev->enabled_protocols = rc_type;
 	}
+
+	mutex_unlock(&dev->lock);
 
 	IR_dprintk(1, "Registered rc%ld (driver: %s, remote: %s, mode %s)\n",
 		   dev->devno,
@@ -1046,6 +1142,8 @@ out_table:
 	ir_free_table(&dev->rc_map);
 out_dev:
 	device_del(&dev->dev);
+out_unlock:
+	mutex_unlock(&dev->lock);
 	return rc;
 }
 EXPORT_SYMBOL_GPL(rc_register_device);
@@ -1060,14 +1158,18 @@ void rc_unregister_device(struct rc_dev *dev)
 	if (dev->driver_type == RC_DRIVER_IR_RAW)
 		ir_raw_event_unregister(dev);
 
-	input_unregister_device(dev->input_dev);
-	dev->input_dev = NULL;
-
+	/* Freeing the table should also call the stop callback */
 	ir_free_table(&dev->rc_map);
 	IR_dprintk(1, "Freed keycode table\n");
 
-	device_unregister(&dev->dev);
+	input_unregister_device(dev->input_dev);
+	dev->input_dev = NULL;
+
+	device_del(&dev->dev);
+
+	rc_free_device(dev);
 }
+
 EXPORT_SYMBOL_GPL(rc_unregister_device);
 
 /*
@@ -1076,14 +1178,12 @@ EXPORT_SYMBOL_GPL(rc_unregister_device);
 
 static int __init rc_core_init(void)
 {
-	int rc = class_register(&ir_input_class);
+	int rc = class_register(&rc_class);
 	if (rc) {
 		printk(KERN_ERR "rc_core: unable to register rc class\n");
 		return rc;
 	}
 
-	/* Initialize/load the decoders/keymap code that will be used */
-	ir_raw_init();
 	rc_map_register(&empty_map);
 
 	return 0;
@@ -1091,11 +1191,11 @@ static int __init rc_core_init(void)
 
 static void __exit rc_core_exit(void)
 {
-	class_unregister(&ir_input_class);
+	class_unregister(&rc_class);
 	rc_map_unregister(&empty_map);
 }
 
-module_init(rc_core_init);
+subsys_initcall(rc_core_init);
 module_exit(rc_core_exit);
 
 int rc_core_debug;    /* ir_debug level (0,1,2) */

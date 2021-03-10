@@ -35,18 +35,6 @@ static inline void ksm_exit(struct mm_struct *mm)
 		__ksm_exit(mm);
 }
 
-/*
- * A KSM page is one of those write-protected "shared pages" or "merged pages"
- * which KSM maps into multiple mms, wherever identical anonymous page content
- * is found in VM_MERGEABLE vmas.  It's a PageAnon page, pointing not to any
- * anon_vma, but to that page's node of the stable tree.
- */
-static inline int PageKsm(struct page *page)
-{
-	return ((unsigned long)page->mapping & PAGE_MAPPING_FLAGS) ==
-				(PAGE_MAPPING_ANON | PAGE_MAPPING_KSM);
-}
-
 static inline struct stable_node *page_stable_node(struct page *page)
 {
 	return PageKsm(page) ? page_rmapping(page) : NULL;
@@ -73,9 +61,6 @@ static inline void set_page_stable_node(struct page *page,
 struct page *ksm_might_need_to_copy(struct page *page,
 			struct vm_area_struct *vma, unsigned long address);
 
-int page_referenced_ksm(struct page *page,
-			struct mem_cgroup *memcg, unsigned long *vm_flags);
-int try_to_unmap_ksm(struct page *page, enum ttu_flags flags);
 int rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc);
 void ksm_migrate_page(struct page *newpage, struct page *oldpage);
 
@@ -88,11 +73,6 @@ static inline int ksm_fork(struct mm_struct *mm, struct mm_struct *oldmm)
 
 static inline void ksm_exit(struct mm_struct *mm)
 {
-}
-
-static inline int PageKsm(struct page *page)
-{
-	return 0;
 }
 
 #ifdef CONFIG_MMU
@@ -110,11 +90,6 @@ static inline struct page *ksm_might_need_to_copy(struct page *page,
 
 static inline int page_referenced_ksm(struct page *page,
 			struct mem_cgroup *memcg, unsigned long *vm_flags)
-{
-	return 0;
-}
-
-static inline int try_to_unmap_ksm(struct page *page, enum ttu_flags flags)
 {
 	return 0;
 }

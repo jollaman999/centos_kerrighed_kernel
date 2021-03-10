@@ -24,9 +24,7 @@
 #include <linux/fb.h>
 #include <linux/io.h>
 #include <linux/module.h>
-#include <linux/platform_data/simplefb.h>
 #include <linux/platform_device.h>
-#include <linux/nospec.h>
 
 static struct fb_fix_screeninfo simplefb_fix = {
 	.id		= "simple",
@@ -53,7 +51,6 @@ static int simplefb_setcolreg(u_int regno, u_int red, u_int green, u_int blue,
 
 	if (regno >= 16)
 		return -EINVAL;
-	regno = array_index_nospec(regno, 16);
 
 	value = (cr << info->var.red.offset) |
 		(cg << info->var.green.offset) |
@@ -76,7 +73,18 @@ static struct fb_ops simplefb_ops = {
 	.fb_imageblit	= cfb_imageblit,
 };
 
-static struct simplefb_format simplefb_formats[] = SIMPLEFB_FORMATS;
+struct simplefb_format {
+	const char *name;
+	u32 bits_per_pixel;
+	struct fb_bitfield red;
+	struct fb_bitfield green;
+	struct fb_bitfield blue;
+	struct fb_bitfield transp;
+};
+
+static struct simplefb_format simplefb_formats[] = {
+	{ "r5g6b5", 16, {11, 5}, {5, 6}, {0, 5}, {0, 0} },
+};
 
 struct simplefb_params {
 	u32 width;
@@ -85,25 +93,44 @@ struct simplefb_params {
 	struct simplefb_format *format;
 };
 
-static int simplefb_parse_pd(struct platform_device *pdev,
-			     struct simplefb_params *params)
+static int simplefb_parse_dt(struct platform_device *pdev,
+			   struct simplefb_params *params)
 {
-	struct simplefb_platform_data *pd = pdev->dev.platform_data;
+	struct device_node *np = pdev->dev.of_node;
+	int ret;
+	const char *format;
 	int i;
 
-	params->width = pd->width;
-	params->height = pd->height;
-	params->stride = pd->stride;
+	ret = of_property_read_u32(np, "width", &params->width);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse width property\n");
+		return ret;
+	}
 
+	ret = of_property_read_u32(np, "height", &params->height);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse height property\n");
+		return ret;
+	}
+
+	ret = of_property_read_u32(np, "stride", &params->stride);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse stride property\n");
+		return ret;
+	}
+
+	ret = of_property_read_string(np, "format", &format);
+	if (ret) {
+		dev_err(&pdev->dev, "Can't parse format property\n");
+		return ret;
+	}
 	params->format = NULL;
 	for (i = 0; i < ARRAY_SIZE(simplefb_formats); i++) {
-		if (strcmp(pd->format, simplefb_formats[i].name))
+		if (strcmp(format, simplefb_formats[i].name))
 			continue;
-
 		params->format = &simplefb_formats[i];
 		break;
 	}
-
 	if (!params->format) {
 		dev_err(&pdev->dev, "Invalid format value\n");
 		return -EINVAL;
@@ -111,6 +138,7 @@ static int simplefb_parse_pd(struct platform_device *pdev,
 
 	return 0;
 }
+
 static int simplefb_probe(struct platform_device *pdev)
 {
 	int ret;
@@ -121,9 +149,7 @@ static int simplefb_probe(struct platform_device *pdev)
 	if (fb_get_options("simplefb", NULL))
 		return -ENODEV;
 
-	ret = -ENODEV;
-	if (pdev->dev.platform_data)
-		ret = simplefb_parse_pd(pdev, &params);
+	ret = simplefb_parse_dt(pdev, &params);
 	if (ret)
 		return ret;
 
@@ -154,11 +180,8 @@ static int simplefb_probe(struct platform_device *pdev)
 	info->var.blue = params.format->blue;
 	info->var.transp = params.format->transp;
 
-	info->aperture_base = info->fix.smem_start;
-	info->aperture_size = info->fix.smem_len;
-
 	info->fbops = &simplefb_ops;
-	info->flags = FBINFO_DEFAULT | FBINFO_MISC_FIRMWARE;
+	info->flags = FBINFO_DEFAULT;
 	info->screen_base = devm_ioremap(&pdev->dev, info->fix.smem_start,
 					 info->fix.smem_len);
 	if (!info->screen_base) {
@@ -199,6 +222,7 @@ static struct platform_driver simplefb_driver = {
 	.driver = {
 		.name = "simple-framebuffer",
 		.owner = THIS_MODULE,
+		.of_match_table = simplefb_of_match,
 	},
 	.probe = simplefb_probe,
 	.remove = simplefb_remove,

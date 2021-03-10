@@ -58,7 +58,6 @@
 	ELFNOTE_END
 
 #else	/* !__ASSEMBLER__ */
-#include <linux/stringify.h>
 #include <linux/elf.h>
 /*
  * Use an anonymous structure which matches the shape of
@@ -94,9 +93,6 @@
 
 #define ELFNOTE32(name, type, desc) ELFNOTE(32, name, type, desc)
 #define ELFNOTE64(name, type, desc) ELFNOTE(64, name, type, desc)
-
-#define ELFNOTE_NAME(name)	__stringify(name)
-#define ELFNOTE_SECTION(name)	".note."ELFNOTE_NAME(name)
 #endif	/* __ASSEMBLER__ */
 
 #endif /* _LINUX_ELFNOTE_H */

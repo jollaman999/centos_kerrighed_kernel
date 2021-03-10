@@ -12,20 +12,22 @@
 
 /*
  * This file essentially defines the interface between board
- * specific PCI code and MIPS common PCI code.  Should potentially put
+ * specific PCI code and MIPS common PCI code.	Should potentially put
  * into include/asm/pci.h file.
  */
 
 #include <linux/ioport.h>
+#include <linux/of.h>
 
 /*
- * Each pci channel is a top-level PCI bus seem by CPU.  A machine  with
+ * Each pci channel is a top-level PCI bus seem by CPU.	 A machine  with
  * multiple PCI channels may have multiple PCI host controllers or a
  * single controller supporting multiple channels.
  */
 struct pci_controller {
 	struct pci_controller *next;
 	struct pci_bus *bus;
+	struct device_node *of_node;
 
 	struct pci_ops *pci_ops;
 	struct resource *mem_resource;
@@ -72,11 +74,6 @@ extern unsigned long PCIBIOS_MIN_MEM;
 
 extern void pcibios_set_master(struct pci_dev *dev);
 
-static inline void pcibios_penalize_isa_irq(int irq, int active)
-{
-	/* We don't do dynamic PCI IRQ allocation */
-}
-
 #define HAVE_PCI_MMAP
 
 extern int pci_mmap_page_range(struct pci_dev *dev, struct vm_area_struct *vma,
@@ -96,33 +93,11 @@ extern int pci_mmap_page_range(struct pci_dev *dev, struct vm_area_struct *vma,
 struct pci_dev;
 
 /*
- * The PCI address space does equal the physical memory address space.  The
+ * The PCI address space does equal the physical memory address space.	The
  * networking and block device layers use this boolean for bounce buffer
  * decisions.  This is set if any hose does not have an IOMMU.
  */
 extern unsigned int PCI_DMA_BUS_IS_PHYS;
-
-#ifdef CONFIG_DMA_NEED_PCI_MAP_STATE
-
-/* pci_unmap_{single,page} is not a nop, thus... */
-#define DECLARE_PCI_UNMAP_ADDR(ADDR_NAME)	dma_addr_t ADDR_NAME;
-#define DECLARE_PCI_UNMAP_LEN(LEN_NAME)		__u32 LEN_NAME;
-#define pci_unmap_addr(PTR, ADDR_NAME)		((PTR)->ADDR_NAME)
-#define pci_unmap_addr_set(PTR, ADDR_NAME, VAL)	(((PTR)->ADDR_NAME) = (VAL))
-#define pci_unmap_len(PTR, LEN_NAME)		((PTR)->LEN_NAME)
-#define pci_unmap_len_set(PTR, LEN_NAME, VAL)	(((PTR)->LEN_NAME) = (VAL))
-
-#else /* CONFIG_DMA_NEED_PCI_MAP_STATE  */
-
-/* pci_unmap_{page,single} is a nop so... */
-#define DECLARE_PCI_UNMAP_ADDR(ADDR_NAME)
-#define DECLARE_PCI_UNMAP_LEN(LEN_NAME)
-#define pci_unmap_addr(PTR, ADDR_NAME)		(0)
-#define pci_unmap_addr_set(PTR, ADDR_NAME, VAL)	do { } while (0)
-#define pci_unmap_len(PTR, LEN_NAME)		(0)
-#define pci_unmap_len_set(PTR, LEN_NAME, VAL)	do { } while (0)
-
-#endif /* CONFIG_DMA_NEED_PCI_MAP_STATE  */
 
 #ifdef CONFIG_PCI
 static inline void pci_dma_burst_advice(struct pci_dev *pdev,
@@ -134,12 +109,6 @@ static inline void pci_dma_burst_advice(struct pci_dev *pdev,
 }
 #endif
 
-extern void pcibios_resource_to_bus(struct pci_dev *dev,
-	struct pci_bus_region *region, struct resource *res);
-
-extern void pcibios_bus_to_resource(struct pci_dev *dev, struct resource *res,
-				    struct pci_bus_region *region);
-
 #define pci_domain_nr(bus) ((struct pci_controller *)(bus)->sysdata)->index
 
 static inline int pci_proc_domain(struct pci_bus *bus)
@@ -150,9 +119,6 @@ static inline int pci_proc_domain(struct pci_bus *bus)
 
 #endif /* __KERNEL__ */
 
-/* implement the pci_ DMA API in terms of the generic device dma_ one */
-#include <asm-generic/pci-dma-compat.h>
-
 /* Do platform specific device initialization at pci_enable_device() time */
 extern int pcibios_plat_dev_init(struct pci_dev *dev);
 
@@ -162,8 +128,20 @@ static inline int pci_get_legacy_ide_irq(struct pci_dev *dev, int channel)
 	return channel ? 15 : 14;
 }
 
-extern int pci_probe_only;
+#ifdef CONFIG_CPU_CAVIUM_OCTEON
+/* MSI arch hook for OCTEON */
+#define arch_setup_msi_irqs arch_setup_msi_irqs
+#endif
 
 extern char * (*pcibios_plat_setup)(char *str);
+
+#ifdef CONFIG_OF
+/* this function parses memory ranges from a device node */
+extern void pci_load_of_ranges(struct pci_controller *hose,
+			       struct device_node *node);
+#else
+static inline void pci_load_of_ranges(struct pci_controller *hose,
+				      struct device_node *node) {}
+#endif
 
 #endif /* _ASM_PCI_H */

@@ -26,22 +26,26 @@ void __init prom_init(void)
 	bcm_wdt_writel(WDT_STOP_2, WDT_CTL_REG);
 
 	/* disable all hardware blocks clock for now */
-	if (BCMCPU_IS_6338())
+	if (BCMCPU_IS_6328())
+		mask = CKCTL_6328_ALL_SAFE_EN;
+	else if (BCMCPU_IS_6338())
 		mask = CKCTL_6338_ALL_SAFE_EN;
 	else if (BCMCPU_IS_6345())
 		mask = CKCTL_6345_ALL_SAFE_EN;
 	else if (BCMCPU_IS_6348())
 		mask = CKCTL_6348_ALL_SAFE_EN;
-	else
-		/* BCMCPU_IS_6358() */
+	else if (BCMCPU_IS_6358())
 		mask = CKCTL_6358_ALL_SAFE_EN;
+	else if (BCMCPU_IS_6362())
+		mask = CKCTL_6362_ALL_SAFE_EN;
+	else if (BCMCPU_IS_6368())
+		mask = CKCTL_6368_ALL_SAFE_EN;
+	else
+		mask = 0;
 
 	reg = bcm_perf_readl(PERF_CKCTL_REG);
 	reg &= ~mask;
 	bcm_perf_writel(reg, PERF_CKCTL_REG);
-
-	/* assign command line from kernel config */
-	strcpy(arcs_cmdline, CONFIG_CMDLINE);
 
 	/* register gpiochip */
 	bcm63xx_gpio_init();

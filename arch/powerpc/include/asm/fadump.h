@@ -31,7 +31,7 @@
  * translate off.
  */
 #define RMA_START	0x0
-#define RMA_END		(lmb.rmo_size)
+#define RMA_END		(ppc64_rma_size)
 
 /*
  * On some Power systems where RMO is 128MB, it still requires minimum of
@@ -43,12 +43,7 @@
 #define MIN_BOOT_MEM	(((RMA_END < (0x1UL << 28)) ? (0x1UL << 28) : RMA_END) \
 			+ (0x1UL << 26))
 
-#define lmb_num_regions(lmb_type)	(lmb.lmb_type.cnt)
-
-#define for_each_lmb(region_iter, lmb_type, reg)			\
-	for (region_iter = 0, reg = &lmb.lmb_type.region[region_iter];	\
-		region_iter < lmb.lmb_type.cnt;				\
-		region_iter++, reg = &lmb.lmb_type.region[region_iter])
+#define memblock_num_regions(memblock_type)	(memblock.memblock_type.cnt)
 
 #ifndef ELF_CORE_EFLAGS
 #define ELF_CORE_EFLAGS 0
@@ -75,39 +70,41 @@
 #define CPU_UNKNOWN		(~((u32)0))
 
 /* Utility macros */
-#define SKIP_TO_NEXT_CPU(reg_entry)			\
-({							\
-	while (reg_entry->reg_id != REG_ID("CPUEND"))	\
-		reg_entry++;				\
-	reg_entry++;					\
+#define SKIP_TO_NEXT_CPU(reg_entry)					\
+({									\
+	while (be64_to_cpu(reg_entry->reg_id) != REG_ID("CPUEND"))	\
+		reg_entry++;						\
+	reg_entry++;							\
 })
+
+extern int crashing_cpu;
 
 /* Kernel Dump section info */
 struct fadump_section {
-	u32	request_flag;
-	u16	source_data_type;
-	u16	error_flags;
-	u64	source_address;
-	u64	source_len;
-	u64	bytes_dumped;
-	u64	destination_address;
+	__be32	request_flag;
+	__be16	source_data_type;
+	__be16	error_flags;
+	__be64	source_address;
+	__be64	source_len;
+	__be64	bytes_dumped;
+	__be64	destination_address;
 };
 
 /* ibm,configure-kernel-dump header. */
 struct fadump_section_header {
-	u32	dump_format_version;
-	u16	dump_num_sections;
-	u16	dump_status_flag;
-	u32	offset_first_dump_section;
+	__be32	dump_format_version;
+	__be16	dump_num_sections;
+	__be16	dump_status_flag;
+	__be32	offset_first_dump_section;
 
 	/* Fields for disk dump option. */
-	u32	dd_block_size;
-	u64	dd_block_offset;
-	u64	dd_num_blocks;
-	u32	dd_offset_disk_path;
+	__be32	dd_block_size;
+	__be64	dd_block_offset;
+	__be64	dd_num_blocks;
+	__be32	dd_offset_disk_path;
 
 	/* Maximum time allowed to prevent an automatic dump-reboot. */
-	u32	max_time_auto;
+	__be32	max_time_auto;
 };
 
 /*
@@ -179,15 +176,15 @@ static inline u64 str_to_u64(const char *str)
 
 /* Register save area header. */
 struct fadump_reg_save_area_header {
-	u64		magic_number;
-	u32		version;
-	u32		num_cpu_offset;
+	__be64		magic_number;
+	__be32		version;
+	__be32		num_cpu_offset;
 };
 
 /* Register entry. */
 struct fadump_reg_entry {
-	u64		reg_id;
-	u64		reg_value;
+	__be64		reg_id;
+	__be64		reg_value;
 };
 
 /* fadump crash info structure */
@@ -199,24 +196,26 @@ struct fadump_crash_info_header {
 	struct cpumask	cpu_online_mask;
 };
 
-/* Crash memory ranges */
-#define INIT_CRASHMEM_RANGES	(MAX_LMB_REGIONS + 2)
-
 struct fad_crash_memory_ranges {
 	unsigned long long	base;
 	unsigned long long	size;
 };
 
+extern int is_fadump_boot_memory_area(u64 addr, ulong size);
 extern int early_init_dt_scan_fw_dump(unsigned long node,
 		const char *uname, int depth, void *data);
 extern int fadump_reserve_mem(void);
 extern int setup_fadump(void);
+extern unsigned long long fadump_default_reserve_size(void);
+extern int is_fadump_enabled(void);
 extern int is_fadump_active(void);
 extern void crash_fadump(struct pt_regs *, const char *);
 extern void fadump_cleanup(void);
 
 extern void vmcore_cleanup(void);
 #else	/* CONFIG_FA_DUMP */
+static inline unsigned long long fadump_default_reserve_size(void) { return 0; }
+static inline int is_fadump_enabled(void) { return 0; }
 static inline int is_fadump_active(void) { return 0; }
 static inline void crash_fadump(struct pt_regs *regs, const char *str) { }
 #endif

@@ -38,7 +38,7 @@ enum ccdc_sample_line {
 	CCDC_SAMPLE_16LINES
 };
 
-/* enum for Alaw gama width */
+/* enum for Alaw gamma width */
 enum ccdc_gamma_width {
 	CCDC_GAMMA_BITS_13_4,
 	CCDC_GAMMA_BITS_12_3,
@@ -97,8 +97,8 @@ enum ccdc_mfilt2 {
 struct ccdc_a_law {
 	/* Enable/disable A-Law */
 	unsigned char enable;
-	/* Gama Width Input */
-	enum ccdc_gamma_width gama_wd;
+	/* Gamma Width Input */
+	enum ccdc_gamma_width gamma_wd;
 };
 
 /* structure for Black Clamping */
@@ -193,7 +193,7 @@ struct ccdc_dft_corr_mem_ctl {
 #define CCDC_DFT_TABLE_SIZE	16
 /*
  * Main Structure for vertical defect correction. Vertical defect
- * correction can correct upto 16 defects if defects less than 16
+ * correction can correct up to 16 defects if defects less than 16
  * then pad the rest with 0
  */
 struct ccdc_vertical_dft {

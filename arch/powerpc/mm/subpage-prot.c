@@ -10,7 +10,6 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/gfp.h>
-#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/mm.h>
 #include <linux/hugetlb.h>
@@ -20,13 +19,25 @@
 #include <asm/tlbflush.h>
 
 /*
+ *  * Allocate memory for an auxillary struct to workaround kabi
+ *   */
+struct protptrs_kabi *subpage_prot_alloc_kabi(void)
+{
+	struct protptrs_kabi *p;
+
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+
+	return p;
+}
+
+/*
  * Free all pages allocated for subpage protection maps and pointers.
  * Also makes sure that the subpage_prot_table structure is
  * reinitialized for the next user.
  */
-void subpage_prot_free(pgd_t *pgd)
+void subpage_prot_free(struct mm_struct *mm)
 {
-	struct subpage_prot_table *spt = pgd_subpage_prot(pgd);
+	struct subpage_prot_table *spt = &mm->context.spt;
 	unsigned long i, j, addr;
 	u32 **p;
 
@@ -36,19 +47,35 @@ void subpage_prot_free(pgd_t *pgd)
 			spt->low_prot[i] = NULL;
 		}
 	}
+
+	if (!spt->rh_kabi) {
+		/* no need to allocate, just skip free'ing pages */
+		goto next;
+	}
+
 	addr = 0;
 	for (i = 0; i < 2; ++i) {
-		p = spt->protptrs[i];
+		p = spt->rh_kabi->protptrs[i];
 		if (!p)
 			continue;
-		spt->protptrs[i] = NULL;
+		spt->rh_kabi->protptrs[i] = NULL;
 		for (j = 0; j < SBP_L2_COUNT && addr < spt->maxaddr;
 		     ++j, addr += PAGE_SIZE)
 			if (p[j])
 				free_page((unsigned long)p[j]);
 		free_page((unsigned long)p);
 	}
+	kfree(spt->rh_kabi);
+
+next:
 	spt->maxaddr = 0;
+}
+
+void subpage_prot_init_new_context(struct mm_struct *mm)
+{
+	struct subpage_prot_table *spt = &mm->context.spt;
+
+	memset(spt, 0, sizeof(*spt));
 }
 
 static void hpte_flush_range(struct mm_struct *mm, unsigned long addr,
@@ -72,7 +99,7 @@ static void hpte_flush_range(struct mm_struct *mm, unsigned long addr,
 	pte = pte_offset_map_lock(mm, pmd, addr, &ptl);
 	arch_enter_lazy_mmu_mode();
 	for (; npages > 0; --npages) {
-		pte_update(mm, addr, pte, 0, 0);
+		pte_update(mm, addr, pte, 0, 0, 0);
 		addr += PAGE_SIZE;
 		++pte;
 	}
@@ -87,10 +114,16 @@ static void hpte_flush_range(struct mm_struct *mm, unsigned long addr,
 static void subpage_prot_clear(unsigned long addr, unsigned long len)
 {
 	struct mm_struct *mm = current->mm;
-	struct subpage_prot_table *spt = pgd_subpage_prot(mm->pgd);
+	struct subpage_prot_table *spt = &mm->context.spt;
 	u32 **spm, *spp;
-	int i, nw;
+	unsigned long i;
+	size_t nw;
 	unsigned long next, limit;
+
+	if (!spt->rh_kabi) {
+		spt->rh_kabi = subpage_prot_alloc_kabi();
+		/* can't return failure here, deal with it below */
+	}
 
 	down_write(&mm->mmap_sem);
 	limit = addr + len;
@@ -98,10 +131,12 @@ static void subpage_prot_clear(unsigned long addr, unsigned long len)
 		limit = spt->maxaddr;
 	for (; addr < limit; addr = next) {
 		next = pmd_addr_end(addr, limit);
-		if (addr < 0x100000000) {
+		if (addr < 0x100000000UL) {
 			spm = spt->low_prot;
 		} else {
-			spm = spt->protptrs[addr >> SBP_L3_SHIFT];
+			if (!spt->rh_kabi)
+				continue;
+			spm = spt->rh_kabi->protptrs[addr >> SBP_L3_SHIFT];
 			if (!spm)
 				continue;
 		}
@@ -123,6 +158,53 @@ static void subpage_prot_clear(unsigned long addr, unsigned long len)
 	up_write(&mm->mmap_sem);
 }
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+static int subpage_walk_pmd_entry(pmd_t *pmd, unsigned long addr,
+				  unsigned long end, struct mm_walk *walk)
+{
+	struct vm_area_struct *vma = walk->private;
+	split_huge_page_pmd(vma, addr, pmd);
+	return 0;
+}
+
+static void subpage_mark_vma_nohuge(struct mm_struct *mm, unsigned long addr,
+				    unsigned long len)
+{
+	struct vm_area_struct *vma;
+	struct mm_walk subpage_proto_walk = {
+		.mm = mm,
+		.pmd_entry = subpage_walk_pmd_entry,
+	};
+
+	/*
+	 * We don't try too hard, we just mark all the vma in that range
+	 * VM_NOHUGEPAGE and split them.
+	 */
+	vma = find_vma(mm, addr);
+	/*
+	 * If the range is in unmapped range, just return
+	 */
+	if (vma && ((addr + len) <= vma->vm_start))
+		return;
+
+	while (vma) {
+		if (vma->vm_start >= (addr + len))
+			break;
+		vma->vm_flags |= VM_NOHUGEPAGE;
+		subpage_proto_walk.private = vma;
+		walk_page_range(vma->vm_start, vma->vm_end,
+				&subpage_proto_walk);
+		vma = vma->vm_next;
+	}
+}
+#else
+static void subpage_mark_vma_nohuge(struct mm_struct *mm, unsigned long addr,
+				    unsigned long len)
+{
+	return;
+}
+#endif
+
 /*
  * Copy in a subpage protection map for an address range.
  * The map has 2 bits per 4k subpage, so 32 bits per 64k page.
@@ -136,9 +218,10 @@ static void subpage_prot_clear(unsigned long addr, unsigned long len)
 long sys_subpage_prot(unsigned long addr, unsigned long len, u32 __user *map)
 {
 	struct mm_struct *mm = current->mm;
-	struct subpage_prot_table *spt = pgd_subpage_prot(mm->pgd);
+	struct subpage_prot_table *spt = &mm->context.spt;
 	u32 **spm, *spp;
-	int i, nw;
+	unsigned long i;
+	size_t nw;
 	unsigned long next, limit;
 	int err;
 
@@ -150,6 +233,12 @@ long sys_subpage_prot(unsigned long addr, unsigned long len, u32 __user *map)
 	if (is_hugepage_only_range(mm, addr, len))
 		return -EINVAL;
 
+	if (!spt->rh_kabi) {
+		spt->rh_kabi = subpage_prot_alloc_kabi();
+		if (!spt->rh_kabi)
+			return -ENOMEM;
+	}
+
 	if (!map) {
 		/* Clear out the protection map for the address range */
 		subpage_prot_clear(addr, len);
@@ -160,18 +249,19 @@ long sys_subpage_prot(unsigned long addr, unsigned long len, u32 __user *map)
 		return -EFAULT;
 
 	down_write(&mm->mmap_sem);
+	subpage_mark_vma_nohuge(mm, addr, len);
 	for (limit = addr + len; addr < limit; addr = next) {
 		next = pmd_addr_end(addr, limit);
 		err = -ENOMEM;
-		if (addr < 0x100000000) {
+		if (addr < 0x100000000UL) {
 			spm = spt->low_prot;
 		} else {
-			spm = spt->protptrs[addr >> SBP_L3_SHIFT];
+			spm = spt->rh_kabi->protptrs[addr >> SBP_L3_SHIFT];
 			if (!spm) {
 				spm = (u32 **)get_zeroed_page(GFP_KERNEL);
 				if (!spm)
 					goto out;
-				spt->protptrs[addr >> SBP_L3_SHIFT] = spm;
+				spt->rh_kabi->protptrs[addr >> SBP_L3_SHIFT] = spm;
 			}
 		}
 		spm += (addr >> SBP_L2_SHIFT) & (SBP_L2_COUNT - 1);

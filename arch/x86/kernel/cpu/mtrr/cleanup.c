@@ -78,13 +78,13 @@ x86_get_mtrr_mem_range(struct range *range, int nr_range,
 		base = range_state[i].base_pfn;
 		size = range_state[i].size_pfn;
 		nr_range = add_range_with_merge(range, RANGE_NUM, nr_range,
-						base, base + size - 1);
+						base, base + size);
 	}
 	if (debug_print) {
 		printk(KERN_DEBUG "After WB checking\n");
 		for (i = 0; i < nr_range; i++)
 			printk(KERN_DEBUG "MTRR MAP PFN: %016llx - %016llx\n",
-				 range[i].start, range[i].end + 1);
+				 range[i].start, range[i].end);
 	}
 
 	/* Take out UC ranges: */
@@ -98,7 +98,8 @@ x86_get_mtrr_mem_range(struct range *range, int nr_range,
 			continue;
 		base = range_state[i].base_pfn;
 		if (base < (1<<(20-PAGE_SHIFT)) && mtrr_state.have_fixed &&
-		    (mtrr_state.enabled & 1)) {
+		    (mtrr_state.enabled & MTRR_STATE_MTRR_ENABLED) &&
+		    (mtrr_state.enabled & MTRR_STATE_MTRR_FIXED_ENABLED)) {
 			/* Var MTRR contains UC entry below 1M? Skip it: */
 			printk(BIOS_BUG_MSG, i);
 			if (base + size <= (1<<(20-PAGE_SHIFT)))
@@ -106,11 +107,11 @@ x86_get_mtrr_mem_range(struct range *range, int nr_range,
 			size -= (1<<(20-PAGE_SHIFT)) - base;
 			base = 1<<(20-PAGE_SHIFT);
 		}
-		subtract_range(range, RANGE_NUM, base, base + size - 1);
+		subtract_range(range, RANGE_NUM, base, base + size);
 	}
 	if (extra_remove_size)
 		subtract_range(range, RANGE_NUM, extra_remove_base,
-				 extra_remove_base + extra_remove_size  - 1);
+				 extra_remove_base + extra_remove_size);
 
 	if  (debug_print) {
 		printk(KERN_DEBUG "After UC checking\n");
@@ -118,7 +119,7 @@ x86_get_mtrr_mem_range(struct range *range, int nr_range,
 			if (!range[i].end)
 				continue;
 			printk(KERN_DEBUG "MTRR MAP PFN: %016llx - %016llx\n",
-				 range[i].start, range[i].end + 1);
+				 range[i].start, range[i].end);
 		}
 	}
 
@@ -128,7 +129,7 @@ x86_get_mtrr_mem_range(struct range *range, int nr_range,
 		printk(KERN_DEBUG "After sorting\n");
 		for (i = 0; i < nr_range; i++)
 			printk(KERN_DEBUG "MTRR MAP PFN: %016llx - %016llx\n",
-				 range[i].start, range[i].end + 1);
+				 range[i].start, range[i].end);
 	}
 
 	return nr_range;
@@ -142,7 +143,7 @@ static unsigned long __init sum_ranges(struct range *range, int nr_range)
 	int i;
 
 	for (i = 0; i < nr_range; i++)
-		sum += range[i].end + 1 - range[i].start;
+		sum += range[i].end - range[i].start;
 
 	return sum;
 }
@@ -258,15 +259,15 @@ range_to_mtrr(unsigned int reg, unsigned long range_startk,
 
 		/* Compute the maximum size with which we can make a range: */
 		if (range_startk)
-			max_align = ffs(range_startk) - 1;
+			max_align = __ffs(range_startk);
 		else
-			max_align = 32;
+			max_align = BITS_PER_LONG - 1;
 
-		align = fls(range_sizek) - 1;
+		align = __fls(range_sizek);
 		if (align > max_align)
 			align = max_align;
 
-		sizek = 1 << align;
+		sizek = 1UL << align;
 		if (debug_print) {
 			char start_factor = 'K', size_factor = 'K';
 			unsigned long start_base, size_base;
@@ -489,7 +490,7 @@ x86_setup_var_mtrrs(struct range *range, int nr_range,
 	/* Write the range: */
 	for (i = 0; i < nr_range; i++) {
 		set_var_mtrr_range(&var_state, range[i].start,
-				   range[i].end - range[i].start + 1);
+				   range[i].end - range[i].start);
 	}
 
 	/* Write the last range: */
@@ -633,9 +634,9 @@ static void __init mtrr_print_out_one_result(int i)
 	unsigned long gran_base, chunk_base, lose_base;
 	char gran_factor, chunk_factor, lose_factor;
 
-	gran_base = to_size_factor(result[i].gran_sizek, &gran_factor),
-	chunk_base = to_size_factor(result[i].chunk_sizek, &chunk_factor),
-	lose_base = to_size_factor(result[i].lose_cover_sizek, &lose_factor),
+	gran_base = to_size_factor(result[i].gran_sizek, &gran_factor);
+	chunk_base = to_size_factor(result[i].chunk_sizek, &chunk_factor);
+	lose_base = to_size_factor(result[i].lose_cover_sizek, &lose_factor);
 
 	pr_info("%sgran_size: %ld%c \tchunk_size: %ld%c \t",
 		result[i].bad ? "*BAD*" : " ",
@@ -715,15 +716,15 @@ int __init mtrr_cleanup(unsigned address_bits)
 	if (mtrr_tom2)
 		x_remove_size = (mtrr_tom2 >> PAGE_SHIFT) - x_remove_base;
 
-	nr_range = x86_get_mtrr_mem_range(range, 0, x_remove_base, x_remove_size);
 	/*
 	 * [0, 1M) should always be covered by var mtrr with WB
 	 * and fixed mtrrs should take effect before var mtrr for it:
 	 */
-	nr_range = add_range_with_merge(range, RANGE_NUM, nr_range, 0,
-					(1ULL<<(20 - PAGE_SHIFT)) - 1);
-	/* Sort the ranges: */
-	sort_range(range, nr_range);
+	nr_range = add_range_with_merge(range, RANGE_NUM, 0, 0,
+					1ULL<<(20 - PAGE_SHIFT));
+	/* add from var mtrr at last */
+	nr_range = x86_get_mtrr_mem_range(range, nr_range,
+					  x_remove_base, x_remove_size);
 
 	range_sums = sum_ranges(range, nr_range);
 	printk(KERN_INFO "total RAM covered: %ldM\n",
@@ -940,9 +941,9 @@ int __init mtrr_trim_uncached_memory(unsigned long end_pfn)
 	nr_range = 0;
 	if (mtrr_tom2) {
 		range[nr_range].start = (1ULL<<(32 - PAGE_SHIFT));
-		range[nr_range].end = (mtrr_tom2 >> PAGE_SHIFT) - 1;
-		if (highest_pfn < range[nr_range].end + 1)
-			highest_pfn = range[nr_range].end + 1;
+		range[nr_range].end = mtrr_tom2 >> PAGE_SHIFT;
+		if (highest_pfn < range[nr_range].end)
+			highest_pfn = range[nr_range].end;
 		nr_range++;
 	}
 	nr_range = x86_get_mtrr_mem_range(range, nr_range, 0, 0);
@@ -954,15 +955,15 @@ int __init mtrr_trim_uncached_memory(unsigned long end_pfn)
 
 	/* Check the holes: */
 	for (i = 0; i < nr_range - 1; i++) {
-		if (range[i].end + 1 < range[i+1].start)
-			total_trim_size += real_trim_memory(range[i].end + 1,
+		if (range[i].end < range[i+1].start)
+			total_trim_size += real_trim_memory(range[i].end,
 							    range[i+1].start);
 	}
 
 	/* Check the top: */
 	i = nr_range - 1;
-	if (range[i].end + 1 < end_pfn)
-		total_trim_size += real_trim_memory(range[i].end + 1,
+	if (range[i].end < end_pfn)
+		total_trim_size += real_trim_memory(range[i].end,
 							 end_pfn);
 
 	if (total_trim_size) {

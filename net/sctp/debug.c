@@ -47,10 +47,6 @@
 
 #include <net/sctp/sctp.h>
 
-#if SCTP_DEBUG
-int sctp_debug_flag = 1;	/* Initially enable DEBUG */
-#endif	/* SCTP_DEBUG */
-
 /* These are printable forms of Chunk ID's from section 3.1.  */
 static const char *const sctp_cid_tbl[SCTP_NUM_BASE_CHUNK_TYPES] = {
 	"DATA",
@@ -98,7 +94,6 @@ const char *sctp_cname(const sctp_subtype_t cid)
 
 /* These are printable forms of the states.  */
 const char *const sctp_state_tbl[SCTP_STATE_NUM_STATES] = {
-	"STATE_EMPTY",
 	"STATE_CLOSED",
 	"STATE_COOKIE_WAIT",
 	"STATE_COOKIE_ECHOED",

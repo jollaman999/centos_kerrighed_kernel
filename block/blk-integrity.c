@@ -24,6 +24,8 @@
 #include <linux/mempool.h>
 #include <linux/bio.h>
 #include <linux/scatterlist.h>
+#include <linux/export.h>
+#include <linux/slab.h>
 
 #include "blk.h"
 
@@ -33,24 +35,37 @@ static const char *bi_unsupported_name = "unsupported";
 
 /**
  * blk_rq_count_integrity_sg - Count number of integrity scatterlist elements
- * @rq:		request with integrity metadata attached
+ * @q:		request queue
+ * @bio:	bio with integrity metadata attached
  *
  * Description: Returns the number of elements required in a
- * scatterlist corresponding to the integrity metadata in a request.
+ * scatterlist corresponding to the integrity metadata in a bio.
  */
-int blk_rq_count_integrity_sg(struct request *rq)
+int blk_rq_count_integrity_sg(struct request_queue *q, struct bio *bio)
 {
-	struct bio_vec *iv, *ivprv;
-	struct req_iterator iter;
-	unsigned int segments;
+	struct bio_vec *iv, *ivprv = NULL;
+	unsigned int segments = 0;
+	unsigned int seg_size = 0;
+	unsigned int i = 0;
 
-	ivprv = NULL;
-	segments = 0;
+	bio_for_each_integrity_vec(iv, bio, i) {
 
-	rq_for_each_integrity_segment(iv, rq, iter) {
+		if (ivprv) {
+			if (!BIOVEC_PHYS_MERGEABLE(ivprv, iv))
+				goto new_segment;
 
-		if (!ivprv || !BIOVEC_PHYS_MERGEABLE(ivprv, iv))
+			if (!BIOVEC_SEG_BOUNDARY(q, ivprv, iv))
+				goto new_segment;
+
+			if (seg_size + iv->bv_len > queue_max_segment_size(q))
+				goto new_segment;
+
+			seg_size += iv->bv_len;
+		} else {
+new_segment:
 			segments++;
+			seg_size = iv->bv_len;
+		}
 
 		ivprv = iv;
 	}
@@ -61,28 +76,32 @@ EXPORT_SYMBOL(blk_rq_count_integrity_sg);
 
 /**
  * blk_rq_map_integrity_sg - Map integrity metadata into a scatterlist
- * @rq:		request with integrity metadata attached
+ * @q:		request queue
+ * @bio:	bio with integrity metadata attached
  * @sglist:	target scatterlist
  *
  * Description: Map the integrity vectors in request into a
  * scatterlist.  The scatterlist must be big enough to hold all
  * elements.  I.e. sized using blk_rq_count_integrity_sg().
  */
-int blk_rq_map_integrity_sg(struct request *rq, struct scatterlist *sglist)
+int blk_rq_map_integrity_sg(struct request_queue *q, struct bio *bio,
+			    struct scatterlist *sglist)
 {
-	struct bio_vec *iv, *ivprv;
-	struct req_iterator iter;
-	struct scatterlist *sg;
-	unsigned int segments;
+	struct bio_vec *iv, *ivprv = NULL;
+	struct scatterlist *sg = NULL;
+	unsigned int segments = 0;
+	unsigned int i = 0;
 
-	ivprv = NULL;
-	sg = NULL;
-	segments = 0;
-
-	rq_for_each_integrity_segment(iv, rq, iter) {
+	bio_for_each_integrity_vec(iv, bio, i) {
 
 		if (ivprv) {
 			if (!BIOVEC_PHYS_MERGEABLE(ivprv, iv))
+				goto new_segment;
+
+			if (!BIOVEC_SEG_BOUNDARY(q, ivprv, iv))
+				goto new_segment;
+
+			if (sg->length + iv->bv_len > queue_max_segment_size(q))
 				goto new_segment;
 
 			sg->length += iv->bv_len;
@@ -91,7 +110,7 @@ new_segment:
 			if (!sg)
 				sg = sglist;
 			else {
-				sg->page_link &= ~0x02;
+				sg_unmark_end(sg);
 				sg = sg_next(sg);
 			}
 
@@ -162,6 +181,57 @@ int blk_integrity_compare(struct gendisk *gd1, struct gendisk *gd2)
 	return 0;
 }
 EXPORT_SYMBOL(blk_integrity_compare);
+
+bool blk_integrity_merge_rq(struct request_queue *q, struct request *req,
+			    struct request *next)
+{
+	if (blk_integrity_rq(req) == 0 && blk_integrity_rq(next) == 0)
+		return true;
+
+	if (blk_integrity_rq(req) == 0 || blk_integrity_rq(next) == 0)
+		return false;
+
+	if ((req->bio->bi_flags & BIP_FLAGS_MASK) !=
+	    (next->bio->bi_flags & BIP_FLAGS_MASK))
+		return false;
+
+	if (req->nr_integrity_segments + next->nr_integrity_segments >
+	    q->limits.max_integrity_segments)
+		return false;
+
+	return true;
+}
+EXPORT_SYMBOL(blk_integrity_merge_rq);
+
+bool blk_integrity_merge_bio(struct request_queue *q, struct request *req,
+			     struct bio *bio)
+{
+	int nr_integrity_segs;
+	struct bio *next = bio->bi_next;
+
+	if (blk_integrity_rq(req) == 0 && bio_integrity(bio) == 0)
+		return true;
+
+	if (blk_integrity_rq(req) == 0 || bio_integrity(bio) == 0)
+		return false;
+
+	if ((req->bio->bi_flags & BIP_FLAGS_MASK) !=
+	    (bio->bi_flags & BIP_FLAGS_MASK))
+		return false;
+
+	bio->bi_next = NULL;
+	nr_integrity_segs = blk_rq_count_integrity_sg(q, bio);
+	bio->bi_next = next;
+
+	if (req->nr_integrity_segments + nr_integrity_segs >
+	    q->limits.max_integrity_segments)
+		return false;
+
+	req->nr_integrity_segments += nr_integrity_segs;
+
+	return true;
+}
+EXPORT_SYMBOL(blk_integrity_merge_bio);
 
 struct integrity_sysfs_entry {
 	struct attribute attr;
@@ -331,14 +401,8 @@ EXPORT_SYMBOL(blk_integrity_is_initialized);
 int blk_integrity_register(struct gendisk *disk, struct blk_integrity *template)
 {
 	struct blk_integrity *bi;
-	static bool seen = false;
 
 	BUG_ON(disk == NULL);
-
-	if (!seen) {
-		mark_tech_preview("DIF/DIX support", NULL);
-		seen = true;
-	}
 
 	if (disk->integrity == NULL) {
 		bi = kmem_cache_alloc(integrity_cachep,
@@ -356,7 +420,8 @@ int blk_integrity_register(struct gendisk *disk, struct blk_integrity *template)
 		kobject_uevent(&bi->kobj, KOBJ_ADD);
 
 		bi->flags |= INTEGRITY_FLAG_READ | INTEGRITY_FLAG_WRITE;
-		bi->sector_size = queue_logical_block_size(disk->queue);
+		if (!template || !template->sector_size)
+			bi->sector_size = queue_logical_block_size(disk->queue);
 		disk->integrity = bi;
 	} else
 		bi = disk->integrity;
@@ -370,6 +435,8 @@ int blk_integrity_register(struct gendisk *disk, struct blk_integrity *template)
 		bi->set_tag_fn = template->set_tag_fn;
 		bi->get_tag_fn = template->get_tag_fn;
 		bi->tag_size = template->tag_size;
+		if (template->sector_size)
+			bi->sector_size = template->sector_size;
 	} else
 		bi->name = bi_unsupported_name;
 

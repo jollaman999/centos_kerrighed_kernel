@@ -10,23 +10,24 @@
 #include <sys/time.h>
 #include <time.h>
 #include <dirent.h>
+#include <errno.h>
 #include <unistd.h>
 #include "builtin.h"
 #include "perf.h"
 #include "util/cache.h"
 #include "util/debug.h"
 #include "util/header.h"
-#include "util/parse-options.h"
+#include <subcmd/parse-options.h>
 #include "util/strlist.h"
 #include "util/build-id.h"
 #include "util/session.h"
 #include "util/symbol.h"
+#include "util/time-utils.h"
+#include "util/probe-file.h"
 
 static int build_id_cache__kcore_buildid(const char *proc_dir, char *sbuildid)
 {
 	char root_dir[PATH_MAX];
-	char notes[PATH_MAX];
-	u8 build_id[BUILD_ID_SIZE];
 	char *p;
 
 	strlcpy(root_dir, proc_dir, sizeof(root_dir));
@@ -35,32 +36,12 @@ static int build_id_cache__kcore_buildid(const char *proc_dir, char *sbuildid)
 	if (!p)
 		return -1;
 	*p = '\0';
-
-	scnprintf(notes, sizeof(notes), "%s/sys/kernel/notes", root_dir);
-
-	if (sysfs__read_build_id(notes, build_id, sizeof(build_id)))
-		return -1;
-
-	build_id__sprintf(build_id, sizeof(build_id), sbuildid);
-
-	return 0;
+	return sysfs__sprintf_build_id(root_dir, sbuildid);
 }
 
 static int build_id_cache__kcore_dir(char *dir, size_t sz)
 {
-	struct timeval tv;
-	struct tm tm;
-	char dt[32];
-
-	if (gettimeofday(&tv, NULL) || !localtime_r(&tv.tv_sec, &tm))
-		return -1;
-
-	if (!strftime(dt, sizeof(dt), "%Y%m%d%H%M%S", &tm))
-		return -1;
-
-	scnprintf(dir, sz, "%s%02u", dt, (unsigned)tv.tv_usec / 10000);
-
-	return 0;
+	return fetch_current_timestamp(dir, sz);
 }
 
 static bool same_kallsyms_reloc(const char *from_dir, char *to_dir)
@@ -69,19 +50,22 @@ static bool same_kallsyms_reloc(const char *from_dir, char *to_dir)
 	char to[PATH_MAX];
 	const char *name;
 	u64 addr1 = 0, addr2 = 0;
-	int i;
+	int i, err = -1;
 
 	scnprintf(from, sizeof(from), "%s/kallsyms", from_dir);
 	scnprintf(to, sizeof(to), "%s/kallsyms", to_dir);
 
 	for (i = 0; (name = ref_reloc_sym_names[i]) != NULL; i++) {
-		addr1 = kallsyms__get_function_start(from, name);
-		if (addr1)
+		err = kallsyms__get_function_start(from, name, &addr1);
+		if (!err)
 			break;
 	}
 
-	if (name)
-		addr2 = kallsyms__get_function_start(to, name);
+	if (err)
+		return false;
+
+	if (kallsyms__get_function_start(to, name, &addr2))
+		return false;
 
 	return addr1 == addr2;
 }
@@ -127,7 +111,7 @@ static int build_id_cache__kcore_existing(const char *from_dir, char *to_dir,
 
 static int build_id_cache__add_kcore(const char *filename, bool force)
 {
-	char dir[32], sbuildid[BUILD_ID_SIZE * 2 + 1];
+	char dir[32], sbuildid[SBUILD_ID_SIZE];
 	char from_dir[PATH_MAX], to_dir[PATH_MAX];
 	char *p;
 
@@ -138,11 +122,11 @@ static int build_id_cache__add_kcore(const char *filename, bool force)
 		return -1;
 	*p = '\0';
 
-	if (build_id_cache__kcore_buildid(from_dir, sbuildid))
+	if (build_id_cache__kcore_buildid(from_dir, sbuildid) < 0)
 		return -1;
 
-	scnprintf(to_dir, sizeof(to_dir), "%s/[kernel.kcore]/%s",
-		  buildid_dir, sbuildid);
+	scnprintf(to_dir, sizeof(to_dir), "%s/%s/%s",
+		  buildid_dir, DSO__NAME_KCORE, sbuildid);
 
 	if (!force &&
 	    !build_id_cache__kcore_existing(from_dir, to_dir, sizeof(to_dir))) {
@@ -153,8 +137,8 @@ static int build_id_cache__add_kcore(const char *filename, bool force)
 	if (build_id_cache__kcore_dir(dir, sizeof(dir)))
 		return -1;
 
-	scnprintf(to_dir, sizeof(to_dir), "%s/[kernel.kcore]/%s/%s",
-		  buildid_dir, sbuildid, dir);
+	scnprintf(to_dir, sizeof(to_dir), "%s/%s/%s/%s",
+		  buildid_dir, DSO__NAME_KCORE, sbuildid, dir);
 
 	if (mkdir_p(to_dir, 0755))
 		return -1;
@@ -184,7 +168,7 @@ static int build_id_cache__add_kcore(const char *filename, bool force)
 
 static int build_id_cache__add_file(const char *filename)
 {
-	char sbuild_id[BUILD_ID_SIZE * 2 + 1];
+	char sbuild_id[SBUILD_ID_SIZE];
 	u8 build_id[BUILD_ID_SIZE];
 	int err;
 
@@ -204,7 +188,7 @@ static int build_id_cache__add_file(const char *filename)
 static int build_id_cache__remove_file(const char *filename)
 {
 	u8 build_id[BUILD_ID_SIZE];
-	char sbuild_id[BUILD_ID_SIZE * 2 + 1];
+	char sbuild_id[SBUILD_ID_SIZE];
 
 	int err;
 
@@ -231,7 +215,7 @@ static int build_id_cache__purge_path(const char *pathname)
 	if (err)
 		goto out;
 
-	strlist__for_each(pos, list) {
+	strlist__for_each_entry(pos, list) {
 		err = build_id_cache__remove_s(pos->s);
 		pr_debug("Removing %s %s: %s\n", pos->s, pathname,
 			 err ? "FAIL" : "Ok");
@@ -243,6 +227,34 @@ static int build_id_cache__purge_path(const char *pathname)
 out:
 	pr_debug("Purging %s: %s\n", pathname, err ? "FAIL" : "Ok");
 
+	return err;
+}
+
+static int build_id_cache__purge_all(void)
+{
+	struct strlist *list;
+	struct str_node *pos;
+	int err = 0;
+	char *buf;
+
+	list = build_id_cache__list_all(false);
+	if (!list) {
+		pr_debug("Failed to get buildids: -%d\n", errno);
+		return -EINVAL;
+	}
+
+	strlist__for_each_entry(pos, list) {
+		buf = build_id_cache__origname(pos->s);
+		err = build_id_cache__remove_s(pos->s);
+		pr_debug("Removing %s (%s): %s\n", buf, pos->s,
+			 err ? "FAIL" : "Ok");
+		free(buf);
+		if (err)
+			break;
+	}
+	strlist__delete(list);
+
+	pr_debug("Purged all: %s\n", err ? "FAIL" : "Ok");
 	return err;
 }
 
@@ -276,7 +288,7 @@ static int build_id_cache__fprintf_missing(struct perf_session *session, FILE *f
 static int build_id_cache__update_file(const char *filename)
 {
 	u8 build_id[BUILD_ID_SIZE];
-	char sbuild_id[BUILD_ID_SIZE * 2 + 1];
+	char sbuild_id[SBUILD_ID_SIZE];
 
 	int err = 0;
 
@@ -298,13 +310,35 @@ static int build_id_cache__update_file(const char *filename)
 	return err;
 }
 
-int cmd_buildid_cache(int argc, const char **argv,
-		      const char *prefix __maybe_unused)
+static int build_id_cache__show_all(void)
+{
+	struct strlist *bidlist;
+	struct str_node *nd;
+	char *buf;
+
+	bidlist = build_id_cache__list_all(true);
+	if (!bidlist) {
+		pr_debug("Failed to get buildids: -%d\n", errno);
+		return -1;
+	}
+	strlist__for_each_entry(nd, bidlist) {
+		buf = build_id_cache__origname(nd->s);
+		fprintf(stdout, "%s %s\n", nd->s, buf);
+		free(buf);
+	}
+	strlist__delete(bidlist);
+	return 0;
+}
+
+int cmd_buildid_cache(int argc, const char **argv)
 {
 	struct strlist *list;
 	struct str_node *pos;
 	int ret = 0;
 	bool force = false;
+	bool list_files = false;
+	bool opts_flag = false;
+	bool purge_all = false;
 	char const *add_name_list_str = NULL,
 		   *remove_name_list_str = NULL,
 		   *purge_name_list_str = NULL,
@@ -313,7 +347,7 @@ int cmd_buildid_cache(int argc, const char **argv,
 		   *kcore_filename = NULL;
 	char sbuf[STRERR_BUFSIZE];
 
-	struct perf_data_file file = {
+	struct perf_data data = {
 		.mode  = PERF_DATA_MODE_READ,
 	};
 	struct perf_session *session = NULL;
@@ -325,8 +359,10 @@ int cmd_buildid_cache(int argc, const char **argv,
 		   "file", "kcore file to add"),
 	OPT_STRING('r', "remove", &remove_name_list_str, "file list",
 		    "file(s) to remove"),
-	OPT_STRING('p', "purge", &purge_name_list_str, "path list",
-		    "path(s) to remove (remove old caches too)"),
+	OPT_STRING('p', "purge", &purge_name_list_str, "file list",
+		    "file(s) to remove (remove old caches too)"),
+	OPT_BOOLEAN('P', "purge-all", &purge_all, "purge all cached files"),
+	OPT_BOOLEAN('l', "list", &list_files, "list all cached files"),
 	OPT_STRING('M', "missing", &missing_filename, "file",
 		   "to find missing build ids in the cache"),
 	OPT_BOOLEAN('f', "force", &force, "don't complain, do it"),
@@ -343,16 +379,25 @@ int cmd_buildid_cache(int argc, const char **argv,
 	argc = parse_options(argc, argv, buildid_cache_options,
 			     buildid_cache_usage, 0);
 
-	if (argc || (!add_name_list_str && !kcore_filename &&
-		     !remove_name_list_str && !purge_name_list_str &&
-		     !missing_filename && !update_name_list_str))
+	opts_flag = add_name_list_str || kcore_filename ||
+		remove_name_list_str || purge_name_list_str ||
+		missing_filename || update_name_list_str ||
+		purge_all;
+
+	if (argc || !(list_files || opts_flag))
 		usage_with_options(buildid_cache_usage, buildid_cache_options);
 
-	if (missing_filename) {
-		file.path = missing_filename;
-		file.force = force;
+	/* -l is exclusive. It can not be used with other options. */
+	if (list_files && opts_flag) {
+		usage_with_options_msg(buildid_cache_usage,
+			buildid_cache_options, "-l is exclusive.\n");
+	}
 
-		session = perf_session__new(&file, false, NULL);
+	if (missing_filename) {
+		data.file.path = missing_filename;
+		data.force     = force;
+
+		session = perf_session__new(&data, false, NULL);
 		if (session == NULL)
 			return -1;
 	}
@@ -362,10 +407,15 @@ int cmd_buildid_cache(int argc, const char **argv,
 
 	setup_pager();
 
+	if (list_files) {
+		ret = build_id_cache__show_all();
+		goto out;
+	}
+
 	if (add_name_list_str) {
-		list = strlist__new(true, add_name_list_str);
+		list = strlist__new(add_name_list_str, NULL);
 		if (list) {
-			strlist__for_each(pos, list)
+			strlist__for_each_entry(pos, list)
 				if (build_id_cache__add_file(pos->s)) {
 					if (errno == EEXIST) {
 						pr_debug("%s already in the cache\n",
@@ -373,7 +423,7 @@ int cmd_buildid_cache(int argc, const char **argv,
 						continue;
 					}
 					pr_warning("Couldn't add %s: %s\n",
-						   pos->s, strerror_r(errno, sbuf, sizeof(sbuf)));
+						   pos->s, str_error_r(errno, sbuf, sizeof(sbuf)));
 				}
 
 			strlist__delete(list);
@@ -381,9 +431,9 @@ int cmd_buildid_cache(int argc, const char **argv,
 	}
 
 	if (remove_name_list_str) {
-		list = strlist__new(true, remove_name_list_str);
+		list = strlist__new(remove_name_list_str, NULL);
 		if (list) {
-			strlist__for_each(pos, list)
+			strlist__for_each_entry(pos, list)
 				if (build_id_cache__remove_file(pos->s)) {
 					if (errno == ENOENT) {
 						pr_debug("%s wasn't in the cache\n",
@@ -391,7 +441,7 @@ int cmd_buildid_cache(int argc, const char **argv,
 						continue;
 					}
 					pr_warning("Couldn't remove %s: %s\n",
-						   pos->s, strerror_r(errno, sbuf, sizeof(sbuf)));
+						   pos->s, str_error_r(errno, sbuf, sizeof(sbuf)));
 				}
 
 			strlist__delete(list);
@@ -399,9 +449,9 @@ int cmd_buildid_cache(int argc, const char **argv,
 	}
 
 	if (purge_name_list_str) {
-		list = strlist__new(true, purge_name_list_str);
+		list = strlist__new(purge_name_list_str, NULL);
 		if (list) {
-			strlist__for_each(pos, list)
+			strlist__for_each_entry(pos, list)
 				if (build_id_cache__purge_path(pos->s)) {
 					if (errno == ENOENT) {
 						pr_debug("%s wasn't in the cache\n",
@@ -409,10 +459,17 @@ int cmd_buildid_cache(int argc, const char **argv,
 						continue;
 					}
 					pr_warning("Couldn't remove %s: %s\n",
-						   pos->s, strerror_r(errno, sbuf, sizeof(sbuf)));
+						   pos->s, str_error_r(errno, sbuf, sizeof(sbuf)));
 				}
 
 			strlist__delete(list);
+		}
+	}
+
+	if (purge_all) {
+		if (build_id_cache__purge_all()) {
+			pr_warning("Couldn't remove some caches. Error: %s.\n",
+				str_error_r(errno, sbuf, sizeof(sbuf)));
 		}
 	}
 
@@ -420,9 +477,9 @@ int cmd_buildid_cache(int argc, const char **argv,
 		ret = build_id_cache__fprintf_missing(session, stdout);
 
 	if (update_name_list_str) {
-		list = strlist__new(true, update_name_list_str);
+		list = strlist__new(update_name_list_str, NULL);
 		if (list) {
-			strlist__for_each(pos, list)
+			strlist__for_each_entry(pos, list)
 				if (build_id_cache__update_file(pos->s)) {
 					if (errno == ENOENT) {
 						pr_debug("%s wasn't in the cache\n",
@@ -430,7 +487,7 @@ int cmd_buildid_cache(int argc, const char **argv,
 						continue;
 					}
 					pr_warning("Couldn't update %s: %s\n",
-						   pos->s, strerror_r(errno, sbuf, sizeof(sbuf)));
+						   pos->s, str_error_r(errno, sbuf, sizeof(sbuf)));
 				}
 
 			strlist__delete(list);
@@ -441,8 +498,7 @@ int cmd_buildid_cache(int argc, const char **argv,
 		pr_warning("Couldn't add %s\n", kcore_filename);
 
 out:
-	if (session)
-		perf_session__delete(session);
+	perf_session__delete(session);
 
 	return ret;
 }

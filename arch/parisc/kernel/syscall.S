@@ -1,11 +1,34 @@
 /* 
  * Linux/PA-RISC Project (http://www.parisc-linux.org/)
  * 
- * System call entry code Copyright (c) Matthew Wilcox 1999 <willy@bofh.ai>
+ * System call entry code / Linux gateway page
+ * Copyright (c) Matthew Wilcox 1999 <willy@bofh.ai>
  * Licensed under the GNU GPL.
  * thanks to Philipp Rumpf, Mike Shaver and various others
  * sorry about the wall, puffin..
  */
+
+/*
+How does the Linux gateway page on PA-RISC work?
+------------------------------------------------
+The Linux gateway page on PA-RISC is "special".
+It actually has PAGE_GATEWAY bits set (this is linux terminology; in parisc
+terminology it's Execute, promote to PL0) in the page map.  So anything
+executing on this page executes with kernel level privilege (there's more to it
+than that: to have this happen, you also have to use a branch with a ,gate
+completer to activate the privilege promotion).  The upshot is that everything
+that runs on the gateway page runs at kernel privilege but with the current
+user process address space (although you have access to kernel space via %sr2).
+For the 0x100 syscall entry, we redo the space registers to point to the kernel
+address space (preserving the user address space in %sr3), move to wide mode if
+required, save the user registers and branch into the kernel syscall entry
+point.  For all the other functions, we execute at kernel privilege but don't
+flip address spaces. The basic upshot of this is that these code snippets are
+executed atomically (because the kernel can't be pre-empted) and they may
+perform architecturally forbidden (to PL3) operations (like setting control
+registers).
+*/
+
 
 #include <asm/asm-offsets.h>
 #include <asm/unistd.h>
@@ -15,6 +38,7 @@
 #include <asm/thread_info.h>
 #include <asm/assembly.h>
 #include <asm/processor.h>
+#include <asm/cache.h>
 
 #include <linux/linkage.h>
 
@@ -47,18 +71,17 @@ ENTRY(linux_gateway_page)
 	KILL_INSN
 	.endr
 
-	/* ADDRESS 0xb0 to 0xb4, lws uses 1 insns for entry */
+	/* ADDRESS 0xb0 to 0xb8, lws uses two insns for entry */
 	/* Light-weight-syscall entry must always be located at 0xb0 */
 	/* WARNING: Keep this number updated with table size changes */
 #define __NR_lws_entries (2)
 
 lws_entry:
-	/* Unconditional branch to lws_start, located on the 
-	   same gateway page */
-	b,n	lws_start
+	gate	lws_start, %r0		/* increase privilege */
+	depi	3, 31, 2, %r31		/* Ensure we return into user mode. */
 
-	/* Fill from 0xb4 to 0xe0 */
-	.rept 11
+	/* Fill from 0xb8 to 0xe0 */
+	.rept 10
 	KILL_INSN
 	.endr
 
@@ -157,7 +180,7 @@ linux_gateway_entry:
 	STREG	%r26, TASK_PT_GR26(%r1)	 	/* 1st argument */
 	STREG	%r27, TASK_PT_GR27(%r1)		/* user dp */
 	STREG   %r28, TASK_PT_GR28(%r1)         /* return value 0 */
-	STREG   %r28, TASK_PT_ORIG_R28(%r1)     /* return value 0 (saved for signals) */
+	STREG   %r0, TASK_PT_ORIG_R28(%r1)      /* don't prohibit restarts */
 	STREG	%r29, TASK_PT_GR29(%r1)		/* return value 1 */
 	STREG	%r31, TASK_PT_GR31(%r1)		/* preserve syscall return ptr */
 	
@@ -181,9 +204,10 @@ linux_gateway_entry:
 
 	/* Are we being ptraced? */
 	mfctl	%cr30, %r1
-	LDREG	TI_TASK(%r1),%r1
-	ldw	TASK_PTRACE(%r1), %r1
-	bb,<,n	%r1,31,.Ltracesys
+	LDREG	TI_FLAGS(%r1),%r1
+	ldi	_TIF_SYSCALL_TRACE_MASK, %r19
+	and,COND(=) %r1, %r19, %r0
+	b,n	.Ltracesys
 	
 	/* Note!  We cannot use the syscall table that is mapped
 	nearby since the gateway page is mapped execute-only. */
@@ -309,10 +333,13 @@ tracesys_next:
 	LDREG   TASK_PT_GR25(%r1), %r25
 	LDREG   TASK_PT_GR24(%r1), %r24
 	LDREG   TASK_PT_GR23(%r1), %r23
-#ifdef CONFIG_64BIT
 	LDREG   TASK_PT_GR22(%r1), %r22
 	LDREG   TASK_PT_GR21(%r1), %r21
+#ifdef CONFIG_64BIT
 	ldo	-16(%r30),%r29			/* Reference param save area */
+#else
+	stw     %r22, -52(%r30)                 /* 5th argument */
+	stw     %r21, -56(%r30)                 /* 6th argument */
 #endif
 
 	comiclr,>>=	__NR_Linux_syscalls, %r20, %r0
@@ -423,9 +450,6 @@ tracesys_sigexit:
 
 	*********************************************************/
 lws_start:
-	/* Gate and ensure we return to userspace */
-	gate	.+8, %r0
-	depi	3, 31, 2, %r31	/* Ensure we return to userspace */
 
 #ifdef CONFIG_64BIT
 	/* FIXME: If we are a 64-bit kernel just
@@ -442,7 +466,7 @@ lws_start:
 #endif	
 
         /* Is the lws entry number valid? */
-	comiclr,>>=	__NR_lws_entries, %r20, %r0
+	comiclr,>>	__NR_lws_entries, %r20, %r0
 	b,n	lws_exit_nosys
 
 	/* WARNING: Trashing sr2 and sr3 */
@@ -473,7 +497,7 @@ lws_exit:
 	/* now reset the lowest bit of sp if it was set */
 	xor	%r30,%r1,%r30
 #endif
-	be,n	0(%sr3, %r31)
+	be,n	0(%sr7, %r31)
 
 
 	
@@ -529,7 +553,6 @@ lws_compare_and_swap32:
 #endif
 
 lws_compare_and_swap:
-#ifdef CONFIG_SMP
 	/* Load start of lock table */
 	ldil	L%lws_lock_start, %r20
 	ldo	R%lws_lock_start(%r20), %r28
@@ -572,8 +595,6 @@ cas_wouldblock:
 	ldo	2(%r0), %r28				/* 2nd case */
 	b	lws_exit				/* Contended... */
 	ldo	-EAGAIN(%r0), %r21			/* Spin in userspace */
-#endif
-/* CONFIG_SMP */
 
 	/*
 		prev = *addr;
@@ -601,26 +622,22 @@ cas_action:
 1:	ldw	0(%sr3,%r26), %r28
 	sub,<>	%r28, %r25, %r0
 2:	stw	%r24, 0(%sr3,%r26)
-#ifdef CONFIG_SMP
 	/* Free lock */
 	stw	%r20, 0(%sr2,%r20)
-# if ENABLE_LWS_DEBUG
+#if ENABLE_LWS_DEBUG
 	/* Clear thread register indicator */
 	stw	%r0, 4(%sr2,%r20)
-# endif
 #endif
 	/* Return to userspace, set no error */
 	b	lws_exit
 	copy	%r0, %r21
 
 3:		
-	/* Error occured on load or store */
-#ifdef CONFIG_SMP
+	/* Error occurred on load or store */
 	/* Free lock */
 	stw	%r20, 0(%sr2,%r20)
-# if ENABLE_LWS_DEBUG
+#if ENABLE_LWS_DEBUG
 	stw	%r0, 4(%sr2,%r20)
-# endif
 #endif
 	b	lws_exit
 	ldo	-EFAULT(%r0),%r21	/* set errno */
@@ -650,7 +667,7 @@ ENTRY(end_linux_gateway_page)
 
 	.section .rodata,"a"
 
-	.align PAGE_SIZE
+	.align 8
 	/* Light-weight-syscall table */
 	/* Start of lws table. */
 ENTRY(lws_table)
@@ -659,20 +676,19 @@ ENTRY(lws_table)
 END(lws_table)
 	/* End of lws table */
 
-	.align PAGE_SIZE
+	.align 8
 ENTRY(sys_call_table)
 #include "syscall_table.S"
 END(sys_call_table)
 
 #ifdef CONFIG_64BIT
-	.align PAGE_SIZE
+	.align 8
 ENTRY(sys_call_table64)
 #define SYSCALL_TABLE_64BIT
 #include "syscall_table.S"
 END(sys_call_table64)
 #endif
 
-#ifdef CONFIG_SMP
 	/*
 		All light-weight-syscall atomic operations 
 		will use this set of locks 
@@ -682,7 +698,7 @@ END(sys_call_table64)
 		with ldcw.
 	*/
 	.section .data
-	.align	PAGE_SIZE
+	.align	L1_CACHE_BYTES
 ENTRY(lws_lock_start)
 	/* lws locks */
 	.rept 16
@@ -694,8 +710,6 @@ ENTRY(lws_lock_start)
 	.endr
 END(lws_lock_start)
 	.previous
-#endif
-/* CONFIG_SMP for lws_lock_start */
 
 .end
 

@@ -2,7 +2,7 @@
  * APEI Error Record Serialization Table debug support
  *
  * ERST is a way provided by APEI to save and retrieve hardware error
- * infomation to and from a persistent store. This file provide the
+ * information to and from a persistent store. This file provide the
  * debugging/testing support for ERST kernel support and firmware
  * implementation.
  *
@@ -111,8 +111,17 @@ retry_next:
 	if (rc)
 		goto out;
 	/* no more record */
-	if (id == APEI_ERST_INVALID_RECORD_ID)
+	if (id == APEI_ERST_INVALID_RECORD_ID) {
+		/*
+		 * If the persistent store is empty initially, the function
+		 * 'erst_read' below will return "-ENOENT" value. This causes
+		 * 'retry_next' label is entered again. The returned value
+		 * should be zero indicating the read operation is EOF.
+		 */
+		len = 0;
+
 		goto out;
+	}
 retry:
 	rc = len = erst_read(id, erst_dbg_buf, erst_dbg_buf_len);
 	/* The record may be cleared by others, try read next record */
@@ -202,6 +211,7 @@ static const struct file_operations erst_dbg_ops = {
 	.read		= erst_dbg_read,
 	.write		= erst_dbg_write,
 	.unlocked_ioctl	= erst_dbg_ioctl,
+	.llseek		= no_llseek,
 };
 
 static struct miscdevice erst_dbg_dev = {

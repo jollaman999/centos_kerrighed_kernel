@@ -1,41 +1,38 @@
-/* -*- c -*- --------------------------------------------------------------- *
- *
- * linux/fs/autofs/init.c
- *
- *  Copyright 1997-1998 Transmeta Corporation -- All Rights Reserved
+/*
+ * Copyright 1997-1998 Transmeta Corporation -- All Rights Reserved
  *
  * This file is part of the Linux kernel and is made available under
  * the terms of the GNU General Public License, version 2, or at your
  * option, any later version, incorporated herein by reference.
- *
- * ------------------------------------------------------------------------- */
+ */
 
 #include <linux/module.h>
 #include <linux/init.h>
 #include "autofs_i.h"
 
-static int autofs_get_sb(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
+static struct dentry *autofs_mount(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data)
 {
-	return get_sb_nodev(fs_type, flags, data, autofs4_fill_super, mnt);
+	return mount_nodev(fs_type, flags, data, autofs4_fill_super);
 }
 
-static struct file_system_type autofs_fs_type = {
+struct file_system_type autofs_fs_type = {
 	.owner		= THIS_MODULE,
 	.name		= "autofs",
-	.get_sb		= autofs_get_sb,
+	.mount		= autofs_mount,
 	.kill_sb	= autofs4_kill_sb,
 };
+MODULE_ALIAS_FS("autofs");
 
 static int __init init_autofs4_fs(void)
 {
 	int err;
 
+	autofs_dev_ioctl_init();
+
 	err = register_filesystem(&autofs_fs_type);
 	if (err)
-		return err;
-
-	autofs_dev_ioctl_init();
+		autofs_dev_ioctl_exit();
 
 	return err;
 }

@@ -7,6 +7,7 @@
 #include <linux/stddef.h>
 #include <linux/stringify.h>
 #include <asm/asm.h>
+#include <asm/ptrace.h>
 
 /*
  * Alternative inline assembly for SMP.
@@ -30,39 +31,30 @@
  */
 
 #ifdef CONFIG_SMP
-#define LOCK_PREFIX \
+#define LOCK_PREFIX_HERE \
 		".pushsection .smp_locks,\"a\"\n"	\
-		_ASM_ALIGN "\n"				\
-		_ASM_PTR "661f\n" /* address */		\
+		".balign 4\n"				\
+		".long 671f - .\n" /* offset */		\
 		".popsection\n"				\
-		"661:\n\tlock; "
+		"671:"
+
+#define LOCK_PREFIX LOCK_PREFIX_HERE "\n\tlock; "
 
 #else /* ! CONFIG_SMP */
+#define LOCK_PREFIX_HERE ""
 #define LOCK_PREFIX ""
 #endif
 
-/* This must be included *after* the definition of LOCK_PREFIX */
-#include <asm/cpufeature.h>
-
 struct alt_instr {
-	u8 *instr;		/* original instruction */
-	u8 *replacement;	/* replacement instruction */
+	s32 instr_offset;	/* original instruction */
+	s32 repl_offset;	/* offset to replacement instruction */
 	u16 cpuid;		/* cpuid bit set for replacement */
 	u8  instrlen;		/* length of original instruction */
-	u8  replacementlen;	/* length of new instruction */
-#ifdef CONFIG_X86_64
-#ifdef __GENKSYMS__
-	u32 pad2;
-#else
-	u8  padlen;		/* length of build-time padding */
-	u8  pad[3];
-#endif
-#endif
-} __packed;
+	u8  replacementlen;	/* length of new instruction, <= instrlen */
+};
 
 extern void alternative_instructions(void);
-extern void apply_alternatives(struct alt_instr *start, struct alt_instr *end,
-			       int fixup);
+extern void apply_alternatives(struct alt_instr *start, struct alt_instr *end);
 
 struct module;
 
@@ -71,96 +63,69 @@ extern void alternatives_smp_module_add(struct module *mod, char *name,
 					void *locks, void *locks_end,
 					void *text, void *text_end);
 extern void alternatives_smp_module_del(struct module *mod);
-extern void alternatives_smp_switch(int smp);
+extern void alternatives_enable_smp(void);
 extern int alternatives_text_reserved(void *start, void *end);
+extern bool skip_smp_alternatives;
 #else
 static inline void alternatives_smp_module_add(struct module *mod, char *name,
 					       void *locks, void *locks_end,
 					       void *text, void *text_end) {}
 static inline void alternatives_smp_module_del(struct module *mod) {}
-static inline void alternatives_smp_switch(int smp) {}
+static inline void alternatives_enable_smp(void) {}
 static inline int alternatives_text_reserved(void *start, void *end)
 {
 	return 0;
 }
 #endif	/* CONFIG_SMP */
 
-#define b_replacement(num)	"664"#num
-#define e_replacement(num)	"665"#num
+#define OLDINSTR(oldinstr)	"661:\n\t" oldinstr "\n662:\n"
 
-#define alt_end_marker		"663"
-#define alt_slen		"662b-661b"
-#define alt_pad_len		alt_end_marker"b-662b"
-#define alt_total_slen		alt_end_marker"b-661b"
-#define alt_rlen(num)		e_replacement(num)"f-"b_replacement(num)"f"
+#define b_replacement(number)	"663"#number
+#define e_replacement(number)	"664"#number
 
-#ifdef CONFIG_X86_64
-#define ALT_PAD_LEN		" .byte " alt_pad_len "\n"
-#define ALT_PAD_LEN0		" .byte 0\n"
-#else
-#define ALT_PAD_LEN
-#define ALT_PAD_LEN0
-#endif
+#define alt_slen "662b-661b"
+#define alt_rlen(number) e_replacement(number)"f-"b_replacement(number)"f"
 
-#define __OLDINSTR(oldinstr, num)					\
-	"661:\n\t" oldinstr "\n662:\n"					\
-	".skip -(((" alt_rlen(num) ")-(" alt_slen ")) > 0) * "		\
-		"((" alt_rlen(num) ")-(" alt_slen ")),0x90\n"
-
-#define OLDINSTR(oldinstr, num)						\
-	__OLDINSTR(oldinstr, num)					\
-	alt_end_marker ":\n"
-
-/*
- * gas compatible max based on the idea from:
- * http://graphics.stanford.edu/~seander/bithacks.html#IntegerMinOrMax
- *
- * The additional "-" is needed because gas uses a "true" value of -1.
- */
-#define alt_max_short(a, b)	"((" a ") ^ (((" a ") ^ (" b ")) & -(-((" a ") < (" b ")))))"
-
-/*
- * Pad the second replacement alternative with additional NOPs if it is
- * additionally longer than the first replacement alternative.
- */
-#define OLDINSTR_2(oldinstr, num1, num2) \
-	"661:\n\t" oldinstr "\n662:\n"								\
-	".skip -((" alt_max_short(alt_rlen(num1), alt_rlen(num2)) " - (" alt_slen ")) > 0) * "	\
-		"(" alt_max_short(alt_rlen(num1), alt_rlen(num2)) " - (" alt_slen ")), 0x90\n"	\
-	alt_end_marker ":\n"
-
-#define ALTINSTR_ENTRY(feature, num)					      \
-	_ASM_ALIGN "\n"							      \
-	_ASM_PTR "661b\n"				/* label           */ \
-	_ASM_PTR b_replacement(num)"f\n"		/* new instruction */ \
+#define ALTINSTR_ENTRY(feature, number)					      \
+	" .long 661b - .\n"				/* label           */ \
+	" .long " b_replacement(number)"f - .\n"	/* new instruction */ \
 	" .word " __stringify(feature) "\n"		/* feature bit     */ \
-	" .byte " alt_total_slen "\n"			/* source len      */ \
-	" .byte " alt_rlen(num) "\n"			/* replacement len */ \
-	ALT_PAD_LEN					/* pad len */
+	" .byte " alt_slen "\n"				/* source len      */ \
+	" .byte " alt_rlen(number) "\n"			/* replacement len */
 
-#define ALTINSTR_REPLACEMENT(newinstr, feature, num)	/* replacement */     \
-	b_replacement(num)":\n\t" newinstr "\n" e_replacement(num) ":\n\t"
+#define DISCARD_ENTRY(number)				/* rlen <= slen */    \
+	" .byte 0xff + (" alt_rlen(number) ") - (" alt_slen ")\n"
+
+#define ALTINSTR_REPLACEMENT(newinstr, feature, number)	/* replacement */     \
+	b_replacement(number)":\n\t" newinstr "\n" e_replacement(number) ":\n\t"
 
 /* alternative assembly primitive: */
 #define ALTERNATIVE(oldinstr, newinstr, feature)			\
-	OLDINSTR(oldinstr, 1)						\
+	OLDINSTR(oldinstr)						\
 	".pushsection .altinstructions,\"a\"\n"				\
 	ALTINSTR_ENTRY(feature, 1)					\
 	".popsection\n"							\
+	".pushsection .discard,\"aw\",@progbits\n"			\
+	DISCARD_ENTRY(1)						\
+	".popsection\n"							\
 	".pushsection .altinstr_replacement, \"ax\"\n"			\
 	ALTINSTR_REPLACEMENT(newinstr, feature, 1)			\
-	".popsection\n"
+	".popsection"
 
 #define ALTERNATIVE_2(oldinstr, newinstr1, feature1, newinstr2, feature2)\
-	OLDINSTR_2(oldinstr, 1, 2)					\
+	OLDINSTR(oldinstr)						\
 	".pushsection .altinstructions,\"a\"\n"				\
 	ALTINSTR_ENTRY(feature1, 1)					\
 	ALTINSTR_ENTRY(feature2, 2)					\
 	".popsection\n"							\
+	".pushsection .discard,\"aw\",@progbits\n"			\
+	DISCARD_ENTRY(1)						\
+	DISCARD_ENTRY(2)						\
+	".popsection\n"							\
 	".pushsection .altinstr_replacement, \"ax\"\n"			\
 	ALTINSTR_REPLACEMENT(newinstr1, feature1, 1)			\
 	ALTINSTR_REPLACEMENT(newinstr2, feature2, 2)			\
-	".popsection\n"
+	".popsection"
 
 /*
  * Alternative instructions for different CPU types or capabilities.
@@ -177,9 +142,6 @@ static inline int alternatives_text_reserved(void *start, void *end)
 #define alternative(oldinstr, newinstr, feature)			\
 	asm volatile (ALTERNATIVE(oldinstr, newinstr, feature) : : : "memory")
 
-#define alternative_2(oldinstr, newinstr1, feature1, newinstr2, feature2) \
-	asm volatile(ALTERNATIVE_2(oldinstr, newinstr1, feature1, newinstr2, feature2) ::: "memory")
-
 /*
  * Alternative inline assembly with input.
  *
@@ -193,6 +155,20 @@ static inline int alternatives_text_reserved(void *start, void *end)
  */
 #define alternative_input(oldinstr, newinstr, feature, input...)	\
 	asm volatile (ALTERNATIVE(oldinstr, newinstr, feature)		\
+		: : "i" (0), ## input)
+
+/*
+ * This is similar to alternative_input. But it has two features and
+ * respective instructions.
+ *
+ * If CPU has feature2, newinstr2 is used.
+ * Otherwise, if CPU has feature1, newinstr1 is used.
+ * Otherwise, oldinstr is used.
+ */
+#define alternative_input_2(oldinstr, newinstr1, feature1, newinstr2,	     \
+			   feature2, input...)				     \
+	asm volatile(ALTERNATIVE_2(oldinstr, newinstr1, feature1,	     \
+		newinstr2, feature2)					     \
 		: : "i" (0), ## input)
 
 /* Like alternative_input, but with a single output argument */
@@ -224,6 +200,12 @@ static inline int alternatives_text_reserved(void *start, void *end)
  */
 #define ASM_OUTPUT2(a...) a
 
+/*
+ * use this macro if you need clobbers but no inputs in
+ * alternative_{input,io,call}()
+ */
+#define ASM_NO_INPUT_CLOBBER(clbr...) "i" (0) : clbr
+
 struct paravirt_patch_site;
 #ifdef CONFIG_PARAVIRT
 void apply_paravirt(struct paravirt_patch_site *start,
@@ -235,6 +217,8 @@ static inline void apply_paravirt(struct paravirt_patch_site *start,
 #define __parainstructions	NULL
 #define __parainstructions_end	NULL
 #endif
+
+extern void *text_poke_early(void *addr, const void *opcode, size_t len);
 
 /*
  * Clear and restore the kernel write-protection flag on the local CPU.
@@ -253,8 +237,17 @@ static inline void apply_paravirt(struct paravirt_patch_site *start,
  * On the local CPU you need to be protected again NMI or MCE handlers seeing an
  * inconsistent instruction while you patch.
  */
+struct text_poke_param {
+	void *addr;
+	const void *opcode;
+	size_t len;
+};
+
 extern void *text_poke(void *addr, const void *opcode, size_t len);
+extern int poke_int3_handler(struct pt_regs *regs);
+extern void *text_poke_bp(void *addr, const void *opcode, size_t len, void *handler);
 extern void *text_poke_smp(void *addr, const void *opcode, size_t len);
+extern void text_poke_smp_batch(struct text_poke_param *params, int n);
 
 #endif /* __ASSEMBLY__ */
 

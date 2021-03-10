@@ -857,7 +857,7 @@ bfa_fcs_lport_uf_recv(struct bfa_fcs_lport_s *lport,
 		bfa_trc(lport->fcs, fchs->s_id);
 		bfa_trc(lport->fcs, fchs->d_id);
 		/* ignore type FC_TYPE_FC_FSS */
-		if(fchs->type != FC_TYPE_FC_FSS)
+		if (fchs->type != FC_TYPE_FC_FSS)
 			bfa_sm_fault(lport->fcs, fchs->type);
 		return;
 	}
@@ -1494,7 +1494,7 @@ bfa_fcs_lport_fdmi_sm_offline(struct bfa_fcs_lport_fdmi_s *fdmi,
 		} else {
 			/*
 			 * For a base port, we should first register the HBA
-			 * atribute. The HBA attribute also contains the base
+			 * attribute. The HBA attribute also contains the base
 			 *  port registration.
 			 */
 			bfa_sm_set_state(fdmi,
@@ -6911,7 +6911,7 @@ bfa_cb_lps_fdisc_comp(void *bfad, void *uarg, bfa_status_t status)
 	switch (status) {
 	case BFA_STATUS_OK:
 		/*
-		 * Initialiaze the V-Port fields
+		 * Initialize the V-Port fields
 		 */
 		__vport_fcid(vport) = vport->lps->lp_pid;
 		vport->vport_stats.fdisc_accepts++;

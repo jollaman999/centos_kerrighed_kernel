@@ -5,6 +5,8 @@
  *
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/device.h>
@@ -13,7 +15,7 @@
 #include <linux/ctype.h>
 #include <linux/err.h>
 #include <linux/fb.h>
-#include <linux/nospec.h>
+#include <linux/slab.h>
 
 #ifdef CONFIG_PMAC_BACKLIGHT
 #include <asm/backlight.h>
@@ -21,6 +23,13 @@
 
 static struct list_head backlight_dev_list;
 static struct mutex backlight_dev_list_mutex;
+static struct blocking_notifier_head backlight_notifier;
+
+static const char *const backlight_types[] = {
+	[BACKLIGHT_RAW] = "raw",
+	[BACKLIGHT_PLATFORM] = "platform",
+	[BACKLIGHT_FIRMWARE] = "firmware",
+};
 
 #if defined(CONFIG_FB) || (defined(CONFIG_FB_MODULE) && \
 			   defined(CONFIG_BACKLIGHT_CLASS_DEVICE_MODULE))
@@ -42,7 +51,7 @@ static int fb_notifier_callback(struct notifier_block *self,
 	mutex_lock(&bd->ops_lock);
 	if (bd->ops)
 		if (!bd->ops->check_fb ||
-		    bd->ops->check_fb(evdata->info)) {
+		    bd->ops->check_fb(bd, evdata->info)) {
 			bd->props.fb_blank = *(int *)evdata->data;
 			if (bd->props.fb_blank == FB_BLANK_UNBLANK)
 				bd->props.state &= ~BL_CORE_FBBLANK;
@@ -99,7 +108,7 @@ static void backlight_generate_event(struct backlight_device *bd,
 }
 
 static ssize_t backlight_show_power(struct device *dev,
-		struct device_attribute *attr,char *buf)
+		struct device_attribute *attr, char *buf)
 {
 	struct backlight_device *bd = to_backlight_device(dev);
 
@@ -113,14 +122,14 @@ static ssize_t backlight_store_power(struct device *dev,
 	struct backlight_device *bd = to_backlight_device(dev);
 	unsigned long power;
 
-	rc = strict_strtoul(buf, 0, &power);
+	rc = kstrtoul(buf, 0, &power);
 	if (rc)
 		return rc;
 
 	rc = -ENXIO;
 	mutex_lock(&bd->ops_lock);
 	if (bd->ops) {
-		pr_debug("backlight: set power to %lu\n", power);
+		pr_debug("set power to %lu\n", power);
 		if (bd->props.power != power) {
 			bd->props.power = power;
 			backlight_update_status(bd);
@@ -147,7 +156,7 @@ static ssize_t backlight_store_brightness(struct device *dev,
 	struct backlight_device *bd = to_backlight_device(dev);
 	unsigned long brightness;
 
-	rc = strict_strtoul(buf, 0, &brightness);
+	rc = kstrtoul(buf, 0, &brightness);
 	if (rc)
 		return rc;
 
@@ -158,10 +167,7 @@ static ssize_t backlight_store_brightness(struct device *dev,
 		if (brightness > bd->props.max_brightness)
 			rc = -EINVAL;
 		else {
-			brightness = array_index_nospec(brightness,
-						bd->props.max_brightness + 1);
-			pr_debug("backlight: set brightness to %lu\n",
-				 brightness);
+			pr_debug("set brightness to %lu\n", brightness);
 			bd->props.brightness = brightness;
 			backlight_update_status(bd);
 			rc = count;
@@ -172,6 +178,14 @@ static ssize_t backlight_store_brightness(struct device *dev,
 	backlight_generate_event(bd, BACKLIGHT_UPDATE_SYSFS);
 
 	return rc;
+}
+
+static ssize_t backlight_show_type(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct backlight_device *bd = to_backlight_device(dev);
+
+	return sprintf(buf, "%s\n", backlight_types[bd->props.type]);
 }
 
 static ssize_t backlight_show_max_brightness(struct device *dev,
@@ -202,12 +216,12 @@ static int backlight_suspend(struct device *dev, pm_message_t state)
 {
 	struct backlight_device *bd = to_backlight_device(dev);
 
-	if (bd->ops->options & BL_CORE_SUSPENDRESUME) {
-		mutex_lock(&bd->ops_lock);
+	mutex_lock(&bd->ops_lock);
+	if (bd->ops && bd->ops->options & BL_CORE_SUSPENDRESUME) {
 		bd->props.state |= BL_CORE_SUSPENDED;
 		backlight_update_status(bd);
-		mutex_unlock(&bd->ops_lock);
 	}
+	mutex_unlock(&bd->ops_lock);
 
 	return 0;
 }
@@ -216,12 +230,12 @@ static int backlight_resume(struct device *dev)
 {
 	struct backlight_device *bd = to_backlight_device(dev);
 
-	if (bd->ops->options & BL_CORE_SUSPENDRESUME) {
-		mutex_lock(&bd->ops_lock);
+	mutex_lock(&bd->ops_lock);
+	if (bd->ops && bd->ops->options & BL_CORE_SUSPENDRESUME) {
 		bd->props.state &= ~BL_CORE_SUSPENDED;
 		backlight_update_status(bd);
-		mutex_unlock(&bd->ops_lock);
 	}
+	mutex_unlock(&bd->ops_lock);
 
 	return 0;
 }
@@ -239,6 +253,7 @@ static struct device_attribute bl_device_attributes[] = {
 	__ATTR(actual_brightness, 0444, backlight_show_actual_brightness,
 		     NULL),
 	__ATTR(max_brightness, 0444, backlight_show_max_brightness, NULL),
+	__ATTR(type, 0444, backlight_show_type, NULL),
 	__ATTR_NULL,
 };
 
@@ -275,7 +290,8 @@ EXPORT_SYMBOL(backlight_force_update);
  * ERR_PTR() or a pointer to the newly allocated device.
  */
 struct backlight_device *backlight_device_register(const char *name,
-		struct device *parent, void *devdata, struct backlight_ops *ops)
+	struct device *parent, void *devdata, const struct backlight_ops *ops,
+	const struct backlight_properties *props)
 {
 	struct backlight_device *new_bd;
 	int rc;
@@ -292,15 +308,20 @@ struct backlight_device *backlight_device_register(const char *name,
 	new_bd->dev.class = backlight_class;
 	new_bd->dev.parent = parent;
 	new_bd->dev.release = bl_device_release;
-	dev_set_name(&new_bd->dev, name);
+	dev_set_name(&new_bd->dev, "%s", name);
 	dev_set_drvdata(&new_bd->dev, devdata);
 
-	/*
-	 * RHEL only:
-	 * no driver sets the backlight type, so just use a plain BACKLIGHT_RAW.
-	 */
 	/* Set default properties */
-	new_bd->type = BACKLIGHT_RAW;
+	if (props) {
+		memcpy(&new_bd->props, props,
+		       sizeof(struct backlight_properties));
+		if (props->type <= 0 || props->type >= BACKLIGHT_TYPE_MAX) {
+			WARN(1, "%s: invalid backlight type", name);
+			new_bd->props.type = BACKLIGHT_RAW;
+		}
+	} else {
+		new_bd->props.type = BACKLIGHT_RAW;
+	}
 
 	rc = device_register(&new_bd->dev);
 	if (rc) {
@@ -327,6 +348,9 @@ struct backlight_device *backlight_device_register(const char *name,
 	list_add(&new_bd->entry, &backlight_dev_list);
 	mutex_unlock(&backlight_dev_list_mutex);
 
+	blocking_notifier_call_chain(&backlight_notifier,
+				     BACKLIGHT_REGISTERED, new_bd);
+
 	return new_bd;
 }
 EXPORT_SYMBOL(backlight_device_register);
@@ -338,7 +362,7 @@ bool backlight_device_registered(enum backlight_type type)
 
 	mutex_lock(&backlight_dev_list_mutex);
 	list_for_each_entry(bd, &backlight_dev_list, entry) {
-		if (bd->type == type) {
+		if (bd->props.type == type) {
 			found = true;
 			break;
 		}
@@ -370,6 +394,10 @@ void backlight_device_unregister(struct backlight_device *bd)
 		pmac_backlight = NULL;
 	mutex_unlock(&pmac_backlight_mutex);
 #endif
+
+	blocking_notifier_call_chain(&backlight_notifier,
+				     BACKLIGHT_UNREGISTERED, bd);
+
 	mutex_lock(&bd->ops_lock);
 	bd->ops = NULL;
 	mutex_unlock(&bd->ops_lock);
@@ -378,6 +406,65 @@ void backlight_device_unregister(struct backlight_device *bd)
 	device_unregister(&bd->dev);
 }
 EXPORT_SYMBOL(backlight_device_unregister);
+
+/**
+ * backlight_register_notifier - get notified of backlight (un)registration
+ * @nb: notifier block with the notifier to call on backlight (un)registration
+ *
+ * @return 0 on success, otherwise a negative error code
+ *
+ * Register a notifier to get notified when backlight devices get registered
+ * or unregistered.
+ */
+int backlight_register_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&backlight_notifier, nb);
+}
+EXPORT_SYMBOL(backlight_register_notifier);
+
+/**
+ * backlight_unregister_notifier - unregister a backlight notifier
+ * @nb: notifier block to unregister
+ *
+ * @return 0 on success, otherwise a negative error code
+ *
+ * Register a notifier to get notified when backlight devices get registered
+ * or unregistered.
+ */
+int backlight_unregister_notifier(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&backlight_notifier, nb);
+}
+EXPORT_SYMBOL(backlight_unregister_notifier);
+
+#ifdef CONFIG_OF
+static int of_parent_match(struct device *dev, const void *data)
+{
+	return dev->parent && dev->parent->of_node == data;
+}
+
+/**
+ * of_find_backlight_by_node() - find backlight device by device-tree node
+ * @node: device-tree node of the backlight device
+ *
+ * Returns a pointer to the backlight device corresponding to the given DT
+ * node or NULL if no such backlight device exists or if the device hasn't
+ * been probed yet.
+ *
+ * This function obtains a reference on the backlight device and it is the
+ * caller's responsibility to drop the reference by calling put_device() on
+ * the backlight device's .dev field.
+ */
+struct backlight_device *of_find_backlight_by_node(struct device_node *node)
+{
+	struct device *dev;
+
+	dev = class_find_device(backlight_class, NULL, node, of_parent_match);
+
+	return dev ? to_backlight_device(dev) : NULL;
+}
+EXPORT_SYMBOL(of_find_backlight_by_node);
+#endif
 
 static void __exit backlight_class_exit(void)
 {
@@ -388,8 +475,8 @@ static int __init backlight_class_init(void)
 {
 	backlight_class = class_create(THIS_MODULE, "backlight");
 	if (IS_ERR(backlight_class)) {
-		printk(KERN_WARNING "Unable to create backlight class; errno = %ld\n",
-				PTR_ERR(backlight_class));
+		pr_warn("Unable to create backlight class; errno = %ld\n",
+			PTR_ERR(backlight_class));
 		return PTR_ERR(backlight_class);
 	}
 
@@ -398,6 +485,8 @@ static int __init backlight_class_init(void)
 	backlight_class->resume = backlight_resume;
 	INIT_LIST_HEAD(&backlight_dev_list);
 	mutex_init(&backlight_dev_list_mutex);
+	BLOCKING_INIT_NOTIFIER_HEAD(&backlight_notifier);
+
 	return 0;
 }
 

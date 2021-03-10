@@ -24,7 +24,6 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/delay.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -34,8 +33,6 @@
 #include <scsi/scsi_transport_srp.h>
 #include "scsi_priv.h"
 #include "scsi_transport_srp_internal.h"
-
-static struct workqueue_struct *srp_long_wq;
 
 struct srp_host_attrs {
 	atomic_t next_port_id;
@@ -55,6 +52,8 @@ struct srp_internal {
 	struct transport_container rport_attr_cont;
 };
 
+static int scsi_is_srp_rport(const struct device *dev);
+
 #define to_srp_internal(tmpl) container_of(tmpl, struct srp_internal, t)
 
 #define	dev_to_rport(d)	container_of(d, struct srp_rport, dev)
@@ -64,16 +63,32 @@ static inline struct Scsi_Host *rport_to_shost(struct srp_rport *r)
 	return dev_to_shost(r->dev.parent);
 }
 
+static int find_child_rport(struct device *dev, void *data)
+{
+	struct device **child = data;
+
+	if (scsi_is_srp_rport(dev)) {
+		WARN_ON_ONCE(*child);
+		*child = dev;
+	}
+	return 0;
+}
+
+static inline struct srp_rport *shost_to_rport(struct Scsi_Host *shost)
+{
+	struct device *child = NULL;
+
+	WARN_ON_ONCE(device_for_each_child(&shost->shost_gendev, &child,
+					   find_child_rport) < 0);
+	return child ? dev_to_rport(child) : NULL;
+}
+
 /**
  * srp_tmo_valid() - check timeout combination validity
- * @reconnect_delay: Reconnect delay in seconds.
- * @fast_io_fail_tmo: Fast I/O fail timeout in seconds.
- * @dev_loss_tmo: Device loss timeout in seconds.
  *
  * The combination of the timeout parameters must be such that SCSI commands
  * are finished in a reasonable time. Hence do not allow the fast I/O fail
- * timeout to exceed SCSI_DEVICE_BLOCK_MAX_TIMEOUT nor allow dev_loss_tmo to
- * exceed that limit if failing I/O fast has been disabled. Furthermore, these
+ * timeout to exceed SCSI_DEVICE_BLOCK_MAX_TIMEOUT. Furthermore, these
  * parameters must be such that multipath can detect failed paths timely.
  * Hence do not allow all three parameters to be disabled simultaneously.
  */
@@ -84,9 +99,6 @@ int srp_tmo_valid(int reconnect_delay, int fast_io_fail_tmo, int dev_loss_tmo)
 	if (reconnect_delay == 0)
 		return -EINVAL;
 	if (fast_io_fail_tmo > SCSI_DEVICE_BLOCK_MAX_TIMEOUT)
-		return -EINVAL;
-	if (fast_io_fail_tmo < 0 &&
-	    dev_loss_tmo > SCSI_DEVICE_BLOCK_MAX_TIMEOUT)
 		return -EINVAL;
 	if (dev_loss_tmo >= LONG_MAX / HZ)
 		return -EINVAL;
@@ -113,21 +125,12 @@ static DECLARE_TRANSPORT_CLASS(srp_host_class, "srp_host", srp_host_setup,
 static DECLARE_TRANSPORT_CLASS(srp_rport_class, "srp_remote_ports",
 			       NULL, NULL, NULL);
 
-#define SRP_PID(p) \
-	(p)->port_id[0], (p)->port_id[1], (p)->port_id[2], (p)->port_id[3], \
-	(p)->port_id[4], (p)->port_id[5], (p)->port_id[6], (p)->port_id[7], \
-	(p)->port_id[8], (p)->port_id[9], (p)->port_id[10], (p)->port_id[11], \
-	(p)->port_id[12], (p)->port_id[13], (p)->port_id[14], (p)->port_id[15]
-
-#define SRP_PID_FMT "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:" \
-	"%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x"
-
 static ssize_t
 show_srp_rport_id(struct device *dev, struct device_attribute *attr,
 		  char *buf)
 {
 	struct srp_rport *rport = transport_class_to_srp_rport(dev);
-	return sprintf(buf, SRP_PID_FMT "\n", SRP_PID(rport));
+	return sprintf(buf, "%16phC\n", rport->port_id);
 }
 
 static DEVICE_ATTR(port_id, S_IRUGO, show_srp_rport_id, NULL);
@@ -201,7 +204,7 @@ static ssize_t srp_show_tmo(char *buf, int tmo)
 	return tmo >= 0 ? sprintf(buf, "%d\n", tmo) : sprintf(buf, "off\n");
 }
 
-static int srp_parse_tmo(int *tmo, const char *buf)
+int srp_parse_tmo(int *tmo, const char *buf)
 {
 	int res = 0;
 
@@ -212,6 +215,7 @@ static int srp_parse_tmo(int *tmo, const char *buf)
 
 	return res;
 }
+EXPORT_SYMBOL(srp_parse_tmo);
 
 static ssize_t show_reconnect_delay(struct device *dev,
 				    struct device_attribute *attr, char *buf)
@@ -238,7 +242,7 @@ static ssize_t store_reconnect_delay(struct device *dev,
 
 	if (rport->reconnect_delay <= 0 && delay > 0 &&
 	    rport->state != SRP_RPORT_RUNNING) {
-		queue_delayed_work(srp_long_wq, &rport->reconnect_work,
+		queue_delayed_work(system_long_wq, &rport->reconnect_work,
 				   delay * HZ);
 	} else if (delay <= 0) {
 		cancel_delayed_work(&rport->reconnect_work);
@@ -377,7 +381,6 @@ invalid:
 
 /**
  * srp_reconnect_work() - reconnect and schedule a new attempt if necessary
- * @work: Work structure used for scheduling this operation.
  */
 static void srp_reconnect_work(struct work_struct *work)
 {
@@ -394,39 +397,9 @@ static void srp_reconnect_work(struct work_struct *work)
 		delay = rport->reconnect_delay *
 			min(100, max(1, rport->failed_reconnects - 10));
 		if (delay > 0)
-			queue_delayed_work(srp_long_wq,
+			queue_delayed_work(system_long_wq,
 					   &rport->reconnect_work, delay * HZ);
 	}
-}
-
-/**
- * scsi_request_fn_active() - number of kernel threads inside scsi_request_fn()
- * @shost: SCSI host for which to count the number of scsi_request_fn() callers.
- *
- * To do: add support for scsi-mq in this function.
- */
-static int scsi_request_fn_active(struct Scsi_Host *shost)
-{
-	struct scsi_device *sdev;
-	struct request_queue *q;
-	int request_fn_active = 0;
-
-	shost_for_each_device(sdev, shost) {
-		q = sdev->request_queue;
-
-		spin_lock_irq(q->queue_lock);
-		request_fn_active += q->request_fn_active;
-		spin_unlock_irq(q->queue_lock);
-	}
-
-	return request_fn_active;
-}
-
-/* Wait until ongoing shost->hostt->queuecommand() calls have finished. */
-static void srp_wait_for_queuecommand(struct Scsi_Host *shost)
-{
-	while (scsi_request_fn_active(shost))
-		msleep(20);
 }
 
 static void __rport_fail_io_fast(struct srp_rport *rport)
@@ -438,19 +411,21 @@ static void __rport_fail_io_fast(struct srp_rport *rport)
 
 	if (srp_rport_set_state(rport, SRP_RPORT_FAIL_FAST))
 		return;
-	__scsi_target_unblock(rport->dev.parent, SDEV_TRANSPORT_OFFLINE);
+	/*
+	 * Call scsi_target_block() to wait for ongoing shost->queuecommand()
+	 * calls before invoking i->f->terminate_rport_io().
+	 */
+	scsi_target_block(rport->dev.parent);
+	scsi_target_unblock(rport->dev.parent, SDEV_TRANSPORT_OFFLINE);
 
 	/* Involve the LLD if possible to terminate all I/O on the rport. */
 	i = to_srp_internal(shost->transportt);
-	if (i->f->terminate_rport_io) {
-		srp_wait_for_queuecommand(shost);
+	if (i->f->terminate_rport_io)
 		i->f->terminate_rport_io(rport);
-	}
 }
 
 /**
  * rport_fast_io_fail_timedout() - fast I/O failure timeout handler
- * @work: Work structure used for scheduling this operation.
  */
 static void rport_fast_io_fail_timedout(struct work_struct *work)
 {
@@ -469,7 +444,6 @@ static void rport_fast_io_fail_timedout(struct work_struct *work)
 
 /**
  * rport_dev_loss_timedout() - device loss timeout handler
- * @work: Work structure used for scheduling this operation.
  */
 static void rport_dev_loss_timedout(struct work_struct *work)
 {
@@ -483,7 +457,7 @@ static void rport_dev_loss_timedout(struct work_struct *work)
 
 	mutex_lock(&rport->mutex);
 	WARN_ON(srp_rport_set_state(rport, SRP_RPORT_LOST) != 0);
-	__scsi_target_unblock(rport->dev.parent, SDEV_TRANSPORT_OFFLINE);
+	scsi_target_unblock(rport->dev.parent, SDEV_TRANSPORT_OFFLINE);
 	mutex_unlock(&rport->mutex);
 
 	i->f->rport_delete(rport);
@@ -505,19 +479,18 @@ static void __srp_start_tl_fail_timers(struct srp_rport *rport)
 	if (rport->state == SRP_RPORT_LOST)
 		return;
 	if (delay > 0)
-		queue_delayed_work(srp_long_wq, &rport->reconnect_work,
+		queue_delayed_work(system_long_wq, &rport->reconnect_work,
 				   1UL * delay * HZ);
-	if ((fast_io_fail_tmo >= 0 || dev_loss_tmo >= 0) &&
-	    srp_rport_set_state(rport, SRP_RPORT_BLOCKED) == 0) {
+	if (srp_rport_set_state(rport, SRP_RPORT_BLOCKED) == 0) {
 		pr_debug("%s new state: %d\n", dev_name(&shost->shost_gendev),
 			 rport->state);
 		scsi_target_block(&shost->shost_gendev);
 		if (fast_io_fail_tmo >= 0)
-			queue_delayed_work(srp_long_wq,
+			queue_delayed_work(system_long_wq,
 					   &rport->fast_io_fail_work,
 					   1UL * fast_io_fail_tmo * HZ);
 		if (dev_loss_tmo >= 0)
-			queue_delayed_work(srp_long_wq,
+			queue_delayed_work(system_long_wq,
 					   &rport->dev_loss_work,
 					   1UL * dev_loss_tmo * HZ);
 	}
@@ -525,7 +498,6 @@ static void __srp_start_tl_fail_timers(struct srp_rport *rport)
 
 /**
  * srp_start_tl_fail_timers() - start the transport layer failure timers
- * @rport: SRP target port.
  *
  * Start the transport layer fast I/O failure and device loss timers. Do not
  * modify a timer that was already started.
@@ -540,7 +512,6 @@ EXPORT_SYMBOL(srp_start_tl_fail_timers);
 
 /**
  * srp_reconnect_rport() - reconnect to an SRP target port
- * @rport: SRP target port.
  *
  * Blocks SCSI command queueing before invoking reconnect() such that
  * queuecommand() won't be invoked concurrently with reconnect() from outside
@@ -573,7 +544,6 @@ int srp_reconnect_rport(struct srp_rport *rport)
 	if (res)
 		goto out;
 	scsi_target_block(&shost->shost_gendev);
-	srp_wait_for_queuecommand(shost);
 	res = rport->state != SRP_RPORT_LOST ? i->f->reconnect(rport) : -ENODEV;
 	pr_debug("%s (state %d): transport.reconnect() returned %d\n",
 		 dev_name(&shost->shost_gendev), rport->state, res);
@@ -583,7 +553,7 @@ int srp_reconnect_rport(struct srp_rport *rport)
 
 		rport->failed_reconnects = 0;
 		srp_rport_set_state(rport, SRP_RPORT_RUNNING);
-		__scsi_target_unblock(&shost->shost_gendev, SDEV_RUNNING);
+		scsi_target_unblock(&shost->shost_gendev, SDEV_RUNNING);
 		/*
 		 * If the SCSI error handler has offlined one or more devices,
 		 * invoking scsi_target_unblock() won't change the state of
@@ -596,17 +566,17 @@ int srp_reconnect_rport(struct srp_rport *rport)
 		spin_unlock_irq(shost->host_lock);
 	} else if (rport->state == SRP_RPORT_RUNNING) {
 		/*
-		 * srp_reconnect_rport() has been invoked with fast_io_fail
-		 * and dev_loss off. Mark the port as failed and start the TL
-		 * failure timers if these had not yet been started.
+		 * srp_reconnect_rport() was invoked with fast_io_fail
+		 * off. Mark the port as failed and start the TL failure
+		 * timers if these had not yet been started.
 		 */
 		__rport_fail_io_fast(rport);
-		__scsi_target_unblock(&shost->shost_gendev,
-				      SDEV_TRANSPORT_OFFLINE);
+		scsi_target_unblock(&shost->shost_gendev,
+				    SDEV_TRANSPORT_OFFLINE);
 		__srp_start_tl_fail_timers(rport);
 	} else if (rport->state != SRP_RPORT_BLOCKED) {
-		__scsi_target_unblock(&shost->shost_gendev,
-				      SDEV_TRANSPORT_OFFLINE);
+		scsi_target_unblock(&shost->shost_gendev,
+				    SDEV_TRANSPORT_OFFLINE);
 	}
 	mutex_unlock(&rport->mutex);
 
@@ -617,7 +587,6 @@ EXPORT_SYMBOL(srp_reconnect_rport);
 
 /**
  * srp_timed_out() - SRP transport intercept of the SCSI timeout EH
- * @scmd: SCSI command.
  *
  * If a timeout occurs while an rport is in the blocked state, ask the SCSI
  * EH to continue waiting (BLK_EH_RESET_TIMER). Otherwise let the SCSI core
@@ -631,9 +600,12 @@ static enum blk_eh_timer_return srp_timed_out(struct scsi_cmnd *scmd)
 	struct scsi_device *sdev = scmd->device;
 	struct Scsi_Host *shost = sdev->host;
 	struct srp_internal *i = to_srp_internal(shost->transportt);
+	struct srp_rport *rport = shost_to_rport(shost);
 
 	pr_debug("timeout for sdev %s\n", dev_name(&sdev->sdev_gendev));
-	return i->f->reset_timer_if_blocked && scsi_device_blocked(sdev) ?
+	return rport && rport->fast_io_fail_tmo < 0 &&
+		rport->dev_loss_tmo < 0 &&
+		i->f->reset_timer_if_blocked && scsi_device_blocked(sdev) ?
 		BLK_EH_RESET_TIMER : BLK_EH_NOT_HANDLED;
 }
 
@@ -689,7 +661,6 @@ static int srp_host_match(struct attribute_container *cont, struct device *dev)
 
 /**
  * srp_rport_get() - increment rport reference count
- * @rport: SRP target port.
  */
 void srp_rport_get(struct srp_rport *rport)
 {
@@ -699,7 +670,6 @@ EXPORT_SYMBOL(srp_rport_get);
 
 /**
  * srp_rport_put() - decrement rport reference count
- * @rport: SRP target port.
  */
 void srp_rport_put(struct srp_rport *rport)
 {
@@ -823,7 +793,6 @@ EXPORT_SYMBOL_GPL(srp_remove_host);
 
 /**
  * srp_stop_rport_timers - stop the transport layer recovery timers
- * @rport: SRP remote port for which to stop the timers.
  *
  * Must be called after srp_remove_host() and scsi_remove_host(). The caller
  * must hold a reference on the rport (rport->dev) and on the SCSI host
@@ -930,20 +899,14 @@ static __init int srp_transport_init(void)
 {
 	int ret;
 
-	srp_long_wq = create_workqueue("srp_long_wq");
-	if (!srp_long_wq)
-		return -ENOMEM;
-
 	ret = transport_class_register(&srp_host_class);
 	if (ret)
-		goto unregister_work_queue;
+		return ret;
 	ret = transport_class_register(&srp_rport_class);
 	if (ret)
 		goto unregister_host_class;
 
 	return 0;
-unregister_work_queue:
-	destroy_workqueue(srp_long_wq);
 unregister_host_class:
 	transport_class_unregister(&srp_host_class);
 	return ret;
@@ -951,8 +914,6 @@ unregister_host_class:
 
 static void __exit srp_transport_exit(void)
 {
-	flush_workqueue(srp_long_wq);
-	destroy_workqueue(srp_long_wq);
 	transport_class_unregister(&srp_host_class);
 	transport_class_unregister(&srp_rport_class);
 }

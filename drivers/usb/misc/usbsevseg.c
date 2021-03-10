@@ -1,18 +1,13 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * USB 7 Segment Driver
  *
  * Copyright (C) 2008 Harrison Metzger <harrisonmetz@gmail.com>
  * Based on usbled.c by Greg Kroah-Hartman (greg@kroah.com)
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License as
- *	published by the Free Software Foundation, version 2.
- *
  */
 
 #include <linux/kernel.h>
 #include <linux/errno.h>
-#include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/string.h>
@@ -24,17 +19,17 @@
 
 #define VENDOR_ID	0x0fc5
 #define PRODUCT_ID	0x1227
-#define MAXLEN		6
+#define MAXLEN		8
 
 /* table of devices that work with this driver */
-static struct usb_device_id id_table[] = {
+static const struct usb_device_id id_table[] = {
 	{ USB_DEVICE(VENDOR_ID, PRODUCT_ID) },
 	{ },
 };
 MODULE_DEVICE_TABLE(usb, id_table);
 
 /* the different text display modes the device is capable of */
-static char *display_textmodes[] = {"raw", "hex", "ascii", NULL};
+static const char *display_textmodes[] = {"raw", "hex", "ascii"};
 
 struct usb_sevsegdev {
 	struct usb_device *udev;
@@ -49,6 +44,7 @@ struct usb_sevsegdev {
 	u16 textlength;
 
 	u8 shadow_power; /* for PM */
+	u8 has_interface_pm;
 };
 
 /* sysfs_streq can't replace this completely
@@ -56,7 +52,7 @@ struct usb_sevsegdev {
  * if str commands are used, we would assume the end of string
  * so mem commands are used.
  */
-inline size_t my_memlen(const char *buf, size_t count)
+static inline size_t my_memlen(const char *buf, size_t count)
 {
 	if (count > 0 && buf[count-1] == '\n')
 		return count - 1;
@@ -68,11 +64,15 @@ static void update_display_powered(struct usb_sevsegdev *mydev)
 {
 	int rc;
 
-	if (!mydev->shadow_power && mydev->powered) {
+	if (mydev->powered && !mydev->has_interface_pm) {
 		rc = usb_autopm_get_interface(mydev->intf);
 		if (rc < 0)
 			return;
+		mydev->has_interface_pm = 1;
 	}
+
+	if (mydev->shadow_power != 1)
+		return;
 
 	rc = usb_control_msg(mydev->udev,
 			usb_sndctrlpipe(mydev->udev, 0),
@@ -86,8 +86,10 @@ static void update_display_powered(struct usb_sevsegdev *mydev)
 	if (rc < 0)
 		dev_dbg(&mydev->udev->dev, "power retval = %d\n", rc);
 
-	if (mydev->shadow_power && !mydev->powered)
+	if (!mydev->powered && mydev->has_interface_pm) {
 		usb_autopm_put_interface(mydev->intf);
+		mydev->has_interface_pm = 0;
+	}
 }
 
 static void update_display_mode(struct usb_sevsegdev *mydev)
@@ -122,10 +124,8 @@ static void update_display_visual(struct usb_sevsegdev *mydev, gfp_t mf)
 		return;
 
 	buffer = kzalloc(MAXLEN, mf);
-	if (!buffer) {
-		dev_err(&mydev->udev->dev, "out of memory\n");
+	if (!buffer)
 		return;
-	}
 
 	/* The device is right to left, where as you write left to right */
 	for (i = 0; i < mydev->textlength; i++)
@@ -165,7 +165,7 @@ static void update_display_visual(struct usb_sevsegdev *mydev, gfp_t mf)
 }
 
 #define MYDEV_ATTR_SIMPLE_UNSIGNED(name, update_fcn)		\
-static ssize_t show_attr_##name(struct device *dev, 		\
+static ssize_t name##_show(struct device *dev,			\
 	struct device_attribute *attr, char *buf) 		\
 {								\
 	struct usb_interface *intf = to_usb_interface(dev);	\
@@ -174,7 +174,7 @@ static ssize_t show_attr_##name(struct device *dev, 		\
 	return sprintf(buf, "%u\n", mydev->name);		\
 }								\
 								\
-static ssize_t set_attr_##name(struct device *dev, 		\
+static ssize_t name##_store(struct device *dev,			\
 	struct device_attribute *attr, const char *buf, size_t count) \
 {								\
 	struct usb_interface *intf = to_usb_interface(dev);	\
@@ -185,9 +185,9 @@ static ssize_t set_attr_##name(struct device *dev, 		\
 								\
 	return count;						\
 }								\
-static DEVICE_ATTR(name, S_IWUGO | S_IRUGO, show_attr_##name, set_attr_##name);
+static DEVICE_ATTR_RW(name);
 
-static ssize_t show_attr_text(struct device *dev,
+static ssize_t text_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
@@ -196,7 +196,7 @@ static ssize_t show_attr_text(struct device *dev,
 	return snprintf(buf, mydev->textlength, "%s\n", mydev->text);
 }
 
-static ssize_t set_attr_text(struct device *dev,
+static ssize_t text_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
@@ -216,9 +216,9 @@ static ssize_t set_attr_text(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(text, S_IWUGO | S_IRUGO, show_attr_text, set_attr_text);
+static DEVICE_ATTR_RW(text);
 
-static ssize_t show_attr_decimals(struct device *dev,
+static ssize_t decimals_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
@@ -240,7 +240,7 @@ static ssize_t show_attr_decimals(struct device *dev,
 	return sizeof(mydev->decimals) + 1;
 }
 
-static ssize_t set_attr_decimals(struct device *dev,
+static ssize_t decimals_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
@@ -265,10 +265,9 @@ static ssize_t set_attr_decimals(struct device *dev,
 	return count;
 }
 
-static DEVICE_ATTR(decimals, S_IWUGO | S_IRUGO,
-	show_attr_decimals, set_attr_decimals);
+static DEVICE_ATTR_RW(decimals);
 
-static ssize_t show_attr_textmode(struct device *dev,
+static ssize_t textmode_show(struct device *dev,
 	struct device_attribute *attr, char *buf)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
@@ -277,7 +276,7 @@ static ssize_t show_attr_textmode(struct device *dev,
 
 	buf[0] = 0;
 
-	for (i = 0; display_textmodes[i]; i++) {
+	for (i = 0; i < ARRAY_SIZE(display_textmodes); i++) {
 		if (mydev->textmode == i) {
 			strcat(buf, " [");
 			strcat(buf, display_textmodes[i]);
@@ -294,26 +293,23 @@ static ssize_t show_attr_textmode(struct device *dev,
 	return strlen(buf);
 }
 
-static ssize_t set_attr_textmode(struct device *dev,
+static ssize_t textmode_store(struct device *dev,
 	struct device_attribute *attr, const char *buf, size_t count)
 {
 	struct usb_interface *intf = to_usb_interface(dev);
 	struct usb_sevsegdev *mydev = usb_get_intfdata(intf);
 	int i;
 
-	for (i = 0; display_textmodes[i]; i++) {
-		if (sysfs_streq(display_textmodes[i], buf)) {
-			mydev->textmode = i;
-			update_display_visual(mydev, GFP_KERNEL);
-			return count;
-		}
-	}
+	i = sysfs_match_string(display_textmodes, buf);
+	if (i < 0)
+		return i;
 
-	return -EINVAL;
+	mydev->textmode = i;
+	update_display_visual(mydev, GFP_KERNEL);
+	return count;
 }
 
-static DEVICE_ATTR(textmode, S_IWUGO | S_IRUGO,
-	show_attr_textmode, set_attr_textmode);
+static DEVICE_ATTR_RW(textmode);
 
 
 MYDEV_ATTR_SIMPLE_UNSIGNED(powered, update_display_powered);
@@ -330,7 +326,7 @@ static struct attribute *dev_attrs[] = {
 	NULL
 };
 
-static struct attribute_group dev_attr_grp = {
+static const struct attribute_group dev_attr_grp = {
 	.attrs = dev_attrs,
 };
 
@@ -342,14 +338,16 @@ static int sevseg_probe(struct usb_interface *interface,
 	int rc = -ENOMEM;
 
 	mydev = kzalloc(sizeof(struct usb_sevsegdev), GFP_KERNEL);
-	if (mydev == NULL) {
-		dev_err(&interface->dev, "Out of memory\n");
+	if (!mydev)
 		goto error_mem;
-	}
 
 	mydev->udev = usb_get_dev(udev);
 	mydev->intf = interface;
 	usb_set_intfdata(interface, mydev);
+
+	/* PM */
+	mydev->shadow_power = 1; /* currently active */
+	mydev->has_interface_pm = 0; /* have not issued autopm_get */
 
 	/*set defaults */
 	mydev->textmode = 0x02; /* ascii mode */
@@ -428,23 +426,7 @@ static struct usb_driver sevseg_driver = {
 	.supports_autosuspend = 1,
 };
 
-static int __init usb_sevseg_init(void)
-{
-	int rc = 0;
-
-	rc = usb_register(&sevseg_driver);
-	if (rc)
-		err("usb_register failed. Error number %d", rc);
-	return rc;
-}
-
-static void __exit usb_sevseg_exit(void)
-{
-	usb_deregister(&sevseg_driver);
-}
-
-module_init(usb_sevseg_init);
-module_exit(usb_sevseg_exit);
+module_usb_driver(sevseg_driver);
 
 MODULE_AUTHOR(DRIVER_AUTHOR);
 MODULE_DESCRIPTION(DRIVER_DESC);

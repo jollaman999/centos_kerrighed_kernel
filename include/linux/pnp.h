@@ -12,6 +12,7 @@
 #include <linux/list.h>
 #include <linux/errno.h>
 #include <linux/mod_devicetable.h>
+#include <linux/console.h>
 
 #define PNP_NAME_LEN		50
 
@@ -50,7 +51,7 @@ static inline resource_size_t pnp_resource_len(struct resource *res)
 {
 	if (res->start == 0 && res->end == 0)
 		return 0;
-	return res->end - res->start + 1;
+	return resource_size(res);
 }
 
 
@@ -309,15 +310,22 @@ struct pnp_fixup {
 #define PNP_DISABLE		0x0004
 #define PNP_CONFIGURABLE	0x0008
 #define PNP_REMOVABLE		0x0010
+#define PNP_CONSOLE		0x0020
 
 #define pnp_can_read(dev)	(((dev)->protocol->get) && \
 				 ((dev)->capabilities & PNP_READ))
 #define pnp_can_write(dev)	(((dev)->protocol->set) && \
 				 ((dev)->capabilities & PNP_WRITE))
-#define pnp_can_disable(dev)	(((dev)->protocol->disable) && \
-				 ((dev)->capabilities & PNP_DISABLE))
+#define pnp_can_disable(dev)	(((dev)->protocol->disable) &&		  \
+				 ((dev)->capabilities & PNP_DISABLE) &&	  \
+				 (!((dev)->capabilities & PNP_CONSOLE) || \
+				  console_suspend_enabled))
 #define pnp_can_configure(dev)	((!(dev)->active) && \
 				 ((dev)->capabilities & PNP_CONFIGURABLE))
+#define pnp_can_suspend(dev)	(((dev)->protocol->suspend) &&		  \
+				 (!((dev)->capabilities & PNP_CONSOLE) || \
+				  console_suspend_enabled))
+
 
 #ifdef CONFIG_ISAPNP
 extern struct pnp_protocol isapnp_protocol;
@@ -414,6 +422,7 @@ struct pnp_protocol {
 	int (*disable) (struct pnp_dev *dev);
 
 	/* protocol specific suspend/resume */
+	bool (*can_wakeup) (struct pnp_dev *dev);
 	int (*suspend) (struct pnp_dev * dev, pm_message_t state);
 	int (*resume) (struct pnp_dev * dev);
 

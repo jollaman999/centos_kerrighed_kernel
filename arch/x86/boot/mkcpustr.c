@@ -15,6 +15,9 @@
 
 #include <stdio.h>
 
+#include "../include/asm/required-features.h"
+#include "../include/asm/disabled-features.h"
+#include "../include/asm/cpufeatures.h"
 #include "../kernel/cpu/capflags.c"
 
 int main(void)
@@ -24,11 +27,11 @@ int main(void)
 
 	printf("static const char x86_cap_strs[] =\n");
 
-	for (i = 0; i < RHNCAPINTS; i++) {
+	for (i = 0; i < NCAPINTS; i++) {
 		for (j = 0; j < 32; j++) {
 			str = x86_cap_flags[i*32+j];
 
-			if (i == RHNCAPINTS-1 && j == 31) {
+			if (i == NCAPINTS-1 && j == 31) {
 				/* The last entry must be unconditional; this
 				   also consumes the compiler-added null
 				   character */

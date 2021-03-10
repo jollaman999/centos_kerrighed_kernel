@@ -19,8 +19,32 @@
 #include <linux/random.h>
 #include <linux/skbuff.h>
 #include <linux/rtnetlink.h>
+#include <linux/slab.h>
 
+#include <net/sock.h>
 #include <net/inet_frag.h>
+#include <net/inet_ecn.h>
+
+/* Given the OR values of all fragments, apply RFC 3168 5.3 requirements
+ * Value : 0xff if frame should be dropped.
+ *         0 or INET_ECN_CE value, to be ORed in to final iph->tos field
+ */
+const u8 ip_frag_ecn_table[16] = {
+	/* at least one fragment had CE, and others ECT_0 or ECT_1 */
+	[IPFRAG_ECN_CE | IPFRAG_ECN_ECT_0]			= INET_ECN_CE,
+	[IPFRAG_ECN_CE | IPFRAG_ECN_ECT_1]			= INET_ECN_CE,
+	[IPFRAG_ECN_CE | IPFRAG_ECN_ECT_0 | IPFRAG_ECN_ECT_1]	= INET_ECN_CE,
+
+	/* invalid combinations : drop frame */
+	[IPFRAG_ECN_NOT_ECT | IPFRAG_ECN_CE] = 0xff,
+	[IPFRAG_ECN_NOT_ECT | IPFRAG_ECN_ECT_0] = 0xff,
+	[IPFRAG_ECN_NOT_ECT | IPFRAG_ECN_ECT_1] = 0xff,
+	[IPFRAG_ECN_NOT_ECT | IPFRAG_ECN_ECT_0 | IPFRAG_ECN_ECT_1] = 0xff,
+	[IPFRAG_ECN_NOT_ECT | IPFRAG_ECN_CE | IPFRAG_ECN_ECT_0] = 0xff,
+	[IPFRAG_ECN_NOT_ECT | IPFRAG_ECN_CE | IPFRAG_ECN_ECT_1] = 0xff,
+	[IPFRAG_ECN_NOT_ECT | IPFRAG_ECN_CE | IPFRAG_ECN_ECT_0 | IPFRAG_ECN_ECT_1] = 0xff,
+};
+EXPORT_SYMBOL(ip_frag_ecn_table);
 
 static void inet_frag_secret_rebuild(unsigned long dummy)
 {
@@ -35,10 +59,10 @@ static void inet_frag_secret_rebuild(unsigned long dummy)
 	for (i = 0; i < INETFRAGS_HASHSZ; i++) {
 		struct inet_frag_bucket *hb;
 		struct inet_frag_queue *q;
-		struct hlist_node *p, *n;
+		struct hlist_node *n;
 
 		hb = &f->hash[i];
-		hlist_for_each_entry_safe(q, p, n, &hb->chain, list) {
+		hlist_for_each_entry_safe(q, n, &hb->chain, list) {
 			unsigned int hval = f->hashfn(q);
 
 			if (hval != i) {
@@ -69,9 +93,6 @@ void inet_frags_init(struct inet_frags *f)
 	}
 	rwlock_init(&f->lock);
 
-	f->rnd = (u32) ((num_physpages ^ (num_physpages>>7)) ^
-				   (jiffies ^ (jiffies >> 6)));
-
 	setup_timer(&f->secret_timer, inet_frag_secret_rebuild,
 			(unsigned long)f);
 	f->secret_timer.expires = jiffies + f->secret_interval;
@@ -79,23 +100,12 @@ void inet_frags_init(struct inet_frags *f)
 }
 EXPORT_SYMBOL(inet_frags_init);
 
-int inet_frags_init_net(struct netns_frags *nf)
+void inet_frags_init_net(struct netns_frags *nf)
 {
-	struct netns_frags_priv *nf_priv;
-
-	nf_priv = kmalloc(sizeof(*nf_priv), GFP_KERNEL);
-	if (!nf_priv)
-		return -ENOMEM;
-
-	nf_priv->nqueues = 0;
-	INIT_LIST_HEAD(&nf_priv->lru_list);
-	spin_lock_init(&nf_priv->lru_lock);
-
-	 /* Red Hat: kABI hack using lru_list.next pointer */
-	nf->lru_list.next = (struct list_head *)nf_priv;
+	nf->nqueues = 0;
 	init_frag_mem_limit(nf);
-
-	return 0;
+	INIT_LIST_HEAD(&nf->lru_list);
+	spin_lock_init(&nf->lru_lock);
 }
 EXPORT_SYMBOL(inet_frags_init_net);
 
@@ -107,15 +117,11 @@ EXPORT_SYMBOL(inet_frags_fini);
 
 void inet_frags_exit_net(struct netns_frags *nf, struct inet_frags *f)
 {
-	struct netns_frags_priv *nf_priv = netns_frags_priv(nf);
-
 	nf->low_thresh = 0;
 
 	local_bh_disable();
 	inet_frag_evictor(nf, f, true);
 	local_bh_enable();
-
-	kfree(nf_priv);
 }
 EXPORT_SYMBOL(inet_frags_exit_net);
 
@@ -147,7 +153,6 @@ void inet_frag_kill(struct inet_frag_queue *fq, struct inet_frags *f)
 		fq->last_in |= INET_FRAG_COMPLETE;
 	}
 }
-
 EXPORT_SYMBOL(inet_frag_kill);
 
 static inline void frag_kfree_skb(struct netns_frags *nf, struct inet_frags *f,
@@ -197,7 +202,6 @@ EXPORT_SYMBOL(inet_frag_destroy);
 int inet_frag_evictor(struct netns_frags *nf, struct inet_frags *f, bool force)
 {
 	struct inet_frag_queue *q;
-	struct netns_frags_priv *nf_priv = netns_frags_priv(nf);
 	int work, evicted = 0;
 
 	if (!force) {
@@ -205,22 +209,22 @@ int inet_frag_evictor(struct netns_frags *nf, struct inet_frags *f, bool force)
 			return 0;
 	}
 
-	work = sum_frag_mem_limit(nf) - nf->low_thresh;
+	work = frag_mem_limit(nf) - nf->low_thresh;
 	while (work > 0 || force) {
-		spin_lock(&nf_priv->lru_lock);
+		spin_lock(&nf->lru_lock);
 
-		if (list_empty(&nf_priv->lru_list)) {
-			spin_unlock(&nf_priv->lru_lock);
+		if (list_empty(&nf->lru_list)) {
+			spin_unlock(&nf->lru_lock);
 			break;
 		}
 
-		q = list_first_entry(&nf_priv->lru_list,
+		q = list_first_entry(&nf->lru_list,
 				struct inet_frag_queue, lru_list);
 		atomic_inc(&q->refcnt);
 		/* Remove q from list to avoid several CPUs grabbing it */
 		list_del_init(&q->lru_list);
 
-		spin_unlock(&nf_priv->lru_lock);
+		spin_unlock(&nf->lru_lock);
 
 		spin_lock(&q->lock);
 		if (!(q->last_in & INET_FRAG_COMPLETE))
@@ -242,9 +246,6 @@ static struct inet_frag_queue *inet_frag_intern(struct netns_frags *nf,
 {
 	struct inet_frag_bucket *hb;
 	struct inet_frag_queue *qp;
-#ifdef CONFIG_SMP
-	struct hlist_node *n;
-#endif
 	unsigned int hash;
 
 	read_lock(&f->lock); /* Protects against hash rebuild */
@@ -262,7 +263,7 @@ static struct inet_frag_queue *inet_frag_intern(struct netns_frags *nf,
 	 * such entry could be created on other cpu, while we
 	 * released the hash bucket lock.
 	 */
-	hlist_for_each_entry(qp, n, &hb->chain, list) {
+	hlist_for_each_entry(qp, &hb->chain, list) {
 		if (qp->net == nf && f->match(qp, arg)) {
 			atomic_inc(&qp->refcnt);
 			spin_unlock(&hb->chain_lock);
@@ -325,22 +326,38 @@ struct inet_frag_queue *inet_frag_find(struct netns_frags *nf,
 {
 	struct inet_frag_bucket *hb;
 	struct inet_frag_queue *q;
-	struct hlist_node *n;
+	int depth = 0;
 
 	hb = &f->hash[hash];
 
 	spin_lock(&hb->chain_lock);
-	hlist_for_each_entry(q, n, &hb->chain, list) {
+	hlist_for_each_entry(q, &hb->chain, list) {
 		if (q->net == nf && f->match(q, key)) {
 			atomic_inc(&q->refcnt);
 			spin_unlock(&hb->chain_lock);
 			read_unlock(&f->lock);
 			return q;
 		}
+		depth++;
 	}
 	spin_unlock(&hb->chain_lock);
 	read_unlock(&f->lock);
 
-	return inet_frag_create(nf, f, key);
+	if (depth <= INETFRAGS_MAXDEPTH)
+		return inet_frag_create(nf, f, key);
+	else
+		return ERR_PTR(-ENOBUFS);
 }
 EXPORT_SYMBOL(inet_frag_find);
+
+void inet_frag_maybe_warn_overflow(struct inet_frag_queue *q,
+				   const char *prefix)
+{
+	static const char msg[] = "inet_frag_find: Fragment hash bucket"
+		" list length grew over limit " __stringify(INETFRAGS_MAXDEPTH)
+		". Dropping fragment.\n";
+
+	if (PTR_ERR(q) == -ENOBUFS)
+		LIMIT_NETDEBUG(KERN_WARNING "%s%s", prefix, msg);
+}
+EXPORT_SYMBOL(inet_frag_maybe_warn_overflow);

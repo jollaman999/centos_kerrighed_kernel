@@ -28,8 +28,7 @@ struct gfs2_glock;
 
 /* reserve either the number of blocks to be allocated plus the rg header
  * block, or all of the blocks in the rg, whichever is smaller */
-static inline unsigned int gfs2_rg_blocks(const struct gfs2_inode *ip,
-					  unsigned requested)
+static inline unsigned int gfs2_rg_blocks(const struct gfs2_inode *ip, unsigned requested)
 {
 	if (requested < ip->i_rgd->rd_length)
 		return requested + 1;

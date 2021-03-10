@@ -334,6 +334,12 @@ void qla4xxx_alloc_fw_dump(struct scsi_qla_host *ha)
 	/* Allocate memory for saving the template */
 	md_tmp = dma_alloc_coherent(&ha->pdev->dev, ha->fw_dump_tmplt_size,
 				    &md_tmp_dma, GFP_KERNEL);
+	if (!md_tmp) {
+		ql4_printk(KERN_INFO, ha,
+			   "scsi%ld: Failed to allocate DMA memory\n",
+			   ha->host_no);
+		return;
+	}
 
 	/* Request template */
 	status =  qla4xxx_get_minidump_template(ha, md_tmp_dma);
@@ -700,8 +706,8 @@ static int qla4xxx_start_firmware_from_flash(struct scsi_qla_host *ha)
 		writel(set_rmask(NVR_WRITE_ENABLE),
 		       &ha->reg->u1.isp4022.nvram);
 
-	writel(2, &ha->reg->mailbox[6]);
-	readl(&ha->reg->mailbox[6]);
+        writel(2, &ha->reg->mailbox[6]);
+        readl(&ha->reg->mailbox[6]);
 
 	writel(set_rmask(CSR_BOOT_ENABLE), &ha->reg->ctrl_status);
 	readl(&ha->reg->ctrl_status);
@@ -1258,3 +1264,4 @@ exit_login:
 	if (fw_ddb_entry)
 		dma_pool_free(ha->fw_ddb_dma_pool, fw_ddb_entry, fw_ddb_dma);
 }
+

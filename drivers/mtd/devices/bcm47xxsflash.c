@@ -10,7 +10,7 @@
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Serial flash driver for BCMA bus");
 
-static const char *probes[] = { "bcm47xxpart", NULL };
+static const char * const probes[] = { "bcm47xxpart", NULL };
 
 static int bcm47xxsflash_read(struct mtd_info *mtd, loff_t from, size_t len,
 			      size_t *retlen, u_char *buf)
@@ -23,6 +23,7 @@ static int bcm47xxsflash_read(struct mtd_info *mtd, loff_t from, size_t len,
 
 	memcpy_fromio(buf, (void __iomem *)KSEG0ADDR(b47s->window + from),
 		      len);
+	*retlen = len;
 
 	return len;
 }
@@ -43,7 +44,11 @@ static void bcm47xxsflash_fill_mtd(struct bcm47xxsflash *b47s)
 	mtd->writebufsize = mtd->writesize = 1;
 }
 
-static int bcm47xxsflash_probe(struct platform_device *pdev)
+/**************************************************
+ * BCMA
+ **************************************************/
+
+static int bcm47xxsflash_bcma_probe(struct platform_device *pdev)
 {
 	struct bcma_sflash *sflash = dev_get_platdata(&pdev->dev);
 	struct bcm47xxsflash *b47s;
@@ -55,6 +60,17 @@ static int bcm47xxsflash_probe(struct platform_device *pdev)
 		goto out;
 	}
 	sflash->priv = b47s;
+
+	b47s->bcma_cc = container_of(sflash, struct bcma_drv_cc, sflash);
+
+	switch (b47s->bcma_cc->capabilities & BCMA_CC_CAP_FLASHT) {
+	case BCMA_CC_FLASHT_STSER:
+		b47s->type = BCM47XXSFLASH_TYPE_ST;
+		break;
+	case BCMA_CC_FLASHT_ATSER:
+		b47s->type = BCM47XXSFLASH_TYPE_ATMEL;
+		break;
+	}
 
 	b47s->window = sflash->window;
 	b47s->blocksize = sflash->blocksize;
@@ -76,7 +92,7 @@ out:
 	return err;
 }
 
-static int __devexit bcm47xxsflash_remove(struct platform_device *pdev)
+static int bcm47xxsflash_bcma_remove(struct platform_device *pdev)
 {
 	struct bcma_sflash *sflash = dev_get_platdata(&pdev->dev);
 	struct bcm47xxsflash *b47s = sflash->priv;
@@ -88,18 +104,23 @@ static int __devexit bcm47xxsflash_remove(struct platform_device *pdev)
 }
 
 static struct platform_driver bcma_sflash_driver = {
-	.remove = __devexit_p(bcm47xxsflash_remove),
+	.probe	= bcm47xxsflash_bcma_probe,
+	.remove = bcm47xxsflash_bcma_remove,
 	.driver = {
 		.name = "bcma_sflash",
 		.owner = THIS_MODULE,
 	},
 };
 
+/**************************************************
+ * Init
+ **************************************************/
+
 static int __init bcm47xxsflash_init(void)
 {
 	int err;
 
-	err = platform_driver_probe(&bcma_sflash_driver, bcm47xxsflash_probe);
+	err = platform_driver_register(&bcma_sflash_driver);
 	if (err)
 		pr_err("Failed to register BCMA serial flash driver: %d\n",
 		       err);

@@ -1,23 +1,14 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Wireless Host Controller (WHC) debug.
  *
  * Copyright (C) 2008 Cambridge Silicon Radio Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
+#include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/export.h>
 
 #include "../../wusbcore/wusbhc.h"
 
@@ -29,19 +20,31 @@ struct whc_dbg {
 	struct dentry *pzl_f;
 };
 
-void qset_print(struct seq_file *s, struct whc_qset *qset)
+static void qset_print(struct seq_file *s, struct whc_qset *qset)
 {
+	static const char *qh_type[] = {
+		"ctrl", "isoc", "bulk", "intr", "rsvd", "rsvd", "rsvd", "lpintr", };
 	struct whc_std *std;
 	struct urb *urb = NULL;
 	int i;
 
-	seq_printf(s, "qset %08x\n", (u32)qset->qset_dma);
+	seq_printf(s, "qset %08x", (u32)qset->qset_dma);
+	if (&qset->list_node == qset->whc->async_list.prev) {
+		seq_printf(s, " (dummy)\n");
+	} else {
+		seq_printf(s, " ep%d%s-%s maxpkt: %d\n",
+			   qset->qh.info1 & 0x0f,
+			   (qset->qh.info1 >> 4) & 0x1 ? "in" : "out",
+			   qh_type[(qset->qh.info1 >> 5) & 0x7],
+			   (qset->qh.info1 >> 16) & 0xffff);
+	}
 	seq_printf(s, "  -> %08x\n", (u32)qset->qh.link);
 	seq_printf(s, "  info: %08x %08x %08x\n",
-		qset->qh.info1, qset->qh.info2,  qset->qh.info3);
-	seq_printf(s, "  sts: %04x errs: %d\n", qset->qh.status, qset->qh.err_count);
+		   qset->qh.info1, qset->qh.info2,  qset->qh.info3);
+	seq_printf(s, "  sts: %04x errs: %d curwin: %08x\n",
+		   qset->qh.status, qset->qh.err_count, qset->qh.cur_window);
 	seq_printf(s, "  TD: sts: %08x opts: %08x\n",
-		qset->qh.overlay.qtd.status, qset->qh.overlay.qtd.options);
+		   qset->qh.overlay.qtd.status, qset->qh.overlay.qtd.options);
 
 	for (i = 0; i < WHCI_QSET_TD_MAX; i++) {
 		seq_printf(s, "  %c%c TD[%d]: sts: %08x opts: %08x ptr: %08x\n",
@@ -69,20 +72,17 @@ void qset_print(struct seq_file *s, struct whc_qset *qset)
 	}
 }
 
-static int di_print(struct seq_file *s, void *p)
+static int di_show(struct seq_file *s, void *p)
 {
 	struct whc *whc = s->private;
-	char buf[72];
 	int d;
 
 	for (d = 0; d < whc->n_devices; d++) {
 		struct di_buf_entry *di = &whc->di_buf[d];
 
-		bitmap_scnprintf(buf, sizeof(buf),
-				 (unsigned long *)di->availability_info, UWB_NUM_MAS);
-
 		seq_printf(s, "DI[%d]\n", d);
-		seq_printf(s, "  availability: %s\n", buf);
+		seq_printf(s, "  availability: %*pb\n",
+			   UWB_NUM_MAS, (unsigned long *)di->availability_info);
 		seq_printf(s, "  %c%c key idx: %d dev addr: %d\n",
 			   (di->addr_sec_info & WHC_DI_SECURE) ? 'S' : ' ',
 			   (di->addr_sec_info & WHC_DI_DISABLE) ? 'D' : ' ',
@@ -91,8 +91,9 @@ static int di_print(struct seq_file *s, void *p)
 	}
 	return 0;
 }
+DEFINE_SHOW_ATTRIBUTE(di);
 
-static int asl_print(struct seq_file *s, void *p)
+static int asl_show(struct seq_file *s, void *p)
 {
 	struct whc *whc = s->private;
 	struct whc_qset *qset;
@@ -103,8 +104,9 @@ static int asl_print(struct seq_file *s, void *p)
 
 	return 0;
 }
+DEFINE_SHOW_ATTRIBUTE(asl);
 
-static int pzl_print(struct seq_file *s, void *p)
+static int pzl_show(struct seq_file *s, void *p)
 {
 	struct whc *whc = s->private;
 	struct whc_qset *qset;
@@ -118,45 +120,7 @@ static int pzl_print(struct seq_file *s, void *p)
 	}
 	return 0;
 }
-
-static int di_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, di_print, inode->i_private);
-}
-
-static int asl_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, asl_print, inode->i_private);
-}
-
-static int pzl_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, pzl_print, inode->i_private);
-}
-
-static const struct file_operations di_fops = {
-	.open    = di_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = single_release,
-	.owner   = THIS_MODULE,
-};
-
-static const struct file_operations asl_fops = {
-	.open    = asl_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = single_release,
-	.owner   = THIS_MODULE,
-};
-
-static const struct file_operations pzl_fops = {
-	.open    = pzl_open,
-	.read    = seq_read,
-	.llseek  = seq_lseek,
-	.release = single_release,
-	.owner   = THIS_MODULE,
-};
+DEFINE_SHOW_ATTRIBUTE(pzl);
 
 void whc_dbg_init(struct whc *whc)
 {

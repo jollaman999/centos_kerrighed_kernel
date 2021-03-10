@@ -20,7 +20,7 @@
  *
  */
 
-#include <asm/io.h>
+#include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/init.h>
 #include <linux/delay.h>
@@ -28,6 +28,8 @@
 #include <linux/wait.h>
 #include <linux/firmware.h>
 #include <linux/moduleparam.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 #include <sound/core.h>
 #include <sound/snd_wavefront.h>
 #include <sound/initval.h>
@@ -536,7 +538,7 @@ munge_int32 (unsigned int src,
 	                            /* Note: we leave the upper bits in place */ 
 
 		dst++;
- 	};
+	}
 	return dst;
 };
 
@@ -1737,7 +1739,7 @@ snd_wavefront_internal_interrupt (snd_wavefront_card_t *card)
 7 Unused
 */
 
-static int __devinit
+static int
 snd_wavefront_interrupt_bits (int irq)
 
 {
@@ -1765,7 +1767,7 @@ snd_wavefront_interrupt_bits (int irq)
 	return bits;
 }
 
-static void __devinit
+static void
 wavefront_should_cause_interrupt (snd_wavefront_t *dev, 
 				  int val, int port, unsigned long timeout)
 
@@ -1784,7 +1786,7 @@ wavefront_should_cause_interrupt (snd_wavefront_t *dev,
 	}
 }
 
-static int __devinit
+static int
 wavefront_reset_to_cleanliness (snd_wavefront_t *dev)
 
 {
@@ -1935,7 +1937,7 @@ wavefront_reset_to_cleanliness (snd_wavefront_t *dev)
 	return (1);
 }
 
-static int __devinit
+static int
 wavefront_download_firmware (snd_wavefront_t *dev, char *path)
 
 {
@@ -2008,7 +2010,7 @@ wavefront_download_firmware (snd_wavefront_t *dev, char *path)
 }
 
 
-static int __devinit
+static int
 wavefront_do_reset (snd_wavefront_t *dev)
 
 {
@@ -2097,7 +2099,7 @@ wavefront_do_reset (snd_wavefront_t *dev)
 	return 1;
 }
 
-int __devinit
+int
 snd_wavefront_start (snd_wavefront_t *dev)
 
 {
@@ -2139,7 +2141,7 @@ snd_wavefront_start (snd_wavefront_t *dev)
 	return (0);
 }
 
-int __devinit
+int
 snd_wavefront_detect (snd_wavefront_card_t *card)
 
 {

@@ -65,6 +65,8 @@
 #define ACPI_VIDEO_HID			"LNXVIDEO"
 #define ACPI_BAY_HID			"LNXIOBAY"
 #define ACPI_DOCK_HID			"LNXDOCK"
+/* Quirk for broken IBM BIOSes */
+#define ACPI_SMBUS_IBM_HID		"SMBUSIBM"
 
 /*
  * For fixed hardware buttons, we fabricate acpi_devices with HID
@@ -88,17 +90,11 @@ int acpi_pci_link_allocate_irq(acpi_handle handle, int index, int *triggering,
 			       int *polarity, char **name);
 int acpi_pci_link_free_irq(acpi_handle handle);
 
-/* ACPI PCI Interrupt Routing (pci_irq.c) */
-
-int acpi_pci_irq_add_prt(acpi_handle handle, struct pci_bus *bus);
-void acpi_pci_irq_del_prt(struct pci_bus *bus);
-
 /* ACPI PCI Device Binding (pci_bind.c) */
 
 struct pci_bus;
 
 struct pci_dev *acpi_get_pci_dev(acpi_handle);
-int acpi_pci_bind_root(struct acpi_device *device);
 
 /* Arch-defined function to add a bus to the system */
 
@@ -113,45 +109,39 @@ void pci_acpi_crs_quirks(void);
 #define ACPI_PROCESSOR_LIMIT_INCREMENT	0x01
 #define ACPI_PROCESSOR_LIMIT_DECREMENT	0x02
 
-int acpi_processor_set_thermal_limit(acpi_handle handle, int type);
-
 /*--------------------------------------------------------------------------
                                   Dock Station
   -------------------------------------------------------------------------- */
 struct acpi_dock_ops {
+	acpi_notify_handler fixup;
 	acpi_notify_handler handler;
 	acpi_notify_handler uevent;
 };
 
-#if defined(CONFIG_ACPI_DOCK) || defined(CONFIG_ACPI_DOCK_MODULE)
-extern int is_dock_device(acpi_handle handle);
-extern int register_dock_notifier(struct notifier_block *nb);
-extern void unregister_dock_notifier(struct notifier_block *nb);
+#ifdef CONFIG_ACPI_DOCK
+extern int is_dock_device(struct acpi_device *adev);
 extern int register_hotplug_dock_device(acpi_handle handle,
-					struct acpi_dock_ops *ops,
-					void *context);
+					const struct acpi_dock_ops *ops,
+					void *context,
+					void (*init)(void *),
+					void (*release)(void *));
 extern void unregister_hotplug_dock_device(acpi_handle handle);
 #else
-static inline int is_dock_device(acpi_handle handle)
+static inline int is_dock_device(struct acpi_device *adev)
 {
 	return 0;
 }
-static inline int register_dock_notifier(struct notifier_block *nb)
-{
-	return -ENODEV;
-}
-static inline void unregister_dock_notifier(struct notifier_block *nb)
-{
-}
 static inline int register_hotplug_dock_device(acpi_handle handle,
-					       struct acpi_dock_ops *ops,
-					       void *context)
+					       const struct acpi_dock_ops *ops,
+					       void *context,
+					       void (*init)(void *),
+					       void (*release)(void *))
 {
 	return -ENODEV;
 }
 static inline void unregister_hotplug_dock_device(acpi_handle handle)
 {
 }
-#endif
+#endif /* CONFIG_ACPI_DOCK */
 
 #endif /*__ACPI_DRIVERS_H__*/

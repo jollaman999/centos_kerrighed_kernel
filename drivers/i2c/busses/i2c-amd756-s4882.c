@@ -12,10 +12,6 @@
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
  
 /*
@@ -169,11 +165,7 @@ static int __init amd756_s4882_init(void)
 	}
 
 	/* Unregister physical bus */
-	error = i2c_del_adapter(&amd756_smbus);
-	if (error) {
-		dev_err(&amd756_smbus.dev, "Physical bus removal failed\n");
-		goto ERROR0;
-	}
+	i2c_del_adapter(&amd756_smbus);
 
 	printk(KERN_INFO "Enabling SMBus multiplexing for Tyan S4882\n");
 	/* Define the 5 virtual adapters and algorithms structures */

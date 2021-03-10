@@ -74,7 +74,6 @@
 #include <linux/un.h>
 #include <linux/net.h>
 #include <linux/fs.h>
-#include <linux/slab.h>
 #include <linux/skbuff.h>
 #include <linux/netdevice.h>
 #include <linux/file.h>
@@ -99,10 +98,10 @@ unsigned int unix_tot_inflight;
 struct sock *unix_get_socket(struct file *filp)
 {
 	struct sock *u_sock = NULL;
-	struct inode *inode = filp->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(filp);
 
 	/* Socket ? */
-	if (S_ISSOCK(inode->i_mode)) {
+	if (S_ISSOCK(inode->i_mode) && !(filp->f_mode & FMODE_PATH)) {
 		struct socket *sock = SOCKET_I(inode);
 		struct sock *s = sock->sk;
 
@@ -147,6 +146,7 @@ void unix_notinflight(struct user_struct *user, struct file *fp)
 	if (s) {
 		struct unix_sock *u = unix_sk(s);
 
+		BUG_ON(!atomic_long_read(&u->inflight));
 		BUG_ON(list_empty(&u->link));
 
 		if (atomic_long_dec_and_test(&u->inflight))
@@ -157,15 +157,6 @@ void unix_notinflight(struct user_struct *user, struct file *fp)
 	spin_unlock(&unix_gc_lock);
 }
 
-static inline struct sk_buff *sock_queue_head(struct sock *sk)
-{
-	return (struct sk_buff *)&sk->sk_receive_queue;
-}
-
-#define receive_queue_for_each_skb(sk, next, skb) \
-	for (skb = sock_queue_head(sk)->next, next = skb->next; \
-	     skb != sock_queue_head(sk); skb = next, next = skb->next)
-
 static void scan_inflight(struct sock *x, void (*func)(struct unix_sock *),
 			  struct sk_buff_head *hitlist)
 {
@@ -173,7 +164,7 @@ static void scan_inflight(struct sock *x, void (*func)(struct unix_sock *),
 	struct sk_buff *next;
 
 	spin_lock(&x->sk_receive_queue.lock);
-	receive_queue_for_each_skb(x, next, skb) {
+	skb_queue_walk_safe(&x->sk_receive_queue, skb, next) {
 		/* Do we have file descriptors ? */
 		if (UNIXCB(skb).fp) {
 			bool hit = false;
@@ -223,7 +214,7 @@ static void scan_children(struct sock *x, void (*func)(struct unix_sock *),
 		 * and perform a scan on them as well.
 		 */
 		spin_lock(&x->sk_receive_queue.lock);
-		receive_queue_for_each_skb(x, next, skb) {
+		skb_queue_walk_safe(&x->sk_receive_queue, skb, next) {
 			u = unix_sk(skb->sk);
 
 			/* An embryo cannot be in-flight, so it's safe
@@ -263,7 +254,7 @@ static void inc_inflight_move_tail(struct unix_sock *u)
 		list_move_tail(&u->link, &gc_candidates);
 }
 
-static bool gc_in_progress = false;
+static bool gc_in_progress;
 #define UNIX_INFLIGHT_TRIGGER_GC 16000
 
 void wait_for_unix_gc(void)
@@ -351,6 +342,14 @@ void unix_gc(void)
 	}
 	list_del(&cursor);
 
+	/* Now gc_candidates contains only garbage.  Restore original
+	 * inflight counters for these as well, and remove the skbuffs
+	 * which are creating the cycle(s).
+	 */
+	skb_queue_head_init(&hitlist);
+	list_for_each_entry(u, &gc_candidates, link)
+		scan_children(&u->sk, inc_inflight, &hitlist);
+
 	/* not_cycle_list contains those sockets which do not make up a
 	 * cycle.  Restore these to the inflight list.
 	 */
@@ -359,14 +358,6 @@ void unix_gc(void)
 		__clear_bit(UNIX_GC_CANDIDATE, &u->gc_flags);
 		list_move_tail(&u->link, &gc_inflight_list);
 	}
-
-	/* Now gc_candidates contains only garbage.  Restore original
-	 * inflight counters for these as well, and remove the skbuffs
-	 * which are creating the cycle(s).
-	 */
-	skb_queue_head_init(&hitlist);
-	list_for_each_entry(u, &gc_candidates, link)
-	scan_children(&u->sk, inc_inflight, &hitlist);
 
 	spin_unlock(&unix_gc_lock);
 

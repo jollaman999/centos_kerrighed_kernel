@@ -25,7 +25,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/device.h>
@@ -63,6 +62,9 @@ enum {
 };
 
 static int pdc2027x_init_one(struct pci_dev *pdev, const struct pci_device_id *ent);
+#ifdef CONFIG_PM
+static int pdc2027x_reinit_one(struct pci_dev *pdev);
+#endif
 static int pdc2027x_prereset(struct ata_link *link, unsigned long deadline);
 static void pdc2027x_set_piomode(struct ata_port *ap, struct ata_device *adev);
 static void pdc2027x_set_dmamode(struct ata_port *ap, struct ata_device *adev);
@@ -126,6 +128,10 @@ static struct pci_driver pdc2027x_pci_driver = {
 	.id_table		= pdc2027x_pci_tbl,
 	.probe			= pdc2027x_init_one,
 	.remove			= ata_pci_remove_one,
+#ifdef CONFIG_PM
+	.suspend		= ata_pci_device_suspend,
+	.resume			= pdc2027x_reinit_one,
+#endif
 };
 
 static struct scsi_host_template pdc2027x_sht = {
@@ -150,8 +156,7 @@ static struct ata_port_operations pdc2027x_pata133_ops = {
 static struct ata_port_info pdc2027x_port_info[] = {
 	/* PDC_UDMA_100 */
 	{
-		.flags		= ATA_FLAG_NO_LEGACY | ATA_FLAG_SLAVE_POSS |
-		                  ATA_FLAG_MMIO,
+		.flags		= ATA_FLAG_SLAVE_POSS,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA5,
@@ -159,8 +164,7 @@ static struct ata_port_info pdc2027x_port_info[] = {
 	},
 	/* PDC_UDMA_133 */
 	{
-		.flags		= ATA_FLAG_NO_LEGACY | ATA_FLAG_SLAVE_POSS |
-                        	  ATA_FLAG_MMIO,
+		.flags		= ATA_FLAG_SLAVE_POSS,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
@@ -265,7 +269,7 @@ static unsigned long pdc2027x_mode_filter(struct ata_device *adev, unsigned long
 	struct ata_device *pair = ata_dev_pair(adev);
 
 	if (adev->class != ATA_DEV_ATA || adev->devno == 0 || pair == NULL)
-		return ata_bmdma_mode_filter(adev, mask);
+		return mask;
 
 	/* Check for slave of a Maxtor at UDMA6 */
 	ata_id_c_string(pair->id, model_num, ATA_ID_PROD,
@@ -274,7 +278,7 @@ static unsigned long pdc2027x_mode_filter(struct ata_device *adev, unsigned long
 	if (strstr(model_num, "Maxtor") == NULL && pair->dma_mode == XFER_UDMA_6)
 		mask &= ~ (1 << (6 + ATA_SHIFT_UDMA));
 
-	return ata_bmdma_mode_filter(adev, mask);
+	return mask;
 }
 
 /**
@@ -657,7 +661,7 @@ static int pdc_hardware_init(struct ata_host *host, unsigned int board_idx)
 	 */
 	pll_clock = pdc_detect_pll_input_clock(host);
 
-	dev_printk(KERN_INFO, host->dev, "PLL input clock %ld kHz\n", pll_clock/1000);
+	dev_info(host->dev, "PLL input clock %ld kHz\n", pll_clock/1000);
 
 	/* Adjust PLL control register */
 	pdc_adjust_pll(host, pll_clock, board_idx);
@@ -697,9 +701,9 @@ static void pdc_ata_setup_port(struct ata_ioports *port, void __iomem *base)
  * @pdev: instance of pci_dev found
  * @ent:  matching entry in the id_tbl[]
  */
-static int __devinit pdc2027x_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
+static int pdc2027x_init_one(struct pci_dev *pdev,
+			     const struct pci_device_id *ent)
 {
-	static int printed_version;
 	static const unsigned long cmd_offset[] = { 0x17c0, 0x15c0 };
 	static const unsigned long bmdma_offset[] = { 0x1000, 0x1008 };
 	unsigned int board_idx = (unsigned int) ent->driver_data;
@@ -709,8 +713,7 @@ static int __devinit pdc2027x_init_one(struct pci_dev *pdev, const struct pci_de
 	void __iomem *mmio_base;
 	int i, rc;
 
-	if (!printed_version++)
-		dev_printk(KERN_DEBUG, &pdev->dev, "version " DRV_VERSION "\n");
+	ata_print_version_once(&pdev->dev, DRV_VERSION);
 
 	/* alloc host */
 	host = ata_host_alloc_pinfo(&pdev->dev, ppi, 2);
@@ -754,25 +757,33 @@ static int __devinit pdc2027x_init_one(struct pci_dev *pdev, const struct pci_de
 		return -EIO;
 
 	pci_set_master(pdev);
-	return ata_host_activate(host, pdev->irq, ata_sff_interrupt,
+	return ata_host_activate(host, pdev->irq, ata_bmdma_interrupt,
 				 IRQF_SHARED, &pdc2027x_sht);
 }
 
-/**
- * pdc2027x_init - Called after this module is loaded into the kernel.
- */
-static int __init pdc2027x_init(void)
+#ifdef CONFIG_PM
+static int pdc2027x_reinit_one(struct pci_dev *pdev)
 {
-	return pci_register_driver(&pdc2027x_pci_driver);
-}
+	struct ata_host *host = dev_get_drvdata(&pdev->dev);
+	unsigned int board_idx;
+	int rc;
 
-/**
- * pdc2027x_exit - Called before this module unloaded from the kernel
- */
-static void __exit pdc2027x_exit(void)
-{
-	pci_unregister_driver(&pdc2027x_pci_driver);
-}
+	rc = ata_pci_device_do_resume(pdev);
+	if (rc)
+		return rc;
 
-module_init(pdc2027x_init);
-module_exit(pdc2027x_exit);
+	if (pdev->device == PCI_DEVICE_ID_PROMISE_20268 ||
+	    pdev->device == PCI_DEVICE_ID_PROMISE_20270)
+		board_idx = PDC_UDMA_100;
+	else
+		board_idx = PDC_UDMA_133;
+
+	if (pdc_hardware_init(host, board_idx))
+		return -EIO;
+
+	ata_host_resume(host);
+	return 0;
+}
+#endif
+
+module_pci_driver(pdc2027x_pci_driver);

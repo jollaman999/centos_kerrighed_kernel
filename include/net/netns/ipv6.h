@@ -12,8 +12,11 @@ struct ctl_table_header;
 
 struct netns_sysctl_ipv6 {
 #ifdef CONFIG_SYSCTL
-	struct ctl_table_header *table;
+	struct ctl_table_header *hdr;
+	struct ctl_table_header *route_hdr;
+	struct ctl_table_header *icmp_hdr;
 	struct ctl_table_header *frags_hdr;
+	struct ctl_table_header *xfrm6_hdr;
 #endif
 	int bindv6only;
 	int flush_delay;
@@ -31,12 +34,16 @@ struct netns_ipv6 {
 	struct netns_sysctl_ipv6 sysctl;
 	struct ipv6_devconf	*devconf_all;
 	struct ipv6_devconf	*devconf_dflt;
+	struct inet_peer_base	*peers;
 	struct netns_frags	frags;
 #ifdef CONFIG_NETFILTER
 	struct xt_table		*ip6table_filter;
 	struct xt_table		*ip6table_mangle;
 	struct xt_table		*ip6table_raw;
+#ifdef CONFIG_SECURITY
 	struct xt_table		*ip6table_security;
+#endif
+	struct xt_table		*ip6table_nat;
 #endif
 	struct rt6_info         *ip6_null_entry;
 	struct rt6_statistics   *rt6_stats;
@@ -57,22 +64,21 @@ struct netns_ipv6 {
 	struct sock             *tcp_sk;
 	struct sock             *igmp_sk;
 #ifdef CONFIG_IPV6_MROUTE
-	struct sock		*mroute6_sk;
-	struct mfc6_cache	**mfc6_cache_array;
-	struct mif_device	*vif6_table;
-	int			maxvif;
-	atomic_t		cache_resolve_queue_len;
-	int			mroute_do_assert;
-	int			mroute_do_pim;
-#ifdef CONFIG_IPV6_PIMSM_V2
-	int			mroute_reg_vif_num;
+#ifndef CONFIG_IPV6_MROUTE_MULTIPLE_TABLES
+	struct mr6_table	*mrt6;
+#else
+	struct list_head	mr6_tables;
+	struct fib_rules_ops	*mr6_rules_ops;
 #endif
 #endif
+	atomic_t		dev_addr_genid;
 };
 
+#if IS_ENABLED(CONFIG_NF_DEFRAG_IPV6)
 struct netns_nf_frag {
 	struct netns_sysctl_ipv6 sysctl;
 	struct netns_frags	frags;
 };
+#endif
 
 #endif

@@ -2,7 +2,7 @@
  * APEI Error Record Serialization Table support
  *
  * ERST is a way provided by APEI to save and retrieve hardware error
- * infomation to and from a persistent store.
+ * information to and from a persistent store.
  *
  * For more information about ERST, please refer to ACPI Specification
  * version 4.0, section 17.4.
@@ -36,6 +36,8 @@
 #include <linux/hardirq.h>
 #include <linux/pstore.h>
 #include <acpi/apei.h>
+#include <linux/vmalloc.h>
+#include <linux/mm.h>
 
 #include "apei-internal.h"
 
@@ -54,7 +56,7 @@
 				     sizeof(struct acpi_table_erst)))
 
 #define SPIN_UNIT		100			/* 100ns */
-/* Firmware should respond within 1 miliseconds */
+/* Firmware should respond within 1 milliseconds */
 #define FIRMWARE_TIMEOUT	(1 * NSEC_PER_MSEC)
 #define FIRMWARE_MAX_STALL	50			/* 50us */
 
@@ -87,7 +89,7 @@ static struct erst_erange {
  * It is used to provide exclusive accessing for ERST Error Log
  * Address Range too.
  */
-static DEFINE_SPINLOCK(erst_lock);
+static DEFINE_RAW_SPINLOCK(erst_lock);
 
 static inline int erst_errno(int command_status)
 {
@@ -422,9 +424,9 @@ ssize_t erst_get_record_count(void)
 	if (erst_disable)
 		return -ENODEV;
 
-	spin_lock_irqsave(&erst_lock, flags);
+	raw_spin_lock_irqsave(&erst_lock, flags);
 	count = __erst_get_record_count();
-	spin_unlock_irqrestore(&erst_lock, flags);
+	raw_spin_unlock_irqrestore(&erst_lock, flags);
 
 	return count;
 }
@@ -489,9 +491,9 @@ static int __erst_record_id_cache_add_one(void)
 
 	id = prev_id = first_id = APEI_ERST_INVALID_RECORD_ID;
 retry:
-	spin_lock_irqsave(&erst_lock, flags);
+	raw_spin_lock_irqsave(&erst_lock, flags);
 	rc = __erst_get_next_record_id(&id);
-	spin_unlock_irqrestore(&erst_lock, flags);
+	raw_spin_unlock_irqrestore(&erst_lock, flags);
 	if (rc == -ENOENT)
 		return 0;
 	if (rc)
@@ -514,7 +516,7 @@ retry:
 	if (i < erst_record_id_cache.len)
 		goto retry;
 	if (erst_record_id_cache.len >= erst_record_id_cache.size) {
-		int new_size, alloc_size;
+		int new_size;
 		u64 *new_entries;
 
 		new_size = erst_record_id_cache.size * 2;
@@ -526,11 +528,7 @@ retry:
 					   "too many record ID!\n");
 			return 0;
 		}
-		alloc_size = new_size * sizeof(entries[0]);
-		if (alloc_size < PAGE_SIZE)
-			new_entries = kmalloc(alloc_size, GFP_KERNEL);
-		else
-			new_entries = vmalloc(alloc_size);
+		new_entries = kvmalloc(new_size * sizeof(entries[0]), GFP_KERNEL);
 		if (!new_entries)
 			return -ENOMEM;
 		memcpy(new_entries, entries,
@@ -611,7 +609,7 @@ static void __erst_record_id_cache_compact(void)
 		if (entries[i] == APEI_ERST_INVALID_RECORD_ID)
 			continue;
 		if (wpos != i)
-			memcpy(&entries[wpos], &entries[i], sizeof(entries[i]));
+			entries[wpos] = entries[i];
 		wpos++;
 	}
 	erst_record_id_cache.len = wpos;
@@ -794,17 +792,17 @@ int erst_write(const struct cper_record_header *record)
 		return -EINVAL;
 
 	if (erst_erange.attr & ERST_RANGE_NVRAM) {
-		if (!spin_trylock_irqsave(&erst_lock, flags))
+		if (!raw_spin_trylock_irqsave(&erst_lock, flags))
 			return -EBUSY;
 		rc = __erst_write_to_nvram(record);
-		spin_unlock_irqrestore(&erst_lock, flags);
+		raw_spin_unlock_irqrestore(&erst_lock, flags);
 		return rc;
 	}
 
 	if (record->record_length > erst_erange.size)
 		return -EINVAL;
 
-	if (!spin_trylock_irqsave(&erst_lock, flags))
+	if (!raw_spin_trylock_irqsave(&erst_lock, flags))
 		return -EBUSY;
 	memcpy(erst_erange.vaddr, record, record->record_length);
 	rcd_erange = erst_erange.vaddr;
@@ -812,7 +810,7 @@ int erst_write(const struct cper_record_header *record)
 	memcpy(&rcd_erange->persistence_information, "ER", 2);
 
 	rc = __erst_write_to_storage(0);
-	spin_unlock_irqrestore(&erst_lock, flags);
+	raw_spin_unlock_irqrestore(&erst_lock, flags);
 
 	return rc;
 }
@@ -866,9 +864,9 @@ ssize_t erst_read(u64 record_id, struct cper_record_header *record,
 	if (erst_disable)
 		return -ENODEV;
 
-	spin_lock_irqsave(&erst_lock, flags);
+	raw_spin_lock_irqsave(&erst_lock, flags);
 	len = __erst_read(record_id, record, buflen);
-	spin_unlock_irqrestore(&erst_lock, flags);
+	raw_spin_unlock_irqrestore(&erst_lock, flags);
 	return len;
 }
 EXPORT_SYMBOL_GPL(erst_read);
@@ -885,12 +883,12 @@ int erst_clear(u64 record_id)
 	rc = mutex_lock_interruptible(&erst_record_id_cache.lock);
 	if (rc)
 		return rc;
-	spin_lock_irqsave(&erst_lock, flags);
+	raw_spin_lock_irqsave(&erst_lock, flags);
 	if (erst_erange.attr & ERST_RANGE_NVRAM)
 		rc = __erst_clear_from_nvram(record_id);
 	else
 		rc = __erst_clear_from_storage(record_id);
-	spin_unlock_irqrestore(&erst_lock, flags);
+	raw_spin_unlock_irqrestore(&erst_lock, flags);
 	if (rc)
 		goto out;
 	entries = erst_record_id_cache.entries;
@@ -933,9 +931,9 @@ static int erst_open_pstore(struct pstore_info *psi);
 static int erst_close_pstore(struct pstore_info *psi);
 static ssize_t erst_reader(u64 *id, enum pstore_type_id *type, int *count,
 			   struct timespec *time, char **buf,
-			   struct pstore_info *psi);
+			   bool *compressed, struct pstore_info *psi);
 static int erst_writer(enum pstore_type_id type, enum kmsg_dump_reason reason,
-		       u64 *id, unsigned int part, int count,
+		       u64 *id, unsigned int part, int count, bool compressed,
 		       size_t size, struct pstore_info *psi);
 static int erst_clearer(enum pstore_type_id type, u64 id, int count,
 			struct timespec time, struct pstore_info *psi);
@@ -989,7 +987,7 @@ static int erst_close_pstore(struct pstore_info *psi)
 
 static ssize_t erst_reader(u64 *id, enum pstore_type_id *type, int *count,
 			   struct timespec *time, char **buf,
-			   struct pstore_info *psi)
+			   bool *compressed, struct pstore_info *psi)
 {
 	int rc;
 	ssize_t len = 0;
@@ -1055,7 +1053,7 @@ out:
 }
 
 static int erst_writer(enum pstore_type_id type, enum kmsg_dump_reason reason,
-		       u64 *id, unsigned int part, int count,
+		       u64 *id, unsigned int part, int count, bool compressed,
 		       size_t size, struct pstore_info *psi)
 {
 	struct cper_pstore_record *rcd = (struct cper_pstore_record *)
@@ -1202,6 +1200,9 @@ static int __init erst_init(void)
 		pr_err(ERST_PFX
 		"Failed to allocate %lld bytes for persistent store error log\n",
 		erst_erange.size);
+
+	/* Cleanup ERST Resources */
+	apei_resources_fini(&erst_resources);
 
 	return 0;
 

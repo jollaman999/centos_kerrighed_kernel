@@ -15,6 +15,7 @@
 #include <linux/types.h>
 #include <linux/socket.h>
 #include <linux/in.h>
+#include <linux/slab.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/timer.h>
@@ -30,7 +31,6 @@
 #include <net/net_namespace.h>
 #include <net/sock.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/termios.h>	/* For TIOCINQ/OUTQ */
 #include <linux/mm.h>
@@ -104,10 +104,9 @@ static void nr_remove_socket(struct sock *sk)
 static void nr_kill_by_device(struct net_device *dev)
 {
 	struct sock *s;
-	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, node, &nr_list)
+	sk_for_each(s, &nr_list)
 		if (nr_sk(s)->device == dev)
 			nr_disconnect(s, ENETUNREACH);
 	spin_unlock_bh(&nr_list_lock);
@@ -118,7 +117,7 @@ static void nr_kill_by_device(struct net_device *dev)
  */
 static int nr_device_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct net_device *dev = (struct net_device *)ptr;
+	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
 
 	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
@@ -149,10 +148,9 @@ static void nr_insert_socket(struct sock *sk)
 static struct sock *nr_find_listener(ax25_address *addr)
 {
 	struct sock *s;
-	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, node, &nr_list)
+	sk_for_each(s, &nr_list)
 		if (!ax25cmp(&nr_sk(s)->source_addr, addr) &&
 		    s->sk_state == TCP_LISTEN) {
 			bh_lock_sock(s);
@@ -170,10 +168,9 @@ found:
 static struct sock *nr_find_socket(unsigned char index, unsigned char id)
 {
 	struct sock *s;
-	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, node, &nr_list) {
+	sk_for_each(s, &nr_list) {
 		struct nr_sock *nr = nr_sk(s);
 
 		if (nr->my_index == index && nr->my_id == id) {
@@ -194,10 +191,9 @@ static struct sock *nr_find_peer(unsigned char index, unsigned char id,
 	ax25_address *dest)
 {
 	struct sock *s;
-	struct hlist_node *node;
 
 	spin_lock_bh(&nr_list_lock);
-	sk_for_each(s, node, &nr_list) {
+	sk_for_each(s, &nr_list) {
 		struct nr_sock *nr = nr_sk(s);
 
 		if (nr->your_index == index && nr->your_id == id &&
@@ -305,26 +301,26 @@ static int nr_setsockopt(struct socket *sock, int level, int optname,
 {
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
-	int opt;
+	unsigned long opt;
 
 	if (level != SOL_NETROM)
 		return -ENOPROTOOPT;
 
-	if (optlen < sizeof(int))
+	if (optlen < sizeof(unsigned int))
 		return -EINVAL;
 
-	if (get_user(opt, (int __user *)optval))
+	if (get_user(opt, (unsigned int __user *)optval))
 		return -EFAULT;
 
 	switch (optname) {
 	case NETROM_T1:
-		if (opt < 1)
+		if (opt < 1 || opt > ULONG_MAX / HZ)
 			return -EINVAL;
 		nr->t1 = opt * HZ;
 		return 0;
 
 	case NETROM_T2:
-		if (opt < 1)
+		if (opt < 1 || opt > ULONG_MAX / HZ)
 			return -EINVAL;
 		nr->t2 = opt * HZ;
 		return 0;
@@ -336,13 +332,13 @@ static int nr_setsockopt(struct socket *sock, int level, int optname,
 		return 0;
 
 	case NETROM_T4:
-		if (opt < 1)
+		if (opt < 1 || opt > ULONG_MAX / HZ)
 			return -EINVAL;
 		nr->t4 = opt * HZ;
 		return 0;
 
 	case NETROM_IDLE:
-		if (opt < 0)
+		if (opt > ULONG_MAX / (60 * HZ))
 			return -EINVAL;
 		nr->idle = opt * 60 * HZ;
 		return 0;
@@ -431,7 +427,7 @@ static int nr_create(struct net *net, struct socket *sock, int protocol,
 	struct sock *sk;
 	struct nr_sock *nr;
 
-	if (net != &init_net)
+	if (!net_eq(net, &init_net))
 		return -EAFNOSUPPORT;
 
 	if (sock->type != SOCK_SEQPACKET || protocol != 0)
@@ -590,7 +586,6 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		return -EINVAL;
 	}
 	if ((dev = nr_dev_get(&addr->fsa_ax25.sax25_call)) == NULL) {
-		SOCK_DEBUG(sk, "NET/ROM: bind failed: invalid node callsign\n");
 		release_sock(sk);
 		return -EADDRNOTAVAIL;
 	}
@@ -602,7 +597,7 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 		if (!capable(CAP_NET_BIND_SERVICE)) {
 			dev_put(dev);
 			release_sock(sk);
-			return -EACCES;
+			return -EPERM;
 		}
 		nr->user_addr   = addr->fsa_digipeater[0];
 		nr->source_addr = addr->fsa_ax25.sax25_call;
@@ -631,7 +626,7 @@ static int nr_bind(struct socket *sock, struct sockaddr *uaddr, int addr_len)
 	sock_reset_flag(sk, SOCK_ZAPPED);
 	dev_put(dev);
 	release_sock(sk);
-	SOCK_DEBUG(sk, "NET/ROM: socket is bound\n");
+
 	return 0;
 }
 
@@ -738,7 +733,7 @@ static int nr_connect(struct socket *sock, struct sockaddr *uaddr,
 		DEFINE_WAIT(wait);
 
 		for (;;) {
-			prepare_to_wait(sk->sk_sleep, &wait,
+			prepare_to_wait(sk_sleep(sk), &wait,
 					TASK_INTERRUPTIBLE);
 			if (sk->sk_state != TCP_SYN_SENT)
 				break;
@@ -751,7 +746,7 @@ static int nr_connect(struct socket *sock, struct sockaddr *uaddr,
 			err = -ERESTARTSYS;
 			break;
 		}
-		finish_wait(sk->sk_sleep, &wait);
+		finish_wait(sk_sleep(sk), &wait);
 		if (err)
 			goto out_release;
 	}
@@ -797,7 +792,7 @@ static int nr_accept(struct socket *sock, struct socket *newsock, int flags)
 	 *	hooked into the SABM we saved
 	 */
 	for (;;) {
-		prepare_to_wait(sk->sk_sleep, &wait, TASK_INTERRUPTIBLE);
+		prepare_to_wait(sk_sleep(sk), &wait, TASK_INTERRUPTIBLE);
 		skb = skb_dequeue(&sk->sk_receive_queue);
 		if (skb)
 			break;
@@ -815,7 +810,7 @@ static int nr_accept(struct socket *sock, struct socket *newsock, int flags)
 		err = -ERESTARTSYS;
 		break;
 	}
-	finish_wait(sk->sk_sleep, &wait);
+	finish_wait(sk_sleep(sk), &wait);
 	if (err)
 		goto out_release;
 
@@ -838,6 +833,8 @@ static int nr_getname(struct socket *sock, struct sockaddr *uaddr,
 	struct full_sockaddr_ax25 *sax = (struct full_sockaddr_ax25 *)uaddr;
 	struct sock *sk = sock->sk;
 	struct nr_sock *nr = nr_sk(sk);
+
+	memset(&sax->fsa_ax25, 0, sizeof(struct sockaddr_ax25));
 
 	lock_sock(sk);
 	if (peer != 0) {
@@ -1081,8 +1078,6 @@ static int nr_sendmsg(struct kiocb *iocb, struct socket *sock,
 		sax.sax25_call   = nr->dest_addr;
 	}
 
-	SOCK_DEBUG(sk, "NET/ROM: sendto: Addresses built.\n");
-
 	/* Build a packet - the conventional user limit is 236 bytes. We can
 	   do ludicrously large NetROM frames but must not overflow */
 	if (len > 65536) {
@@ -1090,7 +1085,6 @@ static int nr_sendmsg(struct kiocb *iocb, struct socket *sock,
 		goto out;
 	}
 
-	SOCK_DEBUG(sk, "NET/ROM: sendto: building packet.\n");
 	size = len + NR_NETWORK_LEN + NR_TRANSPORT_LEN;
 
 	if ((skb = sock_alloc_send_skb(sk, size, msg->msg_flags & MSG_DONTWAIT, &err)) == NULL)
@@ -1104,7 +1098,6 @@ static int nr_sendmsg(struct kiocb *iocb, struct socket *sock,
 	 */
 
 	asmptr = skb_push(skb, NR_TRANSPORT_LEN);
-	SOCK_DEBUG(sk, "Building NET/ROM Header.\n");
 
 	/* Build a NET/ROM Transport header */
 
@@ -1113,23 +1106,18 @@ static int nr_sendmsg(struct kiocb *iocb, struct socket *sock,
 	*asmptr++ = 0;		/* To be filled in later */
 	*asmptr++ = 0;		/*      Ditto            */
 	*asmptr++ = NR_INFO;
-	SOCK_DEBUG(sk, "Built header.\n");
 
 	/*
 	 *	Put the data on the end
 	 */
 	skb_put(skb, len);
 
-	SOCK_DEBUG(sk, "NET/ROM: Appending user data\n");
-
 	/* User data follows immediately after the NET/ROM transport header */
-	if (memcpy_fromiovec(skb_transport_header(skb), msg->msg_iov, len)) {
+	if (memcpy_from_msg(skb_transport_header(skb), msg, len)) {
 		kfree_skb(skb);
 		err = -EFAULT;
 		goto out;
 	}
-
-	SOCK_DEBUG(sk, "NET/ROM: Transmitting buffer\n");
 
 	if (sk->sk_state != TCP_ESTABLISHED) {
 		kfree_skb(skb);
@@ -1165,8 +1153,6 @@ static int nr_recvmsg(struct kiocb *iocb, struct socket *sock,
 		return -ENOTCONN;
 	}
 
-	msg->msg_namelen = 0;
-
 	/* Now we can treat all alike */
 	if ((skb = skb_recv_datagram(sk, flags & ~MSG_DONTWAIT, flags & MSG_DONTWAIT, &er)) == NULL) {
 		release_sock(sk);
@@ -1181,9 +1167,15 @@ static int nr_recvmsg(struct kiocb *iocb, struct socket *sock,
 		msg->msg_flags |= MSG_TRUNC;
 	}
 
-	skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
+	er = skb_copy_datagram_iovec(skb, 0, msg->msg_iov, copied);
+	if (er < 0) {
+		skb_free_datagram(sk, skb);
+		release_sock(sk);
+		return er;
+	}
 
 	if (sax != NULL) {
+		memset(sax, 0, sizeof(*sax));
 		sax->sax25_family = AF_NETROM;
 		skb_copy_from_linear_data_offset(skb, 7, sax->sax25_call.ax25_call,
 			      AX25_ADDR_LEN);
@@ -1254,7 +1246,8 @@ static int nr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	case SIOCADDRT:
 	case SIOCDELRT:
 	case SIOCNRDECOBS:
-		if (!capable(CAP_NET_ADMIN)) return -EPERM;
+		if (!capable(CAP_NET_ADMIN))
+			return -EPERM;
 		return nr_rt_ioctl(cmd, argp);
 
 	default:
@@ -1268,28 +1261,13 @@ static int nr_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 
 static void *nr_info_start(struct seq_file *seq, loff_t *pos)
 {
-	struct sock *s;
-	struct hlist_node *node;
-	int i = 1;
-
 	spin_lock_bh(&nr_list_lock);
-	if (*pos == 0)
-		return SEQ_START_TOKEN;
-
-	sk_for_each(s, node, &nr_list) {
-		if (i == *pos)
-			return s;
-		++i;
-	}
-	return NULL;
+	return seq_hlist_start_head(&nr_list, *pos);
 }
 
 static void *nr_info_next(struct seq_file *seq, void *v, loff_t *pos)
 {
-	++*pos;
-
-	return (v == SEQ_START_TOKEN) ? sk_head(&nr_list)
-		: sk_next((struct sock *)v);
+	return seq_hlist_next(v, &nr_list, pos);
 }
 
 static void nr_info_stop(struct seq_file *seq, void *v)
@@ -1299,7 +1277,7 @@ static void nr_info_stop(struct seq_file *seq, void *v)
 
 static int nr_info_show(struct seq_file *seq, void *v)
 {
-	struct sock *s = v;
+	struct sock *s = sk_entry(v);
 	struct net_device *dev;
 	struct nr_sock *nr;
 	const char *devname;
@@ -1374,7 +1352,7 @@ static const struct file_operations nr_info_fops = {
 };
 #endif	/* CONFIG_PROC_FS */
 
-static struct net_proto_family nr_family_ops = {
+static const struct net_proto_family nr_family_ops = {
 	.family		=	PF_NETROM,
 	.create		=	nr_create,
 	.owner		=	THIS_MODULE,
@@ -1461,7 +1439,7 @@ static int __init nr_proto_init(void)
 		goto fail;
 	}
 
-	register_netdevice_notifier(&nr_dev_notifier);
+	register_netdevice_notifier_rh(&nr_dev_notifier);
 
 	ax25_register_pid(&nr_pid);
 	ax25_linkfail_register(&nr_linkfail_notifier);
@@ -1472,9 +1450,9 @@ static int __init nr_proto_init(void)
 
 	nr_loopback_init();
 
-	proc_net_fops_create(&init_net, "nr", S_IRUGO, &nr_info_fops);
-	proc_net_fops_create(&init_net, "nr_neigh", S_IRUGO, &nr_neigh_fops);
-	proc_net_fops_create(&init_net, "nr_nodes", S_IRUGO, &nr_nodes_fops);
+	proc_create("nr", S_IRUGO, init_net.proc_net, &nr_info_fops);
+	proc_create("nr_neigh", S_IRUGO, init_net.proc_net, &nr_neigh_fops);
+	proc_create("nr_nodes", S_IRUGO, init_net.proc_net, &nr_nodes_fops);
 out:
 	return rc;
 fail:
@@ -1502,9 +1480,9 @@ static void __exit nr_exit(void)
 {
 	int i;
 
-	proc_net_remove(&init_net, "nr");
-	proc_net_remove(&init_net, "nr_neigh");
-	proc_net_remove(&init_net, "nr_nodes");
+	remove_proc_entry("nr", init_net.proc_net);
+	remove_proc_entry("nr_neigh", init_net.proc_net);
+	remove_proc_entry("nr_nodes", init_net.proc_net);
 	nr_loopback_clear();
 
 	nr_rt_free();
@@ -1516,7 +1494,7 @@ static void __exit nr_exit(void)
 	ax25_linkfail_release(&nr_linkfail_notifier);
 	ax25_protocol_release(AX25_P_NETROM);
 
-	unregister_netdevice_notifier(&nr_dev_notifier);
+	unregister_netdevice_notifier_rh(&nr_dev_notifier);
 
 	sock_unregister(PF_NETROM);
 

@@ -36,7 +36,7 @@ sub syscalls::sys_exit_read
 {
     my ($event_name, $context, $common_cpu, $common_secs, $common_nsecs,
 	$common_pid, $common_comm,
-	$ret) = @_;
+	$nr, $ret) = @_;
 
     print_check();
 
@@ -54,7 +54,7 @@ sub syscalls::sys_enter_read
 {
     my ($event_name, $context, $common_cpu, $common_secs, $common_nsecs,
 	$common_pid, $common_comm,
-	$fd, $buf, $count) = @_;
+	$nr, $fd, $buf, $count) = @_;
 
     print_check();
 
@@ -67,7 +67,7 @@ sub syscalls::sys_exit_write
 {
     my ($event_name, $context, $common_cpu, $common_secs, $common_nsecs,
 	$common_pid, $common_comm,
-	$ret) = @_;
+	$nr, $ret) = @_;
 
     print_check();
 
@@ -80,7 +80,7 @@ sub syscalls::sys_enter_write
 {
     my ($event_name, $context, $common_cpu, $common_secs, $common_nsecs,
 	$common_pid, $common_comm,
-	$fd, $buf, $count) = @_;
+	$nr, $fd, $buf, $count) = @_;
 
     print_check();
 

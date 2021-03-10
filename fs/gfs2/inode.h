@@ -17,7 +17,6 @@
 
 extern int gfs2_releasepage(struct page *page, gfp_t gfp_mask);
 extern int gfs2_internal_read(struct gfs2_inode *ip,
-			      struct file_ra_state *ra_state,
 			      char *buf, loff_t *pos, unsigned size);
 extern void gfs2_set_aops(struct inode *inode);
 
@@ -94,28 +93,6 @@ err:
 	return -EIO;
 }
 
-/**
- * gfs2_size_hint - Give a hint to the size of a write request
- * @file: The struct file
- * @offset: The file offset of the write
- * @size: The length of the write
- *
- * When we are about to do a write, this function records the total
- * write size in order to provide a suitable hint to the lower layers
- * about how many blocks will be required.
- *
- */
-
-static inline void gfs2_size_hint(struct inode *inode, loff_t offset,
-				  size_t size)
-{
-	struct gfs2_sbd *sdp = GFS2_SB(inode);
-	struct gfs2_inode *ip = GFS2_I(inode);
-	size_t blks = (size + sdp->sd_sb.sb_bsize - 1) >> sdp->sd_sb.sb_bsize_shift;
-	int hint = min_t(size_t, INT_MAX, blks);
-	atomic_set(&ip->i_res.rs_sizehint, hint);
-}
-
 extern struct inode *gfs2_inode_lookup(struct super_block *sb, unsigned type, 
 				       u64 no_addr, u64 no_formal_ino,
 				       unsigned int blktype);
@@ -127,17 +104,16 @@ extern int gfs2_inode_refresh(struct gfs2_inode *ip);
 
 extern struct inode *gfs2_lookupi(struct inode *dir, const struct qstr *name,
 				  int is_root);
-extern int gfs2_create_inode(struct inode *dir, struct dentry *dentry,
-			     unsigned int mode, dev_t dev, const char *symname,
-			     unsigned int size, int excl);
 extern int gfs2_permission(struct inode *inode, int mask);
 extern int gfs2_setattr_simple(struct inode *inode, struct iattr *attr);
 extern struct inode *gfs2_lookup_simple(struct inode *dip, const char *name);
 extern void gfs2_dinode_out(const struct gfs2_inode *ip, void *buf);
-extern void gfs2_dinode_print(const struct gfs2_inode *ip);
+extern int gfs2_open_common(struct inode *inode, struct file *file);
+extern loff_t gfs2_seek_data(struct file *file, loff_t offset);
+extern loff_t gfs2_seek_hole(struct file *file, loff_t offset);
 
 extern const struct inode_operations gfs2_file_iops;
-extern const struct inode_operations gfs2_dir_iops;
+extern const struct inode_operations_wrapper gfs2_dir_iops;
 extern const struct inode_operations gfs2_symlink_iops;
 extern const struct file_operations gfs2_file_fops_nolock;
 extern const struct file_operations gfs2_dir_fops_nolock;

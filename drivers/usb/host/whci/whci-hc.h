@@ -1,21 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Wireless Host Controller (WHC) data structures.
  *
  * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
- * 02110-1301, USA.
  */
 #ifndef _WHCI_WHCI_HC_H
 #define _WHCI_WHCI_HC_H
@@ -172,14 +159,7 @@ struct whc_qhead {
 #define QH_INFO3_MAX_DELAY(d)    ((d) << 0)  /* maximum stream delay in 125 us units (isoc only) */
 #define QH_INFO3_INTERVAL(i)     ((i) << 16) /* segment interval in 125 us units (isoc only) */
 
-#define QH_INFO3_TX_RATE_53_3    (0 << 24)
-#define QH_INFO3_TX_RATE_80      (1 << 24)
-#define QH_INFO3_TX_RATE_106_7   (2 << 24)
-#define QH_INFO3_TX_RATE_160     (3 << 24)
-#define QH_INFO3_TX_RATE_200     (4 << 24)
-#define QH_INFO3_TX_RATE_320     (5 << 24)
-#define QH_INFO3_TX_RATE_400     (6 << 24)
-#define QH_INFO3_TX_RATE_480     (7 << 24)
+#define QH_INFO3_TX_RATE(r)      ((r) << 24) /* PHY rate (see [ECMA-368] section 10.3.1.1) */
 #define QH_INFO3_TX_PWR(p)       ((p) << 29) /* transmit power (see [WUSB] section 5.2.1.2) */
 
 #define QH_STATUS_FLOW_CTRL      (1 << 15)

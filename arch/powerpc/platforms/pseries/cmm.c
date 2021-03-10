@@ -24,7 +24,7 @@
 #include <linux/delay.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
-#include <linux/init.h>
+#include <linux/gfp.h>
 #include <linux/kthread.h>
 #include <linux/module.h>
 #include <linux/oom.h>
@@ -32,15 +32,14 @@
 #include <linux/sched.h>
 #include <linux/stringify.h>
 #include <linux/swap.h>
-#include <linux/sysdev.h>
+#include <linux/device.h>
 #include <asm/firmware.h>
 #include <asm/hvcall.h>
 #include <asm/mmu.h>
 #include <asm/pgalloc.h>
 #include <asm/uaccess.h>
 #include <linux/memory.h>
-
-#include "plpar_wrappers.h"
+#include <asm/plpar_wrappers.h>
 
 #define CMM_DRIVER_VERSION	"1.0.0"
 #define CMM_DEFAULT_DELAY	1
@@ -64,7 +63,7 @@ static unsigned int oom_kb = CMM_OOM_KB;
 static unsigned int cmm_debug = CMM_DEBUG;
 static unsigned int cmm_disabled = CMM_DISABLE;
 static unsigned long min_mem_mb = CMM_MIN_MEM_MB;
-static struct sys_device cmm_sysdev;
+static struct device cmm_dev;
 
 MODULE_AUTHOR("Brian King <brking@linux.vnet.ibm.com>");
 MODULE_DESCRIPTION("IBM System p Collaborative Memory Manager");
@@ -257,9 +256,9 @@ static void cmm_get_mpp(void)
 {
 	int rc;
 	struct hvcall_mpp_data mpp_data;
-       signed long active_pages_target, page_loan_request, target;
-       signed long total_pages = totalram_pages + loaned_pages;
-       signed long min_mem_pages = (min_mem_mb * 1024 * 1024) / PAGE_SIZE;
+	signed long active_pages_target, page_loan_request, target;
+	signed long total_pages = totalram_pages + loaned_pages;
+	signed long min_mem_pages = (min_mem_mb * 1024 * 1024) / PAGE_SIZE;
 
 	rc = h_get_mpp(&mpp_data);
 
@@ -267,25 +266,25 @@ static void cmm_get_mpp(void)
 		return;
 
 	page_loan_request = div_s64((s64)mpp_data.loan_request, PAGE_SIZE);
-       target = page_loan_request + (signed long)loaned_pages;
+	target = page_loan_request + (signed long)loaned_pages;
 
-       if (target < 0 || total_pages < min_mem_pages)
-               target = 0;
+	if (target < 0 || total_pages < min_mem_pages)
+		target = 0;
 
-       if (target > oom_freed_pages)
-               target -= oom_freed_pages;
+	if (target > oom_freed_pages)
+		target -= oom_freed_pages;
 	else
-               target = 0;
+		target = 0;
 
-       active_pages_target = total_pages - target;
+	active_pages_target = total_pages - target;
 
-       if (min_mem_pages > active_pages_target)
-               target = total_pages - min_mem_pages;
+	if (min_mem_pages > active_pages_target)
+		target = total_pages - min_mem_pages;
 
-       if (target < 0)
-               target = 0;
+	if (target < 0)
+		target = 0;
 
-       loaned_pages_target = target;
+	loaned_pages_target = target;
 
 	cmm_dbg("delta = %ld, loaned = %lu, target = %lu, oom = %lu, totalram = %lu\n",
 		page_loan_request, loaned_pages, loaned_pages_target,
@@ -346,25 +345,25 @@ static int cmm_thread(void *dummy)
 }
 
 #define CMM_SHOW(name, format, args...)			\
-	static ssize_t show_##name(struct sys_device *dev,	\
-				   struct sysdev_attribute *attr,	\
+	static ssize_t show_##name(struct device *dev,	\
+				   struct device_attribute *attr,	\
 				   char *buf)			\
 	{							\
 		return sprintf(buf, format, ##args);		\
 	}							\
-	static SYSDEV_ATTR(name, S_IRUGO, show_##name, NULL)
+	static DEVICE_ATTR(name, S_IRUGO, show_##name, NULL)
 
 CMM_SHOW(loaned_kb, "%lu\n", PAGES2KB(loaned_pages));
 CMM_SHOW(loaned_target_kb, "%lu\n", PAGES2KB(loaned_pages_target));
 
-static ssize_t show_oom_pages(struct sys_device *dev,
-			      struct sysdev_attribute *attr, char *buf)
+static ssize_t show_oom_pages(struct device *dev,
+			      struct device_attribute *attr, char *buf)
 {
 	return sprintf(buf, "%lu\n", PAGES2KB(oom_freed_pages));
 }
 
-static ssize_t store_oom_pages(struct sys_device *dev,
-			       struct sysdev_attribute *attr,
+static ssize_t store_oom_pages(struct device *dev,
+			       struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
 	unsigned long val = simple_strtoul (buf, NULL, 10);
@@ -378,17 +377,18 @@ static ssize_t store_oom_pages(struct sys_device *dev,
 	return count;
 }
 
-static SYSDEV_ATTR(oom_freed_kb, S_IWUSR| S_IRUGO,
+static DEVICE_ATTR(oom_freed_kb, S_IWUSR | S_IRUGO,
 		   show_oom_pages, store_oom_pages);
 
-static struct sysdev_attribute *cmm_attrs[] = {
-	&attr_loaned_kb,
-	&attr_loaned_target_kb,
-	&attr_oom_freed_kb,
+static struct device_attribute *cmm_attrs[] = {
+	&dev_attr_loaned_kb,
+	&dev_attr_loaned_target_kb,
+	&dev_attr_oom_freed_kb,
 };
 
-static struct sysdev_class cmm_sysdev_class = {
+static struct bus_type cmm_subsys = {
 	.name = "cmm",
+	.dev_name = "cmm",
 };
 
 /**
@@ -397,21 +397,21 @@ static struct sysdev_class cmm_sysdev_class = {
  * Return value:
  * 	0 on success / other on failure
  **/
-static int cmm_sysfs_register(struct sys_device *sysdev)
+static int cmm_sysfs_register(struct device *dev)
 {
 	int i, rc;
 
-	if ((rc = sysdev_class_register(&cmm_sysdev_class)))
+	if ((rc = subsys_system_register(&cmm_subsys, NULL)))
 		return rc;
 
-	sysdev->id = 0;
-	sysdev->cls = &cmm_sysdev_class;
+	dev->id = 0;
+	dev->bus = &cmm_subsys;
 
-	if ((rc = sysdev_register(sysdev)))
-		goto class_unregister;
+	if ((rc = device_register(dev)))
+		goto subsys_unregister;
 
 	for (i = 0; i < ARRAY_SIZE(cmm_attrs); i++) {
-		if ((rc = sysdev_create_file(sysdev, cmm_attrs[i])))
+		if ((rc = device_create_file(dev, cmm_attrs[i])))
 			goto fail;
 	}
 
@@ -419,10 +419,10 @@ static int cmm_sysfs_register(struct sys_device *sysdev)
 
 fail:
 	while (--i >= 0)
-		sysdev_remove_file(sysdev, cmm_attrs[i]);
-	sysdev_unregister(sysdev);
-class_unregister:
-	sysdev_class_unregister(&cmm_sysdev_class);
+		device_remove_file(dev, cmm_attrs[i]);
+	device_unregister(dev);
+subsys_unregister:
+	bus_unregister(&cmm_subsys);
 	return rc;
 }
 
@@ -430,14 +430,14 @@ class_unregister:
  * cmm_unregister_sysfs - Unregister from sysfs
  *
  **/
-static void cmm_unregister_sysfs(struct sys_device *sysdev)
+static void cmm_unregister_sysfs(struct device *dev)
 {
 	int i;
 
 	for (i = 0; i < ARRAY_SIZE(cmm_attrs); i++)
-		sysdev_remove_file(sysdev, cmm_attrs[i]);
-	sysdev_unregister(sysdev);
-	sysdev_class_unregister(&cmm_sysdev_class);
+		device_remove_file(dev, cmm_attrs[i]);
+	device_unregister(dev);
+	bus_unregister(&cmm_subsys);
 }
 
 /**
@@ -507,12 +507,7 @@ static int cmm_memory_isolate_cb(struct notifier_block *self,
 	if (action == MEM_ISOLATE_COUNT)
 		ret = cmm_count_pages(arg);
 
-	if (ret)
-		ret = notifier_from_errno(ret);
-	else
-		ret = NOTIFY_OK;
-
-	return ret;
+	return notifier_from_errno(ret);
 }
 
 static struct notifier_block cmm_mem_isolate_nb = {
@@ -634,12 +629,7 @@ static int cmm_memory_cb(struct notifier_block *self,
 		break;
 	}
 
-	if (ret)
-		ret = notifier_from_errno(ret);
-	else
-		ret = NOTIFY_OK;
-
-	return ret;
+	return notifier_from_errno(ret);
 }
 
 static struct notifier_block cmm_mem_nb = {
@@ -666,7 +656,7 @@ static int cmm_init(void)
 	if ((rc = register_reboot_notifier(&cmm_reboot_nb)))
 		goto out_oom_notifier;
 
-	if ((rc = cmm_sysfs_register(&cmm_sysdev)))
+	if ((rc = cmm_sysfs_register(&cmm_dev)))
 		goto out_reboot_notifier;
 
 	if (register_memory_notifier(&cmm_mem_nb) ||
@@ -687,7 +677,7 @@ static int cmm_init(void)
 out_unregister_notifier:
 	unregister_memory_notifier(&cmm_mem_nb);
 	unregister_memory_isolate_notifier(&cmm_mem_isolate_nb);
-	cmm_unregister_sysfs(&cmm_sysdev);
+	cmm_unregister_sysfs(&cmm_dev);
 out_reboot_notifier:
 	unregister_reboot_notifier(&cmm_reboot_nb);
 out_oom_notifier:
@@ -710,7 +700,7 @@ static void cmm_exit(void)
 	unregister_memory_notifier(&cmm_mem_nb);
 	unregister_memory_isolate_notifier(&cmm_mem_isolate_nb);
 	cmm_free_pages(loaned_pages);
-	cmm_unregister_sysfs(&cmm_sysdev);
+	cmm_unregister_sysfs(&cmm_dev);
 }
 
 /**

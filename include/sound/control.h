@@ -46,7 +46,7 @@ struct snd_kcontrol_new {
 	snd_ctl_elem_iface_t iface;	/* interface identifier */
 	unsigned int device;		/* device/client number */
 	unsigned int subdevice;		/* subdevice (substream) number */
-	unsigned char *name;		/* ASCII name of item */
+	const unsigned char *name;	/* ASCII name of item */
 	unsigned int index;		/* index of item */
 	unsigned int access;		/* access rights */
 	unsigned int count;		/* count of same elements */
@@ -62,7 +62,6 @@ struct snd_kcontrol_new {
 
 struct snd_kcontrol_volatile {
 	struct snd_ctl_file *owner;	/* locked */
-	pid_t owner_pid;
 	unsigned int access;	/* access rights */
 };
 
@@ -93,12 +92,19 @@ struct snd_kctl_event {
 
 #define snd_kctl_event(n) list_entry(n, struct snd_kctl_event, list)
 
+struct pid;
+
+enum {
+	SND_CTL_SUBDEV_PCM,
+	SND_CTL_SUBDEV_RAWMIDI,
+	SND_CTL_SUBDEV_ITEMS,
+};
+
 struct snd_ctl_file {
 	struct list_head list;		/* list of all control files */
 	struct snd_card *card;
-	pid_t pid;
-	int prefer_pcm_subdevice;
-	int prefer_rawmidi_subdevice;
+	struct pid *pid;
+	int preferred_subdevice[SND_CTL_SUBDEV_ITEMS];
 	wait_queue_head_t change_sleep;
 	spinlock_t read_lock;
 	struct fasync_struct *fasync;
@@ -118,8 +124,11 @@ struct snd_kcontrol *snd_ctl_new1(const struct snd_kcontrol_new * kcontrolnew, v
 void snd_ctl_free_one(struct snd_kcontrol * kcontrol);
 int snd_ctl_add(struct snd_card * card, struct snd_kcontrol * kcontrol);
 int snd_ctl_remove(struct snd_card * card, struct snd_kcontrol * kcontrol);
+int snd_ctl_replace(struct snd_card *card, struct snd_kcontrol *kcontrol, bool add_on_replace);
 int snd_ctl_remove_id(struct snd_card * card, struct snd_ctl_elem_id *id);
 int snd_ctl_rename_id(struct snd_card * card, struct snd_ctl_elem_id *src_id, struct snd_ctl_elem_id *dst_id);
+int snd_ctl_activate_id(struct snd_card *card, struct snd_ctl_elem_id *id,
+			int active);
 struct snd_kcontrol *snd_ctl_find_numid(struct snd_card * card, unsigned int numid);
 struct snd_kcontrol *snd_ctl_find_id(struct snd_card * card, struct snd_ctl_elem_id *id);
 
@@ -134,6 +143,8 @@ int snd_ctl_unregister_ioctl_compat(snd_kctl_ioctl_func_t fcn);
 #define snd_ctl_register_ioctl_compat(fcn)
 #define snd_ctl_unregister_ioctl_compat(fcn)
 #endif
+
+int snd_ctl_get_preferred_subdevice(struct snd_card *card, int type);
 
 static inline unsigned int snd_ctl_get_ioffnum(struct snd_kcontrol *kctl, struct snd_ctl_elem_id *id)
 {
@@ -193,7 +204,6 @@ int _snd_ctl_add_slave(struct snd_kcontrol *master, struct snd_kcontrol *slave,
  *
  * Add a virtual slave control to the given master element created via
  * snd_ctl_create_virtual_master() beforehand.
- * Returns zero if successful or a negative error code.
  *
  * All slaves must be the same type (returning the same information
  * via info callback).  The function doesn't check it, so it's your
@@ -203,6 +213,8 @@ int _snd_ctl_add_slave(struct snd_kcontrol *master, struct snd_kcontrol *slave,
  * at most two channels,
  * logarithmic volume control (dB level) thus no linear volume,
  * master can only attenuate the volume without gain
+ *
+ * Return: Zero if successful or a negative error code.
  */
 static inline int
 snd_ctl_add_slave(struct snd_kcontrol *master, struct snd_kcontrol *slave)
@@ -218,11 +230,13 @@ snd_ctl_add_slave(struct snd_kcontrol *master, struct snd_kcontrol *slave)
  * Add a virtual slave control to the given master.
  * Unlike snd_ctl_add_slave(), the element added via this function
  * is supposed to have volatile values, and get callback is called
- * at each time quried from the master.
+ * at each time queried from the master.
  *
  * When the control peeks the hardware values directly and the value
  * can be changed by other means than the put callback of the element,
  * this function should be used to keep the value always up-to-date.
+ *
+ * Return: Zero if successful or a negative error code.
  */
 static inline int
 snd_ctl_add_slave_uncached(struct snd_kcontrol *master,
@@ -235,13 +249,18 @@ int snd_ctl_add_vmaster_hook(struct snd_kcontrol *kctl,
 			     void (*hook)(void *private_data, int),
 			     void *private_data);
 void snd_ctl_sync_vmaster(struct snd_kcontrol *kctl, bool hook_only);
-void snd_ctl_sync_vmaster_hook(struct snd_kcontrol *kctl);
+#define snd_ctl_sync_vmaster_hook(kctl)	snd_ctl_sync_vmaster(kctl, true)
+int snd_ctl_apply_vmaster_slaves(struct snd_kcontrol *kctl,
+				 int (*func)(struct snd_kcontrol *vslave,
+					     struct snd_kcontrol *slave,
+					     void *arg),
+				 void *arg);
 
 /*
  * Helper functions for jack-detection controls
  */
 struct snd_kcontrol *
-snd_kctl_jack_new(const char *name, int idx, void *private_data);
+snd_kctl_jack_new(const char *name, struct snd_card *card);
 void snd_kctl_jack_report(struct snd_card *card,
 			  struct snd_kcontrol *kctl, bool status);
 

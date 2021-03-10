@@ -133,14 +133,21 @@ a memory block under /sys/devices/system/memory as
 (XXX is the section id.)
 
 Now, XXX is defined as (start_address_of_section / section_size) of the first
-section contained in the memory block.
+section contained in the memory block.  The files 'phys_index' and
+'end_phys_index' under each directory report the beginning and end section id's
+for the memory block covered by the sysfs directory.  It is expected that all
+memory sections in this range are present and no memory holes exist in the
+range. Currently there is no way to determine if there is a memory hole, but
+the existence of one should not affect the hotplug capabilities of the memory
+block.
 
 For example, assume 1GiB section size. A device for a memory starting at
 0x100000000 is /sys/device/system/memory/memory4
 (0x100000000 / 1Gib = 4)
 This device covers address range [0x100000000 ... 0x140000000)
 
-Under each section, you can see 5 files.
+Under each section, you can see 4 or 5 files, the end_phys_index file being
+a recent addition and not present on older kernels.
 
 /sys/devices/system/memory/memoryXXX/start_phys_index
 /sys/devices/system/memory/memoryXXX/end_phys_index
@@ -148,31 +155,35 @@ Under each section, you can see 5 files.
 /sys/devices/system/memory/memoryXXX/state
 /sys/devices/system/memory/memoryXXX/removable
 
-'start_phys_index' : read-only and contains section id of the first section
-		     in the memory block, same as XXX.
-'end_phys_index'   : read-only and contains section id of the last section
-		     in the memory block.
-'state'            : read-write
-                     at read:  contains online/offline state of memory.
-                     at write: user can specify "online", "offline" command
-                     which will be performed on al sections in the block.
-'phys_device'      : read-only: designed to show the name of physical memory
-                     device.  This is not well implemented now.
-'removable'        : read-only: contains an integer value indicating
-                     whether the memory block is removable or not
-                     removable.  A value of 1 indicates that the memory
-                     block is removable and a value of 0 indicates that
-                     it is not removable. A memory block is removable only if
-                     every section in the block is removable.
+'phys_index'      : read-only and contains section id of the first section
+		    in the memory block, same as XXX.
+'end_phys_index'  : read-only and contains section id of the last section
+		    in the memory block.
+'state'           : read-write
+                    at read:  contains online/offline state of memory.
+                    at write: user can specify "online_kernel",
+                    "online_movable", "online", "offline" command
+                    which will be performed on al sections in the block.
+'phys_device'     : read-only: designed to show the name of physical memory
+                    device.  This is not well implemented now.
+'removable'       : read-only: contains an integer value indicating
+                    whether the memory block is removable or not
+                    removable.  A value of 1 indicates that the memory
+                    block is removable and a value of 0 indicates that
+                    it is not removable. A memory block is removable only if
+                    every section in the block is removable.
 
 NOTE:
   These directories/files appear after physical memory hotplug phase.
 
-If CONFIG_NUMA is enabled the
-/sys/devices/system/memory/memoryXXX memory section
-directories can also be accessed via symbolic links located in
-the /sys/devices/system/node/node* directories.  For example:
+If CONFIG_NUMA is enabled the memoryXXX/ directories can also be accessed
+via symbolic links located in the /sys/devices/system/node/node* directories.
+
+For example:
 /sys/devices/system/node/node0/memory9 -> ../../memory/memory9
+
+A backlink will also be created:
+/sys/devices/system/memory/memory9/node0 -> ../../node/node0
 
 --------------------------------
 4. Physical memory hot-add phase
@@ -244,6 +255,17 @@ For using newly added memory, you have to "online" the memory section.
 For onlining, you have to write "online" to the section's state file as:
 
 % echo online > /sys/devices/system/memory/memoryXXX/state
+
+This onlining will not change the ZONE type of the target memory section,
+If the memory section is in ZONE_NORMAL, you can change it to ZONE_MOVABLE:
+
+% echo online_movable > /sys/devices/system/memory/memoryXXX/state
+(NOTE: current limit: this memory section must be adjacent to ZONE_MOVABLE)
+
+And if the memory section is in ZONE_MOVABLE, you can change it to ZONE_NORMAL:
+
+% echo online_kernel > /sys/devices/system/memory/memoryXXX/state
+(NOTE: current limit: this memory section must be adjacent to ZONE_NORMAL)
 
 After this, section memoryXXX's state will be 'online' and the amount of
 available memory will be increased.
@@ -331,7 +353,7 @@ Need more implementation yet....
 --------------------------------
 8. Memory hotplug event notifier
 --------------------------------
-Memory hotplug has event notifer. There are 6 types of notification.
+Memory hotplug has event notifier. There are 6 types of notification.
 
 MEMORY_GOING_ONLINE
   Generated before new memory becomes available in order to be able to
@@ -367,15 +389,21 @@ The third argument is passed by pointer of struct memory_notify.
 struct memory_notify {
        unsigned long start_pfn;
        unsigned long nr_pages;
+       int status_change_nid_normal;
+       int status_change_nid_high;
        int status_change_nid;
 }
 
 start_pfn is start_pfn of online/offline memory.
 nr_pages is # of pages of online/offline memory.
-status_change_nid is set node id when N_HIGH_MEMORY of nodemask is (will be)
+status_change_nid_normal is set node id when N_NORMAL_MEMORY of nodemask
+is (will be) set/clear, if this is -1, then nodemask status is not changed.
+status_change_nid_high is set node id when N_HIGH_MEMORY of nodemask
+is (will be) set/clear, if this is -1, then nodemask status is not changed.
+status_change_nid is set node id when N_MEMORY of nodemask is (will be)
 set/clear. It means a new(memoryless) node gets new memory by online and a
 node loses all memory. If this is -1, then nodemask status is not changed.
-If status_changed_nid >= 0, callback should create/discard structures for the
+If status_changed_nid* >= 0, callback should create/discard structures for the
 node if necessary.
 
 --------------

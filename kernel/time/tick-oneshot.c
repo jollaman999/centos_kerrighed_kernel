@@ -18,7 +18,6 @@
 #include <linux/percpu.h>
 #include <linux/profile.h>
 #include <linux/sched.h>
-#include <linux/tick.h>
 
 #include "tick-internal.h"
 
@@ -27,7 +26,7 @@
  */
 int tick_program_event(ktime_t expires, int force)
 {
-	struct clock_event_device *dev = __get_cpu_var(tick_cpu_device).evtdev;
+	struct clock_event_device *dev = __this_cpu_read(tick_cpu_device.evtdev);
 
 	return clockevents_program_event(dev, expires, force);
 }
@@ -37,7 +36,7 @@ int tick_program_event(ktime_t expires, int force)
  */
 void tick_resume_oneshot(void)
 {
-	struct clock_event_device *dev = __get_cpu_var(tick_cpu_device).evtdev;
+	struct clock_event_device *dev = __this_cpu_read(tick_cpu_device.evtdev);
 
 	clockevents_set_mode(dev, CLOCK_EVT_MODE_ONESHOT);
 	clockevents_program_event(dev, ktime_get(), true);
@@ -98,7 +97,7 @@ int tick_oneshot_mode_active(void)
 	int ret;
 
 	local_irq_save(flags);
-	ret = __get_cpu_var(tick_cpu_device).mode == TICKDEV_MODE_ONESHOT;
+	ret = __this_cpu_read(tick_cpu_device.mode) == TICKDEV_MODE_ONESHOT;
 	local_irq_restore(flags);
 
 	return ret;

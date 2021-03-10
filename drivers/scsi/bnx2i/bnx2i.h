@@ -42,11 +42,11 @@
 #include <scsi/libiscsi.h>
 #include <scsi/scsi_transport_iscsi.h>
 
-#include "../../net/cnic_if.h"
+#include "../../net/ethernet/broadcom/cnic_if.h"
 #include "57xx_iscsi_hsi.h"
 #include "57xx_iscsi_constants.h"
 
-#include "../../net/bnx2x/bnx2x_mfw_req.h"
+#include "../../net/ethernet/broadcom/bnx2x/bnx2x_mfw_req.h"
 
 #define BNX2_ISCSI_DRIVER_NAME		"bnx2i"
 

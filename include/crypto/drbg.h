@@ -116,10 +116,6 @@ struct drbg_state {
 	void *priv_data;	/* Cipher handle */
 	bool seeded;		/* DRBG fully seeded? */
 	bool pr;		/* Prediction resistance enabled? */
-#ifdef CONFIG_CRYPTO_FIPS
-	bool fips_primed;	/* Continuous test primed? */
-	unsigned char *prev;	/* FIPS 140-2 continuous test value */
-#endif
 	const struct drbg_state_ops *d_ops;
 	const struct drbg_core *core;
 	struct drbg_test_data *test_data;
@@ -161,7 +157,7 @@ static inline size_t drbg_max_addtl(struct drbg_state *drbg)
 	 * return SIZE_MAX - 1 to allow the verification of the enforcement
 	 * of this value in drbg_healthcheck_sanity.
 	 */
-	return ((~(size_t)0) - 1);
+	return (SIZE_MAX - 1);
 #else
 	return (1UL<<35);
 #endif
@@ -171,7 +167,7 @@ static inline size_t drbg_max_requests(struct drbg_state *drbg)
 {
 	/* SP800-90A requires 2**48 maximum requests before reseeding */
 #if (__BITS_PER_LONG == 32)
-	return (~(size_t)0);
+	return SIZE_MAX;
 #else
 	return (1UL<<48);
 #endif

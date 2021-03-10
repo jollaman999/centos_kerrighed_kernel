@@ -8,9 +8,7 @@
  * Licensed under the GNU/GPL. See COPYING for details.
  */
 
-#if 0 /* Not in RHEL */
 #include <linux/gpio/driver.h>
-#endif
 #include <linux/interrupt.h>
 #include <linux/export.h>
 #include <linux/bcma/bcma.h>
@@ -190,17 +188,18 @@ int bcma_gpio_init(struct bcma_drv_cc *cc)
 	chip->direction_input	= bcma_gpio_direction_input;
 	chip->direction_output	= bcma_gpio_direction_output;
 	chip->owner		= THIS_MODULE;
-	chip->dev		= bcma_bus_get_host_dev(bus);
-#if IS_BUILTIN(CONFIG_OF)
 #if 0 /* Not in RHEL */
+	chip->parent		= bcma_bus_get_host_dev(bus);
+#endif
+#if IS_BUILTIN(CONFIG_OF)
 	if (cc->core->bus->hosttype == BCMA_HOSTTYPE_SOC)
 		chip->of_node	= cc->core->dev.of_node;
-#endif
 #endif
 	switch (bus->chipinfo.id) {
 	case BCMA_CHIP_ID_BCM4707:
 	case BCMA_CHIP_ID_BCM5357:
 	case BCMA_CHIP_ID_BCM53572:
+	case BCMA_CHIP_ID_BCM47094:
 		chip->ngpio	= 32;
 		break;
 	default:
@@ -226,13 +225,8 @@ int bcma_gpio_init(struct bcma_drv_cc *cc)
 
 	err = bcma_gpio_irq_init(cc);
 	if (err) {
-#if 0 /* Not in RHEL */
 		gpiochip_remove(chip);
 		return err;
-#else
-		int err1 = gpiochip_remove(chip);
-		return err ? err : err1;
-#endif
 	}
 
 	return 0;
@@ -241,10 +235,6 @@ int bcma_gpio_init(struct bcma_drv_cc *cc)
 int bcma_gpio_unregister(struct bcma_drv_cc *cc)
 {
 	bcma_gpio_irq_exit(cc);
-#if 0 /* Not in RHEL */
 	gpiochip_remove(&cc->gpio);
 	return 0;
-#else
-	return gpiochip_remove(&cc->gpio);
-#endif
 }

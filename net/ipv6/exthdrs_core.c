@@ -2,24 +2,26 @@
  * IPv6 library code, needed by static components when full IPv6 support is
  * not configured or static.
  */
+#include <linux/export.h>
 #include <net/ipv6.h>
 
 /*
  * find out if nexthdr is a well-known extension header or a protocol
  */
 
-int ipv6_ext_hdr(u8 nexthdr)
+bool ipv6_ext_hdr(u8 nexthdr)
 {
 	/*
 	 * find out if nexthdr is an extension header or a protocol
 	 */
-	return ( (nexthdr == NEXTHDR_HOP)	||
+	return   (nexthdr == NEXTHDR_HOP)	||
 		 (nexthdr == NEXTHDR_ROUTING)	||
 		 (nexthdr == NEXTHDR_FRAGMENT)	||
 		 (nexthdr == NEXTHDR_AUTH)	||
 		 (nexthdr == NEXTHDR_NONE)	||
-		 (nexthdr == NEXTHDR_DEST) );
+		 (nexthdr == NEXTHDR_DEST);
 }
+EXPORT_SYMBOL(ipv6_ext_hdr);
 
 /*
  * Skip any extension headers. This is used by the ICMP module.
@@ -66,8 +68,8 @@ int ipv6_ext_hdr(u8 nexthdr)
  * --ANK (980726)
  */
 
-int ipv6_skip_exthdr_fragoff(const struct sk_buff *skb, int start,
-			     u8 *nexthdrp, __be16 *frag_offp)
+int ipv6_skip_exthdr(const struct sk_buff *skb, int start, u8 *nexthdrp,
+		     __be16 *frag_offp)
 {
 	u8 nexthdr = *nexthdrp;
 
@@ -108,18 +110,12 @@ int ipv6_skip_exthdr_fragoff(const struct sk_buff *skb, int start,
 	*nexthdrp = nexthdr;
 	return start;
 }
-
-int ipv6_skip_exthdr(const struct sk_buff *skb, int start, u8 *nexthdrp)
-{
-	__be16 fragoff;
-
-	return ipv6_skip_exthdr_fragoff(skb, start, nexthdrp, &fragoff);
-}
+EXPORT_SYMBOL(ipv6_skip_exthdr);
 
 int ipv6_find_tlv(struct sk_buff *skb, int offset, int type)
 {
 	const unsigned char *nh = skb_network_header(skb);
-	int packet_len = skb->tail - skb->network_header;
+	int packet_len = skb_tail_pointer(skb) - skb_network_header(skb);
 	struct ipv6_opt_hdr *hdr;
 	int len;
 
@@ -142,7 +138,7 @@ int ipv6_find_tlv(struct sk_buff *skb, int offset, int type)
 			return offset;
 
 		switch (opttype) {
-		case IPV6_TLV_PAD0:
+		case IPV6_TLV_PAD1:
 			optlen = 1;
 			break;
 		default:
@@ -158,11 +154,7 @@ int ipv6_find_tlv(struct sk_buff *skb, int offset, int type)
  bad:
 	return -1;
 }
-
 EXPORT_SYMBOL_GPL(ipv6_find_tlv);
-EXPORT_SYMBOL(ipv6_ext_hdr);
-EXPORT_SYMBOL(ipv6_skip_exthdr);
-EXPORT_SYMBOL_GPL(ipv6_skip_exthdr_fragoff);
 
 /*
  * find the offset to specified header or the protocol number of last header
@@ -205,10 +197,8 @@ int ipv6_find_hdr(const struct sk_buff *skb, unsigned int *offset,
 		struct ipv6hdr _ip6, *ip6;
 
 		ip6 = skb_header_pointer(skb, *offset, sizeof(_ip6), &_ip6);
-		if (!ip6 || (ip6->version != 6)) {
-			printk(KERN_ERR "IPv6 header not found\n");
+		if (!ip6 || (ip6->version != 6))
 			return -EBADMSG;
-		}
 		start = *offset + sizeof(struct ipv6hdr);
 		nexthdr = ip6->nexthdr;
 	}
@@ -286,3 +276,4 @@ int ipv6_find_hdr(const struct sk_buff *skb, unsigned int *offset,
 	return nexthdr;
 }
 EXPORT_SYMBOL(ipv6_find_hdr);
+

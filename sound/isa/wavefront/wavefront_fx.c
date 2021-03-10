@@ -16,10 +16,12 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
-#include <asm/io.h>
+#include <linux/io.h>
 #include <linux/init.h>
 #include <linux/time.h>
 #include <linux/wait.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 #include <linux/firmware.h>
 #include <sound/core.h>
 #include <sound/snd_wavefront.h>
@@ -238,7 +240,7 @@ snd_wavefront_fx_ioctl (struct snd_hwdep *sdev, struct file *file,
    that outputs it.
 */
 
-int __devinit
+int
 snd_wavefront_fx_start (snd_wavefront_t *dev)
 {
 	unsigned int i;

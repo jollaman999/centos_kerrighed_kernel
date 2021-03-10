@@ -694,7 +694,7 @@ sci_io_request_construct_sata(struct isci_request *ireq,
 	}
 
 	/* ATAPI */
-	if (dev->sata_dev.command_set == ATAPI_COMMAND_SET &&
+	if (dev->sata_dev.class == ATA_DEV_ATAPI &&
 	    task->ata_task.fis.command == ATA_CMD_PACKET) {
 		sci_atapi_construct(ireq);
 		return SCI_SUCCESS;
@@ -1427,9 +1427,9 @@ sci_stp_request_pio_data_in_copy_data_buffer(struct isci_stp_request *stp_req,
 			struct page *page = sg_page(sg);
 
 			copy_len = min_t(int, total_len, sg_dma_len(sg));
-			kaddr = kmap_atomic(page, KM_IRQ0);
+			kaddr = kmap_atomic(page);
 			memcpy(kaddr + sg->offset, src_addr, copy_len);
-			kunmap_atomic(kaddr, KM_IRQ0);
+			kunmap_atomic(kaddr);
 			total_len -= copy_len;
 			src_addr += copy_len;
 			sg = sg_next(sg);
@@ -1777,7 +1777,7 @@ sci_io_request_frame_handler(struct isci_request *ireq,
 		sci_unsolicited_frame_control_get_header(&ihost->uf_control,
 							 frame_index,
 							 &frame_header);
-		kaddr = kmap_atomic(sg_page(sg), KM_IRQ0);
+		kaddr = kmap_atomic(sg_page(sg));
 		rsp = kaddr + sg->offset;
 		sci_swab32_cpy(rsp, frame_header, 1);
 
@@ -1814,7 +1814,7 @@ sci_io_request_frame_handler(struct isci_request *ireq,
 			ireq->sci_status = SCI_FAILURE_CONTROLLER_SPECIFIC_IO_ERR;
 			sci_change_state(&ireq->sm, SCI_REQ_COMPLETED);
 		}
-		kunmap_atomic(kaddr, KM_IRQ0);
+		kunmap_atomic(kaddr);
 
 		sci_controller_release_frame(ihost, frame_index);
 
@@ -2240,7 +2240,7 @@ static enum sci_status atapi_data_tc_completion_handler(struct isci_request *ire
 			status = ireq->sci_status;
 			sci_change_state(&idev->sm, SCI_STP_DEV_ATAPI_ERROR);
 		} else {
-			/* If receiving any non-sucess TC status, no UF
+			/* If receiving any non-success TC status, no UF
 			 * received yet, then an UF for the status fis
 			 * is coming after (XXX: suspect this is
 			 * actually a protocol error or a bug like the
@@ -2924,10 +2924,10 @@ static void isci_request_io_request_complete(struct isci_host *ihost,
 		dma_unmap_sg(&ihost->pdev->dev, sg, 1, DMA_TO_DEVICE);
 
 		/* need to swab it back in case the command buffer is re-used */
-		kaddr = kmap_atomic(sg_page(sg), KM_IRQ0);
+		kaddr = kmap_atomic(sg_page(sg));
 		smp_req = kaddr + sg->offset;
 		sci_swab32_cpy(smp_req, smp_req, sg->length / sizeof(u32));
-		kunmap_atomic(kaddr, KM_IRQ0);
+		kunmap_atomic(kaddr);
 		break;
 	}
 	default:
@@ -2974,13 +2974,13 @@ static void sci_request_started_state_enter(struct sci_base_state_machine *sm)
 	/* all unaccelerated request types (non ssp or ncq) handled with
 	 * substates
 	 */
-	if (!task && dev->dev_type == SAS_END_DEV) {
+	if (!task && dev->dev_type == SAS_END_DEVICE) {
 		state = SCI_REQ_TASK_WAIT_TC_COMP;
 	} else if (task && task->task_proto == SAS_PROTOCOL_SMP) {
 		state = SCI_REQ_SMP_WAIT_RESP;
 	} else if (task && sas_protocol_ata(task->task_proto) &&
 		   !task->ata_task.use_ncq) {
-		if (dev->sata_dev.command_set == ATAPI_COMMAND_SET &&
+		if (dev->sata_dev.class == ATA_DEV_ATAPI &&
 			task->ata_task.fis.command == ATA_CMD_PACKET) {
 			state = SCI_REQ_ATAPI_WAIT_H2D;
 		} else if (task->data_dir == DMA_NONE) {
@@ -3097,7 +3097,7 @@ sci_io_request_construct(struct isci_host *ihost,
 	if (idev->rnc.remote_node_index == SCIC_SDS_REMOTE_NODE_CONTEXT_INVALID_INDEX)
 		return SCI_FAILURE_INVALID_REMOTE_DEVICE;
 
-	if (dev->dev_type == SAS_END_DEV)
+	if (dev->dev_type == SAS_END_DEVICE)
 		/* pass */;
 	else if (dev_is_sata(dev))
 		memset(&ireq->stp.cmd, 0, sizeof(ireq->stp.cmd));
@@ -3121,7 +3121,7 @@ enum sci_status sci_task_request_construct(struct isci_host *ihost,
 	/* Build the common part of the request */
 	sci_general_request_construct(ihost, idev, ireq);
 
-	if (dev->dev_type == SAS_END_DEV || dev_is_sata(dev)) {
+	if (dev->dev_type == SAS_END_DEVICE || dev_is_sata(dev)) {
 		set_bit(IREQ_TMF, &ireq->flags);
 		memset(ireq->tc, 0, sizeof(struct scu_task_context));
 
@@ -3191,7 +3191,7 @@ sci_io_request_construct_smp(struct device *dev,
 	u8 req_len;
 	u32 cmd;
 
-	kaddr = kmap_atomic(sg_page(sg), KM_IRQ0);
+	kaddr = kmap_atomic(sg_page(sg));
 	smp_req = kaddr + sg->offset;
 	/*
 	 * Look at the SMP requests' header fields; for certain SAS 1.x SMP
@@ -3217,7 +3217,7 @@ sci_io_request_construct_smp(struct device *dev,
 	req_len = smp_req->req_len;
 	sci_swab32_cpy(smp_req, smp_req, sg->length / sizeof(u32));
 	cmd = *(u32 *) smp_req;
-	kunmap_atomic(kaddr, KM_IRQ0);
+	kunmap_atomic(kaddr);
 
 	if (!dma_map_sg(dev, sg, 1, DMA_TO_DEVICE))
 		return SCI_FAILURE;

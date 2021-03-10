@@ -18,9 +18,15 @@
 #include <linux/uio_driver.h>
 #include <linux/spinlock.h>
 #include <linux/bitops.h>
+#include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/stringify.h>
 #include <linux/pm_runtime.h>
+#include <linux/slab.h>
+
+#include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/of_address.h>
 
 #define DRIVER_NAME "uio_pdrv_genirq"
 
@@ -96,22 +102,42 @@ static int uio_pdrv_genirq_probe(struct platform_device *pdev)
 	int ret = -EINVAL;
 	int i;
 
+	if (pdev->dev.of_node) {
+		int irq;
+
+		/* alloc uioinfo for one device */
+		uioinfo = devm_kzalloc(&pdev->dev, sizeof(*uioinfo),
+				       GFP_KERNEL);
+		if (!uioinfo) {
+			dev_err(&pdev->dev, "unable to kmalloc\n");
+			return -ENOMEM;
+		}
+		uioinfo->name = pdev->dev.of_node->name;
+		uioinfo->version = "devicetree";
+
+		/* Multiple IRQs are not supported */
+		irq = platform_get_irq(pdev, 0);
+		if (irq == -ENXIO)
+			uioinfo->irq = UIO_IRQ_NONE;
+		else
+			uioinfo->irq = irq;
+	}
+
 	if (!uioinfo || !uioinfo->name || !uioinfo->version) {
 		dev_err(&pdev->dev, "missing platform_data\n");
-		goto bad0;
+		return ret;
 	}
 
 	if (uioinfo->handler || uioinfo->irqcontrol ||
 	    uioinfo->irq_flags & IRQF_SHARED) {
 		dev_err(&pdev->dev, "interrupt configuration error\n");
-		goto bad0;
+		return ret;
 	}
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
 	if (!priv) {
-		ret = -ENOMEM;
 		dev_err(&pdev->dev, "unable to kmalloc\n");
-		goto bad0;
+		return -ENOMEM;
 	}
 
 	priv->uioinfo = uioinfo;
@@ -119,6 +145,14 @@ static int uio_pdrv_genirq_probe(struct platform_device *pdev)
 	priv->flags = 0; /* interrupt is enabled to begin with */
 	priv->pdev = pdev;
 
+	if (!uioinfo->irq) {
+		ret = platform_get_irq(pdev, 0);
+		if (ret < 0) {
+			dev_err(&pdev->dev, "failed to get IRQ\n");
+			return ret;
+		}
+		uioinfo->irq = ret;
+	}
 	uiomem = &uioinfo->mem[0];
 
 	for (i = 0; i < pdev->num_resources; ++i) {
@@ -136,7 +170,8 @@ static int uio_pdrv_genirq_probe(struct platform_device *pdev)
 
 		uiomem->memtype = UIO_MEM_PHYS;
 		uiomem->addr = r->start;
-		uiomem->size = r->end - r->start + 1;
+		uiomem->size = resource_size(r);
+		uiomem->name = r->name;
 		++uiomem;
 	}
 
@@ -154,7 +189,6 @@ static int uio_pdrv_genirq_probe(struct platform_device *pdev)
 	 * Interrupt sharing is not supported.
 	 */
 
-	uioinfo->irq_flags |= IRQF_DISABLED;
 	uioinfo->handler = uio_pdrv_genirq_handler;
 	uioinfo->irqcontrol = uio_pdrv_genirq_irqcontrol;
 	uioinfo->open = uio_pdrv_genirq_open;
@@ -171,16 +205,12 @@ static int uio_pdrv_genirq_probe(struct platform_device *pdev)
 	ret = uio_register_device(&pdev->dev, priv->uioinfo);
 	if (ret) {
 		dev_err(&pdev->dev, "unable to register uio device\n");
-		goto bad1;
+		pm_runtime_disable(&pdev->dev);
+		return ret;
 	}
 
 	platform_set_drvdata(pdev, priv);
 	return 0;
- bad1:
-	kfree(priv);
-	pm_runtime_disable(&pdev->dev);
- bad0:
-	return ret;
 }
 
 static int uio_pdrv_genirq_remove(struct platform_device *pdev)
@@ -189,7 +219,10 @@ static int uio_pdrv_genirq_remove(struct platform_device *pdev)
 
 	uio_unregister_device(priv->uioinfo);
 	pm_runtime_disable(&pdev->dev);
-	kfree(priv);
+
+	priv->uioinfo->handler = NULL;
+	priv->uioinfo->irqcontrol = NULL;
+
 	return 0;
 }
 
@@ -210,10 +243,19 @@ static int uio_pdrv_genirq_runtime_nop(struct device *dev)
 	return 0;
 }
 
-static struct dev_pm_ops uio_pdrv_genirq_dev_pm_ops = {
+static const struct dev_pm_ops uio_pdrv_genirq_dev_pm_ops = {
 	.runtime_suspend = uio_pdrv_genirq_runtime_nop,
 	.runtime_resume = uio_pdrv_genirq_runtime_nop,
 };
+
+#ifdef CONFIG_OF
+static const struct of_device_id uio_of_genirq_match[] = {
+	{ /* empty for now */ },
+};
+MODULE_DEVICE_TABLE(of, uio_of_genirq_match);
+#else
+# define uio_of_genirq_match NULL
+#endif
 
 static struct platform_driver uio_pdrv_genirq = {
 	.probe = uio_pdrv_genirq_probe,
@@ -222,21 +264,11 @@ static struct platform_driver uio_pdrv_genirq = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
 		.pm = &uio_pdrv_genirq_dev_pm_ops,
+		.of_match_table = uio_of_genirq_match,
 	},
 };
 
-static int __init uio_pdrv_genirq_init(void)
-{
-	return platform_driver_register(&uio_pdrv_genirq);
-}
-
-static void __exit uio_pdrv_genirq_exit(void)
-{
-	platform_driver_unregister(&uio_pdrv_genirq);
-}
-
-module_init(uio_pdrv_genirq_init);
-module_exit(uio_pdrv_genirq_exit);
+module_platform_driver(uio_pdrv_genirq);
 
 MODULE_AUTHOR("Magnus Damm");
 MODULE_DESCRIPTION("Userspace I/O platform driver with generic IRQ handling");

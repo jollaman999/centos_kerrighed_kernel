@@ -1,15 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Michael MIC implementation - optimized for TKIP MIC operations
  * Copyright 2002-2003, Instant802 Networks, Inc.
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
  */
 #include <linux/types.h>
 #include <linux/bitops.h>
 #include <linux/ieee80211.h>
-#include <linux/nospec.h>
 #include <asm/unaligned.h>
 
 #include "michael.h"
@@ -36,7 +32,7 @@ static void michael_mic_hdr(struct michael_mic_ctx *mctx, const u8 *key,
 	da = ieee80211_get_DA(hdr);
 	sa = ieee80211_get_SA(hdr);
 	if (ieee80211_is_data_qos(hdr->frame_control))
-		tid = *ieee80211_get_qos_ctl(hdr) & IEEE80211_QOS_CTL_TID_MASK;
+		tid = ieee80211_get_tid(hdr);
 	else
 		tid = 0;
 
@@ -67,7 +63,6 @@ void michael_mic(const u8 *key, struct ieee80211_hdr *hdr,
 	blocks = data_len / 4;
 	left = data_len % 4;
 
-	barrier_nospec();
 	for (block = 0; block < blocks; block++)
 		michael_block(&mctx, get_unaligned_le32(&data[block * 4]));
 

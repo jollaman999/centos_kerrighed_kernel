@@ -272,11 +272,7 @@ static const struct file_operations prism2_crypt_proc_fops = {
 static ssize_t prism2_pda_proc_read(struct file *file, char __user *buf,
 				    size_t count, loff_t *_pos)
 {
-#if 0 /* Not in RHEL */
 	local_info_t *local = PDE_DATA(file_inode(file));
-#else
-	local_info_t *local = PDE_DATA(file->f_path.dentry->d_inode);
-#endif
 	size_t off;
 
 	if (local->pda == NULL || *_pos >= PRISM2_PDA_SIZE)
@@ -500,29 +496,7 @@ void hostap_init_proc(local_info_t *local)
 
 void hostap_remove_proc(local_info_t *local)
 {
-#if 0 /* Not in RHEL */
 	remove_proc_subtree(local->ddev->name, hostap_proc);
-#else
-	if (local->proc != NULL) {
-#ifndef PRISM2_NO_STATION_MODES
-		remove_proc_entry("scan_results", local->proc);
-#endif /* PRISM2_NO_STATION_MODES */
-#ifdef PRISM2_IO_DEBUG
-		remove_proc_entry("io_debug", local->proc);
-#endif /* PRISM2_IO_DEBUG */
-		remove_proc_entry("pda", local->proc);
-		remove_proc_entry("aux_dump", local->proc);
-		remove_proc_entry("wds", local->proc);
-		remove_proc_entry("stats", local->proc);
-		remove_proc_entry("bss_list", local->proc);
-		remove_proc_entry("crypt", local->proc);
-#ifndef PRISM2_NO_PROCFS_DEBUG
-		remove_proc_entry("debug", local->proc);
-#endif /* PRISM2_NO_PROCFS_DEBUG */
-		if (hostap_proc != NULL)
-			remove_proc_entry(local->proc->name, hostap_proc);
-	}
-#endif /* Not in RHEL */
 }
 
 

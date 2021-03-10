@@ -30,16 +30,16 @@ extern struct pglist_data *node_data[];
  */
 
 extern int numa_cpu_lookup_table[];
-extern cpumask_t numa_cpumask_lookup_table[];
+extern cpumask_var_t node_to_cpumask_map[];
 #ifdef CONFIG_MEMORY_HOTPLUG
 extern unsigned long max_pfn;
 u64 memory_hotplug_max(void);
 #else
-#define memory_hotplug_max() lmb_end_of_DRAM()
+#define memory_hotplug_max() memblock_end_of_DRAM()
 #endif
 
 #else
-#define memory_hotplug_max() lmb_end_of_DRAM()
+#define memory_hotplug_max() memblock_end_of_DRAM()
 #endif /* CONFIG_NEED_MULTIPLE_NODES */
 
 #endif /* __KERNEL__ */

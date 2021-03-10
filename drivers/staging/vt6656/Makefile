@@ -1,6 +1,6 @@
 # TODO: all of these should be removed
-EXTRA_CFLAGS += -DLINUX -D__KERNEL__ -DEXPORT_SYMTAB -D__NO_VERSION__
-EXTRA_CFLAGS += -DHOSTAP
+ccflags-y := -DLINUX -D__KERNEL__ -DEXPORT_SYMTAB -D__NO_VERSION__
+ccflags-y += -DHOSTAP
 
 vt6656_stage-y +=	main_usb.o \
 			card.o  \
@@ -20,7 +20,6 @@ vt6656_stage-y +=	main_usb.o \
 			rc4.o \
 			tether.o \
 			tcrc.o \
-			ioctl.o \
 			hostap.o \
 			wpa.o \
 			key.o \

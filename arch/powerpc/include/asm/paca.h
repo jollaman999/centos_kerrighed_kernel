@@ -14,11 +14,17 @@
 #define _ASM_POWERPC_PACA_H
 #ifdef __KERNEL__
 
+#ifdef CONFIG_PPC64
+
 #include <asm/types.h>
 #include <asm/lppaca.h>
 #include <asm/mmu.h>
 #include <asm/page.h>
 #include <asm/exception-64e.h>
+#ifdef CONFIG_KVM_BOOK3S_64_HANDLER
+#include <asm/kvm_book3s_asm.h>
+#endif
+#include <asm/hmi.h>
 
 register struct paca_struct *local_paca asm("r13");
 
@@ -36,23 +42,17 @@ extern unsigned int debug_smp_processor_id(void); /* from linux/smp.h */
 #define get_lppaca()	(get_paca()->lppaca_ptr)
 #define get_slb_shadow()	(get_paca()->slb_shadow_ptr)
 
-struct task_struct;
-
 /*
- * This is pointed to by paca->aux_ptr, for the purpose of extending the
- * paca structure without kABI breakage.
+ * RHEL7 kABI: This is required for kABI paca_aux workaround definition
+ * of PACA_AUX_PTR. We use new paca_aux accessors to use shadow struct
  */
-#ifdef CONFIG_PPC_BOOK3S_64
-struct paca_aux_struct {
-	/*
-	 * rfi fallback flush must be in its own cacheline to prevent
-	 * other paca data leaking into the L1d
-	 */
-	u64 exrfi[13] __aligned(0x80);
-	void *rfi_flush_fallback_area;
-	u64 l1d_flush_size;
-};
-#endif
+#define EX_DAR		48
+
+#define get_paca_aux()   ((struct paca_aux_struct *)get_paca()->exslb[EX_DAR/8])
+#define paca_aux_of(cpu) ((struct paca_aux_struct *)paca[cpu].exslb[EX_DAR/8])
+
+struct task_struct;
+struct opal_machine_check_event;
 
 /*
  * Defines the layout of the paca.
@@ -77,8 +77,13 @@ struct paca_struct {
 	 * instruction.  They must travel together and be properly
 	 * aligned.
 	 */
+#ifdef __BIG_ENDIAN__
 	u16 lock_token;			/* Constant 0x8000, used in locks */
 	u16 paca_index;			/* Logical processor number */
+#else
+	u16 paca_index;			/* Logical processor number */
+	u16 lock_token;			/* Constant 0x8000, used in locks */
+#endif
 
 	u64 kernel_toc;			/* Kernel TOC address */
 	u64 kernelbase;			/* Base address of kernel */
@@ -92,40 +97,36 @@ struct paca_struct {
 	s16 hw_cpu_id;			/* Physical processor number */
 	u8 cpu_start;			/* At startup, processor spins until */
 					/* this becomes non-zero. */
+	u8 kexec_state;		/* set when kexec down has irqs off */
 #ifdef CONFIG_PPC_STD_MMU_64
 	struct slb_shadow *slb_shadow_ptr;
 	struct dtl_entry *dispatch_log;
 	struct dtl_entry *dispatch_log_end;
+#endif /* CONFIG_PPC_STD_MMU_64 */
+	u64 dscr_default;		/* per-CPU default DSCR */
 
-	/*
-	 * Because of alignement of exgen there is a hole here, we use that hole
-	 * for the aux_ptr and so don't change the size of the paca or the
-	 * location of any members.
-	 */
-#ifdef CONFIG_PPC_BOOK3S_64
-#ifndef __GENKSYMS__
-	struct paca_aux_struct *aux_ptr;
-#endif
-#endif
+#ifdef CONFIG_PPC_STD_MMU_64
 	/*
 	 * Now, starting in cacheline 2, the exception save areas
 	 */
 	/* used for most interrupts/exceptions */
-	u64 exgen[10] __attribute__((aligned(0x80)));
-	u64 exmc[10];		/* used for machine checks */
-	u64 exslb[10];		/* used for SLB/segment table misses
+	u64 exgen[13] __attribute__((aligned(0x80)));
+	u64 exmc[13];		/* used for machine checks */
+	u64 exslb[13];		/* used for SLB/segment table misses
  				 * on the linear mapping */
 	/* SLB related definitions */
 	u16 vmalloc_sllp;
 	u16 slb_cache_ptr;
-	u16 slb_cache[SLB_CACHE_ENTRIES];
+	u32 slb_cache[SLB_CACHE_ENTRIES];
 #endif /* CONFIG_PPC_STD_MMU_64 */
 
 #ifdef CONFIG_PPC_BOOK3E
-	pgd_t *pgd;			/* Current PGD */
-	pgd_t *kernel_pgd;		/* Kernel PGD */
 	u64 exgen[8] __attribute__((aligned(0x80)));
-	u64 extlb[EX_TLB_SIZE*3] __attribute__((aligned(0x80)));
+	/* Keep pgd in the same cacheline as the start of extlb */
+	pgd_t *pgd __attribute__((aligned(0x80))); /* Current PGD */
+	pgd_t *kernel_pgd;		/* Kernel PGD */
+	/* We can have up to 3 levels of reentrancy in the TLB miss handler */
+	u64 extlb[3][EX_TLB_SIZE / sizeof(u64)];
 	u64 exmc[8];		/* used for machine checks */
 	u64 excrit[8];		/* used for crit interrupts */
 	u64 exdbg[8];		/* used for debug interrupts */
@@ -144,17 +145,49 @@ struct paca_struct {
 	struct task_struct *__current;	/* Pointer to current */
 	u64 kstack;			/* Saved Kernel stack addr */
 	u64 stab_rr;			/* stab/slb round-robin counter */
-	u64 saved_r1;			/* r1 save for RTAS calls */
+	u64 saved_r1;			/* r1 save for RTAS calls or PM */
 	u64 saved_msr;			/* MSR saved here by enter_rtas */
 	u16 trap_save;			/* Used when bad stack is encountered */
 	u8 soft_enabled;		/* irq soft-enable flag */
-	u8 hard_enabled;		/* set if irqs are enabled in MSR */
+	u8 irq_happened;		/* irq happened while soft-disabled */
 	u8 io_sync;			/* writel() needs spin_unlock sync */
-#ifndef __GENKSYMS__
 	u8 irq_work_pending;		/* IRQ_WORK interrupt while soft-disable */
-#else
-	u8 perf_event_pending;		/* PM interrupt while soft-disabled */
+	u8 nap_state_lost;		/* NV GPR values lost in power7_idle */
+	u64 sprg3;			/* Saved user-visible sprg */
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+	u64 tm_scratch;                 /* TM scratch area for reclaim */
 #endif
+
+#ifdef CONFIG_PPC_POWERNV
+	/* Pointer to OPAL machine check event structure set by the
+	 * early exception handler for use by high level C handler
+	 */
+	struct opal_machine_check_event *opal_mc_evt;
+	/* Per-core mask tracking idle threads and a lock bit-[L][TTTTTTTT] */
+	u32 *core_idle_state_ptr;
+	u8 thread_idle_state;		/* PNV_THREAD_RUNNING/NAP/SLEEP	*/
+	/* Mask to indicate thread id in core */
+	u8 thread_mask;
+	/* Mask to denote subcore sibling threads */
+	u8 subcore_sibling_mask;
+#endif
+
+#ifdef CONFIG_PPC_BOOK3S_64
+	/* Exclusive emergency stack pointer for machine check exception. */
+	void *mc_emergency_sp;
+	/*
+	 * Flag to check whether we are in machine check early handler
+	 * and already using emergency stack.
+	 */
+	u16 in_mce;
+	u8 hmi_event_available;		 /* HMI event is available */
+	/*
+	 * Bitmap for sibling subcore status. See kvm/book3s_hv_ras.c for
+	 * more details
+	 */
+	struct sibling_subcore_state *sibling_subcore_state;
+#endif
+	u8 ftrace_enabled;		/* Hard disable ftrace */
 
 	/* Stuff for accurate time accounting */
 	u64 user_time;			/* accumulated usermode TB ticks */
@@ -167,10 +200,46 @@ struct paca_struct {
 	u64 stolen_time;		/* TB ticks taken by hypervisor */
 	u64 dtl_ridx;			/* read index in dispatch log */
 	struct dtl_entry *dtl_curr;	/* pointer corresponding to dtl_ridx */
+
+#ifdef CONFIG_KVM_BOOK3S_HANDLER
+#ifdef CONFIG_KVM_BOOK3S_PR_POSSIBLE
+	/* We use this to store guest state in */
+	struct kvmppc_book3s_shadow_vcpu shadow_vcpu;
+#endif
+	struct kvmppc_host_state kvm_hstate;
+#endif
 };
 
-extern struct paca_struct paca[];
-extern void initialise_pacas(void);
+/*
+ * This is pointer to by a pointer in paca->exslb[EX_DAR] (which is not used
+ * by exception handlers in RHEL7. For the purpose of extending the PACA
+ * structure without breaking kABI.
+ */
+
+#ifdef CONFIG_PPC_BOOK3S_64
+struct paca_aux_struct {
+	/*
+	 * rfi fallback flush must be in its own cacheline to prevent
+	 * other paca data leaking into the L1d
+	 */
+	u64 exrfi[13] __aligned(0x80);
+	void *rfi_flush_fallback_area;
+	u64 l1d_flush_size;
+};
+#endif
+
+extern struct paca_struct *paca;
+extern void initialise_paca(struct paca_struct *new_paca, int cpu);
+extern void setup_paca(struct paca_struct *new_paca);
+extern void allocate_pacas(void);
+extern void free_unused_pacas(void);
+
+#else /* CONFIG_PPC64 */
+
+static inline void allocate_pacas(void) { };
+static inline void free_unused_pacas(void) { };
+
+#endif /* CONFIG_PPC64 */
 
 #endif /* __KERNEL__ */
 #endif /* _ASM_POWERPC_PACA_H */

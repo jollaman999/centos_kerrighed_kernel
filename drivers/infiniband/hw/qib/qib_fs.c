@@ -45,10 +45,10 @@
 
 static struct super_block *qib_super;
 
-#define private2dd(file) ((file)->f_dentry->d_inode->i_private)
+#define private2dd(file) (file_inode(file)->i_private)
 
 static int qibfs_mknod(struct inode *dir, struct dentry *dentry,
-		       int mode, const struct file_operations *fops,
+		       umode_t mode, const struct file_operations *fops,
 		       void *data)
 {
 	int error;
@@ -59,15 +59,16 @@ static int qibfs_mknod(struct inode *dir, struct dentry *dentry,
 		goto bail;
 	}
 
+	inode->i_ino = get_next_ino();
 	inode->i_mode = mode;
-	inode->i_uid = 0;
-	inode->i_gid = 0;
+	inode->i_uid = GLOBAL_ROOT_UID;
+	inode->i_gid = GLOBAL_ROOT_GID;
 	inode->i_blocks = 0;
 	inode->i_atime = CURRENT_TIME;
 	inode->i_mtime = inode->i_atime;
 	inode->i_ctime = inode->i_atime;
 	inode->i_private = data;
-	if ((mode & S_IFMT) == S_IFDIR) {
+	if (S_ISDIR(mode)) {
 		inode->i_op = &simple_dir_inode_operations;
 		inc_nlink(inode);
 		inc_nlink(dir);
@@ -82,12 +83,13 @@ bail:
 	return error;
 }
 
-static int create_file(const char *name, mode_t mode,
+static int create_file(const char *name, umode_t mode,
 		       struct dentry *parent, struct dentry **dentry,
 		       const struct file_operations *fops, void *data)
 {
 	int error;
 
+	*dentry = NULL;
 	mutex_lock(&parent->d_inode->i_mutex);
 	*dentry = lookup_one_len(name, parent, strlen(name));
 	if (!IS_ERR(*dentry))
@@ -170,7 +172,7 @@ static const struct file_operations cntr_ops[] = {
 };
 
 /*
- * Could use file->f_dentry->d_inode->i_ino to figure out which file,
+ * Could use file_inode(file)->i_ino to figure out which file,
  * instead of separate routine for each, but for now, this works...
  */
 
@@ -327,26 +329,12 @@ static ssize_t flash_write(struct file *file, const char __user *buf,
 
 	pos = *ppos;
 
-	if (pos != 0) {
-		ret = -EINVAL;
-		goto bail;
-	}
+	if (pos != 0 || count != sizeof(struct qib_flash))
+		return -EINVAL;
 
-	if (count != sizeof(struct qib_flash)) {
-		ret = -EINVAL;
-		goto bail;
-	}
-
-	tmp = kmalloc(count, GFP_KERNEL);
-	if (!tmp) {
-		ret = -ENOMEM;
-		goto bail;
-	}
-
-	if (copy_from_user(tmp, buf, count)) {
-		ret = -EFAULT;
-		goto bail_tmp;
-	}
+	tmp = memdup_user(buf, count);
+	if (IS_ERR(tmp))
+		return PTR_ERR(tmp);
 
 	dd = private2dd(file);
 	if (qib_eeprom_write(dd, pos, tmp, count)) {
@@ -360,14 +348,13 @@ static ssize_t flash_write(struct file *file, const char __user *buf,
 
 bail_tmp:
 	kfree(tmp);
-
-bail:
 	return ret;
 }
 
 static const struct file_operations flash_ops = {
 	.read = flash_read,
 	.write = flash_write,
+	.llseek = default_llseek,
 };
 
 static int add_cntr_files(struct super_block *sb, struct qib_devdata *dd)
@@ -452,16 +439,13 @@ static int remove_file(struct dentry *parent, char *name)
 		goto bail;
 	}
 
-	spin_lock(&dcache_lock);
 	spin_lock(&tmp->d_lock);
 	if (!d_unhashed(tmp) && tmp->d_inode) {
 		__d_drop(tmp);
 		spin_unlock(&tmp->d_lock);
-		spin_unlock(&dcache_lock);
 		simple_unlink(parent->d_inode, tmp);
 	} else {
 		spin_unlock(&tmp->d_lock);
-		spin_unlock(&dcache_lock);
 	}
 	dput(tmp);
 
@@ -557,13 +541,14 @@ bail:
 	return ret;
 }
 
-static int qibfs_get_sb(struct file_system_type *fs_type, int flags,
-			const char *dev_name, void *data, struct vfsmount *mnt)
+static struct dentry *qibfs_mount(struct file_system_type *fs_type, int flags,
+			const char *dev_name, void *data)
 {
-	int ret = get_sb_single(fs_type, flags, data,
-				qibfs_fill_super, mnt);
-	if (ret >= 0)
-		qib_super = mnt->mnt_sb;
+	struct dentry *ret;
+
+	ret = mount_single(fs_type, flags, data, qibfs_fill_super);
+	if (!IS_ERR(ret))
+		qib_super = ret->d_sb;
 	return ret;
 }
 
@@ -605,9 +590,10 @@ int qibfs_remove(struct qib_devdata *dd)
 static struct file_system_type qibfs_fs_type = {
 	.owner =        THIS_MODULE,
 	.name =         "ipathfs",
-	.get_sb =       qibfs_get_sb,
+	.mount =        qibfs_mount,
 	.kill_sb =      qibfs_kill_super,
 };
+MODULE_ALIAS_FS("ipathfs");
 
 int __init qib_init_qibfs(void)
 {

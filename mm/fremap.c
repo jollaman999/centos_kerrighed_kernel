@@ -5,6 +5,7 @@
  *
  * started by Ingo Molnar, Copyright (C) 2002, 2003
  */
+#include <linux/export.h>
 #include <linux/backing-dev.h>
 #include <linux/mm.h>
 #include <linux/swap.h>
@@ -13,9 +14,9 @@
 #include <linux/pagemap.h>
 #include <linux/swapops.h>
 #include <linux/rmap.h>
-#include <linux/module.h>
 #include <linux/syscalls.h>
 #include <linux/mmu_notifier.h>
+#include <linux/userfaultfd_k.h>
 
 #include <asm/mmu_context.h>
 #include <asm/cacheflush.h>
@@ -27,24 +28,35 @@ static void zap_pte(struct mm_struct *mm, struct vm_area_struct *vma,
 			unsigned long addr, pte_t *ptep)
 {
 	pte_t pte = *ptep;
+	struct page *page;
+	swp_entry_t entry;
 
 	if (pte_present(pte)) {
-		struct page *page;
-
 		flush_cache_page(vma, addr, pte_pfn(pte));
-		pte = ptep_clear_flush(vma, addr, ptep);
+		pte = ptep_clear_flush_notify(vma, addr, ptep);
 		page = vm_normal_page(vma, addr, pte);
 		if (page) {
 			if (pte_dirty(pte))
 				set_page_dirty(page);
+			update_hiwater_rss(mm);
+			dec_mm_counter(mm, mm_counter(page));
 			page_remove_rmap(page);
 			page_cache_release(page);
-			update_hiwater_rss(mm);
-			dec_mm_counter(mm, file_rss);
 		}
-	} else {
-		if (!pte_file(pte))
-			free_swap_and_cache(pte_to_swp_entry(pte));
+	} else {	/* zap_pte() is not called when pte_none() */
+		if (!pte_file(pte)) {
+			update_hiwater_rss(mm);
+			entry = pte_to_swp_entry(pte);
+			if (non_swap_entry(entry)) {
+				if (is_migration_entry(entry)) {
+					page = migration_entry_to_page(entry);
+					dec_mm_counter(mm, mm_counter(page));
+				}
+			} else {
+				free_swap_and_cache(entry);
+				dec_mm_counter(mm, MM_SWAPENTS);
+			}
+		}
 		pte_clear_not_present_full(mm, addr, ptep, 0);
 	}
 }
@@ -57,17 +69,19 @@ static int install_file_pte(struct mm_struct *mm, struct vm_area_struct *vma,
 		unsigned long addr, unsigned long pgoff, pgprot_t prot)
 {
 	int err = -ENOMEM;
-	pte_t *pte;
+	pte_t *pte, ptfile;
 	spinlock_t *ptl;
 
 	pte = get_locked_pte(mm, addr, &ptl);
 	if (!pte)
 		goto out;
 
+	ptfile = pgoff_to_pte(pgoff);
+
 	if (!pte_none(*pte))
 		zap_pte(mm, vma, addr, pte);
 
-	set_pte_at(mm, addr, pte, pgoff_to_pte(pgoff));
+	set_pte_at(mm, addr, pte, pte_file_mksoft_dirty(ptfile));
 	/*
 	 * We don't need to run update_mmu_cache() here because the "file pte"
 	 * being installed by install_file_pte() is not a real pte - it's a
@@ -81,9 +95,10 @@ out:
 	return err;
 }
 
-static int populate_range(struct mm_struct *mm, struct vm_area_struct *vma,
-			unsigned long addr, unsigned long size, pgoff_t pgoff)
+int generic_file_remap_pages(struct vm_area_struct *vma, unsigned long addr,
+			     unsigned long size, pgoff_t pgoff)
 {
+	struct mm_struct *mm = vma->vm_mm;
 	int err;
 
 	do {
@@ -96,9 +111,9 @@ static int populate_range(struct mm_struct *mm, struct vm_area_struct *vma,
 		pgoff++;
 	} while (size);
 
-        return 0;
-
+	return 0;
 }
+EXPORT_SYMBOL(generic_file_remap_pages);
 
 /**
  * sys_remap_file_pages - remap arbitrary pages of an existing VM_SHARED vma
@@ -128,6 +143,8 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 	struct vm_area_struct *vma;
 	int err = -EINVAL;
 	int has_write_lock = 0;
+	vm_flags_t vm_flags = 0;
+	LIST_HEAD(uf);
 
 	if (prot)
 		return err;
@@ -164,16 +181,12 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 	/*
 	 * Make sure the vma is shared, that it supports prefaulting,
 	 * and that the remapped range is valid and fully within
-	 * the single existing vma.  vm_private_data is used as a
-	 * swapout cursor in a VM_NONLINEAR vma.
+	 * the single existing vma.
 	 */
 	if (!vma || !(vma->vm_flags & VM_SHARED))
 		goto out;
 
-	if (vma->vm_private_data && !(vma->vm_flags & VM_NONLINEAR))
-		goto out;
-
-	if (!(vma->vm_flags & VM_CAN_NONLINEAR))
+	if (!vma->vm_ops || !vma->vm_ops->remap_pages)
 		goto out;
 
 	if (start < vma->vm_start || start + size > vma->vm_end)
@@ -181,6 +194,13 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 
 	/* Must set VM_NONLINEAR before any pages are populated. */
 	if (!(vma->vm_flags & VM_NONLINEAR)) {
+		/*
+		 * vm_private_data is used as a swapout cursor
+		 * in a VM_NONLINEAR vma.
+		 */
+		if (vma->vm_private_data)
+			goto out;
+
 		/* Don't need a nonlinear mapping, exit success */
 		if (pgoff == linear_page_index(vma, start)) {
 			err = 0;
@@ -188,6 +208,7 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 		}
 
 		if (!has_write_lock) {
+get_write_lock:
 			up_read(&mm->mmap_sem);
 			down_write(&mm->mmap_sem);
 			has_write_lock = 1;
@@ -201,12 +222,12 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 		 */
 		if (mapping_cap_account_dirty(mapping)) {
 			unsigned long addr;
-			struct file *file = vma->vm_file;
+			struct file *file = get_file(vma->vm_file);
+			/* mmap_region may free vma; grab the info now */
+			vm_flags = vma->vm_flags;
 
-			flags &= MAP_NONBLOCK;
-			get_file(file);
-			addr = mmap_region(file, start, size,
-					flags, vma->vm_flags, pgoff);
+			addr = mmap_region(file, start, size, vm_flags, pgoff,
+					   &uf);
 			fput(file);
 			if (IS_ERR_VALUE(addr)) {
 				err = addr;
@@ -214,43 +235,31 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 				BUG_ON(addr != start);
 				err = 0;
 			}
-			goto out;
+			goto out_freed;
 		}
-		spin_lock(&mapping->i_mmap_lock);
+		mutex_lock(&mapping->i_mmap_mutex);
 		flush_dcache_mmap_lock(mapping);
 		vma->vm_flags |= VM_NONLINEAR;
-		vma_prio_tree_remove(vma, &mapping->i_mmap);
+		vma_interval_tree_remove(vma, &mapping->i_mmap);
 		vma_nonlinear_insert(vma, &mapping->i_mmap_nonlinear);
 		flush_dcache_mmap_unlock(mapping);
-		spin_unlock(&mapping->i_mmap_lock);
+		mutex_unlock(&mapping->i_mmap_mutex);
 	}
 
 	if (vma->vm_flags & VM_LOCKED) {
 		/*
 		 * drop PG_Mlocked flag for over-mapped range
 		 */
-		unsigned int saved_flags = vma->vm_flags;
+		if (!has_write_lock)
+			goto get_write_lock;
+		vm_flags = vma->vm_flags;
 		munlock_vma_pages_range(vma, start, start + size);
-		vma->vm_flags = saved_flags;
+		vma->vm_flags = vm_flags;
 	}
 
 	mmu_notifier_invalidate_range_start(mm, start, start + size);
-	err = populate_range(mm, vma, start, size, pgoff);
+	err = vma->vm_ops->remap_pages(vma, start, size, pgoff);
 	mmu_notifier_invalidate_range_end(mm, start, start + size);
-	if (!err && !(flags & MAP_NONBLOCK)) {
-		if (vma->vm_flags & VM_LOCKED) {
-			/*
-			 * might be mapping previously unmapped range of file
-			 */
-			mlock_vma_pages_range(vma, start, start + size);
-		} else {
-			if (unlikely(has_write_lock)) {
-				downgrade_write(&mm->mmap_sem);
-				has_write_lock = 0;
-			}
-			make_pages_present(start, start+size);
-		}
-	}
 
 	/*
 	 * We can't clear VM_NONLINEAR because we'd have to do
@@ -259,10 +268,16 @@ SYSCALL_DEFINE5(remap_file_pages, unsigned long, start, unsigned long, size,
 	 */
 
 out:
+	if (vma)
+		vm_flags = vma->vm_flags;
+out_freed:
 	if (likely(!has_write_lock))
 		up_read(&mm->mmap_sem);
 	else
 		up_write(&mm->mmap_sem);
+	userfaultfd_unmap_complete(mm, &uf);
+	if (!err && ((vm_flags & VM_LOCKED) || !(flags & MAP_NONBLOCK)))
+		mm_populate(start, size);
 
 	return err;
 }

@@ -10,7 +10,7 @@
  */
 
 #include <linux/types.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <linux/blkdev.h>
 #include <linux/fs.h>
 #include <linux/init.h>
@@ -26,7 +26,7 @@
 #include <linux/device-mapper.h>
 #include <linux/dm-kcopyd.h>
 
-#include "dm.h"
+#include "dm-core.h"
 
 #define SUB_JOB_SIZE	128
 #define SPLIT_COUNT	8
@@ -41,13 +41,6 @@ struct dm_kcopyd_client {
 	struct page_list *pages;
 	unsigned nr_reserved_pages;
 	unsigned nr_free_pages;
-
-	/*
-	 * Block devices to unplug.
-	 * Non-NULL pointer means that a block device has some pending requests
-	 * and needs to be unplugged.
-	 */
-	struct block_device *unplug[2];
 
 	struct dm_io_client *io_client;
 
@@ -461,32 +454,9 @@ static int run_complete_job(struct kcopyd_job *job)
 	if (atomic_dec_and_test(&kc->nr_jobs))
 		wake_up(&kc->destroyq);
 
+	cond_resched();
+
 	return 0;
-}
-
-/*
- * Unplug the block device at the specified index.
- */
-static void unplug(struct dm_kcopyd_client *kc, int rw)
-{
-	if (kc->unplug[rw] != NULL) {
-		blk_unplug(bdev_get_queue(kc->unplug[rw]));
-		kc->unplug[rw] = NULL;
-	}
-}
-
-/*
- * Prepare block device unplug. If there's another device
- * to be unplugged at the same array index, we unplug that
- * device first.
- */
-static void prepare_unplug(struct dm_kcopyd_client *kc, int rw,
-			   struct block_device *bdev)
-{
-	if (likely(kc->unplug[rw] == bdev))
-		return;
-	unplug(kc, rw);
-	kc->unplug[rw] = bdev;
 }
 
 static void complete_io(unsigned long error, void *context)
@@ -539,16 +509,10 @@ static int run_io_job(struct kcopyd_job *job)
 
 	io_job_start(job->kc->throttle);
 
-	if (job->rw == READ) {
+	if (job->rw == READ)
 		r = dm_io(&io_req, 1, &job->source, NULL);
-		prepare_unplug(job->kc, READ, job->source.bdev);
-	} else {
-		if (job->num_dests > 1)
-			io_req.bi_rw |= (1 << BIO_RW_UNPLUG);
+	else
 		r = dm_io(&io_req, job->num_dests, job->dests, NULL);
-		if (!(io_req.bi_rw & (1 << BIO_RW_UNPLUG)))
-			prepare_unplug(job->kc, WRITE, job->dests[0].bdev);
-	}
 
 	return r;
 }
@@ -618,6 +582,7 @@ static void do_work(struct work_struct *work)
 {
 	struct dm_kcopyd_client *kc = container_of(work,
 					struct dm_kcopyd_client, kcopyd_work);
+	struct blk_plug plug;
 
 	/*
 	 * The order that these are called is *very* important.
@@ -625,18 +590,12 @@ static void do_work(struct work_struct *work)
 	 * Pages jobs when successful will jump onto the io jobs
 	 * list.  io jobs call wake when they complete and it all
 	 * starts again.
-	 *
-	 * Note that io_jobs add block devices to the unplug array,
-	 * this array is cleared with "unplug" calls. It is thus
-	 * forbidden to run complete_jobs after io_jobs and before
-	 * unplug because the block device could be destroyed in
-	 * job completion callback.
 	 */
+	blk_start_plug(&plug);
 	process_jobs(&kc->complete_jobs, kc, run_complete_job);
 	process_jobs(&kc->pages_jobs, kc, run_pages_job);
 	process_jobs(&kc->io_jobs, kc, run_io_job);
-	unplug(kc, READ);
-	unplug(kc, WRITE);
+	blk_finish_plug(&plug);
 }
 
 /*
@@ -746,6 +705,7 @@ int dm_kcopyd_copy(struct dm_kcopyd_client *kc, struct dm_io_region *from,
 		   unsigned int flags, dm_kcopyd_notify_fn fn, void *context)
 {
 	struct kcopyd_job *job;
+	int i;
 
 	/*
 	 * Allocate an array of jobs consisting of one master job
@@ -772,7 +732,16 @@ int dm_kcopyd_copy(struct dm_kcopyd_client *kc, struct dm_io_region *from,
 		memset(&job->source, 0, sizeof job->source);
 		job->source.count = job->dests[0].count;
 		job->pages = &zero_page_list;
-		job->rw = WRITE;
+
+		/*
+		 * Use WRITE SAME to optimize zeroing if all dests support it.
+		 */
+		job->rw = WRITE | REQ_WRITE_SAME;
+		for (i = 0; i < job->num_dests; i++)
+			if (!bdev_write_same(job->dests[i].bdev)) {
+				job->rw = WRITE;
+				break;
+			}
 	}
 
 	job->fn = fn;
@@ -851,7 +820,7 @@ struct dm_kcopyd_client *dm_kcopyd_client_create(struct dm_kcopyd_throttle *thro
 	int r = -ENOMEM;
 	struct dm_kcopyd_client *kc;
 
-	kc = kmalloc(sizeof(*kc), GFP_KERNEL);
+	kc = kzalloc(sizeof(*kc), GFP_KERNEL);
 	if (!kc)
 		return ERR_PTR(-ENOMEM);
 
@@ -861,14 +830,12 @@ struct dm_kcopyd_client *dm_kcopyd_client_create(struct dm_kcopyd_throttle *thro
 	INIT_LIST_HEAD(&kc->pages_jobs);
 	kc->throttle = throttle;
 
-	memset(kc->unplug, 0, sizeof(kc->unplug));
-
 	kc->job_pool = mempool_create_slab_pool(MIN_JOBS, _job_cache);
 	if (!kc->job_pool)
 		goto bad_slab;
 
 	INIT_WORK(&kc->kcopyd_work, do_work);
-	kc->kcopyd_wq = create_singlethread_workqueue("kcopyd");
+	kc->kcopyd_wq = alloc_workqueue("kcopyd", WQ_MEM_RECLAIM, 0);
 	if (!kc->kcopyd_wq)
 		goto bad_workqueue;
 

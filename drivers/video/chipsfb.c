@@ -19,7 +19,6 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/mm.h>
-#include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -293,7 +292,7 @@ static void __init chips_hw_init(void)
 		write_fr(chips_init_fr[i].addr, chips_init_fr[i].data);
 }
 
-static struct fb_fix_screeninfo chipsfb_fix __devinitdata = {
+static struct fb_fix_screeninfo chipsfb_fix = {
 	.id =		"C&T 65550",
 	.type =		FB_TYPE_PACKED_PIXELS,
 	.visual =	FB_VISUAL_PSEUDOCOLOR,
@@ -310,7 +309,7 @@ static struct fb_fix_screeninfo chipsfb_fix __devinitdata = {
 	.smem_len =	0x100000,	/* 1MB */
 };
 
-static struct fb_var_screeninfo chipsfb_var __devinitdata = {
+static struct fb_var_screeninfo chipsfb_var = {
 	.xres = 800,
 	.yres = 600,
 	.xres_virtual = 800,
@@ -331,7 +330,7 @@ static struct fb_var_screeninfo chipsfb_var __devinitdata = {
 	.vsync_len = 8,
 };
 
-static void __devinit init_chips(struct fb_info *p, unsigned long addr)
+static void init_chips(struct fb_info *p, unsigned long addr)
 {
 	memset(p->screen_base, 0, 0x100000);
 
@@ -348,8 +347,7 @@ static void __devinit init_chips(struct fb_info *p, unsigned long addr)
 	chips_hw_init();
 }
 
-static int __devinit
-chipsfb_pci_init(struct pci_dev *dp, const struct pci_device_id *ent)
+static int chipsfb_pci_init(struct pci_dev *dp, const struct pci_device_id *ent)
 {
 	struct fb_info *p;
 	unsigned long addr, size;
@@ -439,7 +437,7 @@ chipsfb_pci_init(struct pci_dev *dp, const struct pci_device_id *ent)
 	return rc;
 }
 
-static void __devexit chipsfb_remove(struct pci_dev *dp)
+static void chipsfb_remove(struct pci_dev *dp)
 {
 	struct fb_info *p = pci_get_drvdata(dp);
 
@@ -461,10 +459,10 @@ static int chipsfb_pci_suspend(struct pci_dev *pdev, pm_message_t state)
 	if (!(state.event & PM_EVENT_SLEEP))
 		goto done;
 
-	acquire_console_sem();
+	console_lock();
 	chipsfb_blank(1, p);
 	fb_set_suspend(p, 1);
-	release_console_sem();
+	console_unlock();
  done:
 	pdev->dev.power.power_state = state;
 	return 0;
@@ -474,10 +472,10 @@ static int chipsfb_pci_resume(struct pci_dev *pdev)
 {
         struct fb_info *p = pci_get_drvdata(pdev);
 
-	acquire_console_sem();
+	console_lock();
 	fb_set_suspend(p, 0);
 	chipsfb_blank(0, p);
-	release_console_sem();
+	console_unlock();
 
 	pdev->dev.power.power_state = PMSG_ON;
 	return 0;
@@ -496,7 +494,7 @@ static struct pci_driver chipsfb_driver = {
 	.name =		"chipsfb",
 	.id_table =	chipsfb_pci_tbl,
 	.probe =	chipsfb_pci_init,
-	.remove =	__devexit_p(chipsfb_remove),
+	.remove =	chipsfb_remove,
 #ifdef CONFIG_PM
 	.suspend =	chipsfb_pci_suspend,
 	.resume =	chipsfb_pci_resume,

@@ -17,6 +17,7 @@
 #include <linux/init.h>
 #include <linux/bootmem.h>
 #include <linux/irq.h>
+#include <linux/of_pci.h>
 
 #include <asm/sections.h>
 #include <asm/io.h>
@@ -26,6 +27,8 @@
 #include <asm/pmac_feature.h>
 #include <asm/grackle.h>
 #include <asm/ppc-pci.h>
+
+#include "pmac.h"
 
 #undef DEBUG
 
@@ -235,7 +238,7 @@ static int chaos_validate_dev(struct pci_bus *bus, int devfn, int offset)
 
 	if (offset >= 0x100)
 		return  PCIBIOS_BAD_REGISTER_NUMBER;
-	np = pci_busdev_to_OF_node(bus, devfn);
+	np = of_pci_find_child_device(bus->dev.of_node, devfn);
 	if (np == NULL)
 		return PCIBIOS_DEVICE_NOT_FOUND;
 
@@ -299,10 +302,10 @@ static void __init setup_chaos(struct pci_controller *hose,
  * This function deals with some "special cases" devices.
  *
  *  0 -> No special case
- *  1 -> Skip the device but act as if the access was successfull
+ *  1 -> Skip the device but act as if the access was successful
  *       (return 0xff's on reads, eventually, cache config space
  *       accesses in a later version)
- * -1 -> Hide the device (unsuccessful acess)
+ * -1 -> Hide the device (unsuccessful access)
  */
 static int u3_ht_skip_device(struct pci_controller *hose,
 			     struct pci_bus *bus, unsigned int devfn)
@@ -559,6 +562,20 @@ static struct pci_ops u4_pcie_pci_ops =
 	.read = u4_pcie_read_config,
 	.write = u4_pcie_write_config,
 };
+
+static void pmac_pci_fixup_u4_of_node(struct pci_dev *dev)
+{
+	/* Apple's device-tree "hides" the root complex virtual P2P bridge
+	 * on U4. However, Linux sees it, causing the PCI <-> OF matching
+	 * code to fail to properly match devices below it. This works around
+	 * it by setting the node of the bridge to point to the PHB node,
+	 * which is not entirely correct but fixes the matching code and
+	 * doesn't break anything else. It's also the simplest possible fix.
+	 */
+	if (dev->dev.of_node == NULL)
+		dev->dev.of_node = pcibios_get_phb_of_node(dev->bus);
+}
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_APPLE, 0x5b, pmac_pci_fixup_u4_of_node);
 
 #endif /* CONFIG_PPC64 */
 
@@ -839,8 +856,7 @@ static void __init setup_u3_ht(struct pci_controller* hose)
 	 * into cfg_addr
 	 */
 	hose->cfg_data = ioremap(cfg_res.start, 0x02000000);
-	hose->cfg_addr = ioremap(self_res.start,
-				 self_res.end - self_res.start + 1);
+	hose->cfg_addr = ioremap(self_res.start, resource_size(&self_res));
 
 	/*
 	 * /ht node doesn't expose a "ranges" property, we read the register
@@ -916,6 +932,7 @@ static int __init pmac_add_bridge(struct device_node *dev)
 		return -ENOMEM;
 	hose->first_busno = bus_range ? bus_range[0] : 0;
 	hose->last_busno = bus_range ? bus_range[1] : 0xff;
+	hose->controller_ops = pmac_pci_controller_ops;
 
 	disp_name = NULL;
 
@@ -974,7 +991,7 @@ static int __init pmac_add_bridge(struct device_node *dev)
 	return 0;
 }
 
-void __devinit pmac_pci_irq_fixup(struct pci_dev *dev)
+void pmac_pci_irq_fixup(struct pci_dev *dev)
 {
 #ifdef CONFIG_PPC32
 	/* Fixup interrupt for the modem/ethernet combo controller.
@@ -988,7 +1005,7 @@ void __devinit pmac_pci_irq_fixup(struct pci_dev *dev)
 	    dev->vendor == PCI_VENDOR_ID_DEC &&
 	    dev->device == PCI_DEVICE_ID_DEC_TULIP_PLUS) {
 		dev->irq = irq_create_mapping(NULL, 60);
-		set_irq_type(dev->irq, IRQ_TYPE_LEVEL_LOW);
+		irq_set_irq_type(dev->irq, IRQ_TYPE_LEVEL_LOW);
 	}
 #endif /* CONFIG_PPC32 */
 }
@@ -1060,7 +1077,7 @@ void __init pmac_pci_init(void)
 }
 
 #ifdef CONFIG_PPC32
-int pmac_pci_enable_device_hook(struct pci_dev *dev)
+static bool pmac_pci_enable_device_hook(struct pci_dev *dev)
 {
 	struct device_node* node;
 	int updatecfg = 0;
@@ -1076,11 +1093,11 @@ int pmac_pci_enable_device_hook(struct pci_dev *dev)
 	    && !node) {
 		printk(KERN_INFO "Apple USB OHCI %s disabled by firmware\n",
 		       pci_name(dev));
-		return -EINVAL;
+		return false;
 	}
 
 	if (!node)
-		return 0;
+		return true;
 
 	uninorth_child = node->parent &&
 		of_device_is_compatible(node->parent, "uni-north");
@@ -1121,10 +1138,10 @@ int pmac_pci_enable_device_hook(struct pci_dev *dev)
 				      L1_CACHE_BYTES >> 2);
 	}
 
-	return 0;
+	return true;
 }
 
-void __devinit pmac_pci_fixup_ohci(struct pci_dev *dev)
+void pmac_pci_fixup_ohci(struct pci_dev *dev)
 {
 	struct device_node *node = pci_device_to_OF_node(dev);
 
@@ -1152,13 +1169,11 @@ void __init pmac_pcibios_after_init(void)
 			pmac_call_feature(PMAC_FTR_1394_CABLE_POWER, nd, 0, 0);
 		}
 	}
-	of_node_put(nd);
 	for_each_node_by_name(nd, "ethernet") {
 		if (nd->parent && of_device_is_compatible(nd, "gmac")
 		    && of_device_is_compatible(nd->parent, "uni-north"))
 			pmac_call_feature(PMAC_FTR_GMAC_ENABLE, nd, 0, 0);
 	}
-	of_node_put(nd);
 }
 
 void pmac_pci_fixup_cardbus(struct pci_dev* dev)
@@ -1322,8 +1337,7 @@ static void fixup_u4_pcie(struct pci_dev* dev)
 		 */
 		if (r->start >= 0xf0000000 && r->start < 0xf3000000)
 			continue;
-		if (!region || (r->end - r->start) >
-		    (region->end - region->start))
+		if (!region || resource_size(r) > resource_size(region))
 			region = r;
 	}
 	/* Nothing found, bail */
@@ -1344,3 +1358,30 @@ static void fixup_u4_pcie(struct pci_dev* dev)
 	pci_write_config_dword(dev, PCI_PREF_MEMORY_BASE, 0);
 }
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_APPLE, PCI_DEVICE_ID_APPLE_U4_PCIE, fixup_u4_pcie);
+
+#ifdef CONFIG_PPC64
+static int pmac_pci_probe_mode(struct pci_bus *bus)
+{
+	struct device_node *node = pci_bus_to_OF_node(bus);
+
+	/* We need to use normal PCI probing for the AGP bus,
+	 * since the device for the AGP bridge isn't in the tree.
+	 * Same for the PCIe host on U4 and the HT host bridge.
+	 */
+	if (bus->self == NULL && (of_device_is_compatible(node, "u3-agp") ||
+				  of_device_is_compatible(node, "u4-pcie") ||
+				  of_device_is_compatible(node, "u3-ht")))
+		return PCI_PROBE_NORMAL;
+	return PCI_PROBE_DEVTREE;
+}
+#endif /* CONFIG_PPC64 */
+
+struct pci_controller_ops pmac_pci_controller_ops = {
+#ifdef CONFIG_PPC64
+	.probe_mode		= pmac_pci_probe_mode,
+#endif
+#ifdef CONFIG_PPC32
+	.enable_device_hook	= pmac_pci_enable_device_hook,
+#endif
+};
+

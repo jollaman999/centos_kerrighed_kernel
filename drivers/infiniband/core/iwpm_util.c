@@ -37,6 +37,7 @@
 #define IWPM_MAPINFO_HASH_MASK	(IWPM_MAPINFO_HASH_SIZE - 1)
 #define IWPM_REMINFO_HASH_SIZE	64
 #define IWPM_REMINFO_HASH_MASK	(IWPM_REMINFO_HASH_SIZE - 1)
+#define IWPM_MSG_SIZE		512
 
 static LIST_HEAD(iwpm_nlmsg_req_list);
 static DEFINE_SPINLOCK(iwpm_nlmsg_req_lock);
@@ -53,23 +54,21 @@ static struct iwpm_admin_data iwpm_admin;
 int iwpm_init(u8 nl_client)
 {
 	int ret = 0;
-	if (iwpm_valid_client(nl_client))
-		return -EINVAL;
 	mutex_lock(&iwpm_admin_lock);
 	if (atomic_read(&iwpm_admin.refcount) == 0) {
-		iwpm_hash_bucket = kzalloc(IWPM_MAPINFO_HASH_SIZE *
-					sizeof(struct hlist_head), GFP_KERNEL);
+		iwpm_hash_bucket = kcalloc(IWPM_MAPINFO_HASH_SIZE,
+					   sizeof(struct hlist_head),
+					   GFP_KERNEL);
 		if (!iwpm_hash_bucket) {
 			ret = -ENOMEM;
-			pr_err("%s Unable to create mapinfo hash table\n", __func__);
 			goto init_exit;
 		}
-		iwpm_reminfo_bucket = kzalloc(IWPM_REMINFO_HASH_SIZE *
-					sizeof(struct hlist_head), GFP_KERNEL);
+		iwpm_reminfo_bucket = kcalloc(IWPM_REMINFO_HASH_SIZE,
+					      sizeof(struct hlist_head),
+					      GFP_KERNEL);
 		if (!iwpm_reminfo_bucket) {
 			kfree(iwpm_hash_bucket);
 			ret = -ENOMEM;
-			pr_err("%s Unable to create reminfo hash table\n", __func__);
 			goto init_exit;
 		}
 	}
@@ -78,12 +77,12 @@ init_exit:
 	mutex_unlock(&iwpm_admin_lock);
 	if (!ret) {
 		iwpm_set_valid(nl_client, 1);
+		iwpm_set_registration(nl_client, IWPM_REG_UNDEF);
 		pr_debug("%s: Mapinfo and reminfo tables are created\n",
 				__func__);
 	}
 	return ret;
 }
-EXPORT_SYMBOL(iwpm_init);
 
 static void free_hash_bucket(void);
 static void free_reminfo_bucket(void);
@@ -106,9 +105,9 @@ int iwpm_exit(u8 nl_client)
 	}
 	mutex_unlock(&iwpm_admin_lock);
 	iwpm_set_valid(nl_client, 0);
+	iwpm_set_registration(nl_client, IWPM_REG_UNDEF);
 	return 0;
 }
-EXPORT_SYMBOL(iwpm_exit);
 
 static struct hlist_head *get_mapinfo_hash_bucket(struct sockaddr_storage *,
 					       struct sockaddr_storage *);
@@ -117,7 +116,7 @@ int iwpm_create_mapinfo(struct sockaddr_storage *local_sockaddr,
 			struct sockaddr_storage *mapped_sockaddr,
 			u8 nl_client)
 {
-	struct hlist_head *hash_bucket_head;
+	struct hlist_head *hash_bucket_head = NULL;
 	struct iwpm_mapping_info *map_info;
 	unsigned long flags;
 	int ret = -EINVAL;
@@ -125,10 +124,9 @@ int iwpm_create_mapinfo(struct sockaddr_storage *local_sockaddr,
 	if (!iwpm_valid_client(nl_client))
 		return ret;
 	map_info = kzalloc(sizeof(struct iwpm_mapping_info), GFP_KERNEL);
-	if (!map_info) {
-		pr_err("%s: Unable to allocate a mapping info\n", __func__);
+	if (!map_info)
 		return -ENOMEM;
-	}
+
 	memcpy(&map_info->local_sockaddr, local_sockaddr,
 	       sizeof(struct sockaddr_storage));
 	memcpy(&map_info->mapped_sockaddr, mapped_sockaddr,
@@ -146,14 +144,16 @@ int iwpm_create_mapinfo(struct sockaddr_storage *local_sockaddr,
 		}
 	}
 	spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
+
+	if (!hash_bucket_head)
+		kfree(map_info);
 	return ret;
 }
-EXPORT_SYMBOL(iwpm_create_mapinfo);
 
 int iwpm_remove_mapinfo(struct sockaddr_storage *local_sockaddr,
 			struct sockaddr_storage *mapped_local_addr)
 {
-	struct hlist_node *n, *tmp_hlist_node;
+	struct hlist_node *tmp_hlist_node;
 	struct hlist_head *hash_bucket_head;
 	struct iwpm_mapping_info *map_info = NULL;
 	unsigned long flags;
@@ -167,7 +167,7 @@ int iwpm_remove_mapinfo(struct sockaddr_storage *local_sockaddr,
 		if (!hash_bucket_head)
 			goto remove_mapinfo_exit;
 
-		hlist_for_each_entry_safe(map_info, n, tmp_hlist_node,
+		hlist_for_each_entry_safe(map_info, tmp_hlist_node,
 					hash_bucket_head, hlist_node) {
 
 			if (!iwpm_compare_sockaddr(&map_info->mapped_sockaddr,
@@ -184,11 +184,10 @@ remove_mapinfo_exit:
 	spin_unlock_irqrestore(&iwpm_mapinfo_lock, flags);
 	return ret;
 }
-EXPORT_SYMBOL(iwpm_remove_mapinfo);
 
 static void free_hash_bucket(void)
 {
-	struct hlist_node *n, *tmp_hlist_node;
+	struct hlist_node *tmp_hlist_node;
 	struct iwpm_mapping_info *map_info;
 	unsigned long flags;
 	int i;
@@ -196,7 +195,7 @@ static void free_hash_bucket(void)
 	/* remove all the mapinfo data from the list */
 	spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
 	for (i = 0; i < IWPM_MAPINFO_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(map_info, n, tmp_hlist_node,
+		hlist_for_each_entry_safe(map_info, tmp_hlist_node,
 			&iwpm_hash_bucket[i], hlist_node) {
 
 				hlist_del_init(&map_info->hlist_node);
@@ -211,7 +210,7 @@ static void free_hash_bucket(void)
 
 static void free_reminfo_bucket(void)
 {
-	struct hlist_node *n, *tmp_hlist_node;
+	struct hlist_node *tmp_hlist_node;
 	struct iwpm_remote_info *rem_info;
 	unsigned long flags;
 	int i;
@@ -219,7 +218,7 @@ static void free_reminfo_bucket(void)
 	/* remove all the remote info from the list */
 	spin_lock_irqsave(&iwpm_reminfo_lock, flags);
 	for (i = 0; i < IWPM_REMINFO_HASH_SIZE; i++) {
-		hlist_for_each_entry_safe(rem_info, n, tmp_hlist_node,
+		hlist_for_each_entry_safe(rem_info, tmp_hlist_node,
 			&iwpm_reminfo_bucket[i], hlist_node) {
 
 				hlist_del_init(&rem_info->hlist_node);
@@ -256,7 +255,7 @@ int iwpm_get_remote_info(struct sockaddr_storage *mapped_loc_addr,
 			 struct sockaddr_storage *remote_addr,
 			 u8 nl_client)
 {
-	struct hlist_node *n, *tmp_hlist_node;
+	struct hlist_node *tmp_hlist_node;
 	struct hlist_head *hash_bucket_head;
 	struct iwpm_remote_info *rem_info = NULL;
 	unsigned long flags;
@@ -273,7 +272,7 @@ int iwpm_get_remote_info(struct sockaddr_storage *mapped_loc_addr,
 					mapped_rem_addr);
 		if (!hash_bucket_head)
 			goto get_remote_info_exit;
-		hlist_for_each_entry_safe(rem_info, n, tmp_hlist_node,
+		hlist_for_each_entry_safe(rem_info, tmp_hlist_node,
 					hash_bucket_head, hlist_node) {
 
 			if (!iwpm_compare_sockaddr(&rem_info->mapped_loc_sockaddr,
@@ -297,7 +296,6 @@ get_remote_info_exit:
 	spin_unlock_irqrestore(&iwpm_reminfo_lock, flags);
 	return ret;
 }
-EXPORT_SYMBOL(iwpm_get_remote_info);
 
 struct iwpm_nlmsg_request *iwpm_get_nlmsg_request(__u32 nlmsg_seq,
 					u8 nl_client, gfp_t gfp)
@@ -306,10 +304,9 @@ struct iwpm_nlmsg_request *iwpm_get_nlmsg_request(__u32 nlmsg_seq,
 	unsigned long flags;
 
 	nlmsg_request = kzalloc(sizeof(struct iwpm_nlmsg_request), gfp);
-	if (!nlmsg_request) {
-		pr_err("%s Unable to allocate a nlmsg_request\n", __func__);
+	if (!nlmsg_request)
 		return NULL;
-	}
+
 	spin_lock_irqsave(&iwpm_nlmsg_req_lock, flags);
 	list_add_tail(&nlmsg_request->inprocess_list, &iwpm_nlmsg_req_list);
 	spin_unlock_irqrestore(&iwpm_nlmsg_req_lock, flags);
@@ -384,28 +381,30 @@ int iwpm_get_nlmsg_seq(void)
 
 int iwpm_valid_client(u8 nl_client)
 {
-	if (nl_client >= RDMA_NL_NUM_CLIENTS)
-		return 0;
 	return iwpm_admin.client_list[nl_client];
 }
 
 void iwpm_set_valid(u8 nl_client, int valid)
 {
-	if (nl_client >= RDMA_NL_NUM_CLIENTS)
-		return;
 	iwpm_admin.client_list[nl_client] = valid;
 }
 
 /* valid client */
-int iwpm_registered_client(u8 nl_client)
+u32 iwpm_get_registration(u8 nl_client)
 {
 	return iwpm_admin.reg_list[nl_client];
 }
 
 /* valid client */
-void iwpm_set_registered(u8 nl_client, int reg)
+void iwpm_set_registration(u8 nl_client, u32 reg)
 {
 	iwpm_admin.reg_list[nl_client] = reg;
+}
+
+/* valid client */
+u32 iwpm_check_registration(u8 nl_client, u32 reg)
+{
+	return (iwpm_get_registration(nl_client) & reg);
 }
 
 int iwpm_compare_sockaddr(struct sockaddr_storage *a_sockaddr,
@@ -444,11 +443,10 @@ struct sk_buff *iwpm_create_nlmsg(u32 nl_op, struct nlmsghdr **nlh,
 {
 	struct sk_buff *skb = NULL;
 
-	skb = dev_alloc_skb(NLMSG_GOODSIZE);
-	if (!skb) {
-		pr_err("%s Unable to allocate skb\n", __func__);
+	skb = dev_alloc_skb(IWPM_MSG_SIZE);
+	if (!skb)
 		goto create_nlmsg_exit;
-	}
+
 	if (!(ibnl_put_msg(skb, nlh, 0, 0, nl_client, nl_op,
 			   NLM_F_REQUEST))) {
 		pr_warn("%s: Unable to put the nlmsg header\n", __func__);
@@ -467,7 +465,7 @@ int iwpm_parse_nlmsg(struct netlink_callback *cb, int policy_max,
 	int ret;
 	const char *err_str = "";
 
-	ret = nlmsg_validate((struct nlmsghdr *)cb->nlh, nlh_len, policy_max-1, nlmsg_policy);
+	ret = nlmsg_validate(cb->nlh, nlh_len, policy_max-1, nlmsg_policy);
 	if (ret) {
 		err_str = "Invalid attribute";
 		goto parse_nlmsg_error;
@@ -601,7 +599,10 @@ static int send_mapinfo_num(u32 mapping_num, u8 nl_client, int iwpm_pid)
 				&mapping_num, IWPM_NLA_MAPINFO_SEND_NUM);
 	if (ret)
 		goto mapinfo_num_error;
-	ret = ibnl_unicast(skb, nlh, iwpm_pid);
+
+	nlmsg_end(skb, nlh);
+
+	ret = rdma_nl_unicast(skb, iwpm_pid);
 	if (ret) {
 		skb = NULL;
 		err_str = "Unable to send a nlmsg";
@@ -626,10 +627,11 @@ static int send_nlmsg_done(struct sk_buff *skb, u8 nl_client, int iwpm_pid)
 	if (!(ibnl_put_msg(skb, &nlh, 0, 0, nl_client,
 			   RDMA_NL_IWPM_MAPINFO, NLM_F_MULTI))) {
 		pr_warn("%s Unable to put NLMSG_DONE\n", __func__);
+		dev_kfree_skb(skb);
 		return -ENOMEM;
 	}
 	nlh->nlmsg_type = NLMSG_DONE;
-	ret = ibnl_unicast(skb, (struct nlmsghdr *)skb->data, iwpm_pid);
+	ret = rdma_nl_unicast(skb, iwpm_pid);
 	if (ret)
 		pr_warn("%s Unable to send a nlmsg\n", __func__);
 	return ret;
@@ -645,7 +647,6 @@ int iwpm_send_mapinfo(u8 nl_client, int iwpm_pid)
 	unsigned long flags;
 	const char *err_str = "";
 	int ret;
-	struct hlist_node *tmp_hlist_node;
 
 	skb = dev_alloc_skb(NLMSG_GOODSIZE);
 	if (!skb) {
@@ -655,8 +656,9 @@ int iwpm_send_mapinfo(u8 nl_client, int iwpm_pid)
 	}
 	skb_num++;
 	spin_lock_irqsave(&iwpm_mapinfo_lock, flags);
+	ret = -EINVAL;
 	for (i = 0; i < IWPM_MAPINFO_HASH_SIZE; i++) {
-		hlist_for_each_entry(map_info, tmp_hlist_node, &iwpm_hash_bucket[i],
+		hlist_for_each_entry(map_info, &iwpm_hash_bucket[i],
 				     hlist_node) {
 			if (map_info->nl_client != nl_client)
 				continue;
@@ -681,6 +683,8 @@ int iwpm_send_mapinfo(u8 nl_client, int iwpm_pid)
 					IWPM_NLA_MAPINFO_MAPPED_ADDR);
 			if (ret)
 				goto send_mapping_info_unlock;
+
+			nlmsg_end(skb, nlh);
 
 			iwpm_print_sockaddr(&map_info->local_sockaddr,
 				"send_mapping_info: Local sockaddr:");

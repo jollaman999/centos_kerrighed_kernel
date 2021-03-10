@@ -11,8 +11,7 @@
  * more details.
  *
  * You should have received a copy of the GNU General Public License along with
- * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
- * Place - Suite 330, Boston, MA 02111-1307 USA.
+ * this program; if not, see <http://www.gnu.org/licenses/>.
  *
  * Author: Lucy Liu <lucy.liu@intel.com>
  */
@@ -45,6 +44,19 @@ int dcbnl_cee_notify(struct net_device *dev, int event, int cmd,
  * the netdevice struct.
  */
 struct dcbnl_rtnl_ops {
+	/* IEEE 802.1Qaz std */
+	int (*ieee_getets) (struct net_device *, struct ieee_ets *);
+	int (*ieee_setets) (struct net_device *, struct ieee_ets *);
+	int (*ieee_getmaxrate) (struct net_device *, struct ieee_maxrate *);
+	int (*ieee_setmaxrate) (struct net_device *, struct ieee_maxrate *);
+	int (*ieee_getpfc) (struct net_device *, struct ieee_pfc *);
+	int (*ieee_setpfc) (struct net_device *, struct ieee_pfc *);
+	int (*ieee_getapp) (struct net_device *, struct dcb_app *);
+	int (*ieee_setapp) (struct net_device *, struct dcb_app *);
+	int (*ieee_delapp) (struct net_device *, struct dcb_app *);
+	int (*ieee_peer_getets) (struct net_device *, struct ieee_ets *);
+	int (*ieee_peer_getpfc) (struct net_device *, struct ieee_pfc *);
+
 	/* CEE std */
 	u8   (*getstate)(struct net_device *);
 	u8   (*setstate)(struct net_device *, u8);
@@ -61,8 +73,8 @@ struct dcbnl_rtnl_ops {
 	void (*getpfccfg)(struct net_device *, int, u8 *);
 	u8   (*setall)(struct net_device *);
 	u8   (*getcap)(struct net_device *, int, u8 *);
-	u8   (*getnumtcs)(struct net_device *, int, u8 *);
-	u8   (*setnumtcs)(struct net_device *, int, u8);
+	int  (*getnumtcs)(struct net_device *, int, u8 *);
+	int  (*setnumtcs)(struct net_device *, int, u8);
 	u8   (*getpfcstate)(struct net_device *);
 	void (*setpfcstate)(struct net_device *, u8);
 	void (*getbcncfg)(struct net_device *, int, u32 *);
@@ -71,30 +83,12 @@ struct dcbnl_rtnl_ops {
 	void (*setbcnrp)(struct net_device *, int, u8);
 	u8   (*setapp)(struct net_device *, u8, u16, u8);
 	u8   (*getapp)(struct net_device *, u8, u16);
-
-#ifndef __GENKSYMS__
-	/* IEEE 802.1Qaz std */
-	int (*ieee_getets) (struct net_device *, struct ieee_ets *);
-	int (*ieee_setets) (struct net_device *, struct ieee_ets *);
-	int (*ieee_getmaxrate) (struct net_device *, struct ieee_maxrate *);
-	int (*ieee_setmaxrate) (struct net_device *, struct ieee_maxrate *);
-	int (*ieee_getpfc) (struct net_device *, struct ieee_pfc *);
-	int (*ieee_setpfc) (struct net_device *, struct ieee_pfc *);
-	int (*ieee_getapp) (struct net_device *, struct dcb_app *);
-	int (*ieee_setapp) (struct net_device *, struct dcb_app *);
+	u8   (*getfeatcfg)(struct net_device *, int, u8 *);
+	u8   (*setfeatcfg)(struct net_device *, int, u8);
 
 	/* DCBX configuration */
 	u8   (*getdcbx)(struct net_device *);
 	u8   (*setdcbx)(struct net_device *, u8);
-
-	/* CEE std */
-	u8   (*getfeatcfg)(struct net_device *, int, u8 *);
-	u8   (*setfeatcfg)(struct net_device *, int, u8);
-
-	/* IEEE 802.1Qaz std */
-	int (*ieee_delapp) (struct net_device *, struct dcb_app *);
-	int (*ieee_peer_getets) (struct net_device *, struct ieee_ets *);
-	int (*ieee_peer_getpfc) (struct net_device *, struct ieee_pfc *);
 
 	/* peer apps */
 	int (*peer_getappinfo)(struct net_device *, struct dcb_peer_app_info *,
@@ -104,7 +98,20 @@ struct dcbnl_rtnl_ops {
 	/* CEE peer */
 	int (*cee_peer_getpg) (struct net_device *, struct cee_pg *);
 	int (*cee_peer_getpfc) (struct net_device *, struct cee_pfc *);
-#endif
+};
+
+struct dcbnl_rtnl_ops_ext {
+	int (*ieee_getqcn) (struct net_device *, struct ieee_qcn *);
+	int (*ieee_setqcn) (struct net_device *, struct ieee_qcn *);
+	int (*ieee_getqcnstats) (struct net_device *, struct ieee_qcn_stats *);
+
+	/* buffer settings */
+	int (*dcbnl_getbuffer)(struct net_device *, struct dcbnl_buffer *);
+	int (*dcbnl_setbuffer)(struct net_device *, struct dcbnl_buffer *);
+
+	RH_KABI_RESERVE_P(3)
+	RH_KABI_RESERVE_P(4)
+	RH_KABI_RESERVE_P(5)
 };
 
 #endif /* __NET_DCBNL_H__ */

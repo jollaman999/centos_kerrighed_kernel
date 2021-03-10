@@ -34,11 +34,11 @@ Configuration options:
   [0] - I/O port base
   [1] - unused
   [2] - Analog input reference
-          0 = single ended
-          1 = differential
+	0 = single ended
+	1 = differential
   [3] - Analog input encoding (must match jumpers)
-          0 = straight binary
-          1 = two's complement
+	0 = straight binary
+	1 = two's complement
 */
 
 #include <linux/interrupt.h>
@@ -57,39 +57,11 @@ struct pcmad_board_struct {
 	const char *name;
 	int n_ai_bits;
 };
-static const struct pcmad_board_struct pcmad_boards[] = {
-	{
-	 .name = "pcmad12",
-	 .n_ai_bits = 12,
-	 },
-	{
-	 .name = "pcmad16",
-	 .n_ai_bits = 16,
-	 },
-};
-
-#define this_board ((const struct pcmad_board_struct *)(dev->board_ptr))
-#define n_pcmad_boards ARRAY_SIZE(pcmad_boards)
 
 struct pcmad_priv_struct {
 	int differential;
 	int twos_comp;
 };
-#define devpriv ((struct pcmad_priv_struct *)dev->private)
-
-static int pcmad_attach(struct comedi_device *dev, struct comedi_devconfig *it);
-static int pcmad_detach(struct comedi_device *dev);
-static struct comedi_driver driver_pcmad = {
-	.driver_name = "pcmad",
-	.module = THIS_MODULE,
-	.attach = pcmad_attach,
-	.detach = pcmad_detach,
-	.board_name = &pcmad_boards[0].name,
-	.num_names = n_pcmad_boards,
-	.offset = sizeof(pcmad_boards[0]),
-};
-
-COMEDI_INITCLEANUP(driver_pcmad);
 
 #define TIMEOUT	100
 
@@ -97,6 +69,8 @@ static int pcmad_ai_insn_read(struct comedi_device *dev,
 			      struct comedi_subdevice *s,
 			      struct comedi_insn *insn, unsigned int *data)
 {
+	const struct pcmad_board_struct *board = comedi_board(dev);
+	struct pcmad_priv_struct *devpriv = dev->private;
 	int i;
 	int chan;
 	int n;
@@ -113,9 +87,8 @@ static int pcmad_ai_insn_read(struct comedi_device *dev,
 		data[n] = inb(dev->iobase + PCMAD_LSB);
 		data[n] |= (inb(dev->iobase + PCMAD_MSB) << 8);
 
-		if (devpriv->twos_comp) {
-			data[n] ^= (1 << (this_board->n_ai_bits - 1));
-		}
+		if (devpriv->twos_comp)
+			data[n] ^= (1 << (board->n_ai_bits - 1));
 	}
 
 	return n;
@@ -130,49 +103,56 @@ static int pcmad_ai_insn_read(struct comedi_device *dev,
  */
 static int pcmad_attach(struct comedi_device *dev, struct comedi_devconfig *it)
 {
-	int ret;
+	const struct pcmad_board_struct *board = comedi_board(dev);
+	struct pcmad_priv_struct *devpriv;
 	struct comedi_subdevice *s;
-	unsigned long iobase;
+	int ret;
 
-	iobase = it->options[0];
-	printk("comedi%d: pcmad: 0x%04lx ", dev->minor, iobase);
-	if (!request_region(iobase, PCMAD_SIZE, "pcmad")) {
-		printk("I/O port conflict\n");
-		return -EIO;
-	}
-	dev->iobase = iobase;
-
-	ret = alloc_subdevices(dev, 1);
-	if (ret < 0)
+	ret = comedi_request_region(dev, it->options[0], PCMAD_SIZE);
+	if (ret)
 		return ret;
 
-	ret = alloc_private(dev, sizeof(struct pcmad_priv_struct));
-	if (ret < 0)
+	ret = comedi_alloc_subdevices(dev, 1);
+	if (ret)
 		return ret;
 
-	dev->board_name = this_board->name;
+	devpriv = kzalloc(sizeof(*devpriv), GFP_KERNEL);
+	if (!devpriv)
+		return -ENOMEM;
+	dev->private = devpriv;
 
-	s = dev->subdevices + 0;
+	s = &dev->subdevices[0];
 	s->type = COMEDI_SUBD_AI;
 	s->subdev_flags = SDF_READABLE | AREF_GROUND;
 	s->n_chan = 16;		/* XXX */
 	s->len_chanlist = 1;
 	s->insn_read = pcmad_ai_insn_read;
-	s->maxdata = (1 << this_board->n_ai_bits) - 1;
+	s->maxdata = (1 << board->n_ai_bits) - 1;
 	s->range_table = &range_unknown;
 
 	return 0;
 }
 
-static int pcmad_detach(struct comedi_device *dev)
-{
-	printk("comedi%d: pcmad: remove\n", dev->minor);
+static const struct pcmad_board_struct pcmad_boards[] = {
+	{
+		.name		= "pcmad12",
+		.n_ai_bits	= 12,
+	}, {
+		.name		= "pcmad16",
+		.n_ai_bits	= 16,
+	},
+};
+static struct comedi_driver pcmad_driver = {
+	.driver_name	= "pcmad",
+	.module		= THIS_MODULE,
+	.attach		= pcmad_attach,
+	.detach		= comedi_legacy_detach,
+	.board_name	= &pcmad_boards[0].name,
+	.num_names	= ARRAY_SIZE(pcmad_boards),
+	.offset		= sizeof(pcmad_boards[0]),
+};
+module_comedi_driver(pcmad_driver);
 
-	if (dev->irq) {
-		free_irq(dev->irq, dev);
-	}
-	if (dev->iobase)
-		release_region(dev->iobase, PCMAD_SIZE);
-
-	return 0;
-}
+MODULE_AUTHOR("Comedi http://www.comedi.org");
+MODULE_DESCRIPTION("Comedi low-level driver");
+MODULE_LICENSE("GPL");

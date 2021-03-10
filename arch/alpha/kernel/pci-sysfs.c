@@ -10,6 +10,8 @@
  */
 
 #include <linux/sched.h>
+#include <linux/stat.h>
+#include <linux/slab.h>
 #include <linux/pci.h>
 
 static int hose_mmap_page_range(struct pci_controller *hose,
@@ -24,7 +26,7 @@ static int hose_mmap_page_range(struct pci_controller *hose,
 		base = sparse ? hose->sparse_io_base : hose->dense_io_base;
 
 	vma->vm_pgoff += base >> PAGE_SHIFT;
-	vma->vm_flags |= (VM_IO | VM_RESERVED);
+	vma->vm_flags |= VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
 
 	return io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 				  vma->vm_end - vma->vm_start,
@@ -52,7 +54,6 @@ static int __pci_mmap_fits(struct pci_dev *pdev, int num,
 
 /**
  * pci_mmap_resource - map a PCI resource into user memory space
- * @filp: open sysfs file
  * @kobj: kobject for mapping
  * @attr: struct bin_attribute for the file being mapped
  * @vma: struct vm_area_struct passed into the mmap
@@ -60,13 +61,13 @@ static int __pci_mmap_fits(struct pci_dev *pdev, int num,
  *
  * Use the bus mapping routines to map a PCI resource into userspace.
  */
-static int pci_mmap_resource(struct file *filp, struct kobject *kobj,
+static int pci_mmap_resource(struct kobject *kobj,
 			     struct bin_attribute *attr,
 			     struct vm_area_struct *vma, int sparse)
 {
 	struct pci_dev *pdev = to_pci_dev(container_of(kobj,
 						       struct device, kobj));
-	struct resource *res = (struct resource *)attr->private;
+	struct resource *res = attr->private;
 	enum pci_mmap_state mmap_type;
 	struct pci_bus_region bar;
 	int i;

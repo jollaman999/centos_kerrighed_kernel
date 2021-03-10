@@ -16,8 +16,7 @@
 #include <linux/gfs2_ondisk.h>
 #include <linux/rcupdate.h>
 #include <linux/rculist_bl.h>
-#include <asm/atomic.h>
-#include <linux/slow-work.h>
+#include <linux/atomic.h>
 #include <linux/mempool.h>
 
 #include "gfs2.h"
@@ -27,16 +26,10 @@
 #include "util.h"
 #include "glock.h"
 #include "quota.h"
+#include "recovery.h"
 #include "dir.h"
 
-static char *gl_hash_size = "32K";
-module_param(gl_hash_size, charp, 0644);
-MODULE_PARM_DESC(gl_hash_size, "Number of glock hash buckets (factor of 2)");
-
-static struct shrinker qd_shrinker = {
-	.shrink = gfs2_shrink_qd_memory,
-	.seeks = DEFAULT_SEEKS,
-};
+struct workqueue_struct *gfs2_control_wq;
 
 static void gfs2_init_inode_once(void *foo)
 {
@@ -57,7 +50,7 @@ static void gfs2_init_glock_once(void *foo)
 	struct gfs2_glock *gl = foo;
 
 	INIT_HLIST_BL_NODE(&gl->gl_list);
-	spin_lock_init(&gl->gl_spin);
+	spin_lock_init(&gl->gl_lockref.lock);
 	INIT_LIST_HEAD(&gl->gl_holders);
 	INIT_LIST_HEAD(&gl->gl_lru);
 	INIT_LIST_HEAD(&gl->gl_ail_list);
@@ -71,24 +64,7 @@ static void gfs2_init_gl_aspace_once(void *foo)
 	struct address_space *mapping = (struct address_space *)(gl + 1);
 
 	gfs2_init_glock_once(gl);
-	memset(mapping, 0, sizeof(*mapping));
-	INIT_RADIX_TREE(&mapping->page_tree, GFP_ATOMIC);
-	spin_lock_init(&mapping->tree_lock);
-	spin_lock_init(&mapping->i_mmap_lock);
-	INIT_LIST_HEAD(&mapping->private_list);
-	spin_lock_init(&mapping->private_lock);
-	INIT_RAW_PRIO_TREE_ROOT(&mapping->i_mmap);
-	INIT_LIST_HEAD(&mapping->i_mmap_nonlinear);
-}
-
-static void *gfs2_bh_alloc(gfp_t mask, void *data)
-{
-	return alloc_buffer_head(mask);
-}
-
-static void gfs2_bh_free(void *ptr, void *data)
-{
-	return free_buffer_head(ptr);
+	address_space_init_once(mapping);
 }
 
 /**
@@ -100,55 +76,22 @@ static void gfs2_bh_free(void *ptr, void *data)
 static int __init init_gfs2_fs(void)
 {
 	int error;
-	size_t glock_hashtbl_size = 0, hts, factor = 0;
-	static char *last;
 
 	gfs2_str2qstr(&gfs2_qdot, ".");
 	gfs2_str2qstr(&gfs2_qdotdot, "..");
+	gfs2_quota_hash_init();
 
 	error = gfs2_sys_init();
 	if (error)
 		return error;
 
-	if (strlen(gl_hash_size) == 0)
-		goto fail_invalid_hashsize;
-
-	glock_hashtbl_size = simple_strtoul(gl_hash_size, NULL, 0);
-	if (glock_hashtbl_size == 0)
-		goto fail_invalid_hashsize;
-
-	last = gl_hash_size + strlen(gl_hash_size) - 1;
-
-	/* Check for KB, MB, GB, and such */
-	if (last && (strlen(gl_hash_size) > 1) &&
-	    ((*last == 'b') || (*last == 'B')) &&
-	    strchr("gmkGMK", *(last - 1)))
-		last--;
-	switch(*last) {
-	case 'g':
-	case 'G':
-		glock_hashtbl_size *= 1024; /* fall through */
-	case 'm':
-	case 'M':
-		glock_hashtbl_size *= 1024; /* fall through */
-	case 'k':
-	case 'K':
-		glock_hashtbl_size *= 1024; /* fall through */
-	default:
-		break;
-	};
-	hts = glock_hashtbl_size;
-	while (hts > 1) {
-		factor++;
-		hts >>= 1;
-	}
-	hts <<= factor;
-	if (hts != glock_hashtbl_size)
-		goto fail_invalid_hashsize;
-
-	error = gfs2_glock_init(glock_hashtbl_size);
+	error = list_lru_init(&gfs2_qd_lru);
 	if (error)
-		goto fail_uninit;
+		goto fail_lru;
+
+	error = gfs2_glock_init();
+	if (error)
+		goto fail;
 
 	error = -ENOMEM;
 	gfs2_glock_cachep = kmem_cache_create("gfs2_glock",
@@ -169,7 +112,8 @@ static int __init init_gfs2_fs(void)
 	gfs2_inode_cachep = kmem_cache_create("gfs2_inode",
 					      sizeof(struct gfs2_inode),
 					      0,  SLAB_RECLAIM_ACCOUNT|
-					          SLAB_MEM_SPREAD,
+						  SLAB_MEM_SPREAD|
+						  SLAB_ACCOUNT,
 					      gfs2_init_inode_once);
 	if (!gfs2_inode_cachep)
 		goto fail;
@@ -198,7 +142,7 @@ static int __init init_gfs2_fs(void)
 	if (!gfs2_qadata_cachep)
 		goto fail;
 
-	register_shrinker(&qd_shrinker);
+	register_shrinker(&gfs2_qd_shrinker);
 
 	error = register_filesystem(&gfs2_fs_type);
 	if (error)
@@ -208,31 +152,39 @@ static int __init init_gfs2_fs(void)
 	if (error)
 		goto fail_unregister;
 
-	error = slow_work_register_user(THIS_MODULE);
-	if (error)
-		goto fail_slow;
+	error = -ENOMEM;
+	gfs_recovery_wq = alloc_workqueue("gfs_recovery",
+					  WQ_MEM_RECLAIM | WQ_FREEZABLE, 0);
+	if (!gfs_recovery_wq)
+		goto fail_wq;
 
-	gfs2_bh_pool = mempool_create(1024, gfs2_bh_alloc, gfs2_bh_free, NULL);
-	if (!gfs2_bh_pool)
-		goto fail_mempool;
+	gfs2_control_wq = alloc_workqueue("gfs2_control",
+			       WQ_NON_REENTRANT | WQ_UNBOUND | WQ_FREEZABLE, 0);
+	if (!gfs2_control_wq)
+		goto fail_recovery;
+
+	gfs2_page_pool = mempool_create_page_pool(64, 0);
+	if (!gfs2_page_pool)
+		goto fail_control;
 
 	gfs2_register_debugfs();
 
-	printk("GFS2 (built %s %s) installed\n", __DATE__, __TIME__);
-	if (glock_hashtbl_size != 32768)
-		printk(KERN_ERR "GFS2: Using glock hash table size: %lu\n",
-		       (unsigned long)glock_hashtbl_size);
+	printk("GFS2 installed\n");
 
 	return 0;
 
-fail_mempool:
-	slow_work_unregister_user(THIS_MODULE);
-fail_slow:
+fail_control:
+	destroy_workqueue(gfs2_control_wq);
+fail_recovery:
+	destroy_workqueue(gfs_recovery_wq);
+fail_wq:
 	unregister_filesystem(&gfs2meta_fs_type);
 fail_unregister:
 	unregister_filesystem(&gfs2_fs_type);
 fail:
-	unregister_shrinker(&qd_shrinker);
+	list_lru_destroy(&gfs2_qd_lru);
+fail_lru:
+	unregister_shrinker(&gfs2_qd_shrinker);
 	gfs2_glock_exit();
 
 	if (gfs2_qadata_cachep)
@@ -256,21 +208,8 @@ fail:
 	if (gfs2_glock_cachep)
 		kmem_cache_destroy(gfs2_glock_cachep);
 
-fail_uninit:
 	gfs2_sys_uninit();
 	return error;
-
-fail_invalid_hashsize:
-	printk(KERN_ERR "Glock hash table buckets %lu is invalid.\n",
-	       (unsigned long)glock_hashtbl_size);
-	printk(KERN_ERR "Value must be >= 1024 and should be a multiple "
-	       "of 2.\n");
-	printk(KERN_ERR "Value may be specified in K, M, or G. For example, "
-	       "gl_hash_size=128K. Default is 32K buckets.\n");
-	printk(KERN_ERR "(This is the number of hash table buckets, not the "
-	       "byte size of the hash table.)\n");
-	error = -EINVAL;
-	goto fail_uninit;
 }
 
 /**
@@ -280,16 +219,18 @@ fail_invalid_hashsize:
 
 static void __exit exit_gfs2_fs(void)
 {
-	unregister_shrinker(&qd_shrinker);
+	unregister_shrinker(&gfs2_qd_shrinker);
 	gfs2_glock_exit();
 	gfs2_unregister_debugfs();
 	unregister_filesystem(&gfs2_fs_type);
 	unregister_filesystem(&gfs2meta_fs_type);
-	slow_work_unregister_user(THIS_MODULE);
+	destroy_workqueue(gfs_recovery_wq);
+	destroy_workqueue(gfs2_control_wq);
+	list_lru_destroy(&gfs2_qd_lru);
 
 	rcu_barrier();
 
-	mempool_destroy(gfs2_bh_pool);
+	mempool_destroy(gfs2_page_pool);
 	kmem_cache_destroy(gfs2_qadata_cachep);
 	kmem_cache_destroy(gfs2_quotad_cachep);
 	kmem_cache_destroy(gfs2_rgrpd_cachep);

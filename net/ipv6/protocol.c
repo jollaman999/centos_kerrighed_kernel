@@ -25,30 +25,15 @@
 #include <linux/spinlock.h>
 #include <net/protocol.h>
 
-const struct inet6_protocol *inet6_protos[MAX_INET_PROTOS];
+#if IS_ENABLED(CONFIG_IPV6)
+const struct inet6_protocol __rcu *inet6_protos[MAX_INET_PROTOS] __read_mostly;
 EXPORT_SYMBOL(inet6_protos);
-
-#if defined(CONFIG_IPV6) || defined(CONFIG_IPV6_MODULE)
-static DEFINE_SPINLOCK(inet6_proto_lock);
 
 int inet6_add_protocol(const struct inet6_protocol *prot, unsigned char protocol)
 {
-	int ret, hash = protocol & (MAX_INET_PROTOS - 1);
-
-	spin_lock_bh(&inet6_proto_lock);
-
-	if (inet6_protos[hash]) {
-		ret = -1;
-	} else {
-		inet6_protos[hash] = prot;
-		ret = 0;
-	}
-
-	spin_unlock_bh(&inet6_proto_lock);
-
-	return ret;
+	return !cmpxchg((const struct inet6_protocol **)&inet6_protos[protocol],
+			NULL, prot) ? 0 : -1;
 }
-
 EXPORT_SYMBOL(inet6_add_protocol);
 
 /*
@@ -57,63 +42,34 @@ EXPORT_SYMBOL(inet6_add_protocol);
 
 int inet6_del_protocol(const struct inet6_protocol *prot, unsigned char protocol)
 {
-	int ret, hash = protocol & (MAX_INET_PROTOS - 1);
+	int ret;
 
-	spin_lock_bh(&inet6_proto_lock);
-
-	if (inet6_protos[hash] != prot) {
-		ret = -1;
-	} else {
-		inet6_protos[hash] = NULL;
-		ret = 0;
-	}
-
-	spin_unlock_bh(&inet6_proto_lock);
+	ret = (cmpxchg((const struct inet6_protocol **)&inet6_protos[protocol],
+		       prot, NULL) == prot) ? 0 : -1;
 
 	synchronize_net();
 
 	return ret;
 }
-
 EXPORT_SYMBOL(inet6_del_protocol);
 #endif
 
-const struct net_offload *inet6_offloads[MAX_INET_PROTOS];
-static DEFINE_SPINLOCK(inet6_offload_lock);
+const struct net_offload __rcu *inet6_offloads[MAX_INET_PROTOS] __read_mostly;
+EXPORT_SYMBOL(inet6_offloads);
 
 int inet6_add_offload(const struct net_offload *prot, unsigned char protocol)
 {
-	int ret, hash = protocol & (MAX_INET_PROTOS - 1);
-
-	spin_lock_bh(&inet6_offload_lock);
-
-	if (inet6_offloads[hash]) {
-		ret = -1;
-	} else {
-		inet6_offloads[hash] = prot;
-		ret = 0;
-	}
-
-	spin_unlock_bh(&inet6_offload_lock);
-
-	return ret;
+	return !cmpxchg((const struct net_offload **)&inet6_offloads[protocol],
+			NULL, prot) ? 0 : -1;
 }
 EXPORT_SYMBOL(inet6_add_offload);
 
 int inet6_del_offload(const struct net_offload *prot, unsigned char protocol)
 {
-	int ret, hash = protocol & (MAX_INET_PROTOS - 1);
+	int ret;
 
-	spin_lock_bh(&inet6_offload_lock);
-
-	if (inet6_offloads[hash] != prot) {
-		ret = -1;
-	} else {
-		inet6_offloads[hash] = NULL;
-		ret = 0;
-	}
-
-	spin_unlock_bh(&inet6_offload_lock);
+	ret = (cmpxchg((const struct net_offload **)&inet6_offloads[protocol],
+		       prot, NULL) == prot) ? 0 : -1;
 
 	synchronize_net();
 

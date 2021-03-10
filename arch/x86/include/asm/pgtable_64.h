@@ -21,6 +21,7 @@ extern pud_t level3_ident_pgt[512];
 extern pmd_t level2_kernel_pgt[512];
 extern pmd_t level2_fixmap_pgt[512];
 extern pmd_t level2_ident_pgt[512];
+extern pte_t level1_fixmap_pgt[512];
 extern pgd_t init_level4_pgt[];
 
 #define swapper_pg_dir init_level4_pgt
@@ -28,16 +29,16 @@ extern pgd_t init_level4_pgt[];
 extern void paging_init(void);
 
 #define pte_ERROR(e)					\
-	printk("%s:%d: bad pte %p(%016lx).\n",		\
+	pr_err("%s:%d: bad pte %p(%016lx)\n",		\
 	       __FILE__, __LINE__, &(e), pte_val(e))
 #define pmd_ERROR(e)					\
-	printk("%s:%d: bad pmd %p(%016lx).\n",		\
+	pr_err("%s:%d: bad pmd %p(%016lx)\n",		\
 	       __FILE__, __LINE__, &(e), pmd_val(e))
 #define pud_ERROR(e)					\
-	printk("%s:%d: bad pud %p(%016lx).\n",		\
+	pr_err("%s:%d: bad pud %p(%016lx)\n",		\
 	       __FILE__, __LINE__, &(e), pud_val(e))
 #define pgd_ERROR(e)					\
-	printk("%s:%d: bad pgd %p(%016lx).\n",		\
+	pr_err("%s:%d: bad pgd %p(%016lx)\n",		\
 	       __FILE__, __LINE__, &(e), pgd_val(e))
 
 struct mm_struct;
@@ -63,22 +64,6 @@ static inline void native_set_pte_atomic(pte_t *ptep, pte_t pte)
 	native_set_pte(ptep, pte);
 }
 
-static inline pte_t native_ptep_get_and_clear(pte_t *xp)
-{
-#ifdef CONFIG_SMP
-	mm_track_pte(xp);
-	return native_make_pte(xchg(&xp->pte, 0));
-#else
-	/* native_local_ptep_get_and_clear,
-	   but duplicated because of cyclic dependency */
-	pte_t ret;
-	mm_track_pte(xp);
-	ret = *xp;
-	native_pte_clear(NULL, 0, xp);
-	return ret;
-#endif
-}
-
 static inline void native_set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
 	mm_track_pmd(pmdp);
@@ -90,8 +75,23 @@ static inline void native_pmd_clear(pmd_t *pmd)
 	native_set_pmd(pmd, native_make_pmd(0));
 }
 
+static inline pte_t native_ptep_get_and_clear(pte_t *xp)
+{
+	mm_track_pte(xp);
+#ifdef CONFIG_SMP
+	return native_make_pte(xchg(&xp->pte, 0));
+#else
+	/* native_local_ptep_get_and_clear,
+	   but duplicated because of cyclic dependency */
+	pte_t ret = *xp;
+	native_pte_clear(NULL, 0, xp);
+	return ret;
+#endif
+}
+
 static inline pmd_t native_pmdp_get_and_clear(pmd_t *xp)
 {
+	mm_track_pmd(xp);
 #ifdef CONFIG_SMP
 	return native_make_pmd(xchg(&xp->pmd, 0));
 #else
@@ -112,6 +112,81 @@ static inline void native_set_pud(pud_t *pudp, pud_t pud)
 static inline void native_pud_clear(pud_t *pud)
 {
 	native_set_pud(pud, native_make_pud(0));
+}
+
+static inline pud_t native_pudp_get_and_clear(pud_t *xp)
+{
+#ifdef CONFIG_SMP
+	return native_make_pud(xchg(&xp->pud, 0));
+#else
+	/* native_local_pudp_get_and_clear,
+	 * but duplicated because of cyclic dependency
+	 */
+	pud_t ret = *xp;
+
+	native_pud_clear(xp);
+	return ret;
+#endif
+}
+
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+/*
+ * All top-level KAISER page tables are order-1 pages (8k-aligned
+ * and 8k in size).  The kernel one is at the beginning 4k and
+ * the user (shadow) one is in the last 4k.  To switch between
+ * them, you just need to flip the 12th bit in their addresses.
+ */
+#define KAISER_PGTABLE_SWITCH_BIT	PAGE_SHIFT
+
+/*
+ * This generates better code than the inline assembly in
+ * __set_bit().
+ */
+static inline void *ptr_set_bit(void *ptr, int bit)
+{
+	unsigned long __ptr = (unsigned long)ptr;
+
+	__ptr |= (1<<bit);
+	return (void *)__ptr;
+}
+static inline void *ptr_clear_bit(void *ptr, int bit)
+{
+	unsigned long __ptr = (unsigned long)ptr;
+
+	__ptr &= ~(1<<bit);
+	return (void *)__ptr;
+}
+
+static inline pgd_t *kernel_to_shadow_pgdp(pgd_t *pgdp)
+{
+	return ptr_set_bit(pgdp, KAISER_PGTABLE_SWITCH_BIT);
+}
+static inline pgd_t *shadow_to_kernel_pgdp(pgd_t *pgdp)
+{
+	return ptr_clear_bit(pgdp, KAISER_PGTABLE_SWITCH_BIT);
+}
+#endif /* CONFIG_PAGE_TABLE_ISOLATION */
+
+/*
+ * Page table pages are page-aligned.  The lower half of the top
+ * level is used for userspace and the top half for the kernel.
+ *
+ * Returns true for parts of the PGD that map userspace and
+ * false for the parts that map the kernel.
+ */
+static inline bool pgdp_maps_userspace(void *__ptr)
+{
+	unsigned long ptr = (unsigned long)__ptr;
+
+	return (ptr & ~PAGE_MASK) < (PAGE_SIZE / 2);
+}
+
+/*
+ * Does this PGD allow access from userspace?
+ */
+static inline bool pgd_userspace_access(pgd_t pgd)
+{
+	return pgd.pgd & _PAGE_USER;
 }
 
 static inline void kaiser_poison_pgd(pgd_t *pgd)
@@ -139,16 +214,86 @@ static inline void kaiser_unpoison_pgd_atomic(pgd_t *pgd)
 		clear_bit(_PAGE_BIT_NX, &pgd->pgd);
 }
 
+/*
+ * Take a PGD location (pgdp) and a pgd value that needs
+ * to be set there.  Populates the shadow and returns
+ * the resulting PGD that must be set in the kernel copy
+ * of the page tables.
+ */
+static inline pgd_t kaiser_set_shadow_pgd(pgd_t *pgdp, pgd_t pgd)
+{
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	if (pgd_userspace_access(pgd)) {
+		if (pgdp_maps_userspace(pgdp)) {
+			VM_WARN_ON_ONCE(!is_kaiser_pgd(pgdp));
+			/*
+			 * The user/shadow page tables get the full
+			 * PGD, accessible from userspace:
+			 */
+			kernel_to_shadow_pgdp(pgdp)->pgd = pgd.pgd;
+			/*
+			 * For the copy of the pgd that the kernel
+			 * uses, make it unusable to userspace.  This
+			 * ensures if we get out to userspace with the
+			 * wrong CR3 value, userspace will crash
+			 * instead of running.
+			 */
+			if (kaiser_active())
+				kaiser_poison_pgd(&pgd);
+		}
+	} else if (pgd_userspace_access(*pgdp)) {
+		/*
+		 * We are clearing a _PAGE_USER PGD for which we
+		 * presumably populated the shadow.  We must now
+		 * clear the shadow PGD entry.
+		 */
+		if (pgdp_maps_userspace(pgdp)) {
+			VM_WARN_ON_ONCE(!is_kaiser_pgd(pgdp));
+			kernel_to_shadow_pgdp(pgdp)->pgd = pgd.pgd;
+		} else {
+			/*
+			 * Attempted to clear a _PAGE_USER PGD which
+			 * is in the kernel porttion of the address
+			 * space.  PGDs are pre-populated and we
+			 * never clear them.
+			 */
+			WARN_ON_ONCE(1);
+		}
+	} else {
+		extern struct mutex kexec_mutex;
+
+		/*
+		 * _PAGE_USER was not set in either the PGD being set
+		 * or cleared.  All kernel PGDs should be
+		 * pre-populated so this should never happen after
+		 * boot except when kexec'ing a new kernel.
+		 */
+		VM_WARN_ON_ONCE(system_state == SYSTEM_RUNNING &&
+				!mutex_is_locked(&kexec_mutex) &&
+				is_kaiser_pgd(pgdp));
+	}
+#endif
+	/* return the copy of the PGD we want the kernel to use: */
+	return pgd;
+}
+
 static inline void native_set_pgd(pgd_t *pgdp, pgd_t pgd)
 {
 	mm_track_pgd(pgdp);
-	*pgdp = pti_set_user_pgd(pgdp, pgd);
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	*pgdp = kaiser_set_shadow_pgd(pgdp, pgd);
+#else /* CONFIG_PAGE_TABLE_ISOLATION */
+	*pgdp = pgd;
+#endif
 }
 
 static inline void native_pgd_clear(pgd_t *pgd)
 {
 	native_set_pgd(pgd, native_make_pgd(0));
 }
+
+extern void sync_global_pgds(unsigned long start, unsigned long end,
+			     int removed);
 
 /*
  * Conversion functions: convert a page and protection to a page entry,
@@ -189,19 +334,19 @@ static inline int pte_file_max_bits(void)
 
 /* x86-64 always has all page tables mapped. */
 #define pte_offset_map(dir, address) pte_offset_kernel((dir), (address))
-#define pte_offset_map_nested(dir, address) pte_offset_kernel((dir), (address))
-#define pte_unmap(pte) /* NOP */
-#define pte_unmap_nested(pte) /* NOP */
+#define pte_unmap(pte) ((void)(pte))/* NOP */
 
-#define update_mmu_cache(vma, address, pte) do { } while (0)
+/* Encode and de-code a swap entry */
+#if _PAGE_BIT_FILE > _PAGE_BIT_PROTNONE
+#error unsupported PTE bit arrangement
+#endif
 
 /*
  * Encode and de-code a swap entry
  *
  * |     ...            | 11| 10|  9|8|7|6|5| 4| 3|2|1|0| <- bit number
  * |     ...            |SW3|SW2|SW1|G|L|D|A|CD|WT|U|W|P| <- bit names
- * | TYPE (59-63) | ~OFFSET (9-58)  |0|0|X|X| X| X|X|X|0| <- swp entry
- *
+ * | TYPE (59-63) | ~OFFSET (9-58)  |0|X|X|X| X| X|X|X|0| <- swp entry
  *
  * G (8) is aliased and used as a PROT_NONE indicator for
  * !present ptes.  We need to start storing swap entries above
@@ -257,119 +402,10 @@ extern void cleanup_highmap(void);
 
 #define __HAVE_ARCH_PTE_SAME
 
-#ifdef CONFIG_TRANSPARENT_HUGEPAGE
-static inline int pmd_trans_splitting(pmd_t pmd)
-{
-	return pmd_val(pmd) & _PAGE_SPLITTING;
-}
+#define vmemmap ((struct page *)VMEMMAP_START)
 
-static inline int pmd_trans_huge(pmd_t pmd)
-{
-	return pmd_val(pmd) & _PAGE_PSE;
-}
-
-static inline int has_transparent_hugepage(void)
-{
-	return cpu_has_pse;
-}
-#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
-
-#define mk_pmd(page, pgprot)   pfn_pmd(page_to_pfn(page), (pgprot))
-
-#define  __HAVE_ARCH_PMDP_SET_ACCESS_FLAGS
-extern int pmdp_set_access_flags(struct vm_area_struct *vma,
-				 unsigned long address, pmd_t *pmdp,
-				 pmd_t entry, int dirty);
-
-#define __HAVE_ARCH_PMDP_TEST_AND_CLEAR_YOUNG
-extern int pmdp_test_and_clear_young(struct vm_area_struct *vma,
-				     unsigned long addr, pmd_t *pmdp);
-
-#define __HAVE_ARCH_PMDP_CLEAR_YOUNG_FLUSH
-extern int pmdp_clear_flush_young(struct vm_area_struct *vma,
-				  unsigned long address, pmd_t *pmdp);
-
-
-#define __HAVE_ARCH_PMDP_SPLITTING_FLUSH
-extern void pmdp_splitting_flush(struct vm_area_struct *vma,
-				 unsigned long addr, pmd_t *pmdp);
-
-#define __HAVE_ARCH_PMD_WRITE
-static inline int pmd_write(pmd_t pmd)
-{
-	return pmd_flags(pmd) & _PAGE_RW;
-}
-
-#define __HAVE_ARCH_PMDP_GET_AND_CLEAR
-static inline pmd_t pmdp_get_and_clear(struct mm_struct *mm, unsigned long addr,
-				       pmd_t *pmdp)
-{
-	pmd_t pmd = native_pmdp_get_and_clear(pmdp);
-	pmd_update(mm, addr, pmdp);
-	return pmd;
-}
-
-#define __HAVE_ARCH_PMDP_SET_WRPROTECT
-static inline void pmdp_set_wrprotect(struct mm_struct *mm,
-				      unsigned long addr, pmd_t *pmdp)
-{
-	clear_bit(_PAGE_BIT_RW, (unsigned long *)&pmdp->pmd);
-	pmd_update(mm, addr, pmdp);
-}
-
-static inline int pmd_young(pmd_t pmd)
-{
-	return pmd_flags(pmd) & _PAGE_ACCESSED;
-}
-
-static inline pmd_t pmd_set_flags(pmd_t pmd, pmdval_t set)
-{
-	pmdval_t v = native_pmd_val(pmd);
-
-	return native_make_pmd(v | set);
-}
-
-static inline pmd_t pmd_clear_flags(pmd_t pmd, pmdval_t clear)
-{
-	pmdval_t v = native_pmd_val(pmd);
-
-	return native_make_pmd(v & ~clear);
-}
-
-static inline pmd_t pmd_mkold(pmd_t pmd)
-{
-	return pmd_clear_flags(pmd, _PAGE_ACCESSED);
-}
-
-static inline pmd_t pmd_wrprotect(pmd_t pmd)
-{
-	return pmd_clear_flags(pmd, _PAGE_RW);
-}
-
-static inline pmd_t pmd_mkdirty(pmd_t pmd)
-{
-	return pmd_set_flags(pmd, _PAGE_DIRTY);
-}
-
-static inline pmd_t pmd_mkhuge(pmd_t pmd)
-{
-	return pmd_set_flags(pmd, _PAGE_PSE);
-}
-
-static inline pmd_t pmd_mkyoung(pmd_t pmd)
-{
-	return pmd_set_flags(pmd, _PAGE_ACCESSED);
-}
-
-static inline pmd_t pmd_mkwrite(pmd_t pmd)
-{
-	return pmd_set_flags(pmd, _PAGE_RW);
-}
-
-static inline pmd_t pmd_mknotpresent(pmd_t pmd)
-{
-	return pmd_clear_flags(pmd, _PAGE_PRESENT);
-}
+extern void init_extra_mapping_uc(unsigned long phys, unsigned long size);
+extern void init_extra_mapping_wb(unsigned long phys, unsigned long size);
 
 #include <asm/pgtable-invert.h>
 

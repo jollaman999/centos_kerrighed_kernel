@@ -7,7 +7,6 @@
 #include <linux/if_arp.h>
 #include <linux/module.h>
 #include <linux/etherdevice.h>
-#include <linux/nospec.h>
 #include <net/lib80211.h>
 
 #include "hostap_wlan.h"
@@ -3459,14 +3458,10 @@ static int prism2_ioctl_set_encryption(local_info_t *local,
 		return -EINVAL;
 
 	if (is_broadcast_ether_addr(param->sta_addr)) {
-		u8 idx;
-
 		if (param->u.crypt.idx >= WEP_KEYS)
 			return -EINVAL;
-		idx = array_index_nospec(param->u.crypt.idx, WEP_KEYS);
-
 		sta_ptr = NULL;
-		crypt = &local->crypt_info.crypt[idx];
+		crypt = &local->crypt_info.crypt[param->u.crypt.idx];
 	} else {
 		if (param->u.crypt.idx)
 			return -EINVAL;

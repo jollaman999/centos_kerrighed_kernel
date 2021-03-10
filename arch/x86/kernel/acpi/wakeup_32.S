@@ -1,8 +1,7 @@
-	.section .text.page_aligned
+	.text
 #include <linux/linkage.h>
 #include <asm/segment.h>
 #include <asm/page_types.h>
-#include <asm/nospec-branch.h>
 
 # Copyright 2003, 2008 Pavel Machek <pavel@suse.cz>, distribute under GPLv2
 
@@ -19,7 +18,6 @@ wakeup_pmode_return:
 	movw	%ax, %gs
 
 	# reload the gdt, as we need the full 32 bit address
-	lgdt	saved_gdt
 	lidt	saved_idt
 	lldt	saved_ldt
 	ljmp	$(__KERNEL_CS), $1f
@@ -37,7 +35,7 @@ wakeup_pmode_return:
 
 	# jump to place where we left off
 	movl	saved_eip, %eax
-	JMP_NOSPEC %eax
+	jmp	*%eax
 
 bogus_magic:
 	jmp	bogus_magic
@@ -45,7 +43,6 @@ bogus_magic:
 
 
 save_registers:
-	sgdt	saved_gdt
 	sidt	saved_idt
 	sldt	saved_ldt
 	str	saved_tss
@@ -76,7 +73,7 @@ ENTRY(do_suspend_lowlevel)
 	call	save_processor_state
 	call	save_registers
 	pushl	$3
-	call	acpi_enter_sleep_state
+	call	x86_acpi_enter_sleep_state
 	addl	$4, %esp
 
 #	In case of S3 failure, we'll emerge here.  Jump
@@ -94,7 +91,6 @@ ENTRY(saved_magic)	.long	0
 ENTRY(saved_eip)	.long	0
 
 # saved registers
-saved_gdt:	.long	0,0
 saved_idt:	.long	0,0
 saved_ldt:	.long	0
 saved_tss:	.long	0

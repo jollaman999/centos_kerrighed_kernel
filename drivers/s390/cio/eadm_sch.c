@@ -5,6 +5,7 @@
  * Author(s): Sebastian Ott <sebott@linux.vnet.ibm.com>
  */
 
+#include <linux/kernel_stat.h>
 #include <linux/workqueue.h>
 #include <linux/spinlock.h>
 #include <linux/device.h>
@@ -23,8 +24,8 @@
 #include "eadm_sch.h"
 #include "ioasm.h"
 #include "cio.h"
-#include "orb.h"
 #include "css.h"
+#include "orb.h"
 
 MODULE_DESCRIPTION("driver for s390 eadm subchannels");
 MODULE_LICENSE("GPL");
@@ -138,6 +139,8 @@ static void eadm_subchannel_irq(struct subchannel *sch)
 	EADM_LOG(6, "irq");
 	EADM_LOG_HEX(6, irb, sizeof(*irb));
 
+	inc_irq_stat(IRQIO_ADM);
+
 	if ((scsw->stctl & (SCSW_STCTL_ALERT_STATUS | SCSW_STCTL_STATUS_PEND))
 	    && scsw->eswf == 1 && irb->esw.eadm.erw.r)
 		error = -EIO;
@@ -183,7 +186,7 @@ static struct subchannel *eadm_get_idle_sch(void)
 	return NULL;
 }
 
-static int eadm_start_aob(struct aob *aob)
+int eadm_start_aob(struct aob *aob)
 {
 	struct eadm_private *private;
 	struct subchannel *sch;
@@ -211,6 +214,7 @@ out_unlock:
 
 	return ret;
 }
+EXPORT_SYMBOL_GPL(eadm_start_aob);
 
 static int eadm_subchannel_probe(struct subchannel *sch)
 {
@@ -339,8 +343,10 @@ static struct css_device_id eadm_subchannel_ids[] = {
 MODULE_DEVICE_TABLE(css, eadm_subchannel_ids);
 
 static struct css_driver eadm_subchannel_driver = {
-	.name = "eadm_subchannel",
-	.owner = THIS_MODULE,
+	.drv = {
+		.name = "eadm_subchannel",
+		.owner = THIS_MODULE,
+	},
 	.subchannel_type = eadm_subchannel_ids,
 	.irq = eadm_subchannel_irq,
 	.probe = eadm_subchannel_probe,
@@ -350,11 +356,6 @@ static struct css_driver eadm_subchannel_driver = {
 	.freeze = eadm_subchannel_freeze,
 	.thaw = eadm_subchannel_restore,
 	.restore = eadm_subchannel_restore,
-};
-
-static struct eadm_ops eadm_ops = {
-	.eadm_start = eadm_start_aob,
-	.owner = THIS_MODULE,
 };
 
 static int __init eadm_sch_init(void)
@@ -376,7 +377,6 @@ static int __init eadm_sch_init(void)
 	if (ret)
 		goto cleanup;
 
-	register_eadm_ops(&eadm_ops);
 	return ret;
 
 cleanup:
@@ -387,7 +387,6 @@ cleanup:
 
 static void __exit eadm_sch_exit(void)
 {
-	unregister_eadm_ops(&eadm_ops);
 	css_driver_unregister(&eadm_subchannel_driver);
 	isc_unregister(EADM_SCH_ISC);
 	debug_unregister(eadm_debug);

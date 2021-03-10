@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -44,6 +44,8 @@
 #ifndef __ACGCC_H__
 #define __ACGCC_H__
 
+#define ACPI_INLINE             __inline__
+
 /* Function name is used for debug output. Non-ANSI, compiler-dependent */
 
 #define ACPI_GET_FUNCTION_NAME          __func__
@@ -61,9 +63,5 @@
  * is unused.
  */
 #define ACPI_UNUSED_VAR __attribute__ ((unused))
-
-#ifdef _ANSI
-#define inline
-#endif
 
 #endif				/* __ACGCC_H__ */

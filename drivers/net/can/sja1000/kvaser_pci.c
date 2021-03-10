@@ -36,7 +36,6 @@
 #include <linux/netdevice.h>
 #include <linux/delay.h>
 #include <linux/pci.h>
-#include <linux/can.h>
 #include <linux/can/dev.h>
 #include <linux/io.h>
 
@@ -109,7 +108,7 @@ struct kvaser_pci {
 #define KVASER_PCI_VENDOR_ID2     0x1a07    /* the PCI device and vendor IDs */
 #define KVASER_PCI_DEVICE_ID2     0x0008
 
-static struct pci_device_id kvaser_pci_tbl[] = {
+static const struct pci_device_id kvaser_pci_tbl[] = {
 	{KVASER_PCI_VENDOR_ID1, KVASER_PCI_DEVICE_ID1, PCI_ANY_ID, PCI_ANY_ID,},
 	{KVASER_PCI_VENDOR_ID2, KVASER_PCI_DEVICE_ID2, PCI_ANY_ID, PCI_ANY_ID,},
 	{ 0,}
@@ -160,9 +159,9 @@ static int number_of_sja1000_chip(void __iomem *base_addr)
 	for (i = 0; i < MAX_NO_OF_CHANNELS; i++) {
 		/* reset chip */
 		iowrite8(MOD_RM, base_addr +
-			 (i * KVASER_PCI_PORT_BYTES) + REG_MOD);
+			 (i * KVASER_PCI_PORT_BYTES) + SJA1000_MOD);
 		status = ioread8(base_addr +
-				 (i * KVASER_PCI_PORT_BYTES) + REG_MOD);
+				 (i * KVASER_PCI_PORT_BYTES) + SJA1000_MOD);
 		/* check reset bit */
 		if (!(status & MOD_RM))
 			break;
@@ -291,8 +290,8 @@ failure:
 	return err;
 }
 
-static int __devinit kvaser_pci_init_one(struct pci_dev *pdev,
-					 const struct pci_device_id *ent)
+static int kvaser_pci_init_one(struct pci_dev *pdev,
+			       const struct pci_device_id *ent)
 {
 	int err;
 	struct net_device *master_dev = NULL;
@@ -380,7 +379,7 @@ failure:
 
 }
 
-static void __devexit kvaser_pci_remove_one(struct pci_dev *pdev)
+static void kvaser_pci_remove_one(struct pci_dev *pdev)
 {
 	struct net_device *dev = pci_get_drvdata(pdev);
 
@@ -395,18 +394,7 @@ static struct pci_driver kvaser_pci_driver = {
 	.name = DRV_NAME,
 	.id_table = kvaser_pci_tbl,
 	.probe = kvaser_pci_init_one,
-	.remove = __devexit_p(kvaser_pci_remove_one),
+	.remove = kvaser_pci_remove_one,
 };
 
-static int __init kvaser_pci_init(void)
-{
-	return pci_register_driver(&kvaser_pci_driver);
-}
-
-static void __exit kvaser_pci_exit(void)
-{
-	pci_unregister_driver(&kvaser_pci_driver);
-}
-
-module_init(kvaser_pci_init);
-module_exit(kvaser_pci_exit);
+module_pci_driver(kvaser_pci_driver);

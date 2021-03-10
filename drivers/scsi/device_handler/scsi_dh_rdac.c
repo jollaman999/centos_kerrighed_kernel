@@ -23,6 +23,8 @@
 #include <scsi/scsi_eh.h>
 #include <scsi/scsi_dh.h>
 #include <linux/workqueue.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 
 #define RDAC_NAME "rdac"
 #define RDAC_RETRY_COUNT 5
@@ -34,7 +36,7 @@
  * mode page were taken from the LSI RDAC 2.4 GPL'd
  * driver, and then converted to Linux conventions.
  */
-#define RDAC_QUIESCENCE_TIME 20;
+#define RDAC_QUIESCENCE_TIME 20
 /*
  * Page Codes
  */
@@ -179,6 +181,7 @@ struct c2_inquiry {
 };
 
 struct rdac_dh_data {
+	struct scsi_dh_data	dh_data;
 	struct rdac_controller	*ctlr;
 #define UNINITIALIZED_LUN	(1 << 8)
 	unsigned		lun;
@@ -259,9 +262,7 @@ do { \
 
 static inline struct rdac_dh_data *get_rdac_data(struct scsi_device *sdev)
 {
-	struct scsi_dh_data *scsi_dh_data = sdev->scsi_dh_data;
-	BUG_ON(scsi_dh_data == NULL);
-	return ((struct rdac_dh_data *) scsi_dh_data->buf);
+	return container_of(sdev->scsi_dh_data, struct rdac_dh_data, dh_data);
 }
 
 static struct request *get_rdac_req(struct scsi_device *sdev,
@@ -272,11 +273,12 @@ static struct request *get_rdac_req(struct scsi_device *sdev,
 
 	rq = blk_get_request(q, rw, GFP_NOIO);
 
-	if (!rq) {
+	if (IS_ERR(rq)) {
 		sdev_printk(KERN_INFO, sdev,
 				"get_rdac_req: blk_get_request failed.\n");
 		return NULL;
 	}
+	blk_rq_set_block_pc(rq);
 
 	if (buflen && blk_rq_map_kern(q, rq, buffer, buflen, GFP_NOIO)) {
 		blk_put_request(rq);
@@ -285,7 +287,6 @@ static struct request *get_rdac_req(struct scsi_device *sdev,
 		return NULL;
 	}
 
-	rq->cmd_type = REQ_TYPE_BLOCK_PC;
 	rq->cmd_flags |= REQ_FAILFAST_DEV | REQ_FAILFAST_TRANSPORT |
 			 REQ_FAILFAST_DRIVER;
 	rq->retries = RDAC_RETRIES;
@@ -567,7 +568,7 @@ static int mode_select_handle_sense(struct scsi_device *sdev,
 			/*
 			 * Command Lock contention
 			 */
-			err = SCSI_DH_RETRY;
+			err = SCSI_DH_IMM_RETRY;
 		break;
 	default:
 		break;
@@ -617,6 +618,8 @@ retry:
 		err = mode_select_handle_sense(sdev, h->sense);
 		if (err == SCSI_DH_RETRY && retry_cnt--)
 			goto retry;
+		if (err == SCSI_DH_IMM_RETRY)
+			goto retry;
 	}
 	if (err == SCSI_DH_OK) {
 		h->state = RDAC_STATE_ACTIVE;
@@ -643,7 +646,7 @@ static int queue_mode_select(struct scsi_device *sdev,
 	struct rdac_queue_data *qdata;
 	struct rdac_controller *ctlr;
 
-	qdata = kzalloc(sizeof(*qdata), GFP_NOIO);
+	qdata = kzalloc(sizeof(*qdata), GFP_KERNEL);
 	if (!qdata)
 		return SCSI_DH_RETRY;
 
@@ -777,7 +780,10 @@ static int rdac_check_sense(struct scsi_device *sdev,
 	return SCSI_RETURN_NOT_HANDLED;
 }
 
-static const struct scsi_dh_devlist rdac_dev_list[] = {
+static const struct {
+	char *vendor;
+	char *model;
+} rdac_dev_list[] = {
 	{"IBM", "1722"},
 	{"IBM", "1724"},
 	{"IBM", "1726"},
@@ -802,6 +808,7 @@ static const struct scsi_dh_devlist rdac_dev_list[] = {
 	{"NETAPP", "INF-01-00"},
 	{"LSI", "INF-01-00"},
 	{"ENGENIO", "INF-01-00"},
+	{"LENOVO", "DE_Series"},
 	{NULL, NULL},
 };
 
@@ -829,33 +836,30 @@ static void rdac_bus_detach(struct scsi_device *sdev);
 static struct scsi_device_handler rdac_dh = {
 	.name = RDAC_NAME,
 	.module = THIS_MODULE,
-	.devlist = rdac_dev_list,
 	.prep_fn = rdac_prep_fn,
 	.check_sense = rdac_check_sense,
 	.attach = rdac_bus_attach,
 	.detach = rdac_bus_detach,
 	.activate = rdac_activate,
+	.match = rdac_match,
 };
 
 static int rdac_bus_attach(struct scsi_device *sdev)
 {
-	struct scsi_dh_data *scsi_dh_data;
 	struct rdac_dh_data *h;
 	unsigned long flags;
 	int err;
 	char array_name[ARRAY_LABEL_LEN];
 	char array_id[UNIQUE_ID_LEN];
 
-	scsi_dh_data = kzalloc(sizeof(*scsi_dh_data)
-			       + sizeof(*h) , GFP_KERNEL);
-	if (!scsi_dh_data) {
+	h = kzalloc(sizeof(*h) , GFP_KERNEL);
+	if (!h) {
 		sdev_printk(KERN_ERR, sdev, "%s: Attach failed\n",
 			    RDAC_NAME);
 		return -ENOMEM;
 	}
 
-	scsi_dh_data->scsi_dh = &rdac_dh;
-	h = (struct rdac_dh_data *) scsi_dh_data->buf;
+	h->dh_data.scsi_dh = &rdac_dh;
 	h->lun = UNINITIALIZED_LUN;
 	h->state = RDAC_STATE_ACTIVE;
 
@@ -875,11 +879,8 @@ static int rdac_bus_attach(struct scsi_device *sdev)
 	if (err != SCSI_DH_OK)
 		goto clean_ctlr;
 
-	if (!try_module_get(THIS_MODULE))
-		goto clean_ctlr;
-
 	spin_lock_irqsave(sdev->request_queue->queue_lock, flags);
-	sdev->scsi_dh_data = scsi_dh_data;
+	sdev->scsi_dh_data = &h->dh_data;
 	spin_unlock_irqrestore(sdev->request_queue->queue_lock, flags);
 
 	sdev_printk(KERN_NOTICE, sdev,
@@ -895,7 +896,7 @@ clean_ctlr:
 	spin_unlock(&list_lock);
 
 failed:
-	kfree(scsi_dh_data);
+	kfree(h);
 	sdev_printk(KERN_ERR, sdev, "%s: not attached\n",
 		    RDAC_NAME);
 	return -EINVAL;
@@ -903,12 +904,9 @@ failed:
 
 static void rdac_bus_detach( struct scsi_device *sdev )
 {
-	struct scsi_dh_data *scsi_dh_data;
-	struct rdac_dh_data *h;
+	struct rdac_dh_data *h = get_rdac_data(sdev);
 	unsigned long flags;
 
-	scsi_dh_data = sdev->scsi_dh_data;
-	h = (struct rdac_dh_data *) scsi_dh_data->buf;
 	if (h->ctlr && h->ctlr->ms_queued)
 		flush_workqueue(kmpath_rdacd);
 
@@ -920,26 +918,16 @@ static void rdac_bus_detach( struct scsi_device *sdev )
 	if (h->ctlr)
 		kref_put(&h->ctlr->kref, release_controller);
 	spin_unlock(&list_lock);
-	kfree(scsi_dh_data);
-	module_put(THIS_MODULE);
+	kfree(h);
 	sdev_printk(KERN_NOTICE, sdev, "%s: Detached\n", RDAC_NAME);
 }
-
-
 
 static int __init rdac_init(void)
 {
 	int r;
-	struct scsi_device_handler_aux *scsi_dh_aux = NULL;
 
-	scsi_dh_aux = kzalloc(sizeof(struct scsi_device_handler_aux), GFP_KERNEL);
-	if (!scsi_dh_aux)
-		return -ENOMEM;
-	scsi_dh_aux->match = rdac_match;
-
-	r = scsi_register_device_handler(&rdac_dh, scsi_dh_aux);
+	r = scsi_register_device_handler(&rdac_dh, NULL, 0);
 	if (r != 0) {
-		kfree(scsi_dh_aux);
 		printk(KERN_ERR "Failed to register scsi device handler.");
 		goto done;
 	}
@@ -949,10 +937,6 @@ static int __init rdac_init(void)
 	 */
 	kmpath_rdacd = create_singlethread_workqueue("kmpath_rdacd");
 	if (!kmpath_rdacd) {
-		/*
-		 * scsi_dh_aux will be kfree()'d by
-		 * scsi_unregister_device_handler()
-		 */
 		scsi_unregister_device_handler(&rdac_dh);
 		printk(KERN_ERR "kmpath_rdacd creation failed.\n");
 
@@ -973,4 +957,5 @@ module_exit(rdac_exit);
 
 MODULE_DESCRIPTION("Multipath LSI/Engenio/NetApp E-Series RDAC driver");
 MODULE_AUTHOR("Mike Christie, Chandra Seetharaman");
+MODULE_VERSION("01.00.0000.0000");
 MODULE_LICENSE("GPL");

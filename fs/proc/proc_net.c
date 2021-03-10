@@ -14,6 +14,7 @@
 #include <linux/time.h>
 #include <linux/proc_fs.h>
 #include <linux/stat.h>
+#include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/sched.h>
 #include <linux/module.h>
@@ -25,6 +26,10 @@
 
 #include "internal.h"
 
+static inline struct net *PDE_NET(struct proc_dir_entry *pde)
+{
+	return pde->parent->data;
+}
 
 static struct net *get_proc_net(const struct inode *inode)
 {
@@ -108,9 +113,11 @@ static struct net *get_proc_task_net(struct inode *dir)
 	rcu_read_lock();
 	task = pid_task(proc_pid(dir), PIDTYPE_PID);
 	if (task != NULL) {
-		ns = task_nsproxy(task);
+		task_lock(task);
+		ns = task->nsproxy;
 		if (ns != NULL)
 			net = get_net(ns->net_ns);
+		task_unlock(task);
 	}
 	rcu_read_unlock();
 
@@ -118,7 +125,7 @@ static struct net *get_proc_task_net(struct inode *dir)
 }
 
 static struct dentry *proc_tgid_net_lookup(struct inode *dir,
-		struct dentry *dentry, struct nameidata *nd)
+		struct dentry *dentry, unsigned int flags)
 {
 	struct dentry *de;
 	struct net *net;
@@ -162,7 +169,7 @@ static int proc_tgid_net_readdir(struct file *filp, void *dirent,
 	struct net *net;
 
 	ret = -EINVAL;
-	net = get_proc_task_net(filp->f_path.dentry->d_inode);
+	net = get_proc_task_net(file_inode(filp));
 	if (net != NULL) {
 		ret = proc_readdir_de(net->proc_net, filp, dirent, filldir);
 		put_net(net);
@@ -176,35 +183,22 @@ const struct file_operations proc_net_operations = {
 	.readdir	= proc_tgid_net_readdir,
 };
 
-
-struct proc_dir_entry *proc_net_fops_create(struct net *net,
-	const char *name, mode_t mode, const struct file_operations *fops)
-{
-	return proc_create(name, mode, net->proc_net, fops);
-}
-EXPORT_SYMBOL_GPL(proc_net_fops_create);
-
-void proc_net_remove(struct net *net, const char *name)
-{
-	remove_proc_entry(name, net->proc_net);
-}
-EXPORT_SYMBOL_GPL(proc_net_remove);
-
 static __net_init int proc_net_ns_init(struct net *net)
 {
 	struct proc_dir_entry *netd, *net_statd;
 	int err;
 
 	err = -ENOMEM;
-	netd = kzalloc(sizeof(*netd), GFP_KERNEL);
+	netd = kzalloc(sizeof(*netd) + 4, GFP_KERNEL);
 	if (!netd)
 		goto out;
 
+	netd->subdir = RB_ROOT;
 	netd->data = net;
 	netd->nlink = 2;
-	netd->name = "net";
 	netd->namelen = 3;
 	netd->parent = &proc_root;
+	memcpy(netd->name, "net", 4);
 
 	err = -EEXIST;
 	net_statd = proc_net_mkdir(net, "stat", netd);

@@ -8,7 +8,7 @@ Copyright (C) 2004,2005  ADDI-DATA GmbH for the source code of this module.
 	D-77833 Ottersweier
 	Tel: +19(0)7223/9493-0
 	Fax: +49(0)7223/9493-92
-	http://www.addi-data-com
+	http://www.addi-data.com
 	info@addi-data.com
 
 This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 2 of the License, or (at your option) any later version.
@@ -17,7 +17,7 @@ This program is distributed in the hope that it will be useful, but WITHOUT ANY 
 
 You should have received a copy of the GNU General Public License along with this program; if not, write to the Free Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
 
-You shoud also find the complete GPL in the COPYING file accompanying this source code.
+You should also find the complete GPL in the COPYING file accompanying this source code.
 
 @endverbatim
 */
@@ -52,13 +52,11 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
   +-----------------------------------------------------------------------+
 */
 
-/*
-+----------------------------------------------------------------------------+
-|                               Included files                               |
-+----------------------------------------------------------------------------+
-*/
+#define APCI1710_TTL_INIT		0
+#define APCI1710_TTL_INITDIRECTION	1
 
-#include "APCI1710_Ttl.h"
+#define APCI1710_TTL_READCHANNEL	0
+#define APCI1710_TTL_READPORT		1
 
 /*
 +----------------------------------------------------------------------------+
@@ -100,9 +98,12 @@ You shoud also find the complete GPL in the COPYING file accompanying this sourc
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI1710_InsnConfigInitTTLIO(struct comedi_device *dev, struct comedi_subdevice *s,
-	struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnConfigInitTTLIO(struct comedi_device *dev,
+					  struct comedi_subdevice *s,
+					  struct comedi_insn *insn,
+					  unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned char b_ModulNbr;
 	unsigned char b_InitType;
@@ -406,9 +407,12 @@ APCI1710_TTL_READCHANNEL
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI1710_InsnBitsReadTTLIO(struct comedi_device *dev, struct comedi_subdevice *s,
-	struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnBitsReadTTLIO(struct comedi_device *dev,
+					struct comedi_subdevice *s,
+					struct comedi_insn *insn,
+					unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int dw_StatusReg;
 	unsigned char b_ModulNbr;
@@ -655,9 +659,12 @@ int i_APCI1710_InsnBitsReadTTLIO(struct comedi_device *dev, struct comedi_subdev
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI1710_InsnReadTTLIOAllPortValue(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnReadTTLIOAllPortValue(struct comedi_device *dev,
+						struct comedi_subdevice *s,
+						struct comedi_insn *insn,
+						unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int dw_StatusReg;
 	unsigned char b_ModulNbr;
@@ -825,9 +832,12 @@ int i_APCI1710_InsnWriteSetTTLIOChlOnOff(struct comedi_device *dev,struct comedi
 +----------------------------------------------------------------------------+
 */
 
-int i_APCI1710_InsnWriteSetTTLIOChlOnOff(struct comedi_device *dev,
-	struct comedi_subdevice *s, struct comedi_insn *insn, unsigned int *data)
+static int i_APCI1710_InsnWriteSetTTLIOChlOnOff(struct comedi_device *dev,
+						struct comedi_subdevice *s,
+						struct comedi_insn *insn,
+						unsigned int *data)
 {
+	struct addi_private *devpriv = dev->private;
 	int i_ReturnValue = 0;
 	unsigned int dw_StatusReg = 0;
 	unsigned char b_ModulNbr;

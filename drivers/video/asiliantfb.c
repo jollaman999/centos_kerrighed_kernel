@@ -34,7 +34,6 @@
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/mm.h>
-#include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -140,7 +139,7 @@ static void asiliant_calc_dclk2(u32 *ppixclock, u8 *dclk2_m, u8 *dclk2_n, u8 *dc
 
 		/* 3 <= m <= 257 */
 		if (m >= 3 && m <= 257) {
-			unsigned new_error = ((Ftarget * n) - (Fref * m)) >= 0 ?
+			unsigned new_error = Ftarget * n >= Fref * m ?
 					       ((Ftarget * n) - (Fref * m)) : ((Fref * m) - (Ftarget * n));
 			if (new_error < best_error) {
 				best_n = n;
@@ -152,7 +151,7 @@ static void asiliant_calc_dclk2(u32 *ppixclock, u8 *dclk2_m, u8 *dclk2_n, u8 *dc
 		else if (m <= 1028) {
 			/* remember there are still only 8-bits of precision in m, so
 			 * avoid over-optimistic error calculations */
-			unsigned new_error = ((Ftarget * n) - (Fref * (m & ~3))) >= 0 ?
+			unsigned new_error = Ftarget * n >= Fref * (m & ~3) ?
 					       ((Ftarget * n) - (Fref * (m & ~3))) : ((Fref * (m & ~3)) - (Ftarget * n));
 			if (new_error < best_error) {
 				best_n = n;
@@ -452,7 +451,7 @@ static struct chips_init_reg chips_init_xr[] =
 	{0xd1, 0x01},
 };
 
-static void __devinit chips_hw_init(struct fb_info *p)
+static void chips_hw_init(struct fb_info *p)
 {
 	int i;
 
@@ -475,7 +474,7 @@ static void __devinit chips_hw_init(struct fb_info *p)
 		write_fr(chips_init_fr[i].addr, chips_init_fr[i].data);
 }
 
-static struct fb_fix_screeninfo asiliantfb_fix __devinitdata = {
+static struct fb_fix_screeninfo asiliantfb_fix = {
 	.id =		"Asiliant 69000",
 	.type =		FB_TYPE_PACKED_PIXELS,
 	.visual =	FB_VISUAL_PSEUDOCOLOR,
@@ -484,7 +483,7 @@ static struct fb_fix_screeninfo asiliantfb_fix __devinitdata = {
 	.smem_len =	0x200000,	/* 2MB */
 };
 
-static struct fb_var_screeninfo asiliantfb_var __devinitdata = {
+static struct fb_var_screeninfo asiliantfb_var = {
 	.xres 		= 640,
 	.yres 		= 480,
 	.xres_virtual 	= 640,
@@ -505,7 +504,7 @@ static struct fb_var_screeninfo asiliantfb_var __devinitdata = {
 	.vsync_len 	= 2,
 };
 
-static int __devinit init_asiliant(struct fb_info *p, unsigned long addr)
+static int init_asiliant(struct fb_info *p, unsigned long addr)
 {
 	int err;
 
@@ -536,8 +535,8 @@ static int __devinit init_asiliant(struct fb_info *p, unsigned long addr)
 	return 0;
 }
 
-static int __devinit
-asiliantfb_pci_init(struct pci_dev *dp, const struct pci_device_id *ent)
+static int asiliantfb_pci_init(struct pci_dev *dp,
+			       const struct pci_device_id *ent)
 {
 	unsigned long addr, size;
 	struct fb_info *p;
@@ -582,7 +581,7 @@ asiliantfb_pci_init(struct pci_dev *dp, const struct pci_device_id *ent)
 	return 0;
 }
 
-static void __devexit asiliantfb_remove(struct pci_dev *dp)
+static void asiliantfb_remove(struct pci_dev *dp)
 {
 	struct fb_info *p = pci_get_drvdata(dp);
 
@@ -594,7 +593,7 @@ static void __devexit asiliantfb_remove(struct pci_dev *dp)
 	framebuffer_release(p);
 }
 
-static struct pci_device_id asiliantfb_pci_tbl[] __devinitdata = {
+static struct pci_device_id asiliantfb_pci_tbl[] = {
 	{ PCI_VENDOR_ID_CT, PCI_DEVICE_ID_CT_69000, PCI_ANY_ID, PCI_ANY_ID },
 	{ 0 }
 };
@@ -605,7 +604,7 @@ static struct pci_driver asiliantfb_driver = {
 	.name =		"asiliantfb",
 	.id_table =	asiliantfb_pci_tbl,
 	.probe =	asiliantfb_pci_init,
-	.remove =	__devexit_p(asiliantfb_remove),
+	.remove =	asiliantfb_remove,
 };
 
 static int __init asiliantfb_init(void)

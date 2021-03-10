@@ -14,6 +14,7 @@ struct trace_seq {
 	unsigned char		buffer[PAGE_SIZE];
 	unsigned int		len;
 	unsigned int		readpos;
+	int			full;
 };
 
 static inline void
@@ -21,16 +22,44 @@ trace_seq_init(struct trace_seq *s)
 {
 	s->len = 0;
 	s->readpos = 0;
+	s->full = 0;
+}
+
+/**
+ * trace_seq_buffer_ptr - return pointer to next location in buffer
+ * @s: trace sequence descriptor
+ *
+ * Returns the pointer to the buffer where the next write to
+ * the buffer will happen. This is useful to save the location
+ * that is about to be written to and then return the result
+ * of that write.
+ */
+static inline unsigned char *
+trace_seq_buffer_ptr(struct trace_seq *s)
+{
+	return s->buffer + s->len;
+}
+
+/**
+ * trace_seq_has_overflowed - return true if the trace_seq took too much
+ * @s: trace sequence descriptor
+ *
+ * Returns true if too much data was added to the trace_seq and it is
+ * now full and will not take anymore.
+ */
+static inline bool trace_seq_has_overflowed(struct trace_seq *s)
+{
+	return s->full || s->len > PAGE_SIZE - 1;
 }
 
 /*
  * Currently only defined when tracing is enabled.
  */
 #ifdef CONFIG_TRACING
-extern int trace_seq_printf(struct trace_seq *s, const char *fmt, ...)
-	__attribute__ ((format (printf, 2, 3)));
-extern int trace_seq_vprintf(struct trace_seq *s, const char *fmt, va_list args)
-	__attribute__ ((format (printf, 2, 0)));
+extern __printf(2, 3)
+int trace_seq_printf(struct trace_seq *s, const char *fmt, ...);
+extern __printf(2, 0)
+int trace_seq_vprintf(struct trace_seq *s, const char *fmt, va_list args);
 extern int
 trace_seq_bprintf(struct trace_seq *s, const char *fmt, const u32 *binary);
 extern int trace_print_seq(struct seq_file *m, struct trace_seq *s);
@@ -42,7 +71,7 @@ extern int trace_seq_putmem(struct trace_seq *s, const void *mem, size_t len);
 extern int trace_seq_putmem_hex(struct trace_seq *s, const void *mem,
 				size_t len);
 extern void *trace_seq_reserve(struct trace_seq *s, size_t len);
-extern int trace_seq_path(struct trace_seq *s, struct path *path);
+extern int trace_seq_path(struct trace_seq *s, const struct path *path);
 
 #else /* CONFIG_TRACING */
 static inline int trace_seq_printf(struct trace_seq *s, const char *fmt, ...)
@@ -86,7 +115,7 @@ static inline void *trace_seq_reserve(struct trace_seq *s, size_t len)
 {
 	return NULL;
 }
-static inline int trace_seq_path(struct trace_seq *s, struct path *path)
+static inline int trace_seq_path(struct trace_seq *s, const struct path *path)
 {
 	return 0;
 }

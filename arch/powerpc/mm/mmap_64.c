@@ -47,7 +47,7 @@ static inline int mmap_is_legacy(void)
 	if (current->personality & ADDR_COMPAT_LAYOUT)
 		return 1;
 
-	if (current->signal->rlim[RLIMIT_STACK].rlim_cur == RLIM_INFINITY)
+	if (rlimit(RLIMIT_STACK) == RLIM_INFINITY)
 		return 1;
 
 	return sysctl_legacy_va_layout;
@@ -55,20 +55,21 @@ static inline int mmap_is_legacy(void)
 
 unsigned long arch_mmap_rnd(void)
 {
-	unsigned long rnd;
+	unsigned long shift, rnd;
 
-	/* 8MB for 32bit, 1GB for 64bit */
+	shift = mmap_rnd_bits;
+#ifdef CONFIG_COMPAT
 	if (is_32bit_task())
-		rnd = (unsigned long)get_random_int() % (1<<(23-PAGE_SHIFT));
-	else
-		rnd = (unsigned long)get_random_int() % (1<<(30-PAGE_SHIFT));
+		shift = mmap_rnd_compat_bits;
+#endif
+	rnd = get_random_long() % (1UL << shift);
 
 	return rnd << PAGE_SHIFT;
 }
 
 static inline unsigned long mmap_base(unsigned long rnd)
 {
-	unsigned long gap = current->signal->rlim[RLIMIT_STACK].rlim_cur;
+	unsigned long gap = rlimit(RLIMIT_STACK);
 
 	if (gap < MIN_GAP)
 		gap = MIN_GAP;

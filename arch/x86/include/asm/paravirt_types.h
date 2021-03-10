@@ -41,6 +41,8 @@
 
 #include <asm/desc_defs.h>
 #include <asm/kmap_types.h>
+#include <asm/pgtable_types.h>
+#include <linux/rh_kabi.h>
 
 struct page;
 struct thread_struct;
@@ -63,6 +65,11 @@ struct paravirt_callee_save {
 struct pv_info {
 	unsigned int kernel_rpl;
 	int shared_kernel_pmd;
+
+#ifdef CONFIG_X86_64
+	u16 extra_user_64bit_cs;  /* __USER_CS if none */
+#endif
+
 	int paravirt_enabled;
 	const char *name;
 };
@@ -85,11 +92,13 @@ struct pv_lazy_ops {
 	/* Set deferred update mode, used for batching operations. */
 	void (*enter)(void);
 	void (*leave)(void);
+	void (*flush)(void);
 };
 
 struct pv_time_ops {
 	unsigned long long (*sched_clock)(void);
 	unsigned long long (*steal_clock)(int cpu);
+	unsigned long (*get_tsc_khz)(void);
 };
 
 struct pv_cpu_ops {
@@ -115,12 +124,9 @@ struct pv_cpu_ops {
 	void (*load_tr_desc)(void);
 	void (*load_gdt)(const struct desc_ptr *);
 	void (*load_idt)(const struct desc_ptr *);
-	void (*store_gdt)(struct desc_ptr *);
+	/* store_gdt has been removed. */
 	void (*store_idt)(struct desc_ptr *);
 	void (*set_ldt)(const void *desc, unsigned entries);
-#ifdef CONFIG_X86_32
-	void (*load_user_cs_desc)(int cpu, struct mm_struct *mm);
-#endif
 	unsigned long (*store_tr)(void);
 	void (*load_tls)(struct thread_struct *t, unsigned int cpu);
 #ifdef CONFIG_X86_64
@@ -149,13 +155,16 @@ struct pv_cpu_ops {
 	/* MSR, PMC and TSR operations.
 	   err = 0/-EFAULT.  wrmsr returns 0/-EFAULT. */
 	u64 (*read_msr)(unsigned int msr, int *err);
-	int (*rdmsr_regs)(u32 *regs);
 	int (*write_msr)(unsigned int msr, unsigned low, unsigned high);
-	int (*wrmsr_regs)(u32 *regs);
+
+	/*
+	 * The member read_tsc() can't be deprecated because it is used
+	 * by get_cycles() indirectly.
+	 */
 
 	u64 (*read_tsc)(void);
 	u64 (*read_pmc)(int counter);
-	unsigned long long (*read_tscp)(unsigned int *aux);
+	RH_KABI_DEPRECATE_FN(unsigned long long, read_tscp, unsigned int *aux)
 
 	/*
 	 * Atomically enable interrupts and return to userspace.  This
@@ -246,7 +255,8 @@ struct pv_mmu_ops {
 	void (*flush_tlb_single)(unsigned long addr);
 	void (*flush_tlb_others)(const struct cpumask *cpus,
 				 struct mm_struct *mm,
-				 unsigned long va);
+				 unsigned long start,
+				 unsigned long end);
 
 	/* Hooks for allocating and freeing a pagetable top-level */
 	int  (*pgd_alloc)(struct mm_struct *mm);
@@ -258,7 +268,6 @@ struct pv_mmu_ops {
 	 */
 	void (*alloc_pte)(struct mm_struct *mm, unsigned long pfn);
 	void (*alloc_pmd)(struct mm_struct *mm, unsigned long pfn);
-	void (*alloc_pmd_clone)(unsigned long pfn, unsigned long clonepfn, unsigned long start, unsigned long count);
 	void (*alloc_pud)(struct mm_struct *mm, unsigned long pfn);
 	void (*release_pte)(unsigned long pfn);
 	void (*release_pmd)(unsigned long pfn);
@@ -273,12 +282,12 @@ struct pv_mmu_ops {
 			   pmd_t *pmdp, pmd_t pmdval);
 	void (*pte_update)(struct mm_struct *mm, unsigned long addr,
 			   pte_t *ptep);
-	void (*pte_update_defer)(struct mm_struct *mm,
-				 unsigned long addr, pte_t *ptep);
-	void (*pmd_update)(struct mm_struct *mm, unsigned long addr,
-			   pmd_t *pmdp);
-	void (*pmd_update_defer)(struct mm_struct *mm,
-				 unsigned long addr, pmd_t *pmdp);
+	RH_KABI_DEPRECATE_FN(void, pte_update_defer, struct mm_struct *mm,
+			   unsigned long addr, pte_t *ptep)
+	RH_KABI_DEPRECATE_FN(void, pmd_update, struct mm_struct *mm,
+			   unsigned long addr, pmd_t *pmdp)
+	RH_KABI_DEPRECATE_FN(void, pmd_update_defer, struct mm_struct *mm,
+			   unsigned long addr, pmd_t *pmdp)
 
 	pte_t (*ptep_modify_prot_start)(struct mm_struct *mm, unsigned long addr,
 					pte_t *ptep);
@@ -323,14 +332,25 @@ struct pv_mmu_ops {
 			   phys_addr_t phys, pgprot_t flags);
 };
 
-struct raw_spinlock;
+struct arch_spinlock;
+#ifdef CONFIG_SMP
+#include <asm/spinlock_types.h>
+#else
+typedef u16 __ticket_t;
+#endif
+
+struct qspinlock;
+
 struct pv_lock_ops {
-	int (*spin_is_locked)(struct raw_spinlock *lock);
-	int (*spin_is_contended)(struct raw_spinlock *lock);
-	void (*spin_lock)(struct raw_spinlock *lock);
-	void (*spin_lock_flags)(struct raw_spinlock *lock, unsigned long flags);
-	int (*spin_trylock)(struct raw_spinlock *lock);
-	void (*spin_unlock)(struct raw_spinlock *lock);
+	struct paravirt_callee_save lock_spinning;
+	void (*unlock_kick)(struct arch_spinlock *lock, __ticket_t ticket);
+#if defined(CONFIG_QUEUED_SPINLOCKS) && !defined(__GENKSYMS__)
+	struct paravirt_callee_save queued_spin_unlock;
+	void (*queued_spin_lock_slowpath)(struct qspinlock *lock, u32 val);
+
+	void (*wait)(u8 *ptr, u8 val);
+	void (*kick)(int cpu);
+#endif /* !CONFIG_QUEUED_SPINLOCKS || __GENKSYMS__ */
 };
 
 /* This contains all the paravirt structures: we get a convenient
@@ -481,8 +501,9 @@ int paravirt_disable_iospace(void);
  * makes sure the incoming and outgoing types are always correct.
  */
 #ifdef CONFIG_X86_32
-#define PVOP_VCALL_ARGS				\
-	unsigned long __eax = __eax, __edx = __edx, __ecx = __ecx
+#define PVOP_VCALL_ARGS							\
+	unsigned long __eax = __eax, __edx = __edx, __ecx = __ecx;	\
+	register void *__sp asm("esp")
 #define PVOP_CALL_ARGS			PVOP_VCALL_ARGS
 
 #define PVOP_CALL_ARG1(x)		"a" ((unsigned long)(x))
@@ -500,9 +521,10 @@ int paravirt_disable_iospace(void);
 #define VEXTRA_CLOBBERS
 #else  /* CONFIG_X86_64 */
 /* [re]ax isn't an arg, but the return val */
-#define PVOP_VCALL_ARGS					\
-	unsigned long __edi = __edi, __esi = __esi,	\
-		__edx = __edx, __ecx = __ecx, __eax = __eax
+#define PVOP_VCALL_ARGS						\
+	unsigned long __edi = __edi, __esi = __esi,		\
+		__edx = __edx, __ecx = __ecx, __eax = __eax;	\
+	register void *__sp asm("rsp")
 #define PVOP_CALL_ARGS		PVOP_VCALL_ARGS
 
 #define PVOP_CALL_ARG1(x)		"D" ((unsigned long)(x))
@@ -541,7 +563,7 @@ int paravirt_disable_iospace(void);
 			asm volatile(pre				\
 				     paravirt_alt(PARAVIRT_CALL)	\
 				     post				\
-				     : call_clbr			\
+				     : call_clbr, "+r" (__sp)		\
 				     : paravirt_type(op),		\
 				       paravirt_clobber(clbr),		\
 				       ##__VA_ARGS__			\
@@ -551,7 +573,7 @@ int paravirt_disable_iospace(void);
 			asm volatile(pre				\
 				     paravirt_alt(PARAVIRT_CALL)	\
 				     post				\
-				     : call_clbr			\
+				     : call_clbr, "+r" (__sp)		\
 				     : paravirt_type(op),		\
 				       paravirt_clobber(clbr),		\
 				       ##__VA_ARGS__			\
@@ -578,7 +600,7 @@ int paravirt_disable_iospace(void);
 		asm volatile(pre					\
 			     paravirt_alt(PARAVIRT_CALL)		\
 			     post					\
-			     : call_clbr				\
+			     : call_clbr, "+r" (__sp)			\
 			     : paravirt_type(op),			\
 			       paravirt_clobber(clbr),			\
 			       ##__VA_ARGS__				\
@@ -677,6 +699,7 @@ void paravirt_end_context_switch(struct task_struct *next);
 
 void paravirt_enter_lazy_mmu(void);
 void paravirt_leave_lazy_mmu(void);
+void paravirt_flush_lazy_mmu(void);
 
 void _paravirt_nop(void);
 u32 _paravirt_ident_32(u32);

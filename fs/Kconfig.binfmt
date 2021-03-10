@@ -30,7 +30,7 @@ config COMPAT_BINFMT_ELF
 config BINFMT_ELF_FDPIC
 	bool "Kernel support for FDPIC ELF binaries"
 	default y
-	depends on (FRV || BLACKFIN || (SUPERH32 && !MMU))
+	depends on (FRV || BLACKFIN || (SUPERH32 && !MMU) || C6X)
 	help
 	  ELF FDPIC binaries are based on ELF, but allow the individual load
 	  segments of a binary to be located in memory independently of each
@@ -42,7 +42,7 @@ config BINFMT_ELF_FDPIC
 
 config CORE_DUMP_DEFAULT_ELF_HEADERS
 	bool "Write ELF core dumps with partial segments"
-	default n
+	default y
 	depends on BINFMT_ELF && ELF_CORE
 	help
 	  ELF core dump files describe each memory mapping of the crashed
@@ -60,7 +60,21 @@ config CORE_DUMP_DEFAULT_ELF_HEADERS
 	  inherited.  See Documentation/filesystems/proc.txt for details.
 
 	  This config option changes the default setting of coredump_filter
-	  seen at boot time.  If unsure, say N.
+	  seen at boot time.  If unsure, say Y.
+
+config BINFMT_SCRIPT
+	tristate "Kernel support for scripts starting with #!"
+	default y
+	help
+	  Say Y here if you want to execute interpreted scripts starting with
+	  #! followed by the path to an interpreter.
+
+	  You can build this support as a module; however, until that module
+	  gets loaded, you cannot run scripts.  Thus, if you want to load this
+	  module from an initramfs, the portion of the initramfs before loading
+	  this module must consist of compiled binaries only.
+
+	  Most systems will not boot if you say M or N here.  If unsure, say Y.
 
 config BINFMT_FLAT
 	bool "Kernel support for flat binaries"
@@ -161,3 +175,11 @@ config BINFMT_MISC
 	  You may say M here for module support and later load the module when
 	  you have use for it; the module is called binfmt_misc. If you
 	  don't know what to answer at this point, say Y.
+
+config COREDUMP
+	bool "Enable core dump support" if EXPERT
+	default y
+	help
+	  This option enables support for performing core dumps. You almost
+	  certainly want to say Y here. Not necessary on systems that never
+	  need debugging or only ever run flawless code.

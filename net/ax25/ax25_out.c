@@ -19,6 +19,7 @@
 #include <linux/sockios.h>
 #include <linux/spinlock.h>
 #include <linux/net.h>
+#include <linux/slab.h>
 #include <net/ax25.h>
 #include <linux/inet.h>
 #include <linux/netdevice.h>
@@ -26,7 +27,6 @@
 #include <linux/netfilter.h>
 #include <net/sock.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <linux/fcntl.h>
 #include <linux/mm.h>
 #include <linux/interrupt.h>
@@ -91,6 +91,12 @@ ax25_cb *ax25_send_frame(struct sk_buff *skb, int paclen, ax25_address *src, ax2
 		break;
 #endif
 	}
+
+	/*
+	 * There is one ref for the state machine; a caller needs
+	 * one more to put it back, just like with the existing one.
+	 */
+	ax25_cb_hold(ax25);
 
 	ax25_cb_add(ax25);
 
@@ -344,7 +350,7 @@ void ax25_transmit_buffer(ax25_cb *ax25, struct sk_buff *skb, int type)
 		if (skb->sk != NULL)
 			skb_set_owner_w(skbn, skb->sk);
 
-		kfree_skb(skb);
+		consume_skb(skb);
 		skb = skbn;
 	}
 

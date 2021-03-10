@@ -21,14 +21,18 @@
 #include <linux/tsacct_kern.h>
 #include <linux/acct.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 
 /*
  * fill in basic accounting fields
  */
-void bacct_add_tsk(struct taskstats *stats, struct task_struct *tsk)
+void bacct_add_tsk(struct user_namespace *user_ns,
+		   struct pid_namespace *pid_ns,
+		   struct taskstats *stats, struct task_struct *tsk)
 {
 	const struct cred *tcred;
 	struct timespec uptime, ts;
+	cputime_t utime, stime, utimescaled, stimescaled;
 	u64 ac_etime;
 
 	BUILD_BUG_ON(TS_COMM_LEN < TASK_COMM_LEN);
@@ -54,18 +58,23 @@ void bacct_add_tsk(struct taskstats *stats, struct task_struct *tsk)
 		stats->ac_flag |= AXSIG;
 	stats->ac_nice	 = task_nice(tsk);
 	stats->ac_sched	 = tsk->policy;
-	stats->ac_pid	 = tsk->pid;
+	stats->ac_pid	 = task_pid_nr_ns(tsk, pid_ns);
 	rcu_read_lock();
 	tcred = __task_cred(tsk);
-	stats->ac_uid	 = tcred->uid;
-	stats->ac_gid	 = tcred->gid;
+	stats->ac_uid	 = from_kuid_munged(user_ns, tcred->uid);
+	stats->ac_gid	 = from_kgid_munged(user_ns, tcred->gid);
 	stats->ac_ppid	 = pid_alive(tsk) ?
-				rcu_dereference(tsk->real_parent)->tgid : 0;
+		task_tgid_nr_ns(rcu_dereference(tsk->real_parent), pid_ns) : 0;
 	rcu_read_unlock();
-	stats->ac_utime = cputime_to_usecs(tsk->utime);
-	stats->ac_stime = cputime_to_usecs(tsk->stime);
-	stats->ac_utimescaled = cputime_to_usecs(tsk->utimescaled);
-	stats->ac_stimescaled = cputime_to_usecs(tsk->stimescaled);
+
+	task_cputime(tsk, &utime, &stime);
+	stats->ac_utime = cputime_to_usecs(utime);
+	stats->ac_stime = cputime_to_usecs(stime);
+
+	task_cputime_scaled(tsk, &utimescaled, &stimescaled);
+	stats->ac_utimescaled = cputime_to_usecs(utimescaled);
+	stats->ac_stimescaled = cputime_to_usecs(stimescaled);
+
 	stats->ac_minflt = tsk->min_flt;
 	stats->ac_majflt = tsk->maj_flt;
 
@@ -77,6 +86,7 @@ void bacct_add_tsk(struct taskstats *stats, struct task_struct *tsk)
 
 #define KB 1024
 #define MB (1024*KB)
+#define KB_MASK (~(KB-1))
 /*
  * fill in extended accounting fields
  */
@@ -84,9 +94,11 @@ void xacct_add_tsk(struct taskstats *stats, struct task_struct *p)
 {
 	struct mm_struct *mm;
 
-	/* convert pages-usec to Mbyte-usec */
-	stats->coremem = p->acct_rss_mem1 * PAGE_SIZE / MB;
-	stats->virtmem = p->acct_vm_mem1 * PAGE_SIZE / MB;
+	/* convert pages-nsec/1024 to Mbyte-usec, see __acct_update_integrals */
+	stats->coremem = p->acct_rss_mem1 * PAGE_SIZE;
+	do_div(stats->coremem, 1000 * KB);
+	stats->virtmem = p->acct_vm_mem1 * PAGE_SIZE;
+	do_div(stats->virtmem, 1000 * KB);
 	mm = get_task_mm(p);
 	if (mm) {
 		/* adjust to KB unit */
@@ -94,14 +106,14 @@ void xacct_add_tsk(struct taskstats *stats, struct task_struct *p)
 		stats->hiwater_vm    = get_mm_hiwater_vm(mm)  * PAGE_SIZE / KB;
 		mmput(mm);
 	}
-	stats->read_char	= p->ioac.rchar;
-	stats->write_char	= p->ioac.wchar;
-	stats->read_syscalls	= p->ioac.syscr;
-	stats->write_syscalls	= p->ioac.syscw;
+	stats->read_char	= p->ioac.rchar & KB_MASK;
+	stats->write_char	= p->ioac.wchar & KB_MASK;
+	stats->read_syscalls	= p->ioac.syscr & KB_MASK;
+	stats->write_syscalls	= p->ioac.syscw & KB_MASK;
 #ifdef CONFIG_TASK_IO_ACCOUNTING
-	stats->read_bytes	= p->ioac.read_bytes;
-	stats->write_bytes	= p->ioac.write_bytes;
-	stats->cancelled_write_bytes = p->ioac.cancelled_write_bytes;
+	stats->read_bytes	= p->ioac.read_bytes & KB_MASK;
+	stats->write_bytes	= p->ioac.write_bytes & KB_MASK;
+	stats->cancelled_write_bytes = p->ioac.cancelled_write_bytes & KB_MASK;
 #else
 	stats->read_bytes	= 0;
 	stats->write_bytes	= 0;
@@ -111,33 +123,55 @@ void xacct_add_tsk(struct taskstats *stats, struct task_struct *p)
 #undef KB
 #undef MB
 
+static void __acct_update_integrals(struct task_struct *tsk,
+				    cputime_t utime, cputime_t stime)
+{
+	cputime_t time, dtime;
+	u64 delta;
+
+	if (!likely(tsk->mm))
+		return;
+
+	time = stime + utime;
+	dtime = time - tsk->acct_timexpd;
+	/* Avoid division: cputime_t is often in nanoseconds already. */
+	delta = cputime_to_nsecs(dtime);
+
+	if (delta < TICK_NSEC)
+		return;
+
+	tsk->acct_timexpd = time;
+	/*
+	 * Divide by 1024 to avoid overflow, and to avoid division.
+	 * The final unit reported to userspace is Mbyte-usecs,
+	 * the rest of the math is done in xacct_add_tsk.
+	 */
+	tsk->acct_rss_mem1 += delta * get_mm_rss(tsk->mm) >> 10;
+	tsk->acct_vm_mem1 += delta * tsk->mm->total_vm >> 10;
+}
+
 /**
  * acct_update_integrals - update mm integral fields in task_struct
  * @tsk: task_struct for accounting
  */
 void acct_update_integrals(struct task_struct *tsk)
 {
-	if (likely(tsk->mm)) {
-		cputime_t time, dtime;
-		struct timeval value;
-		unsigned long flags;
-		u64 delta;
+	cputime_t utime, stime;
+	unsigned long flags;
 
-		local_irq_save(flags);
-		time = tsk->stime + tsk->utime;
-		dtime = cputime_sub(time, tsk->acct_timexpd);
-		jiffies_to_timeval(cputime_to_jiffies(dtime), &value);
-		delta = value.tv_sec;
-		delta = delta * USEC_PER_SEC + value.tv_usec;
+	local_irq_save(flags);
+	task_cputime(tsk, &utime, &stime);
+	__acct_update_integrals(tsk, utime, stime);
+	local_irq_restore(flags);
+}
 
-		if (delta == 0)
-			goto out;
-		tsk->acct_timexpd = time;
-		tsk->acct_rss_mem1 += delta * get_mm_rss(tsk->mm);
-		tsk->acct_vm_mem1 += delta * tsk->mm->total_vm;
-	out:
-		local_irq_restore(flags);
-	}
+/**
+ * acct_account_cputime - update mm integral after cputime update
+ * @tsk: task_struct for accounting
+ */
+void acct_account_cputime(struct task_struct *tsk)
+{
+	__acct_update_integrals(tsk, tsk->utime, tsk->stime);
 }
 
 /**

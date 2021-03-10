@@ -31,12 +31,13 @@
 #include <linux/preempt.h>
 #include <linux/module.h>
 #include <linux/kdebug.h>
+#include <linux/slab.h>
+#include <asm/code-patching.h>
 #include <asm/cacheflush.h>
 #include <asm/sstep.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 
-#ifdef CONFIG_BOOKE
+#ifdef CONFIG_PPC_ADV_DEBUG_REGS
 #define MSR_SINGLESTEP	(MSR_DE)
 #else
 #define MSR_SINGLESTEP	(MSR_SE)
@@ -110,9 +111,12 @@ static void __kprobes prepare_singlestep(struct kprobe *p, struct pt_regs *regs)
 	 * like Decrementer or External Interrupt */
 	regs->msr &= ~MSR_EE;
 	regs->msr |= MSR_SINGLESTEP;
-#ifdef CONFIG_BOOKE
+#ifdef CONFIG_PPC_ADV_DEBUG_REGS
 	regs->msr &= ~MSR_CE;
 	mtspr(SPRN_DBCR0, mfspr(SPRN_DBCR0) | DBCR0_IC | DBCR0_IDM);
+#ifdef CONFIG_PPC_47x
+	isync();
+#endif
 #endif
 
 	/*
@@ -307,7 +311,7 @@ static int __kprobes trampoline_probe_handler(struct kprobe *p,
 {
 	struct kretprobe_instance *ri = NULL;
 	struct hlist_head *head, empty_rp;
-	struct hlist_node *node, *tmp;
+	struct hlist_node *tmp;
 	unsigned long flags, orig_ret_address = 0;
 	unsigned long trampoline_address =(unsigned long)&kretprobe_trampoline;
 
@@ -327,7 +331,7 @@ static int __kprobes trampoline_probe_handler(struct kprobe *p,
 	 *       real return address, and all the rest will point to
 	 *       kretprobe_trampoline
 	 */
-	hlist_for_each_entry_safe(ri, node, tmp, head, hlist) {
+	hlist_for_each_entry_safe(ri, tmp, head, hlist) {
 		if (ri->task != current)
 			/* another task is sharing our hash bucket */
 			continue;
@@ -354,7 +358,7 @@ static int __kprobes trampoline_probe_handler(struct kprobe *p,
 	kretprobe_hash_unlock(current, &flags);
 	preempt_enable_no_resched();
 
-	hlist_for_each_entry_safe(ri, node, tmp, &empty_rp, hlist) {
+	hlist_for_each_entry_safe(ri, tmp, &empty_rp, hlist) {
 		hlist_del(&ri->hlist);
 		kfree(ri);
 	}
@@ -374,17 +378,6 @@ static int __kprobes trampoline_probe_handler(struct kprobe *p,
  * single-stepped a copy of the instruction.  The address of this
  * copy is p->ainsn.insn.
  */
-static void __kprobes resume_execution(struct kprobe *p, struct pt_regs *regs)
-{
-	int ret;
-	unsigned int insn = *p->ainsn.insn;
-
-	regs->nip = (unsigned long)p->addr;
-	ret = emulate_step(regs, insn);
-	if (ret == 0)
-		regs->nip = (unsigned long)p->addr + 4;
-}
-
 static int __kprobes post_kprobe_handler(struct pt_regs *regs)
 {
 	struct kprobe *cur = kprobe_running();
@@ -402,7 +395,8 @@ static int __kprobes post_kprobe_handler(struct pt_regs *regs)
 		cur->post_handler(cur, regs, 0);
 	}
 
-	resume_execution(cur, regs);
+	/* Adjust nip to after the single-stepped instruction */
+	regs->nip = (unsigned long)cur->addr + 4;
 	regs->msr |= kcb->kprobe_saved_msr;
 
 	/*Restore back the original saved kprobes variables and continue. */
@@ -516,12 +510,10 @@ int __kprobes kprobe_exceptions_notify(struct notifier_block *self,
 	return ret;
 }
 
-#ifdef CONFIG_PPC64
 unsigned long arch_deref_entry_point(void *entry)
 {
-	return ((func_descr_t *)entry)->entry;
+	return ppc_global_function_entry(entry);
 }
-#endif
 
 int __kprobes setjmp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
@@ -532,7 +524,9 @@ int __kprobes setjmp_pre_handler(struct kprobe *p, struct pt_regs *regs)
 
 	/* setup return addr to the jprobe handler routine */
 	regs->nip = arch_deref_entry_point(jp->entry);
-#ifdef CONFIG_PPC64
+#ifdef PPC64_ELF_ABI_v2
+	regs->gpr[12] = (unsigned long)jp->entry;
+#elif defined(PPC64_ELF_ABI_v1)
 	regs->gpr[2] = (unsigned long)(((func_descr_t *)jp->entry)->toc);
 #endif
 

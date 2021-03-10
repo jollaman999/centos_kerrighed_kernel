@@ -91,7 +91,7 @@ config SND_USB_CAIAQ_INPUT
 
 config SND_USB_US122L
 	tristate "Tascam US-122L USB driver"
-	depends on X86
+	depends on X86 || COMPILE_TEST
 	select SND_HWDEP
 	select SND_RAWMIDI
 	help
@@ -159,6 +159,8 @@ config SND_BCD2000
 
 	  To compile this driver as a module, choose M here: the module
 	  will be called snd-bcd2000.
+
+source "sound/usb/line6/Kconfig"
 
 endif	# SND_USB
 

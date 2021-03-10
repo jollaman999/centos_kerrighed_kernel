@@ -35,6 +35,8 @@
  * SOFTWARE.
  *
  */
+#include <linux/gfp.h>
+
 #include "c2.h"
 #include "c2_vq.h"
 #include "c2_status.h"
@@ -255,16 +257,13 @@ int c2_arm_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags notify_flags)
 static void c2_free_cq_buf(struct c2_dev *c2dev, struct c2_mq *mq)
 {
 	dma_free_coherent(&c2dev->pcidev->dev, mq->q_size * mq->msg_size,
-			  mq->msg_pool.host, pci_unmap_addr(mq, mapping));
+			  mq->msg_pool.host, dma_unmap_addr(mq, mapping));
 }
 
-static int c2_alloc_cq_buf(struct c2_dev *c2dev, struct c2_mq *mq,
-			   size_t q_size, size_t msg_size)
+static int c2_alloc_cq_buf(struct c2_dev *c2dev, struct c2_mq *mq, int q_size,
+			   int msg_size)
 {
 	u8 *pool_start;
-
-	if (q_size > SIZE_MAX / msg_size)
-		return -EINVAL;
 
 	pool_start = dma_alloc_coherent(&c2dev->pcidev->dev, q_size * msg_size,
 					&mq->host_dma, GFP_KERNEL);
@@ -279,7 +278,7 @@ static int c2_alloc_cq_buf(struct c2_dev *c2dev, struct c2_mq *mq,
 		       NULL,	/* peer (currently unknown) */
 		       C2_MQ_HOST_TARGET);
 
-	pci_unmap_addr_set(mq, mapping, mq->host_dma);
+	dma_unmap_addr_set(mq, mapping, mq->host_dma);
 
 	return 0;
 }

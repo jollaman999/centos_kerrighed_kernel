@@ -15,12 +15,15 @@
 
 #include <crypto/internal/hash.h>
 #include <crypto/scatterwalk.h>
+#include <linux/bug.h>
 #include <linux/err.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/seq_file.h>
+#include <linux/cryptouser.h>
+#include <net/netlink.h>
 
 #include "internal.h"
 
@@ -44,11 +47,17 @@ static int hash_walk_next(struct crypto_hash_walk *walk)
 	unsigned int nbytes = min(walk->entrylen,
 				  ((unsigned int)(PAGE_SIZE)) - offset);
 
-	walk->data = crypto_kmap(walk->pg, 0);
+	if (walk->flags & CRYPTO_ALG_ASYNC)
+		walk->data = kmap(walk->pg);
+	else
+		walk->data = kmap_atomic(walk->pg);
 	walk->data += offset;
 
-	if (offset & alignmask)
-		nbytes = alignmask + 1 - (offset & alignmask);
+	if (offset & alignmask) {
+		unsigned int unaligned = alignmask + 1 - (offset & alignmask);
+		if (nbytes > unaligned)
+			nbytes = unaligned;
+	}
 
 	walk->entrylen -= nbytes;
 	return nbytes;
@@ -78,7 +87,6 @@ int crypto_hash_walk_done(struct crypto_hash_walk *walk, int err)
 	walk->data -= walk->offset;
 
 	if (nbytes && walk->offset & alignmask && !err) {
-		walk->offset += alignmask - 1;
 		walk->offset = ALIGN(walk->offset, alignmask + 1);
 		walk->data += walk->offset;
 
@@ -89,8 +97,16 @@ int crypto_hash_walk_done(struct crypto_hash_walk *walk, int err)
 		return nbytes;
 	}
 
-	crypto_kunmap(walk->data, 0);
-	crypto_yield(walk->flags);
+	if (walk->flags & CRYPTO_ALG_ASYNC)
+		kunmap(walk->pg);
+	else {
+		kunmap_atomic(walk->data);
+		/*
+		 * The may sleep test only makes sense for sync users.
+		 * Async users don't need to sleep here anyway.
+		 */
+		crypto_yield(walk->flags);
+	}
 
 	if (err)
 		return err;
@@ -115,16 +131,39 @@ int crypto_hash_walk_first(struct ahash_request *req,
 {
 	walk->total = req->nbytes;
 
-	if (!walk->total)
+	if (!walk->total) {
+		walk->entrylen = 0;
 		return 0;
+	}
 
 	walk->alignmask = crypto_ahash_alignmask(crypto_ahash_reqtfm(req));
 	walk->sg = req->src;
-	walk->flags = req->base.flags;
+	walk->flags = req->base.flags & CRYPTO_TFM_REQ_MASK;
 
 	return hash_walk_new_entry(walk);
 }
 EXPORT_SYMBOL_GPL(crypto_hash_walk_first);
+
+int crypto_ahash_walk_first(struct ahash_request *req,
+			    struct crypto_hash_walk *walk)
+{
+	walk->total = req->nbytes;
+
+	if (!walk->total) {
+		walk->entrylen = 0;
+		return 0;
+	}
+
+	walk->alignmask = crypto_ahash_alignmask(crypto_ahash_reqtfm(req));
+	walk->sg = req->src;
+	walk->flags = req->base.flags & CRYPTO_TFM_REQ_MASK;
+	walk->flags |= CRYPTO_ALG_ASYNC;
+
+	BUILD_BUG_ON(CRYPTO_TFM_REQ_MASK & CRYPTO_ALG_ASYNC);
+
+	return hash_walk_new_entry(walk);
+}
+EXPORT_SYMBOL_GPL(crypto_ahash_walk_first);
 
 int crypto_hash_walk_first_compat(struct hash_desc *hdesc,
 				  struct crypto_hash_walk *walk,
@@ -132,12 +171,14 @@ int crypto_hash_walk_first_compat(struct hash_desc *hdesc,
 {
 	walk->total = len;
 
-	if (!walk->total)
+	if (!walk->total) {
+		walk->entrylen = 0;
 		return 0;
+	}
 
 	walk->alignmask = crypto_hash_alignmask(hdesc->tfm);
 	walk->sg = sg;
-	walk->flags = hdesc->flags;
+	walk->flags = hdesc->flags & CRYPTO_TFM_REQ_MASK;
 
 	return hash_walk_new_entry(walk);
 }
@@ -365,6 +406,7 @@ static int crypto_ahash_init_tfm(struct crypto_tfm *tfm)
 	struct ahash_alg *alg = crypto_ahash_alg(hash);
 
 	hash->setkey = ahash_nosetkey;
+	hash->has_setkey = false;
 	hash->export = ahash_no_export;
 	hash->import = ahash_no_import;
 
@@ -377,8 +419,10 @@ static int crypto_ahash_init_tfm(struct crypto_tfm *tfm)
 	hash->finup = alg->finup ?: ahash_def_finup;
 	hash->digest = alg->digest;
 
-	if (alg->setkey)
+	if (alg->setkey) {
 		hash->setkey = alg->setkey;
+		hash->has_setkey = true;
+	}
 	if (alg->export)
 		hash->export = alg->export;
 	if (alg->import)
@@ -394,6 +438,31 @@ static unsigned int crypto_ahash_extsize(struct crypto_alg *alg)
 
 	return sizeof(struct crypto_shash *);
 }
+
+#ifdef CONFIG_NET
+static int crypto_ahash_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	struct crypto_report_hash rhash;
+
+	strncpy(rhash.type, "ahash", sizeof(rhash.type));
+
+	rhash.blocksize = alg->cra_blocksize;
+	rhash.digestsize = __crypto_hash_alg_common(alg)->digestsize;
+
+	if (nla_put(skb, CRYPTOCFGA_REPORT_HASH,
+		    sizeof(struct crypto_report_hash), &rhash))
+		goto nla_put_failure;
+	return 0;
+
+nla_put_failure:
+	return -EMSGSIZE;
+}
+#else
+static int crypto_ahash_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	return -ENOSYS;
+}
+#endif
 
 static void crypto_ahash_show(struct seq_file *m, struct crypto_alg *alg)
 	__attribute__ ((unused));
@@ -413,6 +482,7 @@ const struct crypto_type crypto_ahash_type = {
 #ifdef CONFIG_PROC_FS
 	.show = crypto_ahash_show,
 #endif
+	.report = crypto_ahash_report,
 	.maskclear = ~CRYPTO_ALG_TYPE_MASK,
 	.maskset = CRYPTO_ALG_TYPE_AHASH_MASK,
 	.type = CRYPTO_ALG_TYPE_AHASH,

@@ -25,6 +25,7 @@
 #include <linux/delay.h>
 #include <linux/scatterlist.h>
 #include <linux/bsg-lib.h>
+#include <linux/export.h>
 #include <scsi/scsi_cmnd.h>
 
 /**
@@ -105,24 +106,23 @@ static int bsg_map_buffer(struct bsg_buffer *buf, struct request *req)
  * bsg_create_job - create the bsg_job structure for the bsg request
  * @dev: device that is being sent the bsg request
  * @req: BSG request that needs a job structure
- * @lld_bsg_job_size: size of lld space
  */
-static int bsg_create_job(struct device *dev, struct request *req,
-			  int lld_bsg_job_size)
+static int bsg_create_job(struct device *dev, struct request *req)
 {
 	struct request *rsp = req->next_rq;
+	struct request_queue *q = req->q;
 	struct bsg_job *job;
 	int ret;
 
 	BUG_ON(req->special);
 
-	job = kzalloc(sizeof(struct bsg_job) + lld_bsg_job_size, GFP_KERNEL);
+	job = kzalloc(sizeof(struct bsg_job) + q->bsg_job_size, GFP_KERNEL);
 	if (!job)
 		return -ENOMEM;
 
 	req->special = job;
 	job->req = req;
-	if (lld_bsg_job_size)
+	if (q->bsg_job_size)
 		job->dd_data = (void *)&job[1];
 	job->request = req->cmd;
 	job->request_len = req->cmd_len;
@@ -151,33 +151,16 @@ failjob_rls_job:
 	return -ENOMEM;
 }
 
-/*
- * bsg_goose_queue - restart queue in case it was stopped
- * @q: request q to be restarted
- */
-void bsg_goose_queue(struct request_queue *q)
-{
-	if (!q)
-		return;
-
-	lockdep_assert_held(q->queue_lock);
-	blk_run_queue_async(q);
-}
-EXPORT_SYMBOL_GPL(bsg_goose_queue);
-
 /**
  * bsg_request_fn - generic handler for bsg requests
  * @q: request queue to manage
- * @bsg_job_fn: function to process job.
- * @lld_bsg_job_size: size of lld space
  *
  * On error the create_bsg_job function should return a -Exyz error value
  * that will be set to the req->errors.
  *
  * Drivers/subsys should pass this to the queue init function.
  */
-void bsg_request_fn(struct request_queue *q, bsg_job_fn *bsg_job_fn,
-		    int lld_bsg_job_size)
+void bsg_request_fn(struct request_queue *q)
 {
 	struct device *dev = q->queuedata;
 	struct request *req;
@@ -193,7 +176,7 @@ void bsg_request_fn(struct request_queue *q, bsg_job_fn *bsg_job_fn,
 			break;
 		spin_unlock_irq(q->queue_lock);
 
-		ret = bsg_create_job(dev, req, lld_bsg_job_size);
+		ret = bsg_create_job(dev, req);
 		if (ret) {
 			req->errors = ret;
 			blk_end_request_all(req, ret);
@@ -202,7 +185,7 @@ void bsg_request_fn(struct request_queue *q, bsg_job_fn *bsg_job_fn,
 		}
 
 		job = req->special;
-		ret = bsg_job_fn(job);
+		ret = q->bsg_job_fn(job);
 		spin_lock_irq(q->queue_lock);
 		if (ret)
 			break;
@@ -219,16 +202,22 @@ EXPORT_SYMBOL_GPL(bsg_request_fn);
  * @dev: device to attach bsg device to
  * @q: request queue setup by caller
  * @name: device to give bsg device
+ * @job_fn: bsg job handler
+ * @dd_job_size: size of LLD data needed for each job
  *
  * The caller should have setup the reuqest queue with bsg_request_fn
  * as the request_fn.
  */
-int bsg_setup_queue(struct device *dev, struct request_queue *q, char *name)
+int bsg_setup_queue(struct device *dev, struct request_queue *q,
+		    char *name, bsg_job_fn *job_fn, int dd_job_size)
 {
 	int ret;
 
 	q->queuedata = dev;
+	q->bsg_job_size = dd_job_size;
+	q->bsg_job_fn = job_fn;
 	queue_flag_set_unlocked(QUEUE_FLAG_BIDI, q);
+	queue_flag_set_unlocked(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
 	blk_queue_softirq_done(q, bsg_softirq_done);
 	blk_queue_rq_timeout(q, BLK_DEFAULT_SG_TIMEOUT);
 
@@ -242,56 +231,3 @@ int bsg_setup_queue(struct device *dev, struct request_queue *q, char *name)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(bsg_setup_queue);
-
-/**
- * bsg_remove_queue - Deletes the bsg dev from the q
- * @q:	the request_queue that is to be torn down.
- *
- * Notes:
- *   Before unregistering the queue empty any requests that are blocked
- */
-void bsg_remove_queue(struct request_queue *q)
-{
-	struct request *req; /* block request */
-	int counts; /* totals for request_list count and starved */
-
-	if (!q)
-		return;
-
-	/* Stop taking in new requests */
-	spin_lock_irq(q->queue_lock);
-	blk_stop_queue(q);
-
-	/* drain all requests in the queue */
-	while (1) {
-		/* need the lock to fetch a request
-		 * this may fetch the same reqeust as the previous pass
-		 */
-		req = blk_fetch_request(q);
-		/* save requests in use and starved */
-		counts = q->rq.count[0] + q->rq.count[1] +
-			 q->rq.starved[0] + q->rq.starved[1];
-		spin_unlock_irq(q->queue_lock);
-		/* any requests still outstanding? */
-		if (counts == 0)
-			break;
-
-		/* This may be the same req as the previous iteration,
-		 * always send the blk_end_request_all after a prefetch.
-		 * It is not okay to not end the request because the
-		 * prefetch started the request.
-		 */
-		if (req) {
-			/* return -ENXIO to indicate that this queue is
-			 * going away
-			 */
-			req->errors = -ENXIO;
-			blk_end_request_all(req, -ENXIO);
-		}
-
-		msleep(200); /* allow bsg to possibly finish */
-		spin_lock_irq(q->queue_lock);
-	}
-	bsg_unregister_queue(q);
-}
-EXPORT_SYMBOL_GPL(bsg_remove_queue);

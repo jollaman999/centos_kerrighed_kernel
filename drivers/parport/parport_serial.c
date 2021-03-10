@@ -20,6 +20,7 @@
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/init.h>
+#include <linux/slab.h>
 #include <linux/pci.h>
 #include <linux/interrupt.h>
 #include <linux/parport.h>
@@ -43,6 +44,27 @@ enum parport_pc_pci_cards {
 	siig_2p1s_20x,
 	siig_1s1p_20x,
 	siig_2s1p_20x,
+	timedia_4078a,
+	timedia_4079h,
+	timedia_4085h,
+	timedia_4088a,
+	timedia_4089a,
+	timedia_4095a,
+	timedia_4096a,
+	timedia_4078u,
+	timedia_4079a,
+	timedia_4085u,
+	timedia_4079r,
+	timedia_4079s,
+	timedia_4079d,
+	timedia_4079e,
+	timedia_4079f,
+	timedia_9079a,
+	timedia_9079b,
+	timedia_9079c,
+	wch_ch353_2s1p,
+	wch_ch382_2s1p,
+	sunix_2s1p,
 };
 
 /* each element directly indexed from enum list, above */
@@ -67,7 +89,8 @@ struct parport_pc_pci {
 				struct parport_pc_pci *card, int failed);
 };
 
-static int __devinit netmos_parallel_init(struct pci_dev *dev, struct parport_pc_pci *par, int autoirq, int autodma)
+static int netmos_parallel_init(struct pci_dev *dev, struct parport_pc_pci *par,
+				int autoirq, int autodma)
 {
 	/* the rule described below doesn't hold for this device */
 	if (dev->device == PCI_DEVICE_ID_NETMOS_9835 &&
@@ -91,7 +114,7 @@ static int __devinit netmos_parallel_init(struct pci_dev *dev, struct parport_pc
 	return 0;
 }
 
-static struct parport_pc_pci cards[] __devinitdata = {
+static struct parport_pc_pci cards[] = {
 	/* titan_110l */		{ 1, { { 3, -1 }, } },
 	/* titan_210l */		{ 1, { { 3, -1 }, } },
 	/* netmos_9xx5_combo */		{ 1, { { 2, -1 }, }, netmos_parallel_init },
@@ -108,7 +131,31 @@ static struct parport_pc_pci cards[] __devinitdata = {
 	/* siig_2p1s_20x */		{ 2, { { 1, 2 }, { 3, 4 }, } },
 	/* siig_1s1p_20x */		{ 1, { { 1, 2 }, } },
 	/* siig_2s1p_20x */		{ 1, { { 2, 3 }, } },
+	/* timedia_4078a */		{ 1, { { 2, -1 }, } },
+	/* timedia_4079h */             { 1, { { 2, 3 }, } },
+	/* timedia_4085h */             { 2, { { 2, -1 }, { 4, -1 }, } },
+	/* timedia_4088a */             { 2, { { 2, 3 }, { 4, 5 }, } },
+	/* timedia_4089a */             { 2, { { 2, 3 }, { 4, 5 }, } },
+	/* timedia_4095a */             { 2, { { 2, 3 }, { 4, 5 }, } },
+	/* timedia_4096a */             { 2, { { 2, 3 }, { 4, 5 }, } },
+	/* timedia_4078u */             { 1, { { 2, -1 }, } },
+	/* timedia_4079a */             { 1, { { 2, 3 }, } },
+	/* timedia_4085u */             { 2, { { 2, -1 }, { 4, -1 }, } },
+	/* timedia_4079r */             { 1, { { 2, 3 }, } },
+	/* timedia_4079s */             { 1, { { 2, 3 }, } },
+	/* timedia_4079d */             { 1, { { 2, 3 }, } },
+	/* timedia_4079e */             { 1, { { 2, 3 }, } },
+	/* timedia_4079f */             { 1, { { 2, 3 }, } },
+	/* timedia_9079a */             { 1, { { 2, 3 }, } },
+	/* timedia_9079b */             { 1, { { 2, 3 }, } },
+	/* timedia_9079c */             { 1, { { 2, 3 }, } },
+	/* wch_ch353_2s1p*/             { 1, { { 2, -1}, } },
+	/* wch_ch382_2s1p*/             { 1, { { 2, -1}, } },
+	/* sunix_2s1p */                { 1, { { 3, -1 }, } },
 };
+
+#define PCI_VENDOR_ID_SUNIX		0x1fd4
+#define PCI_DEVICE_ID_SUNIX_1999	0x1999
 
 static struct pci_device_id parport_serial_pci_tbl[] = {
 	/* PCI cards */
@@ -187,6 +234,37 @@ static struct pci_device_id parport_serial_pci_tbl[] = {
 	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, siig_2s1p_20x },
 	{ PCI_VENDOR_ID_SIIG, PCI_DEVICE_ID_SIIG_2S1P_20x_850,
 	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, siig_2s1p_20x },
+	/* PCI_VENDOR_ID_TIMEDIA/SUNIX has many differing cards ...*/
+	{ 0x1409, 0x7168, 0x1409, 0x4078, 0, 0, timedia_4078a },
+	{ 0x1409, 0x7168, 0x1409, 0x4079, 0, 0, timedia_4079h },
+	{ 0x1409, 0x7168, 0x1409, 0x4085, 0, 0, timedia_4085h },
+	{ 0x1409, 0x7168, 0x1409, 0x4088, 0, 0, timedia_4088a },
+	{ 0x1409, 0x7168, 0x1409, 0x4089, 0, 0, timedia_4089a },
+	{ 0x1409, 0x7168, 0x1409, 0x4095, 0, 0, timedia_4095a },
+	{ 0x1409, 0x7168, 0x1409, 0x4096, 0, 0, timedia_4096a },
+	{ 0x1409, 0x7168, 0x1409, 0x5078, 0, 0, timedia_4078u },
+	{ 0x1409, 0x7168, 0x1409, 0x5079, 0, 0, timedia_4079a },
+	{ 0x1409, 0x7168, 0x1409, 0x5085, 0, 0, timedia_4085u },
+	{ 0x1409, 0x7168, 0x1409, 0x6079, 0, 0, timedia_4079r },
+	{ 0x1409, 0x7168, 0x1409, 0x7079, 0, 0, timedia_4079s },
+	{ 0x1409, 0x7168, 0x1409, 0x8079, 0, 0, timedia_4079d },
+	{ 0x1409, 0x7168, 0x1409, 0x9079, 0, 0, timedia_4079e },
+	{ 0x1409, 0x7168, 0x1409, 0xa079, 0, 0, timedia_4079f },
+	{ 0x1409, 0x7168, 0x1409, 0xb079, 0, 0, timedia_9079a },
+	{ 0x1409, 0x7168, 0x1409, 0xc079, 0, 0, timedia_9079b },
+	{ 0x1409, 0x7168, 0x1409, 0xd079, 0, 0, timedia_9079c },
+
+	/* WCH CARDS */
+	{ 0x4348, 0x7053, 0x4348, 0x3253, 0, 0, wch_ch353_2s1p},
+	{ 0x1c00, 0x3250, 0x1c00, 0x3250, 0, 0, wch_ch382_2s1p},
+
+	/*
+	 * More SUNIX variations. At least one of these has part number
+	 * '5079A but subdevice 0x102. That board reports 0x0708 as
+	 * its PCI Class.
+	 */
+	{ PCI_VENDOR_ID_SUNIX, PCI_DEVICE_ID_SUNIX_1999, PCI_VENDOR_ID_SUNIX,
+	  0x0102, 0, 0, sunix_2s1p },
 
 	{ 0, } /* terminate list */
 };
@@ -199,7 +277,7 @@ MODULE_DEVICE_TABLE(pci,parport_serial_pci_tbl);
  * Cards not tested are marked n/t
  * If you have one of these cards and it works for you, please tell me..
  */
-static struct pciserial_board pci_parport_serial_boards[] __devinitdata = {
+static struct pciserial_board pci_parport_serial_boards[] = {
 	[titan_110l] = {
 		.flags		= FL_BASE1 | FL_BASE_BARS,
 		.num_ports	= 1,
@@ -296,6 +374,133 @@ static struct pciserial_board pci_parport_serial_boards[] __devinitdata = {
 		.base_baud	= 921600,
 		.uart_offset	= 8,
 	},
+	[timedia_4078a] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4079h] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4085h] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4088a] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4089a] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4095a] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4096a] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4078u] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4079a] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4085u] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4079r] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4079s] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4079d] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4079e] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_4079f] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_9079a] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_9079b] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[timedia_9079c] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 1,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
+	[wch_ch353_2s1p] = {
+		.flags          = FL_BASE0|FL_BASE_BARS,
+		.num_ports      = 2,
+		.base_baud      = 115200,
+		.uart_offset    = 8,
+	},
+	[wch_ch382_2s1p] = {
+		.flags          = FL_BASE0,
+		.num_ports      = 2,
+		.base_baud      = 115200,
+		.uart_offset    = 8,
+		.first_offset   = 0xC0,
+	},
+	[sunix_2s1p] = {
+		.flags		= FL_BASE0|FL_BASE_BARS,
+		.num_ports	= 2,
+		.base_baud	= 921600,
+		.uart_offset	= 8,
+	},
 };
 
 struct parport_serial_private {
@@ -306,8 +511,7 @@ struct parport_serial_private {
 };
 
 /* Register the serial port(s) of a PCI card. */
-static int __devinit serial_register (struct pci_dev *dev,
-				      const struct pci_device_id *id)
+static int serial_register(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct parport_serial_private *priv = pci_get_drvdata (dev);
 	struct pciserial_board *board;
@@ -328,8 +532,7 @@ static int __devinit serial_register (struct pci_dev *dev,
 }
 
 /* Register the parallel port(s) of a PCI card. */
-static int __devinit parport_register (struct pci_dev *dev,
-				       const struct pci_device_id *id)
+static int parport_register(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct parport_pc_pci *card;
 	struct parport_serial_private *priv = pci_get_drvdata (dev);
@@ -375,7 +578,6 @@ static int __devinit parport_register (struct pci_dev *dev,
 			dev_dbg(&dev->dev,
 		"PCI parallel port detected: I/O at %#lx(%#lx), IRQ %d\n",
 				io_lo, io_hi, irq);
-			irq = PARPORT_IRQ_NONE;
 		}
 		port = parport_pc_probe_port (io_lo, io_hi, irq,
 			      PARPORT_DMA_NONE, &dev->dev, IRQF_SHARED);
@@ -391,8 +593,8 @@ static int __devinit parport_register (struct pci_dev *dev,
 	return 0;
 }
 
-static int __devinit parport_serial_pci_probe (struct pci_dev *dev,
-					       const struct pci_device_id *id)
+static int parport_serial_pci_probe(struct pci_dev *dev,
+				    const struct pci_device_id *id)
 {
 	struct parport_serial_private *priv;
 	int err;
@@ -427,7 +629,7 @@ static int __devinit parport_serial_pci_probe (struct pci_dev *dev,
 	return 0;
 }
 
-static void __devexit parport_serial_pci_remove (struct pci_dev *dev)
+static void parport_serial_pci_remove(struct pci_dev *dev)
 {
 	struct parport_serial_private *priv = pci_get_drvdata (dev);
 	int i;
@@ -492,7 +694,7 @@ static struct pci_driver parport_serial_pci_driver = {
 	.name		= "parport_serial",
 	.id_table	= parport_serial_pci_tbl,
 	.probe		= parport_serial_pci_probe,
-	.remove		= __devexit_p(parport_serial_pci_remove),
+	.remove		= parport_serial_pci_remove,
 #ifdef CONFIG_PM
 	.suspend	= parport_serial_pci_suspend,
 	.resume		= parport_serial_pci_resume,

@@ -232,6 +232,9 @@ struct fc_rport_priv {
  * @RxWords:               Number of received words
  * @ErrorFrames:           Number of received error frames
  * @DumpedFrames:          Number of dumped frames
+ * @FcpPktAllocFails:      Number of fcp packet allocation failures
+ * @FcpPktAborts:          Number of fcp packet aborts
+ * @FcpFrameAllocFails:    Number of fcp frame allocation failures
  * @LinkFailureCount:      Number of link failures
  * @LossOfSignalCount:     Number for signal losses
  * @InvalidTxWordCount:    Number of invalid transmitted words
@@ -252,6 +255,9 @@ struct fc_stats {
 	u64		RxWords;
 	u64		ErrorFrames;
 	u64		DumpedFrames;
+	u64		FcpPktAllocFails;
+	u64		FcpPktAborts;
+	u64		FcpFrameAllocFails;
 	u64		LinkFailureCount;
 	u64		LossOfSignalCount;
 	u64		InvalidTxWordCount;
@@ -268,7 +274,7 @@ struct fc_stats {
 /**
  * struct fc_seq_els_data - ELS data used for passing ELS specific responses
  * @reason: The reason for rejection
- * @explan: The explaination of the rejection
+ * @explan: The explanation of the rejection
  *
  * Mainly used by the exchange manager layer.
  */
@@ -379,7 +385,6 @@ struct fc_seq {
 
 #define FC_EX_DONE		(1 << 0) /* ep is completed */
 #define FC_EX_RST_CLEANUP	(1 << 1) /* reset is forcing completion */
-#define FC_EX_QUARANTINE	(1 << 2) /* exch is quarantined */
 
 /**
  * struct fc_exch - Fibre Channel Exchange
@@ -415,35 +420,32 @@ struct fc_seq {
  *	sequence allocation
  */
 struct fc_exch {
-	struct fc_exch_mgr  *em;
-	struct fc_exch_pool *pool;
-	u32		    state;
-	u16		    xid;
-	struct list_head    ex_list;
 	spinlock_t	    ex_lock;
 	atomic_t	    ex_refcnt;
-	struct delayed_work timeout_work;
+	enum fc_class	    class;
+	struct fc_exch_mgr  *em;
+	struct fc_exch_pool *pool;
+	struct list_head    ex_list;
 	struct fc_lport	    *lp;
+	u32		    esb_stat;
+	u8		    state;
+	u8		    fh_type;
+	u8		    seq_id;
+	u8		    encaps;
+	u16		    xid;
 	u16		    oxid;
 	u16		    rxid;
 	u32		    oid;
 	u32		    sid;
 	u32		    did;
-	u32		    esb_stat;
 	u32		    r_a_tov;
-	u8		    seq_id;
-	u8		    encaps;
 	u32		    f_ctl;
-	u8		    fh_type;
-	enum fc_class	    class;
-	struct fc_seq	    seq;
-
+	struct fc_seq       seq;
 	void		    (*resp)(struct fc_seq *, struct fc_frame *, void *);
 	void		    *arg;
-
 	void		    (*destructor)(struct fc_seq *, void *);
-
-};
+	struct delayed_work timeout_work;
+} ____cacheline_aligned_in_smp;
 #define	fc_seq_exch(sp) container_of(sp, struct fc_exch, seq)
 
 
@@ -535,7 +537,7 @@ struct libfc_function_template {
 			struct fc_frame *);
 
 	/*
-	 * Send an ELS response using infomation from the received frame.
+	 * Send an ELS response using information from the received frame.
 	 *
 	 * STATUS: OPTIONAL
 	 */
@@ -673,7 +675,7 @@ struct libfc_function_template {
 	int (*rport_logoff)(struct fc_rport_priv *);
 
 	/*
-	 * Recieve a request from a remote port.
+	 * Receive a request from a remote port.
 	 *
 	 * STATUS: OPTIONAL
 	 */
@@ -714,7 +716,7 @@ struct libfc_function_template {
 					 void *));
 
 	/*
-	 * Cleanup the FCP layer, used durring link down and reset
+	 * Cleanup the FCP layer, used during link down and reset
 	 *
 	 * STATUS: OPTIONAL
 	 */
@@ -1089,8 +1091,7 @@ void fc_fcp_destroy(struct fc_lport *);
 /*
  * SCSI INTERACTION LAYER
  *****************************/
-int fc_queuecommand(struct scsi_cmnd *,
-		    void (*done)(struct scsi_cmnd *));
+int fc_queuecommand(struct Scsi_Host *, struct scsi_cmnd *);
 int fc_eh_abort(struct scsi_cmnd *);
 int fc_eh_device_reset(struct scsi_cmnd *);
 int fc_eh_host_reset(struct scsi_cmnd *);
@@ -1121,6 +1122,7 @@ void fc_fill_hdr(struct fc_frame *, const struct fc_frame *,
  * EXCHANGE MANAGER LAYER
  *****************************/
 int fc_exch_init(struct fc_lport *);
+void fc_exch_update_stats(struct fc_lport *lport);
 struct fc_exch_mgr_anchor *fc_exch_mgr_add(struct fc_lport *,
 					   struct fc_exch_mgr *,
 					   bool (*match)(struct fc_frame *));

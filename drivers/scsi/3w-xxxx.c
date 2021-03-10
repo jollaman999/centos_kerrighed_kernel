@@ -199,13 +199,13 @@
 
 #include <linux/module.h>
 #include <linux/reboot.h>
-#include <linux/smp_lock.h>
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
 #include <linux/moduleparam.h>
 #include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/delay.h>
+#include <linux/gfp.h>
 #include <linux/pci.h>
 #include <linux/time.h>
 #include <linux/mutex.h>
@@ -219,7 +219,8 @@
 #include "3w-xxxx.h"
 
 /* Globals */
-#define TW_DRIVER_VERSION "1.26.02.003RH"
+#define TW_DRIVER_VERSION "1.26.02.003"
+static DEFINE_MUTEX(tw_mutex);
 static TW_Device_Extension *tw_device_extension_list[TW_MAX_SLOT];
 static int tw_device_extension_count = 0;
 static int twe_major = -1;
@@ -880,7 +881,7 @@ static int tw_allocate_memory(TW_Device_Extension *tw_dev, int size, int which)
 } /* End tw_allocate_memory() */
 
 /* This function handles ioctl for the character device */
-static int tw_chrdev_ioctl(struct inode *inode, struct file *file, unsigned int cmd, unsigned long arg)
+static long tw_chrdev_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	int request_id;
 	dma_addr_t dma_handle;
@@ -888,6 +889,7 @@ static int tw_chrdev_ioctl(struct inode *inode, struct file *file, unsigned int 
 	unsigned long flags;
 	unsigned int data_buffer_length = 0;
 	unsigned long data_buffer_length_adjusted = 0;
+	struct inode *inode = file_inode(file);
 	unsigned long *cpu_addr;
 	long timeout;
 	TW_New_Ioctl *tw_ioctl;
@@ -898,9 +900,12 @@ static int tw_chrdev_ioctl(struct inode *inode, struct file *file, unsigned int 
 
 	dprintk(KERN_WARNING "3w-xxxx: tw_chrdev_ioctl()\n");
 
+	mutex_lock(&tw_mutex);
 	/* Only let one of these through at a time */
-	if (mutex_lock_interruptible(&tw_dev->ioctl_lock))
+	if (mutex_lock_interruptible(&tw_dev->ioctl_lock)) {
+		mutex_unlock(&tw_mutex);
 		return -EINTR;
+	}
 
 	/* First copy down the buffer length */
 	if (copy_from_user(&data_buffer_length, argp, sizeof(unsigned int)))
@@ -1029,6 +1034,7 @@ out2:
 	dma_free_coherent(&tw_dev->tw_pci_dev->dev, data_buffer_length_adjusted+sizeof(TW_New_Ioctl) - 1, cpu_addr, dma_handle);
 out:
 	mutex_unlock(&tw_dev->ioctl_lock);
+	mutex_unlock(&tw_mutex);
 	return retval;
 } /* End tw_chrdev_ioctl() */
 
@@ -1038,7 +1044,6 @@ static int tw_chrdev_open(struct inode *inode, struct file *file)
 {
 	unsigned int minor_number;
 
-	cycle_kernel_lock();
 	dprintk(KERN_WARNING "3w-xxxx: tw_ioctl_open()\n");
 
 	minor_number = iminor(inode);
@@ -1051,9 +1056,10 @@ static int tw_chrdev_open(struct inode *inode, struct file *file)
 /* File operations struct for character device */
 static const struct file_operations tw_fops = {
 	.owner		= THIS_MODULE,
-	.ioctl		= tw_chrdev_ioctl,
+	.unlocked_ioctl	= tw_chrdev_ioctl,
 	.open		= tw_chrdev_open,
-	.release	= NULL
+	.release	= NULL,
+	.llseek		= noop_llseek,
 };
 
 /* This function will free up device extension resources */
@@ -1941,7 +1947,7 @@ static int tw_scsiop_test_unit_ready_complete(TW_Device_Extension *tw_dev, int r
 } /* End tw_scsiop_test_unit_ready_complete() */
 
 /* This is the main scsi queue function to handle scsi opcodes */
-static int tw_scsi_queue(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd *)) 
+static int tw_scsi_queue_lck(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd *))
 {
 	unsigned char *command = SCpnt->cmnd;
 	int request_id = 0;
@@ -2016,6 +2022,8 @@ static int tw_scsi_queue(struct scsi_cmnd *SCpnt, void (*done)(struct scsi_cmnd 
 	}
 	return retval;
 } /* End tw_scsi_queue() */
+
+static DEF_SCSI_QCMD(tw_scsi_queue)
 
 /* This function is the interrupt service routine */
 static irqreturn_t tw_interrupt(int irq, void *dev_instance) 
@@ -2269,11 +2277,12 @@ static struct scsi_host_template driver_template = {
 	.cmd_per_lun		= TW_MAX_CMDS_PER_LUN,	
 	.use_clustering		= ENABLE_CLUSTERING,
 	.shost_attrs		= tw_host_attrs,
-	.emulated		= 1
+	.emulated		= 1,
+	.no_write_same		= 1,
 };
 
 /* This function will probe and initialize a card */
-static int __devinit tw_probe(struct pci_dev *pdev, const struct pci_device_id *dev_id)
+static int tw_probe(struct pci_dev *pdev, const struct pci_device_id *dev_id)
 {
 	struct Scsi_Host *host = NULL;
 	TW_Device_Extension *tw_dev;
@@ -2414,7 +2423,7 @@ static void tw_remove(struct pci_dev *pdev)
 } /* End tw_remove() */
 
 /* PCI Devices supported by this driver */
-static struct pci_device_id tw_pci_tbl[] __devinitdata = {
+static struct pci_device_id tw_pci_tbl[] = {
 	{ PCI_VENDOR_ID_3WARE, PCI_DEVICE_ID_3WARE_1000,
 	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0},
 	{ PCI_VENDOR_ID_3WARE, PCI_DEVICE_ID_3WARE_7000,

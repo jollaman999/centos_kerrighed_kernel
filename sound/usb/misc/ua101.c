@@ -42,7 +42,7 @@ MODULE_SUPPORTED_DEVICE("{{Edirol,UA-101},{Edirol,UA-1000}}");
 /*
  * This magic value optimizes memory usage efficiency for the UA-101's packet
  * sizes at all sample rates, taking into account the stupid cache pool sizes
- * that usb_buffer_alloc() uses.
+ * that usb_alloc_coherent() uses.
  */
 #define DEFAULT_QUEUE_LENGTH	21
 
@@ -52,7 +52,7 @@ MODULE_SUPPORTED_DEVICE("{{Edirol,UA-101},{Edirol,UA-1000}}");
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
-static int enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
+static bool enable[SNDRV_CARDS] = SNDRV_DEFAULT_ENABLE_PNP;
 static unsigned int queue_length = 21;
 
 module_param_array(index, int, NULL, 0444);
@@ -649,7 +649,7 @@ static int set_stream_hw(struct ua101 *ua, struct snd_pcm_substream *substream,
 	err = snd_pcm_hw_constraint_minmax(substream->runtime,
 					   SNDRV_PCM_HW_PARAM_PERIOD_TIME,
 					   1500000 / ua->packets_per_second,
-					   8192000);
+					   UINT_MAX);
 	if (err < 0)
 		return err;
 	err = snd_pcm_hw_constraint_msbits(substream->runtime, 0, 32, 24);
@@ -890,7 +890,7 @@ static snd_pcm_uframes_t playback_pcm_pointer(struct snd_pcm_substream *subs)
 	return ua101_pcm_pointer(ua, &ua->playback);
 }
 
-static struct snd_pcm_ops capture_pcm_ops = {
+static const struct snd_pcm_ops capture_pcm_ops = {
 	.open = capture_pcm_open,
 	.close = capture_pcm_close,
 	.ioctl = snd_pcm_lib_ioctl,
@@ -900,10 +900,9 @@ static struct snd_pcm_ops capture_pcm_ops = {
 	.trigger = capture_pcm_trigger,
 	.pointer = capture_pcm_pointer,
 	.page = snd_pcm_lib_get_vmalloc_page,
-	.mmap = snd_pcm_lib_mmap_vmalloc,
 };
 
-static struct snd_pcm_ops playback_pcm_ops = {
+static const struct snd_pcm_ops playback_pcm_ops = {
 	.open = playback_pcm_open,
 	.close = playback_pcm_close,
 	.ioctl = snd_pcm_lib_ioctl,
@@ -913,7 +912,6 @@ static struct snd_pcm_ops playback_pcm_ops = {
 	.trigger = playback_pcm_trigger,
 	.pointer = playback_pcm_pointer,
 	.page = snd_pcm_lib_get_vmalloc_page,
-	.mmap = snd_pcm_lib_mmap_vmalloc,
 };
 
 static const struct uac_format_type_i_discrete_descriptor *
@@ -1037,7 +1035,7 @@ static int detect_usb_format(struct ua101 *ua)
 		return -ENXIO;
 	}
 	ua->capture.usb_pipe = usb_rcvisocpipe(ua->dev, usb_endpoint_num(epd));
-	ua->capture.max_packet_bytes = le16_to_cpu(epd->wMaxPacketSize);
+	ua->capture.max_packet_bytes = usb_endpoint_maxp(epd);
 
 	epd = &ua->intf[INTF_PLAYBACK]->altsetting[1].endpoint[0].desc;
 	if (!usb_endpoint_is_isoc_out(epd)) {
@@ -1045,7 +1043,7 @@ static int detect_usb_format(struct ua101 *ua)
 		return -ENXIO;
 	}
 	ua->playback.usb_pipe = usb_sndisocpipe(ua->dev, usb_endpoint_num(epd));
-	ua->playback.max_packet_bytes = le16_to_cpu(epd->wMaxPacketSize);
+	ua->playback.max_packet_bytes = usb_endpoint_maxp(epd);
 	return 0;
 }
 
@@ -1061,7 +1059,7 @@ static int alloc_stream_buffers(struct ua101 *ua, struct ua101_stream *stream)
 				   (unsigned int)MAX_QUEUE_LENGTH);
 
 	/*
-	 * The cache pool sizes used by usb_buffer_alloc() (128, 512, 2048) are
+	 * The cache pool sizes used by usb_alloc_coherent() (128, 512, 2048) are
 	 * quite bad when used with the packet sizes of this device (e.g. 280,
 	 * 520, 624).  Therefore, we allocate and subdivide entire pages, using
 	 * a smaller buffer only for the last chunk.
@@ -1072,8 +1070,8 @@ static int alloc_stream_buffers(struct ua101 *ua, struct ua101_stream *stream)
 		packets = min(remaining_packets, packets_per_page);
 		size = packets * stream->max_packet_bytes;
 		stream->buffers[i].addr =
-			usb_buffer_alloc(ua->dev, size, GFP_KERNEL,
-					 &stream->buffers[i].dma);
+			usb_alloc_coherent(ua->dev, size, GFP_KERNEL,
+					   &stream->buffers[i].dma);
 		if (!stream->buffers[i].addr)
 			return -ENOMEM;
 		stream->buffers[i].size = size;
@@ -1093,10 +1091,10 @@ static void free_stream_buffers(struct ua101 *ua, struct ua101_stream *stream)
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(stream->buffers); ++i)
-		usb_buffer_free(ua->dev,
-				stream->buffers[i].size,
-				stream->buffers[i].addr,
-				stream->buffers[i].dma);
+		usb_free_coherent(ua->dev,
+				  stream->buffers[i].size,
+				  stream->buffers[i].addr,
+				  stream->buffers[i].dma);
 }
 
 static int alloc_stream_urbs(struct ua101 *ua, struct ua101_stream *stream,
@@ -1120,8 +1118,7 @@ static int alloc_stream_urbs(struct ua101 *ua, struct ua101_stream *stream,
 			usb_init_urb(&urb->urb);
 			urb->urb.dev = ua->dev;
 			urb->urb.pipe = stream->usb_pipe;
-			urb->urb.transfer_flags = URB_ISO_ASAP |
-					URB_NO_TRANSFER_DMA_MAP;
+			urb->urb.transfer_flags = URB_NO_TRANSFER_DMA_MAP;
 			urb->urb.transfer_buffer = addr;
 			urb->urb.transfer_dma = dma;
 			urb->urb.transfer_buffer_length = max_packet_size;
@@ -1183,7 +1180,7 @@ static void free_usb_related_resources(struct ua101 *ua,
 
 static void ua101_card_free(struct snd_card *card)
 {
-	struct ua101 __maybe_unused *ua = card->private_data;
+	struct ua101 *ua = card->private_data;
 
 	mutex_destroy(&ua->mutex);
 }
@@ -1367,7 +1364,7 @@ static void ua101_disconnect(struct usb_interface *interface)
 	mutex_unlock(&devices_mutex);
 }
 
-static struct usb_device_id ua101_ids[] = {
+static const struct usb_device_id ua101_ids[] = {
 	{ USB_DEVICE(0x0582, 0x0044) }, /* UA-1000 high speed */
 	{ USB_DEVICE(0x0582, 0x007d) }, /* UA-101 high speed */
 	{ USB_DEVICE(0x0582, 0x008d) }, /* UA-101 full speed */

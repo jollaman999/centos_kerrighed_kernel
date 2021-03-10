@@ -19,20 +19,20 @@
 #include <linux/cpu.h>
 #include <linux/delay.h>
 #include <linux/suspend.h>
+#include <linux/stat.h>
 #include <asm/firmware.h>
 #include <asm/hvcall.h>
 #include <asm/machdep.h>
 #include <asm/mmu.h>
 #include <asm/rtas.h>
 #include <asm/topology.h>
-
-#include "pseries.h"
+#include "../../kernel/cacheinfo.h"
 
 static u64 stream_id;
-static struct sys_device suspend_sysdev;
+static struct device suspend_dev;
 static DECLARE_COMPLETION(suspend_work);
 static struct rtas_suspend_me_data suspend_data;
-static int suspending;
+static atomic_t suspending;
 
 /**
  * pseries_suspend_begin - First phase of hibernation
@@ -72,11 +72,28 @@ static int pseries_suspend_begin(suspend_state_t state)
  * Makes the H_JOIN call to suspend the CPU
  *
  **/
-int pseries_suspend_cpu(void)
+static int pseries_suspend_cpu(void)
 {
-	if (suspending)
+	if (atomic_read(&suspending))
 		return rtas_suspend_cpu(&suspend_data);
 	return 0;
+}
+
+/**
+ * pseries_suspend_enable_irqs
+ *
+ * Post suspend configuration updates
+ *
+ **/
+static void pseries_suspend_enable_irqs(void)
+{
+	/*
+	 * Update configuration which can be modified based on device tree
+	 * changes during resume.
+	 */
+	cacheinfo_cpu_offline(smp_processor_id());
+	post_mobility_fixup();
+	cacheinfo_cpu_online(smp_processor_id());
 }
 
 /**
@@ -89,17 +106,8 @@ static int pseries_suspend_enter(suspend_state_t state)
 {
 	int rc = rtas_suspend_last_cpu(&suspend_data);
 
-	smp_wmb(); /* Ensure done is ordered wrt suspend_data.error */
-	suspending = 0;
-	suspend_data.done = 1;
-
-	/* Ensure suspending and suspend_data.done is seen on all CPUs,
-	 since they will be waking up shortly */
-	mb();
-
-	/* Possibly switch to a new RFI flush type */
-	pseries_setup_rfi_flush();
-
+	atomic_set(&suspending, 0);
+	atomic_set(&suspend_data.done, 1);
 	return rc;
 }
 
@@ -111,22 +119,19 @@ static int pseries_suspend_enter(suspend_state_t state)
  **/
 static int pseries_prepare_late(void)
 {
-	suspending = 1;
+	atomic_set(&suspending, 1);
 	atomic_set(&suspend_data.working, 0);
-	suspend_data.done = 0;
-	suspend_data.error = 0;
+	atomic_set(&suspend_data.done, 0);
+	atomic_set(&suspend_data.error, 0);
 	suspend_data.complete = &suspend_work;
 	INIT_COMPLETION(suspend_work);
-
-	/* Ensure suspending and suspend_data.done is seen on all CPUs */
-	mb();
 	return 0;
 }
 
 /**
  * store_hibernate - Initiate partition hibernation
- * @classdev:	sysdev class struct
- * @attr:		class device attribute struct
+ * @dev:		subsys root device
+ * @attr:		device attribute struct
  * @buf:		buffer
  * @count:		buffer size
  *
@@ -136,7 +141,8 @@ static int pseries_prepare_late(void)
  * Return value:
  * 	number of bytes printed to buffer / other on failure
  **/
-static ssize_t store_hibernate(struct sysdev_class *classdev,
+static ssize_t store_hibernate(struct device *dev,
+			       struct device_attribute *attr,
 			       const char *buf, size_t count)
 {
 	cpumask_var_t offline_mask;
@@ -186,13 +192,37 @@ out:
 	return rc;
 }
 
-static SYSDEV_CLASS_ATTR(hibernate, S_IWUSR, NULL, store_hibernate);
+#define USER_DT_UPDATE	0
+#define KERN_DT_UPDATE	1
 
-static struct sysdev_class suspend_sysdev_class = {
+/**
+ * show_hibernate - Report device tree update responsibilty
+ * @dev:		subsys root device
+ * @attr:		device attribute struct
+ * @buf:		buffer
+ *
+ * Report whether a device tree update is performed by the kernel after a
+ * resume, or if drmgr must coordinate the update from user space.
+ *
+ * Return value:
+ *	0 if drmgr is to initiate update, and 1 otherwise
+ **/
+static ssize_t show_hibernate(struct device *dev,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	return sprintf(buf, "%d\n", KERN_DT_UPDATE);
+}
+
+static DEVICE_ATTR(hibernate, S_IWUSR | S_IRUGO,
+		   show_hibernate, store_hibernate);
+
+static struct bus_type suspend_subsys = {
 	.name = "power",
+	.dev_name = "power",
 };
 
-static struct platform_suspend_ops pseries_suspend_ops = {
+static const struct platform_suspend_ops pseries_suspend_ops = {
 	.valid		= suspend_valid_only_mem,
 	.begin		= pseries_suspend_begin,
 	.prepare_late	= pseries_prepare_late,
@@ -205,23 +235,23 @@ static struct platform_suspend_ops pseries_suspend_ops = {
  * Return value:
  * 	0 on success / other on failure
  **/
-static int pseries_suspend_sysfs_register(struct sys_device *sysdev)
+static int pseries_suspend_sysfs_register(struct device *dev)
 {
 	int rc;
 
-	if ((rc = sysdev_class_register(&suspend_sysdev_class)))
+	if ((rc = subsys_system_register(&suspend_subsys, NULL)))
 		return rc;
 
-	sysdev->id = 0;
-	sysdev->cls = &suspend_sysdev_class;
+	dev->id = 0;
+	dev->bus = &suspend_subsys;
 
-	if ((rc = sysdev_class_create_file(&suspend_sysdev_class, &attr_hibernate)))
-		goto class_unregister;
+	if ((rc = device_create_file(suspend_subsys.dev_root, &dev_attr_hibernate)))
+		goto subsys_unregister;
 
 	return 0;
 
-class_unregister:
-	sysdev_class_unregister(&suspend_sysdev_class);
+subsys_unregister:
+	bus_unregister(&suspend_subsys);
 	return rc;
 }
 
@@ -242,9 +272,11 @@ static int __init pseries_suspend_init(void)
 	if (suspend_data.token == RTAS_UNKNOWN_SERVICE)
 		return 0;
 
-	if ((rc = pseries_suspend_sysfs_register(&suspend_sysdev)))
+	if ((rc = pseries_suspend_sysfs_register(&suspend_dev)))
 		return rc;
 
+	ppc_md.suspend_disable_cpu = pseries_suspend_cpu;
+	ppc_md.suspend_enable_irqs = pseries_suspend_enable_irqs;
 	suspend_set_ops(&pseries_suspend_ops);
 	return 0;
 }

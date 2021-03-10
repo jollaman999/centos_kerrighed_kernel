@@ -19,19 +19,19 @@
 #define dprintk(fmt, args...) do{}while(0)
 
 
-static int get_name(struct vfsmount *mnt, struct dentry *dentry, char *name,
-		struct dentry *child);
+static int get_name(const struct path *path, char *name, struct dentry *child);
 
 
 static int exportfs_get_name(struct vfsmount *mnt, struct dentry *dir,
 		char *name, struct dentry *child)
 {
 	const struct export_operations *nop = dir->d_sb->s_export_op;
+	struct path path = {.mnt = mnt, .dentry = dir};
 
 	if (nop->get_name)
 		return nop->get_name(dir, name, child);
 	else
-		return get_name(mnt, dir, name, child);
+		return get_name(&path, name, child);
 }
 
 /*
@@ -43,24 +43,26 @@ find_acceptable_alias(struct dentry *result,
 		void *context)
 {
 	struct dentry *dentry, *toput = NULL;
+	struct inode *inode;
 
 	if (acceptable(context, result))
 		return result;
 
-	spin_lock(&dcache_lock);
-	list_for_each_entry(dentry, &result->d_inode->i_dentry, d_alias) {
-		dget_locked(dentry);
-		spin_unlock(&dcache_lock);
+	inode = result->d_inode;
+	spin_lock(&inode->i_lock);
+	hlist_for_each_entry(dentry, &inode->i_dentry, d_alias) {
+		dget(dentry);
+		spin_unlock(&inode->i_lock);
 		if (toput)
 			dput(toput);
 		if (dentry != result && acceptable(context, dentry)) {
 			dput(result);
 			return dentry;
 		}
-		spin_lock(&dcache_lock);
+		spin_lock(&inode->i_lock);
 		toput = dentry;
 	}
-	spin_unlock(&dcache_lock);
+	spin_unlock(&inode->i_lock);
 
 	if (toput)
 		dput(toput);
@@ -74,20 +76,19 @@ static struct dentry *
 find_disconnected_root(struct dentry *dentry)
 {
 	dget(dentry);
-	spin_lock(&dentry->d_lock);
-	while (!IS_ROOT(dentry) &&
-	       (dentry->d_parent->d_flags & DCACHE_DISCONNECTED)) {
-		struct dentry *parent = dentry->d_parent;
-		dget(parent);
-		spin_unlock(&dentry->d_lock);
+	while (!IS_ROOT(dentry)) {
+		struct dentry *parent = dget_parent(dentry);
+
+		if (!(parent->d_flags & DCACHE_DISCONNECTED)) {
+			dput(parent);
+			break;
+		}
+
 		dput(dentry);
 		dentry = parent;
-		spin_lock(&dentry->d_lock);
 	}
-	spin_unlock(&dentry->d_lock);
 	return dentry;
 }
-
 
 /*
  * Make sure target_dir is fully connected to the dentry tree.
@@ -211,6 +212,7 @@ reconnect_path(struct vfsmount *mnt, struct dentry *target_dir, char *nbuf)
 }
 
 struct getdents_callback {
+	struct dir_context ctx;
 	char *name;		/* name that was found. It already points to a
 				   buffer NAME_MAX+1 is size */
 	unsigned long ino;	/* the inum we are looking for */
@@ -247,11 +249,10 @@ static int filldir_one(void * __buf, const char * name, int len,
  * calls readdir on the parent until it finds an entry with
  * the same inode number as the child, and returns that.
  */
-static int get_name(struct vfsmount *mnt, struct dentry *dentry,
-		char *name, struct dentry *child)
+static int get_name(const struct path *path, char *name, struct dentry *child)
 {
 	const struct cred *cred = current_cred();
-	struct inode *dir = dentry->d_inode;
+	struct inode *dir = path->dentry->d_inode;
 	int error;
 	struct file *file;
 	struct getdents_callback buffer;
@@ -265,23 +266,24 @@ static int get_name(struct vfsmount *mnt, struct dentry *dentry,
 	/*
 	 * Open the directory ...
 	 */
-	file = dentry_open(dget(dentry), mntget(mnt), O_RDONLY, cred);
+	file = dentry_open(path, O_RDONLY, cred);
 	error = PTR_ERR(file);
 	if (IS_ERR(file))
 		goto out;
 
 	error = -EINVAL;
-	if (!file->f_op->readdir)
+	if (!file->f_op->readdir && !file->f_op->iterate)
 		goto out_close;
 
 	buffer.name = name;
 	buffer.ino = child->d_inode->i_ino;
 	buffer.found = 0;
 	buffer.sequence = 0;
+	buffer.ctx.actor = filldir_one;
 	while (1) {
 		int old_seq = buffer.sequence;
 
-		error = vfs_readdir(file, filldir_one, &buffer);
+		error = iterate_dir(file, &buffer.ctx);
 		if (buffer.found) {
 			error = 0;
 			break;
@@ -303,37 +305,36 @@ out:
 
 /**
  * export_encode_fh - default export_operations->encode_fh function
- * @dentry:  the dentry to encode
+ * @inode:   the object to encode
  * @fh:      where to store the file handle fragment
  * @max_len: maximum length to store there
- * @connectable: whether to store parent information
+ * @parent:  parent directory inode, if wanted
  *
  * This default encode_fh function assumes that the 32 inode number
  * is suitable for locating an inode, and that the generation number
  * can be used to check that it is still valid.  It places them in the
  * filehandle fragment where export_decode_fh expects to find them.
  */
-static int export_encode_fh(struct dentry *dentry, struct fid *fid,
-		int *max_len, int connectable)
+static int export_encode_fh(struct inode *inode, struct fid *fid,
+		int *max_len, struct inode *parent)
 {
-	struct inode * inode = dentry->d_inode;
 	int len = *max_len;
 	int type = FILEID_INO32_GEN;
-	
-	if (len < 2 || (connectable && len < 4))
-		return 255;
+
+	if (parent && (len < 4)) {
+		*max_len = 4;
+		return FILEID_INVALID;
+	} else if (len < 2) {
+		*max_len = 2;
+		return FILEID_INVALID;
+	}
 
 	len = 2;
 	fid->i32.ino = inode->i_ino;
 	fid->i32.gen = inode->i_generation;
-	if (connectable && !S_ISDIR(inode->i_mode)) {
-		struct inode *parent;
-
-		spin_lock(&dentry->d_lock);
-		parent = dentry->d_parent->d_inode;
+	if (parent) {
 		fid->i32.parent_ino = parent->i_ino;
 		fid->i32.parent_gen = parent->i_generation;
-		spin_unlock(&dentry->d_lock);
 		len = 4;
 		type = FILEID_INO32_GEN_PARENT;
 	}
@@ -341,16 +342,36 @@ static int export_encode_fh(struct dentry *dentry, struct fid *fid,
 	return type;
 }
 
+int exportfs_encode_inode_fh(struct inode *inode, struct fid *fid,
+			     int *max_len, struct inode *parent)
+{
+	const struct export_operations *nop = inode->i_sb->s_export_op;
+
+	if (nop && nop->encode_fh)
+		return nop->encode_fh(inode, fid->raw, max_len, parent);
+
+	return export_encode_fh(inode, fid, max_len, parent);
+}
+EXPORT_SYMBOL_GPL(exportfs_encode_inode_fh);
+
 int exportfs_encode_fh(struct dentry *dentry, struct fid *fid, int *max_len,
 		int connectable)
 {
-	const struct export_operations *nop = dentry->d_sb->s_export_op;
 	int error;
+	struct dentry *p = NULL;
+	struct inode *inode = dentry->d_inode, *parent = NULL;
 
-	if (nop->encode_fh)
-		error = nop->encode_fh(dentry, fid->raw, max_len, connectable);
-	else
-		error = export_encode_fh(dentry, fid, max_len, connectable);
+	if (connectable && !S_ISDIR(inode->i_mode)) {
+		p = dget_parent(dentry);
+		/*
+		 * note that while p might've ceased to be our parent already,
+		 * it's still pinned by and still positive.
+		 */
+		parent = p->d_inode;
+	}
+
+	error = exportfs_encode_inode_fh(inode, fid, max_len, parent);
+	dput(p);
 
 	return error;
 }
@@ -368,10 +389,21 @@ struct dentry *exportfs_decode_fh(struct vfsmount *mnt, struct fid *fid,
 	/*
 	 * Try to get any dentry for the given file handle from the filesystem.
 	 */
+	if (!nop || !nop->fh_to_dentry)
+		return ERR_PTR(-ESTALE);
 	result = nop->fh_to_dentry(mnt->mnt_sb, fid, fh_len, fileid_type);
 	if (!result)
 		result = ERR_PTR(-ESTALE);
 	if (IS_ERR(result))
+		return result;
+
+	/*
+	 * If no acceptance criteria was specified by caller, a disconnected
+	 * dentry is also accepatable. Callers may use this mode to query if
+	 * file handle is stale or to get a reference to an inode without
+	 * risking the high overhead caused by directory reconnect.
+	 */
+	if (!acceptable)
 		return result;
 
 	if (S_ISDIR(result->d_inode->i_mode)) {

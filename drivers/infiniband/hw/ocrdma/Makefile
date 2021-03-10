@@ -1,4 +1,4 @@
-ccflags-y := -Idrivers/net/benet
+ccflags-y := -Idrivers/net/ethernet/emulex/benet
 
 obj-$(CONFIG_INFINIBAND_OCRDMA)	+= ocrdma.o
 

@@ -32,16 +32,10 @@ static inline struct rcu_string *rcu_string_strdup(const char *src, gfp_t mask)
 	return ret;
 }
 
-static inline void rcu_string_kfree_callback(struct rcu_head *p)
-{
-	struct rcu_string *str = container_of(p, struct rcu_string, rcu);
-	kfree(str);
-}
-
 static inline void rcu_string_free(struct rcu_string *str)
 {
 	if (str)
-		call_rcu(&str->rcu, rcu_string_kfree_callback);
+		kfree_rcu(str, rcu);
 }
 
 #define printk_in_rcu(fmt, ...) do {	\

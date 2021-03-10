@@ -14,6 +14,7 @@
 #include <linux/fscache-cache.h>
 #include <linux/buffer_head.h>
 #include <linux/pagevec.h>
+#include <linux/slab.h>
 #include "internal.h"
 
 /*
@@ -179,16 +180,16 @@ static void fscache_attr_changed_op(struct fscache_operation *op)
 	fscache_stat(&fscache_n_attr_changed_calls);
 
 	if (fscache_object_is_active(object)) {
-		fscache_set_op_state(op, "CallFS");
 		fscache_stat(&fscache_n_cop_attr_changed);
 		ret = object->cache->ops->attr_changed(object);
 		fscache_stat_d(&fscache_n_cop_attr_changed);
-		fscache_set_op_state(op, "Done");
 		if (ret < 0)
 			fscache_abort_object(object);
+		fscache_op_complete(op, ret < 0);
+	} else {
+		fscache_op_complete(op, true);
 	}
 
-	fscache_op_complete(op, true);
 	_leave("");
 }
 
@@ -215,11 +216,9 @@ int __fscache_attr_changed(struct fscache_cookie *cookie)
 	}
 
 	fscache_operation_init(op, fscache_attr_changed_op, NULL, NULL);
-	fscache_operation_init_slow(op);
-	op->flags = FSCACHE_OP_SLOW |
+	op->flags = FSCACHE_OP_ASYNC |
 		(1 << FSCACHE_OP_EXCLUSIVE) |
 		(1 << FSCACHE_OP_UNUSE_COOKIE);
-	fscache_set_op_name(op, "Attr");
 
 	spin_lock(&cookie->lock);
 
@@ -250,24 +249,6 @@ nobufs:
 	return -ENOBUFS;
 }
 EXPORT_SYMBOL(__fscache_attr_changed);
-
-/*
- * handle secondary execution given to a retrieval op on behalf of the
- * cache
- */
-static void fscache_retrieval_work(struct work_struct *work)
-{
-	struct fscache_retrieval *op =
-		container_of(work, struct fscache_retrieval, op.fast_work);
-	unsigned long start;
-
-	_enter("{OP%x}", op->op.debug_id);
-
-	start = jiffies;
-	op->op.processor(&op->op);
-	fscache_hist(fscache_ops_histogram, start);
-	fscache_put_operation(&op->op);
-}
 
 /*
  * Handle cancellation of a pending retrieval op
@@ -329,9 +310,7 @@ static struct fscache_retrieval *fscache_alloc_retrieval(
 	op->end_io_func	= end_io_func;
 	op->context	= context;
 	op->start_time	= jiffies;
-	INIT_WORK(&op->op.fast_work, fscache_retrieval_work);
 	INIT_LIST_HEAD(&op->to_do);
-	fscache_set_op_name(&op->op, "Retr");
 
 	/* Pin the netfs read context in case we need to do the actual netfs
 	 * read because we've encountered a cache read failure.
@@ -359,7 +338,6 @@ int fscache_wait_for_deferred_lookup(struct fscache_cookie *cookie)
 
 	jif = jiffies;
 	if (wait_on_bit(&cookie->flags, FSCACHE_COOKIE_LOOKING_UP,
-			fscache_wait_bit_interruptible,
 			TASK_INTERRUPTIBLE) != 0) {
 		fscache_stat(&fscache_n_retrievals_intr);
 		_leave(" = -ERESTARTSYS");
@@ -391,7 +369,6 @@ int fscache_wait_for_operation_activation(struct fscache_object *object,
 	if (stat_op_waits)
 		fscache_stat(stat_op_waits);
 	if (wait_on_bit(&op->flags, FSCACHE_OP_WAITING,
-			fscache_wait_bit_interruptible,
 			TASK_INTERRUPTIBLE) != 0) {
 		ret = fscache_cancel_op(op, false);
 		if (ret == 0)
@@ -400,7 +377,7 @@ int fscache_wait_for_operation_activation(struct fscache_object *object,
 		/* it's been removed from the pending queue by another party,
 		 * so we should get to run shortly */
 		wait_on_bit(&op->flags, FSCACHE_OP_WAITING,
-			    fscache_wait_bit, TASK_UNINTERRUPTIBLE);
+			    TASK_UNINTERRUPTIBLE);
 	}
 	_debug("<<< GO");
 
@@ -451,7 +428,7 @@ int __fscache_read_or_alloc_page(struct fscache_cookie *cookie,
 		goto nobufs;
 
 	if (test_bit(FSCACHE_COOKIE_INVALIDATING, &cookie->flags)) {
-		kleave(" = -ENOBUFS [invalidating]");
+		_leave(" = -ENOBUFS [invalidating]");
 		return -ENOBUFS;
 	}
 
@@ -467,7 +444,6 @@ int __fscache_read_or_alloc_page(struct fscache_cookie *cookie,
 		_leave(" = -ENOMEM");
 		return -ENOMEM;
 	}
-	fscache_set_op_name(&op->op, "RetrRA1");
 	atomic_set(&op->n_pages, 1);
 
 	spin_lock(&cookie->lock);
@@ -582,7 +558,7 @@ int __fscache_read_or_alloc_pages(struct fscache_cookie *cookie,
 		goto nobufs;
 
 	if (test_bit(FSCACHE_COOKIE_INVALIDATING, &cookie->flags)) {
-		kleave(" = -ENOBUFS [invalidating]");
+		_leave(" = -ENOBUFS [invalidating]");
 		return -ENOBUFS;
 	}
 
@@ -596,7 +572,6 @@ int __fscache_read_or_alloc_pages(struct fscache_cookie *cookie,
 	op = fscache_alloc_retrieval(cookie, mapping, end_io_func, context);
 	if (!op)
 		return -ENOMEM;
-	fscache_set_op_name(&op->op, "RetrRAN");
 	atomic_set(&op->n_pages, *nr_pages);
 
 	spin_lock(&cookie->lock);
@@ -614,7 +589,6 @@ int __fscache_read_or_alloc_pages(struct fscache_cookie *cookie,
 	if (fscache_submit_op(object, &op->op) < 0)
 		goto nobufs_unlock_dec;
 	spin_unlock(&cookie->lock);
-	ASSERTCMP(object->cookie, ==, cookie);
 
 	fscache_stat(&fscache_n_retrieval_ops);
 
@@ -628,26 +602,6 @@ int __fscache_read_or_alloc_pages(struct fscache_cookie *cookie,
 		goto error;
 
 	/* ask the cache to honour the operation */
-	if (!object->cookie) {
-		static const char prefix[] = "fs-";
-		printk(KERN_ERR "%sobject: OBJ%x\n",
-		       prefix, object->debug_id);
-		printk(KERN_ERR "%sobjstate=%s fl=%lx wbusy=%lx ev=%lx[%lx]\n",
-		       prefix, object->state->name,
-		       object->flags, object->work.flags,
-		       object->events,
-		       object->event_mask & FSCACHE_OBJECT_EVENTS_MASK);
-		printk(KERN_ERR "%sops=%u inp=%u exc=%u\n",
-		       prefix, object->n_ops, object->n_in_progress,
-		       object->n_exclusive);
-		printk(KERN_ERR "%sparent=%p\n",
-		       prefix, object->parent);
-		printk(KERN_ERR "%scookie=%p [pr=%p nd=%p fl=%lx]\n",
-		       prefix, object->cookie,
-		       cookie->parent, cookie->netfs_data, cookie->flags);
-	}
-	ASSERTCMP(object->cookie, ==, cookie);
-
 	if (test_bit(FSCACHE_COOKIE_NO_DATA_YET, &object->cookie->flags)) {
 		fscache_stat(&fscache_n_cop_allocate_pages);
 		ret = object->cache->ops->allocate_pages(
@@ -719,7 +673,7 @@ int __fscache_alloc_page(struct fscache_cookie *cookie,
 	ASSERTCMP(page, !=, NULL);
 
 	if (test_bit(FSCACHE_COOKIE_INVALIDATING, &cookie->flags)) {
-		kleave(" = -ENOBUFS [invalidating]");
+		_leave(" = -ENOBUFS [invalidating]");
 		return -ENOBUFS;
 	}
 
@@ -729,7 +683,6 @@ int __fscache_alloc_page(struct fscache_cookie *cookie,
 	op = fscache_alloc_retrieval(cookie, page->mapping, NULL, NULL);
 	if (!op)
 		return -ENOMEM;
-	fscache_set_op_name(&op->op, "RetrAL1");
 	atomic_set(&op->n_pages, 1);
 
 	spin_lock(&cookie->lock);
@@ -825,17 +778,16 @@ static void fscache_write_op(struct fscache_operation *_op)
 
 	_enter("{OP%x,%d}", op->op.debug_id, atomic_read(&op->op.usage));
 
-	fscache_set_op_state(&op->op, "GetPage");
-
 	spin_lock(&object->lock);
 	cookie = object->cookie;
 
 	if (!fscache_object_is_active(object)) {
-		/* If we get here, then the on-disk cache object likely longer
-		 * exists, so we should just cancel this write operation.
+		/* If we get here, then the on-disk cache object likely no
+		 * longer exists, so we should just cancel this write
+		 * operation.
 		 */
 		spin_unlock(&object->lock);
-		fscache_op_complete(&op->op, false);
+		fscache_op_complete(&op->op, true);
 		_leave(" [inactive]");
 		return;
 	}
@@ -848,7 +800,7 @@ static void fscache_write_op(struct fscache_operation *_op)
 		 * cancel this write operation.
 		 */
 		spin_unlock(&object->lock);
-		fscache_op_complete(&op->op, false);
+		fscache_op_complete(&op->op, true);
 		_leave(" [cancel] op{f=%lx s=%u} obj{s=%s f=%lx}",
 		       _op->flags, _op->state, object->state->short_name,
 		       object->flags);
@@ -880,15 +832,12 @@ static void fscache_write_op(struct fscache_operation *_op)
 	spin_unlock(&cookie->stores_lock);
 	spin_unlock(&object->lock);
 
-	fscache_set_op_state(&op->op, "Store");
 	fscache_stat(&fscache_n_store_pages);
 	fscache_stat(&fscache_n_cop_write_page);
 	ret = object->cache->ops->write_page(op, page);
 	fscache_stat_d(&fscache_n_cop_write_page);
-	fscache_set_op_state(&op->op, "EndWrite");
 	fscache_end_page_write(object, page);
 	if (ret < 0) {
-		fscache_set_op_state(&op->op, "Abort");
 		fscache_abort_object(object);
 		fscache_op_complete(&op->op, true);
 	} else {
@@ -905,7 +854,7 @@ superseded:
 	spin_unlock(&cookie->stores_lock);
 	clear_bit(FSCACHE_OBJECT_PENDING_WRITE, &object->flags);
 	spin_unlock(&object->lock);
-	fscache_op_complete(&op->op, true);
+	fscache_op_complete(&op->op, false);
 	_leave("");
 }
 
@@ -940,8 +889,6 @@ void fscache_invalidate_writes(struct fscache_cookie *cookie)
 		for (i = n - 1; i >= 0; i--)
 			page_cache_release(results[i]);
 	}
-
-	wake_up_bit(&cookie->flags, 0);
 
 	_leave("");
 }
@@ -992,7 +939,7 @@ int __fscache_write_page(struct fscache_cookie *cookie,
 	fscache_stat(&fscache_n_stores);
 
 	if (test_bit(FSCACHE_COOKIE_INVALIDATING, &cookie->flags)) {
-		kleave(" = -ENOBUFS [invalidating]");
+		_leave(" = -ENOBUFS [invalidating]");
 		return -ENOBUFS;
 	}
 
@@ -1002,11 +949,9 @@ int __fscache_write_page(struct fscache_cookie *cookie,
 
 	fscache_operation_init(&op->op, fscache_write_op, NULL,
 			       fscache_release_write_op);
-	fscache_operation_init_slow(&op->op);
-	op->op.flags = FSCACHE_OP_SLOW |
+	op->op.flags = FSCACHE_OP_ASYNC |
 		(1 << FSCACHE_OP_WAITING) |
 		(1 << FSCACHE_OP_UNUSE_COOKIE);
-	fscache_set_op_name(&op->op, "Write1");
 
 	ret = radix_tree_maybe_preload(gfp & ~__GFP_HIGHMEM);
 	if (ret < 0)
@@ -1062,7 +1007,7 @@ int __fscache_write_page(struct fscache_cookie *cookie,
 	fscache_stat(&fscache_n_store_ops);
 	fscache_stat(&fscache_n_stores_ok);
 
-	/* the slow work queue now carries its own ref on the object */
+	/* the work queue now carries its own ref on the object */
 	fscache_put_operation(&op->op);
 	_leave(" = 0");
 	return 0;
@@ -1164,13 +1109,11 @@ EXPORT_SYMBOL(__fscache_uncache_page);
  * fscache_mark_page_cached - Mark a page as being cached
  * @op: The retrieval op pages are being marked for
  * @page: The page to be marked
- * @should_have_mapping: True if the pages should have a mapping set
  *
  * Mark a netfs page as being cached.  After this is called, the netfs
  * must call fscache_uncache_page() to remove the mark.
  */
-void fscache_mark_page_cached(struct fscache_retrieval *op, struct page *page,
-			      bool should_have_mapping)
+void fscache_mark_page_cached(struct fscache_retrieval *op, struct page *page)
 {
 	struct fscache_cookie *cookie = op->op.object->cookie;
 
@@ -1187,31 +1130,6 @@ void fscache_mark_page_cached(struct fscache_retrieval *op, struct page *page,
 				cookie->def->name, page->index);
 		}
 	}
-	if (should_have_mapping && !page->mapping) {
-		static bool once_only;
-		if (!once_only) {
-			once_only = 1;
-			printk(KERN_ALERT
-			       "FSC: page:%p count:%d mapcount:%d NO_MAPPING"
-			       " index:%#lx\n",
-			       page, page_count(page), page_mapcount(page),
-			       page->index);
-			WARN_ON(1);
-		}
-	}
-
-	if (!should_have_mapping && page->mapping) {
-		static bool once_only;
-		if (!once_only) {
-			once_only = 1;
-			printk(KERN_ALERT
-			       "FSC: page:%p count:%d mapcount:%d MAPPING:%p"
-			       " index:%#lx\n",
-			       page, page_count(page), page_mapcount(page),
-			       page->mapping, page->index);
-			WARN_ON(1);
-		}
-	}
 
 	if (cookie->def->mark_page_cached)
 		cookie->def->mark_page_cached(cookie->netfs_data,
@@ -1223,20 +1141,17 @@ EXPORT_SYMBOL(fscache_mark_page_cached);
  * fscache_mark_pages_cached - Mark pages as being cached
  * @op: The retrieval op pages are being marked for
  * @pagevec: The pages to be marked
- * @should_have_mapping: True if the pages should have a mapping set
  *
  * Mark a bunch of netfs pages as being cached.  After this is called,
  * the netfs must call fscache_uncache_page() to remove the mark.
  */
 void fscache_mark_pages_cached(struct fscache_retrieval *op,
-			       struct pagevec *pagevec,
-			       bool should_have_mapping)
+			       struct pagevec *pagevec)
 {
 	unsigned long loop;
 
 	for (loop = 0; loop < pagevec->nr; loop++)
-		fscache_mark_page_cached(op, pagevec->pages[loop],
-					 should_have_mapping);
+		fscache_mark_page_cached(op, pagevec->pages[loop]);
 
 	pagevec_reinit(pagevec);
 }

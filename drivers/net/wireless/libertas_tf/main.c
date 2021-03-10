@@ -152,7 +152,7 @@ static int lbtf_setup_firmware(struct lbtf_private *priv)
 	/*
 	 * Read priv address from HW
 	 */
-	eth_broadcast_addr(priv->current_addr);
+	memset(priv->current_addr, 0xff, ETH_ALEN);
 	ret = lbtf_update_hw_spec(priv);
 	if (ret) {
 		ret = -1;
@@ -199,7 +199,7 @@ out:
 static int lbtf_init_adapter(struct lbtf_private *priv)
 {
 	lbtf_deb_enter(LBTF_DEB_MAIN);
-	eth_broadcast_addr(priv->current_addr);
+	memset(priv->current_addr, 0xff, ETH_ALEN);
 	mutex_init(&priv->lock);
 
 	priv->vif = NULL;
@@ -421,36 +421,20 @@ static int lbtf_op_config(struct ieee80211_hw *hw, u32 changed)
 }
 
 static u64 lbtf_op_prepare_multicast(struct ieee80211_hw *hw,
-#if 0 /* Not in RHEL */
 				     struct netdev_hw_addr_list *mc_list)
-#else
-				     int mc_count, struct dev_addr_list *ha)
-#endif
 {
 	struct lbtf_private *priv = hw->priv;
 	int i;
-#if 0 /* Not in RHEL */
 	struct netdev_hw_addr *ha;
 	int mc_count = netdev_hw_addr_list_count(mc_list);
-#endif
 
 	if (!mc_count || mc_count > MRVDRV_MAX_MULTICAST_LIST_SIZE)
 		return mc_count;
 
 	priv->nr_of_multicastmacaddr = mc_count;
-#if 0 /* Not in RHEL */
 	i = 0;
 	netdev_hw_addr_list_for_each(ha, mc_list)
 		memcpy(&priv->multicastlist[i++], ha->addr, ETH_ALEN);
-#else
-	for (i = 0; i < mc_count; i++) {
-		if (!ha)
-			break;
-		memcpy(&priv->multicastlist[i], ha->da_addr,
-				ETH_ALEN);
-		ha = ha->next;
-	}
-#endif
 
 	return mc_count;
 }
@@ -653,7 +637,7 @@ struct lbtf_private *lbtf_add_card(void *card, struct device *dmdev)
 	priv->tx_skb = NULL;
 
 	hw->queues = 1;
-	ieee80211_hw_set(hw, HOST_BROADCAST_PS_BUFFERING);
+	hw->flags = IEEE80211_HW_HOST_BROADCAST_PS_BUFFERING;
 	hw->extra_tx_headroom = sizeof(struct txpd);
 	memcpy(priv->channels, lbtf_channels, sizeof(lbtf_channels));
 	memcpy(priv->rates, lbtf_rates, sizeof(lbtf_rates));

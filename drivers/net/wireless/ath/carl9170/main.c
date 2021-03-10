@@ -970,33 +970,17 @@ out:
 }
 
 static u64 carl9170_op_prepare_multicast(struct ieee80211_hw *hw,
-#if 0 /* Not in RHEL */
 					 struct netdev_hw_addr_list *mc_list)
-#else
-					 int mc_count, struct dev_addr_list *ha)
-#endif
 {
-#if 0 /* Not in RHEL */
 	struct netdev_hw_addr *ha;
-#else
-	int i;
-#endif
 	u64 mchash;
 
 	/* always get broadcast frames */
 	mchash = 1ULL << (0xff >> 2);
 
-#if 0 /* Not in RHEL */
 	netdev_hw_addr_list_for_each(ha, mc_list)
 		mchash |= 1ULL << (ha->addr[5] >> 2);
-#else
-	for (i = 0; i < mc_count; i++) {
-		if (!ha)
-			break;
-		mchash |= 1ULL << (ha->dmi_addr[5] >> 2);
-		ha = ha->next;
-	}
-#endif
+
 	return mchash;
 }
 
@@ -1430,10 +1414,12 @@ static void carl9170_ampdu_work(struct work_struct *work)
 
 static int carl9170_op_ampdu_action(struct ieee80211_hw *hw,
 				    struct ieee80211_vif *vif,
-				    enum ieee80211_ampdu_mlme_action action,
-				    struct ieee80211_sta *sta,
-				    u16 tid, u16 *ssn, u8 buf_size)
+				    struct ieee80211_ampdu_params *params)
 {
+	struct ieee80211_sta *sta = params->sta;
+	enum ieee80211_ampdu_mlme_action action = params->action;
+	u16 tid = params->tid;
+	u16 *ssn = &params->ssn;
 	struct ar9170 *ar = hw->priv;
 	struct carl9170_sta_info *sta_info = (void *) sta->drv_priv;
 	struct carl9170_sta_tid *tid_info;
@@ -1681,7 +1667,7 @@ static int carl9170_op_get_survey(struct ieee80211_hw *hw, int idx,
 			return err;
 	}
 
-	for (b = 0; b < IEEE80211_NUM_BANDS; b++) {
+	for (b = 0; b < NUM_NL80211_BANDS; b++) {
 		band = ar->hw->wiphy->bands[b];
 
 		if (!band)
@@ -1889,6 +1875,8 @@ void *carl9170_alloc(size_t priv_size)
 	for (i = 0; i < ARRAY_SIZE(ar->noise); i++)
 		ar->noise[i] = -95; /* ATH_DEFAULT_NOISE_FLOOR */
 
+	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_CQM_RSSI_LIST);
+
 	return ar;
 
 err_nomem:
@@ -1956,13 +1944,13 @@ static int carl9170_parse_eeprom(struct ar9170 *ar)
 	}
 
 	if (ar->eeprom.operating_flags & AR9170_OPFLAG_2GHZ) {
-		ar->hw->wiphy->bands[IEEE80211_BAND_2GHZ] =
+		ar->hw->wiphy->bands[NL80211_BAND_2GHZ] =
 			&carl9170_band_2GHz;
 		chans += carl9170_band_2GHz.n_channels;
 		bands++;
 	}
 	if (ar->eeprom.operating_flags & AR9170_OPFLAG_5GHZ) {
-		ar->hw->wiphy->bands[IEEE80211_BAND_5GHZ] =
+		ar->hw->wiphy->bands[NL80211_BAND_5GHZ] =
 			&carl9170_band_5GHz;
 		chans += carl9170_band_5GHz.n_channels;
 		bands++;

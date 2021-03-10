@@ -5,10 +5,12 @@
 
 #include <linux/kgdb.h>
 #include <linux/kdebug.h>
+#include <linux/sched.h>
 
 #include <asm/kdebug.h>
 #include <asm/ptrace.h>
 #include <asm/irq.h>
+#include <asm/cacheflush.h>
 
 extern unsigned long trapbase;
 
@@ -156,6 +158,12 @@ int kgdb_arch_init(void)
 
 void kgdb_arch_exit(void)
 {
+}
+
+void kgdb_arch_set_pc(struct pt_regs *regs, unsigned long ip)
+{
+	regs->pc = ip;
+	regs->npc = regs->pc + 4;
 }
 
 struct kgdb_arch arch_kgdb_ops = {

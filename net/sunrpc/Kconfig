@@ -3,6 +3,11 @@ config SUNRPC
 
 config SUNRPC_GSS
 	tristate
+	select OID_REGISTRY
+
+config SUNRPC_BACKCHANNEL
+	bool
+	depends on SUNRPC
 
 config SUNRPC_SWAP
 	bool
@@ -27,47 +32,31 @@ config RPCSEC_GSS_KRB5
 
 	  If unsure, say Y.
 
-config RPCSEC_GSS_SPKM3
-	tristate "Secure RPC: SPKM3 mechanism (EXPERIMENTAL)"
-	depends on SUNRPC && EXPERIMENTAL
-	select SUNRPC_GSS
-	select CRYPTO
-	select CRYPTO_MD5
-	select CRYPTO_DES
-	select CRYPTO_CAST5
-	select CRYPTO_CBC
+config SUNRPC_DEBUG
+	bool "RPC: Enable dprintk debugging"
+	depends on SUNRPC && SYSCTL
+	select DEBUG_FS
 	help
-	  Choose Y here to enable Secure RPC using the SPKM3 public key
-	  GSS-API mechanism (RFC 2025).
+	  This option enables a sysctl-based debugging interface
+	  that is be used by the 'rpcdebug' utility to turn on or off
+	  logging of different aspects of the kernel RPC activity.
 
-	  Secure RPC calls with SPKM3 require an auxiliary userspace
-	  daemon which may be found in the Linux nfs-utils package
-	  available from http://linux-nfs.org/.
+	  Disabling this option will make your kernel slightly smaller,
+	  but makes troubleshooting NFS issues significantly harder.
 
 	  If unsure, say Y.
 
-config SUNRPC_XPRT_RDMA_CLIENT
-	tristate "RPC over RDMA Client Support"
+config SUNRPC_XPRT_RDMA
+	tristate "RPC-over-RDMA transport"
 	depends on SUNRPC && INFINIBAND && INFINIBAND_ADDR_TRANS
 	default SUNRPC && INFINIBAND
+	select SG_POOL
 	help
-	  This option allows the NFS client to support an RDMA-enabled
-	  transport.
+	  This option allows the NFS client and server to use RDMA
+	  transports (InfiniBand, iWARP, or RoCE).
 
-	  To compile RPC client RDMA transport support as a module,
-	  choose M here: the module will be called xprtrdma.
+	  To compile this support as a module, choose M. The module
+	  will be called rpcrdma.ko.
 
-	  If unsure, say N.
-
-config SUNRPC_XPRT_RDMA_SERVER
-	tristate "RPC over RDMA Server Support"
-	depends on SUNRPC && INFINIBAND && INFINIBAND_ADDR_TRANS
-	default SUNRPC && INFINIBAND
-	help
-	  This option allows the NFS server to support an RDMA-enabled
-	  transport.
-
-	  To compile RPC server RDMA transport support as a module,
-	  choose M here: the module will be called svcrdma.
-
-	  If unsure, say N.
+	  If unsure, or you know there is no RDMA capability on your
+	  hardware platform, say N.

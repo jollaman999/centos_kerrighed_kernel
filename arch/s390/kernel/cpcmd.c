@@ -1,8 +1,6 @@
 /*
- *  arch/s390/kernel/cpcmd.c
- *
  *  S390 version
- *    Copyright IBM Corp. 1999,2007
+ *    Copyright IBM Corp. 1999, 2007
  *    Author(s): Martin Schwidefsky (schwidefsky@de.ibm.com),
  *               Christian Borntraeger (cborntra@de.ibm.com),
  */
@@ -17,9 +15,9 @@
 #include <linux/stddef.h>
 #include <linux/string.h>
 #include <linux/mm.h>
+#include <asm/diag.h>
 #include <asm/ebcdic.h>
 #include <asm/cpcmd.h>
-#include <asm/system.h>
 #include <asm/io.h>
 
 static DEFINE_SPINLOCK(cpcmd_lock);
@@ -79,6 +77,7 @@ int  __cpcmd(const char *cmd, char *response, int rlen, int *response_code)
 	memcpy(cpcmd_buf, cmd, cmdlen);
 	ASCEBC(cpcmd_buf, cmdlen);
 
+	diag_stat_inc(DIAG_STAT_X008);
 	if (response) {
 		memset(response, 0, rlen);
 		response_len = rlen;

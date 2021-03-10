@@ -29,42 +29,16 @@
 #ifndef __DPC_H__
 #define __DPC_H__
 
-#include "ttype.h"
 #include "device.h"
 #include "wcmd.h"
 
-/*---------------------  Export Definitions -------------------------*/
+void RXvWorkItem(void *Context);
 
-/*---------------------  Export Classes  ----------------------------*/
+void RXvMngWorkItem(void *Context);
 
-/*---------------------  Export Variables  --------------------------*/
+void RXvFreeRCB(PRCB pRCB, int bReAllocSkb);
 
-/*---------------------  Export Functions  --------------------------*/
+int RXbBulkInProcessData(struct vnt_private *, PRCB pRCB,
+	unsigned long BytesToIndicate);
 
-VOID
-RXvWorkItem(
-    PVOID Context
-    );
-
-VOID
-RXvMngWorkItem(
-    PVOID Context
-    );
-
-VOID
-RXvFreeRCB(
-    IN PRCB pRCB,
-    IN BOOL bReAllocSkb
-    );
-
-BOOL
-RXbBulkInProcessData(
-    IN PSDevice         pDevice,
-    IN PRCB             pRCB,
-    IN ULONG            BytesToIndicate
-    );
-
-#endif // __RXTX_H__
-
-
-
+#endif /* __RXTX_H__ */

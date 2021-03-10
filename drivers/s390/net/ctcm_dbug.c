@@ -1,6 +1,4 @@
 /*
- *	drivers/s390/net/ctcm_dbug.c
- *
  *	Copyright IBM Corp. 2001, 2007
  *	Authors:	Peter Tiedemann (ptiedem@de.ibm.com)
  *
@@ -10,7 +8,6 @@
 #include <linux/string.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
-#include <linux/slab.h>
 #include <linux/ctype.h>
 #include <linux/sysctl.h>
 #include <linux/module.h>

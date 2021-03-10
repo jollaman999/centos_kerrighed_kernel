@@ -17,6 +17,7 @@
 
 #include <asm/hwrpb.h>
 #include <asm/pgalloc.h>
+#include <asm/sections.h>
 
 pg_data_t node_data[MAX_NUMNODES];
 EXPORT_SYMBOL(node_data);
@@ -197,7 +198,7 @@ setup_memory_node(int nid, void *kernel_end)
 	}
 
 	if (bootmap_start == -1)
-		panic("couldn't find a contigous place for the bootmap");
+		panic("couldn't find a contiguous place for the bootmap");
 
 	/* Allocate the bootmap and mark the whole MM as reserved.  */
 	bootmap_size = init_bootmem_node(NODE_DATA(nid), bootmap_start,
@@ -313,6 +314,7 @@ void __init paging_init(void)
 			zones_size[ZONE_DMA] = dma_local_pfn;
 			zones_size[ZONE_NORMAL] = (end_pfn - start_pfn) - dma_local_pfn;
 		}
+		node_set_state(nid, N_NORMAL_MEMORY);
 		free_area_init_node(nid, zones_size, start_pfn, NULL);
 	}
 
@@ -324,8 +326,6 @@ void __init mem_init(void)
 {
 	unsigned long codesize, reservedpages, datasize, initsize, pfn;
 	extern int page_is_ram(unsigned long) __init;
-	extern char _text, _etext, _data, _edata;
-	extern char __init_begin, __init_end;
 	unsigned long nid, i;
 	high_memory = (void *) __va(max_low_pfn << PAGE_SHIFT);
 

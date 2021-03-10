@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
+#include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/interrupt.h>
 #include <linux/errno.h>
@@ -201,7 +202,7 @@ static u8 wait_drive_not_busy(ide_drive_t *drive)
 	u8 stat;
 
 	/*
-	 * Last sector was transfered, wait until device is ready.  This can
+	 * Last sector was transferred, wait until device is ready.  This can
 	 * take up to 6 ms on some ATAPI devices, so we will wait max 10 ms.
 	 */
 	for (retries = 0; retries < 1000; retries++) {
@@ -252,7 +253,7 @@ void ide_pio_bytes(ide_drive_t *drive, struct ide_cmd *cmd,
 		if (page_is_high)
 			local_irq_save(flags);
 
-		buf = kmap_atomic(page, KM_BIO_SRC_IRQ) + offset;
+		buf = kmap_atomic(page) + offset;
 
 		cmd->nleft -= nr_bytes;
 		cmd->cursg_ofs += nr_bytes;
@@ -268,7 +269,7 @@ void ide_pio_bytes(ide_drive_t *drive, struct ide_cmd *cmd,
 		else
 			hwif->tp_ops->input_data(drive, cmd, buf, nr_bytes);
 
-		kunmap_atomic(buf, KM_BIO_SRC_IRQ);
+		kunmap_atomic(buf);
 
 		if (page_is_high)
 			local_irq_restore(flags);
@@ -480,13 +481,9 @@ int ide_taskfile_ioctl(ide_drive_t *drive, unsigned long arg)
 	u16 nsect		= 0;
 	char __user *buf = (char __user *)arg;
 
-	req_task = kzalloc(tasksize, GFP_KERNEL);
-	if (req_task == NULL)
-		return -ENOMEM;
-	if (copy_from_user(req_task, buf, tasksize)) {
-		kfree(req_task);
-		return -EFAULT;
-	}
+	req_task = memdup_user(buf, tasksize);
+	if (IS_ERR(req_task))
+		return PTR_ERR(req_task);
 
 	taskout = req_task->out_size;
 	taskin  = req_task->in_size;

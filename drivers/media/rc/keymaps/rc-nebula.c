@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 static struct rc_map_table nebula[] = {
 	{ 0x00, KEY_0 },
@@ -27,7 +28,7 @@ static struct rc_map_table nebula[] = {
 	{ 0x0b, KEY_AUX },
 	{ 0x0c, KEY_DVD },
 	{ 0x0d, KEY_POWER },
-	{ 0x0e, KEY_MHP },	/* labelled 'Picture' */
+	{ 0x0e, KEY_CAMERA },	/* labelled 'Picture' */
 	{ 0x0f, KEY_AUDIO },
 	{ 0x10, KEY_INFO },
 	{ 0x11, KEY_F13 },	/* 16:9 */

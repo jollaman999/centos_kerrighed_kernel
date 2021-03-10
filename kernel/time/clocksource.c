@@ -23,96 +23,16 @@
  *   o Allow clocksource drivers to be unregistered
  */
 
+#include <linux/device.h>
 #include <linux/clocksource.h>
-#include <linux/sysdev.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/sched.h> /* for spin_unlock_irq() using preempt_count() m68k */
 #include <linux/tick.h>
 #include <linux/kthread.h>
 
+#include "tick-internal.h"
 #include "timekeeping_internal.h"
-
-/* RHEL6: fail clocksource if it is found to be unstable.
- * set 'clocksource_failover' as boot parameter to enable.*/
-static int clocksource_failover;
-static int has_kvm_clock;
-
-void timecounter_init(struct timecounter *tc,
-		      const struct cyclecounter *cc,
-		      u64 start_tstamp)
-{
-	tc->cc = cc;
-	tc->cycle_last = cc->read(cc);
-	tc->nsec = start_tstamp;
-}
-EXPORT_SYMBOL(timecounter_init);
-
-/**
- * timecounter_read_delta - get nanoseconds since last call of this function
- * @tc:         Pointer to time counter
- *
- * When the underlying cycle counter runs over, this will be handled
- * correctly as long as it does not run over more than once between
- * calls.
- *
- * The first call to this function for a new time counter initializes
- * the time tracking and returns an undefined result.
- */
-static u64 timecounter_read_delta(struct timecounter *tc)
-{
-	cycle_t cycle_now, cycle_delta;
-	u64 ns_offset;
-
-	/* read cycle counter: */
-	cycle_now = tc->cc->read(tc->cc);
-
-	/* calculate the delta since the last timecounter_read_delta(): */
-	cycle_delta = (cycle_now - tc->cycle_last) & tc->cc->mask;
-
-	/* convert to nanoseconds: */
-	ns_offset = cyclecounter_cyc2ns(tc->cc, cycle_delta);
-
-	/* update time stamp of timecounter_read_delta() call: */
-	tc->cycle_last = cycle_now;
-
-	return ns_offset;
-}
-
-u64 timecounter_read(struct timecounter *tc)
-{
-	u64 nsec;
-
-	/* increment time by nanoseconds since last call */
-	nsec = timecounter_read_delta(tc);
-	nsec += tc->nsec;
-	tc->nsec = nsec;
-
-	return nsec;
-}
-EXPORT_SYMBOL(timecounter_read);
-
-u64 timecounter_cyc2time(struct timecounter *tc,
-			 cycle_t cycle_tstamp)
-{
-	u64 cycle_delta = (cycle_tstamp - tc->cycle_last) & tc->cc->mask;
-	u64 nsec;
-
-	/*
-	 * Instead of always treating cycle_tstamp as more recent
-	 * than tc->cycle_last, detect when it is too far in the
-	 * future and treat it as old time stamp instead.
-	 */
-	if (cycle_delta > tc->cc->mask / 2) {
-		cycle_delta = (tc->cycle_last - cycle_tstamp) & tc->cc->mask;
-		nsec = tc->nsec - cyclecounter_cyc2ns(tc->cc, cycle_delta);
-	} else {
-		nsec = cyclecounter_cyc2ns(tc->cc, cycle_delta) + tc->nsec;
-	}
-
-	return nsec;
-}
-EXPORT_SYMBOL(timecounter_cyc2time);
 
 /**
  * clocks_calc_mult_shift - calculate mult/shift factors for scaled math of clocks
@@ -120,7 +40,7 @@ EXPORT_SYMBOL(timecounter_cyc2time);
  * @shift:	pointer to shift variable
  * @from:	frequency to convert from
  * @to:		frequency to convert to
- * @minsec:	guaranteed runtime conversion range in seconds
+ * @maxsec:	guaranteed runtime conversion range in seconds
  *
  * The function evaluates the shift/mult pair for the scaled math
  * operations of clocksources and clockevents.
@@ -129,7 +49,7 @@ EXPORT_SYMBOL(timecounter_cyc2time);
  * NSEC_PER_SEC == 1GHz and @from is the counter frequency. For clock
  * event @to is the counter frequency and @from is NSEC_PER_SEC.
  *
- * The @minsec conversion range argument controls the time frame in
+ * The @maxsec conversion range argument controls the time frame in
  * seconds which must be covered by the runtime conversion with the
  * calculated mult and shift factors. This guarantees that no 64bit
  * overflow happens when the input value of the conversion is
@@ -138,7 +58,7 @@ EXPORT_SYMBOL(timecounter_cyc2time);
  * factors.
  */
 void
-clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to, u32 minsec)
+clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to, u32 maxsec)
 {
 	u64 tmp;
 	u32 sft, sftacc= 32;
@@ -147,7 +67,7 @@ clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to, u32 minsec)
 	 * Calculate the shift factor which is limiting the conversion
 	 * range:
 	 */
-	tmp = ((u64)minsec * from) >> 32;
+	tmp = ((u64)maxsec * from) >> 32;
 	while (tmp) {
 		tmp >>=1;
 		sftacc--;
@@ -159,6 +79,7 @@ clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to, u32 minsec)
 	 */
 	for (sft = 32; sft > 0; sft--) {
 		tmp = (u64) to << sft;
+		tmp += from / 2;
 		do_div(tmp, from);
 		if ((tmp >> sftacc) == 0)
 			break;
@@ -180,7 +101,7 @@ clocks_calc_mult_shift(u32 *mult, u32 *shift, u32 from, u32 to, u32 minsec)
 static struct clocksource *curr_clocksource;
 static LIST_HEAD(clocksource_list);
 static DEFINE_MUTEX(clocksource_mutex);
-static char override_name[32];
+static char override_name[CS_NAME_LEN];
 static int finished_booting;
 
 #ifdef CONFIG_CLOCKSOURCE_WATCHDOG
@@ -193,6 +114,7 @@ static struct timer_list watchdog_timer;
 static DECLARE_WORK(watchdog_work, clocksource_watchdog_work);
 static DEFINE_SPINLOCK(watchdog_lock);
 static int watchdog_running;
+static atomic_t watchdog_reset_pending;
 
 static int clocksource_watchdog_kthread(void *data);
 static void __clocksource_change_rating(struct clocksource *cs, int rating);
@@ -252,13 +174,15 @@ void clocksource_mark_unstable(struct clocksource *cs)
 static void clocksource_watchdog(unsigned long data)
 {
 	struct clocksource *cs;
-	cycle_t csnow, wdnow, delta;
+	u64 csnow, wdnow, delta;
 	int64_t wd_nsec, cs_nsec;
-	int next_cpu;
+	int next_cpu, reset_pending;
 
 	spin_lock(&watchdog_lock);
 	if (!watchdog_running)
 		goto out;
+
+	reset_pending = atomic_read(&watchdog_reset_pending);
 
 	list_for_each_entry(cs, &watchdog_list, wd_list) {
 
@@ -275,7 +199,8 @@ static void clocksource_watchdog(unsigned long data)
 		local_irq_enable();
 
 		/* Clocksource initialized ? */
-		if (!(cs->flags & CLOCK_SOURCE_WATCHDOG)) {
+		if (!(cs->flags & CLOCK_SOURCE_WATCHDOG) ||
+		    atomic_read(&watchdog_reset_pending)) {
 			cs->flags |= CLOCK_SOURCE_WATCHDOG;
 			cs->wd_last = wdnow;
 			cs->cs_last = csnow;
@@ -291,14 +216,12 @@ static void clocksource_watchdog(unsigned long data)
 		cs->cs_last = csnow;
 		cs->wd_last = wdnow;
 
+		if (atomic_read(&watchdog_reset_pending))
+			continue;
+
 		/* Check the deviation from the watchdog clocksource. */
-		if (abs(cs_nsec - wd_nsec) > WATCHDOG_THRESHOLD) {
-			if (clocksource_failover ||
-			   (has_kvm_clock && !strcmp(cs->name, "tsc")))
-				clocksource_unstable(cs, cs_nsec - wd_nsec);
-			else
-				printk(KERN_WARNING "Clocksource %s unstable (delta = %Ld ns).  Enable clocksource failover by adding clocksource_failover kernel parameter.\n",
-				       cs->name, cs_nsec - wd_nsec);
+		if ((abs(cs_nsec - wd_nsec) > WATCHDOG_THRESHOLD)) {
+			clocksource_unstable(cs, cs_nsec - wd_nsec);
 			continue;
 		}
 
@@ -331,6 +254,13 @@ static void clocksource_watchdog(unsigned long data)
 			}
 		}
 	}
+
+	/*
+	 * We only clear the watchdog_reset_pending, when we did a
+	 * full cycle through all clocksources.
+	 */
+	if (reset_pending)
+		atomic_dec(&watchdog_reset_pending);
 
 	/*
 	 * Cycle through CPUs to check if the CPUs stay synchronized
@@ -374,11 +304,7 @@ static inline void clocksource_reset_watchdog(void)
 
 static void clocksource_resume_watchdog(void)
 {
-	unsigned long flags;
-
-	spin_lock_irqsave(&watchdog_lock, flags);
-	clocksource_reset_watchdog();
-	spin_unlock_irqrestore(&watchdog_lock, flags);
+	atomic_inc(&watchdog_reset_pending);
 }
 
 static void clocksource_enqueue_watchdog(struct clocksource *cs)
@@ -394,13 +320,42 @@ static void clocksource_enqueue_watchdog(struct clocksource *cs)
 		/* cs is a watchdog. */
 		if (cs->flags & CLOCK_SOURCE_IS_CONTINUOUS)
 			cs->flags |= CLOCK_SOURCE_VALID_FOR_HRES;
-		/* Pick the best watchdog. */
-		if (!watchdog || cs->rating > watchdog->rating) {
-			watchdog = cs;
-			/* Reset watchdog cycles */
-			clocksource_reset_watchdog();
-		}
 	}
+	spin_unlock_irqrestore(&watchdog_lock, flags);
+}
+
+static void clocksource_select_watchdog(bool fallback)
+{
+	struct clocksource *cs, *old_wd;
+	unsigned long flags;
+
+	spin_lock_irqsave(&watchdog_lock, flags);
+	/* save current watchdog */
+	old_wd = watchdog;
+	if (fallback)
+		watchdog = NULL;
+
+	list_for_each_entry(cs, &clocksource_list, list) {
+		/* cs is a clocksource to be watched. */
+		if (cs->flags & CLOCK_SOURCE_MUST_VERIFY)
+			continue;
+
+		/* Skip current if we were requested for a fallback. */
+		if (fallback && cs == old_wd)
+			continue;
+
+		/* Pick the best watchdog. */
+		if (!watchdog || cs->rating > watchdog->rating)
+			watchdog = cs;
+	}
+	/* If we failed to find a fallback restore the old one. */
+	if (!watchdog)
+		watchdog = old_wd;
+
+	/* If we changed the watchdog we need to reset cycles. */
+	if (watchdog != old_wd)
+		clocksource_reset_watchdog();
+
 	/* Check if the watchdog timer needs to be started. */
 	clocksource_start_watchdog();
 	spin_unlock_irqrestore(&watchdog_lock, flags);
@@ -408,28 +363,17 @@ static void clocksource_enqueue_watchdog(struct clocksource *cs)
 
 static void clocksource_dequeue_watchdog(struct clocksource *cs)
 {
-	struct clocksource *tmp;
 	unsigned long flags;
 
 	spin_lock_irqsave(&watchdog_lock, flags);
-	if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
-		/* cs is a watched clocksource. */
-		list_del_init(&cs->wd_list);
-	} else if (cs == watchdog) {
-		/* Reset watchdog cycles */
-		clocksource_reset_watchdog();
-		/* Current watchdog is removed. Find an alternative. */
-		watchdog = NULL;
-		list_for_each_entry(tmp, &clocksource_list, list) {
-			if (tmp == cs || tmp->flags & CLOCK_SOURCE_MUST_VERIFY)
-				continue;
-			if (!watchdog || tmp->rating > watchdog->rating)
-				watchdog = tmp;
+	if (cs != watchdog) {
+		if (cs->flags & CLOCK_SOURCE_MUST_VERIFY) {
+			/* cs is a watched clocksource. */
+			list_del_init(&cs->wd_list);
+			/* Check if the watchdog timer needs to be stopped. */
+			clocksource_stop_watchdog();
 		}
 	}
-	cs->flags &= ~CLOCK_SOURCE_WATCHDOG;
-	/* Check if the watchdog timer needs to be stopped. */
-	clocksource_stop_watchdog();
 	spin_unlock_irqrestore(&watchdog_lock, flags);
 }
 
@@ -473,6 +417,11 @@ static int clocksource_watchdog_kthread(void *data)
 	return 0;
 }
 
+static bool clocksource_is_watchdog(struct clocksource *cs)
+{
+	return cs == watchdog;
+}
+
 #else /* CONFIG_CLOCKSOURCE_WATCHDOG */
 
 static void clocksource_enqueue_watchdog(struct clocksource *cs)
@@ -481,9 +430,11 @@ static void clocksource_enqueue_watchdog(struct clocksource *cs)
 		cs->flags |= CLOCK_SOURCE_VALID_FOR_HRES;
 }
 
+static void clocksource_select_watchdog(bool fallback) { }
 static inline void clocksource_dequeue_watchdog(struct clocksource *cs) { }
 static inline void clocksource_resume_watchdog(void) { }
 static inline int __clocksource_watchdog_kthread(void) { return 0; }
+static bool clocksource_is_watchdog(struct clocksource *cs) { return false; }
 
 #endif /* CONFIG_CLOCKSOURCE_WATCHDOG */
 
@@ -508,7 +459,7 @@ void clocksource_resume(void)
 
 	list_for_each_entry(cs, &clocksource_list, list)
 		if (cs->resume)
-			cs->resume();
+			cs->resume(cs);
 
 	clocksource_resume_watchdog();
 }
@@ -517,15 +468,13 @@ void clocksource_resume(void)
  * clocksource_touch_watchdog - Update watchdog
  *
  * Update the watchdog after exception contexts such as kgdb so as not
- * to incorrectly trip the watchdog.
- *
+ * to incorrectly trip the watchdog. This might fail when the kernel
+ * was stopped in code which holds watchdog_lock.
  */
 void clocksource_touch_watchdog(void)
 {
 	clocksource_resume_watchdog();
 }
-
-#ifndef CONFIG_ARCH_USES_GETTIMEOFFSET
 
 /**
  * clocksource_max_adjustment- Returns max adjustment amount
@@ -584,7 +533,70 @@ static u64 clocksource_max_deferment(struct clocksource *cs)
 	 * note a margin of 12.5% is used because this can be computed with
 	 * a shift, versus say 10% which would require division.
 	 */
-	return max_nsecs - (max_nsecs >> 5);
+	return max_nsecs - (max_nsecs >> 3);
+}
+
+#ifndef CONFIG_ARCH_USES_GETTIMEOFFSET
+
+static struct clocksource *clocksource_find_best(bool oneshot, bool skipcur)
+{
+	struct clocksource *cs;
+
+	if (!finished_booting || list_empty(&clocksource_list))
+		return NULL;
+
+	/*
+	 * We pick the clocksource with the highest rating. If oneshot
+	 * mode is active, we pick the highres valid clocksource with
+	 * the best rating.
+	 */
+	list_for_each_entry(cs, &clocksource_list, list) {
+		if (skipcur && cs == curr_clocksource)
+			continue;
+		if (oneshot && !(cs->flags & CLOCK_SOURCE_VALID_FOR_HRES))
+			continue;
+		return cs;
+	}
+	return NULL;
+}
+
+static void __clocksource_select(bool skipcur)
+{
+	bool oneshot = tick_oneshot_mode_active();
+	struct clocksource *best, *cs;
+
+	/* Find the best suitable clocksource */
+	best = clocksource_find_best(oneshot, skipcur);
+	if (!best)
+		return;
+
+	/* Check for the override clocksource. */
+	list_for_each_entry(cs, &clocksource_list, list) {
+		if (skipcur && cs == curr_clocksource)
+			continue;
+		if (strcmp(cs->name, override_name) != 0)
+			continue;
+		/*
+		 * Check to make sure we don't switch to a non-highres
+		 * capable clocksource if the tick code is in oneshot
+		 * mode (highres or nohz)
+		 */
+		if (!(cs->flags & CLOCK_SOURCE_VALID_FOR_HRES) && oneshot) {
+			/* Override clocksource cannot be used. */
+			printk(KERN_WARNING "Override clocksource %s is not "
+			       "HRT compatible. Cannot switch while in "
+			       "HRT/NOHZ mode\n", cs->name);
+			override_name[0] = 0;
+		} else
+			/* Override clocksource can be used. */
+			best = cs;
+		break;
+	}
+
+	if (curr_clocksource != best && !timekeeping_notify(best)) {
+		pr_info("Switched to clocksource %s\n", best->name);
+		curr_clocksource = best;
+	}
 }
 
 /**
@@ -597,45 +609,12 @@ static u64 clocksource_max_deferment(struct clocksource *cs)
  */
 static void clocksource_select(void)
 {
-	struct clocksource *best, *cs;
+	return __clocksource_select(false);
+}
 
-	if (!finished_booting || list_empty(&clocksource_list))
-		return;
-	/* First clocksource on the list has the best rating. */
-	best = list_first_entry(&clocksource_list, struct clocksource, list);
-	/* Check for the override clocksource. */
-	list_for_each_entry(cs, &clocksource_list, list) {
-		if (strcmp(cs->name, override_name) != 0)
-			continue;
-		/*
-		 * Check to make sure we don't switch to a non-highres
-		 * capable clocksource if the tick code is in oneshot
-		 * mode (highres or nohz)
-		 */
-		if (!(cs->flags & CLOCK_SOURCE_VALID_FOR_HRES) &&
-		    tick_oneshot_mode_active()) {
-			if (cs->flags & CLOCK_SOURCE_UNSTABLE) {
-				pr_warn("Override clocksource %s is unstable and not HRT compatible - cannot switch while in HRT/NOHZ mode\n",
-					cs->name);
-				override_name[0] = 0;
-			} else {
-				/*
-				 * The override cannot be currently verified.
-				 * Deferring to let the watchdog check.
-				 */
-				pr_info("Override clocksource %s is not currently HRT compatible - deferring\n",
-					cs->name);
-			}
-		} else
-			/* Override clocksource can be used. */
-			best = cs;
-		break;
-	}
-	if (curr_clocksource != best) {
-		printk(KERN_INFO "Switching to clocksource %s\n", best->name);
-		curr_clocksource = best;
-		timekeeping_notify(curr_clocksource);
-	}
+static void clocksource_select_fallback(void)
+{
+	return __clocksource_select(true);
 }
 
 #else /* !CONFIG_ARCH_USES_GETTIMEOFFSET */
@@ -653,12 +632,12 @@ static inline void clocksource_select(void) { }
  */
 static int __init clocksource_done_booting(void)
 {
+	mutex_lock(&clocksource_mutex);
+	curr_clocksource = clocksource_default_clock();
 	finished_booting = 1;
-
 	/*
 	 * Run the watchdog first to eliminate unstable clock sources
 	 */
-	mutex_lock(&clocksource_mutex);
 	__clocksource_watchdog_kthread();
 	clocksource_select();
 	mutex_unlock(&clocksource_mutex);
@@ -681,42 +660,40 @@ static void clocksource_enqueue(struct clocksource *cs)
 	list_add(&cs->list, entry);
 }
 
-
-/*
- * Maximum time we expect to go between ticks. This includes idle
- * tickless time. It provides the trade off between selecting a
- * mult/shift pair that is very precise but can only handle a short
- * period of time, vs. a mult/shift pair that can handle long periods
- * of time but isn't as precise.
- *
- * This is a subsystem constant, and actual hardware limitations
- * may override it (ie: clocksources that wrap every 3 seconds).
- */
-#define MAX_UPDATE_LENGTH 5 /* Seconds */
-
 /**
- * __clocksource_register_scale - Used to install new clocksources
- * @t:		clocksource to be registered
+ * __clocksource_updatefreq_scale - Used update clocksource with new freq
+ * @cs:		clocksource to be registered
  * @scale:	Scale factor multiplied against freq to get clocksource hz
  * @freq:	clocksource frequency (cycles per second) divided by scale
  *
- * Returns -EBUSY if registration fails, zero otherwise.
+ * This should only be called from the clocksource->enable() method.
  *
  * This *SHOULD NOT* be called directly! Please use the
- * clocksource_register_hz() or clocksource_register_khz helper functions.
+ * clocksource_updatefreq_hz() or clocksource_updatefreq_khz helper functions.
  */
-int __clocksource_register_scale(struct clocksource *cs, u32 scale, u32 freq)
+void __clocksource_updatefreq_scale(struct clocksource *cs, u32 scale, u32 freq)
 {
-
+	u64 sec;
 	/*
-	 * Ideally we want to use  some of the limits used in
-	 * clocksource_max_deferment, to provide a more informed
-	 * MAX_UPDATE_LENGTH. But for now this just gets the
-	 * register interface working properly.
+	 * Calc the maximum number of seconds which we can run before
+	 * wrapping around. For clocksources which have a mask > 32bit
+	 * we need to limit the max sleep time to have a good
+	 * conversion precision. 10 minutes is still a reasonable
+	 * amount. That results in a shift value of 24 for a
+	 * clocksource with mask >= 40bit and f >= 4GHz. That maps to
+	 * ~ 0.06ppm granularity for NTP. We apply the same 12.5%
+	 * margin as we do in clocksource_max_deferment()
 	 */
+	sec = (cs->mask - (cs->mask >> 3));
+	do_div(sec, freq);
+	do_div(sec, scale);
+	if (!sec)
+		sec = 1;
+	else if (sec > 600 && cs->mask > UINT_MAX)
+		sec = 600;
+
 	clocks_calc_mult_shift(&cs->mult, &cs->shift, freq,
-				      NSEC_PER_SEC/scale,
-				      MAX_UPDATE_LENGTH*scale);
+			       NSEC_PER_SEC / scale, sec * scale);
 
 	/*
 	 * for clocksources that have large mults, to avoid overflow.
@@ -732,11 +709,32 @@ int __clocksource_register_scale(struct clocksource *cs, u32 scale, u32 freq)
 	}
 
 	cs->max_idle_ns = clocksource_max_deferment(cs);
+}
+EXPORT_SYMBOL_GPL(__clocksource_updatefreq_scale);
 
+/**
+ * __clocksource_register_scale - Used to install new clocksources
+ * @cs:		clocksource to be registered
+ * @scale:	Scale factor multiplied against freq to get clocksource hz
+ * @freq:	clocksource frequency (cycles per second) divided by scale
+ *
+ * Returns -EBUSY if registration fails, zero otherwise.
+ *
+ * This *SHOULD NOT* be called directly! Please use the
+ * clocksource_register_hz() or clocksource_register_khz helper functions.
+ */
+int __clocksource_register_scale(struct clocksource *cs, u32 scale, u32 freq)
+{
+
+	/* Initialize mult/shift and max_idle_ns */
+	__clocksource_updatefreq_scale(cs, scale, freq);
+
+	/* Add clocksource to the clcoksource list */
 	mutex_lock(&clocksource_mutex);
 	clocksource_enqueue(cs);
 	clocksource_enqueue_watchdog(cs);
 	clocksource_select();
+	clocksource_select_watchdog(false);
 	mutex_unlock(&clocksource_mutex);
 	return 0;
 }
@@ -745,7 +743,7 @@ EXPORT_SYMBOL_GPL(__clocksource_register_scale);
 
 /**
  * clocksource_register - Used to install new clocksources
- * @t:		clocksource to be registered
+ * @cs:		clocksource to be registered
  *
  * Returns -EBUSY if registration fails, zero otherwise.
  */
@@ -762,11 +760,9 @@ int clocksource_register(struct clocksource *cs)
 
 	mutex_lock(&clocksource_mutex);
 	clocksource_enqueue(cs);
-	clocksource_select();
 	clocksource_enqueue_watchdog(cs);
+	clocksource_select();
 	mutex_unlock(&clocksource_mutex);
-	if (!strcmp(cs->name, "kvm-clock"))
-		has_kvm_clock = 1;
 	return 0;
 }
 EXPORT_SYMBOL(clocksource_register);
@@ -780,26 +776,55 @@ static void __clocksource_change_rating(struct clocksource *cs, int rating)
 
 /**
  * clocksource_change_rating - Change the rating of a registered clocksource
+ * @cs:		clocksource to be changed
+ * @rating:	new rating
  */
 void clocksource_change_rating(struct clocksource *cs, int rating)
 {
 	mutex_lock(&clocksource_mutex);
 	__clocksource_change_rating(cs, rating);
 	clocksource_select();
+	clocksource_select_watchdog(false);
 	mutex_unlock(&clocksource_mutex);
 }
 EXPORT_SYMBOL(clocksource_change_rating);
 
+/*
+ * Unbind clocksource @cs. Called with clocksource_mutex held
+ */
+static int clocksource_unbind(struct clocksource *cs)
+{
+	if (clocksource_is_watchdog(cs)) {
+		/* Select and try to install a replacement watchdog. */
+		clocksource_select_watchdog(true);
+		if (clocksource_is_watchdog(cs))
+			return -EBUSY;
+	}
+
+	if (cs == curr_clocksource) {
+		/* Select and try to install a replacement clock source */
+		clocksource_select_fallback();
+		if (curr_clocksource == cs)
+			return -EBUSY;
+	}
+	clocksource_dequeue_watchdog(cs);
+	list_del_init(&cs->list);
+	return 0;
+}
+
 /**
  * clocksource_unregister - remove a registered clocksource
+ * @cs:	clocksource to be unregistered
  */
-void clocksource_unregister(struct clocksource *cs)
+int clocksource_unregister(struct clocksource *cs)
 {
+	int ret = 0;
+
 	mutex_lock(&clocksource_mutex);
-	clocksource_dequeue_watchdog(cs);
-	list_del(&cs->list);
-	clocksource_select();
+	if (!list_empty(&cs->list))
+		ret = clocksource_unbind(cs);
 	mutex_unlock(&clocksource_mutex);
+	return ret;
 }
 EXPORT_SYMBOL(clocksource_unregister);
 
@@ -807,13 +832,14 @@ EXPORT_SYMBOL(clocksource_unregister);
 /**
  * sysfs_show_current_clocksources - sysfs interface for current clocksource
  * @dev:	unused
+ * @attr:	unused
  * @buf:	char buffer to be filled with clocksource list
  *
  * Provides sysfs interface for listing current clocksource.
  */
 static ssize_t
-sysfs_show_current_clocksources(struct sys_device *dev,
-				struct sysdev_attribute *attr, char *buf)
+sysfs_show_current_clocksources(struct device *dev,
+				struct device_attribute *attr, char *buf)
 {
 	ssize_t count = 0;
 
@@ -824,35 +850,44 @@ sysfs_show_current_clocksources(struct sys_device *dev,
 	return count;
 }
 
+size_t sysfs_get_uname(const char *buf, char *dst, size_t cnt)
+{
+	size_t ret = cnt;
+
+	/* strings from sysfs write are not 0 terminated! */
+	if (!cnt || cnt >= CS_NAME_LEN)
+		return -EINVAL;
+
+	/* strip of \n: */
+	if (buf[cnt-1] == '\n')
+		cnt--;
+	if (cnt > 0)
+		memcpy(dst, buf, cnt);
+	dst[cnt] = 0;
+	return ret;
+}
+
 /**
  * sysfs_override_clocksource - interface for manually overriding clocksource
  * @dev:	unused
+ * @attr:	unused
  * @buf:	name of override clocksource
  * @count:	length of buffer
  *
  * Takes input from sysfs interface for manually overriding the default
- * clocksource selction.
+ * clocksource selection.
  */
-static ssize_t sysfs_override_clocksource(struct sys_device *dev,
-					  struct sysdev_attribute *attr,
+static ssize_t sysfs_override_clocksource(struct device *dev,
+					  struct device_attribute *attr,
 					  const char *buf, size_t count)
 {
-	size_t ret = count;
-
-	/* strings from sysfs write are not 0 terminated! */
-	if (count >= sizeof(override_name))
-		return -EINVAL;
-
-	/* strip of \n: */
-	if (buf[count-1] == '\n')
-		count--;
+	size_t ret;
 
 	mutex_lock(&clocksource_mutex);
 
-	if (count > 0)
-		memcpy(override_name, buf, count);
-	override_name[count] = 0;
-	clocksource_select();
+	ret = sysfs_get_uname(buf, override_name, count);
+	if (ret >= 0)
+		clocksource_select();
 
 	mutex_unlock(&clocksource_mutex);
 
@@ -860,15 +895,50 @@ static ssize_t sysfs_override_clocksource(struct sys_device *dev,
 }
 
 /**
+ * sysfs_unbind_current_clocksource - interface for manually unbinding clocksource
+ * @dev:	unused
+ * @attr:	unused
+ * @buf:	unused
+ * @count:	length of buffer
+ *
+ * Takes input from sysfs interface for manually unbinding a clocksource.
+ */
+static ssize_t sysfs_unbind_clocksource(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct clocksource *cs;
+	char name[CS_NAME_LEN];
+	size_t ret;
+
+	ret = sysfs_get_uname(buf, name, count);
+	if (ret < 0)
+		return ret;
+
+	ret = -ENODEV;
+	mutex_lock(&clocksource_mutex);
+	list_for_each_entry(cs, &clocksource_list, list) {
+		if (strcmp(cs->name, name))
+			continue;
+		ret = clocksource_unbind(cs);
+		break;
+	}
+	mutex_unlock(&clocksource_mutex);
+
+	return ret ? ret : count;
+}
+
+/**
  * sysfs_show_available_clocksources - sysfs interface for listing clocksource
  * @dev:	unused
+ * @attr:	unused
  * @buf:	char buffer to be filled with clocksource list
  *
  * Provides sysfs interface for listing registered clocksources
  */
 static ssize_t
-sysfs_show_available_clocksources(struct sys_device *dev,
-				  struct sysdev_attribute *attr,
+sysfs_show_available_clocksources(struct device *dev,
+				  struct device_attribute *attr,
 				  char *buf)
 {
 	struct clocksource *src;
@@ -897,35 +967,41 @@ sysfs_show_available_clocksources(struct sys_device *dev,
 /*
  * Sysfs setup bits:
  */
-static SYSDEV_ATTR(current_clocksource, 0644, sysfs_show_current_clocksources,
+static DEVICE_ATTR(current_clocksource, 0644, sysfs_show_current_clocksources,
 		   sysfs_override_clocksource);
 
-static SYSDEV_ATTR(available_clocksource, 0444,
+static DEVICE_ATTR(unbind_clocksource, 0200, NULL, sysfs_unbind_clocksource);
+
+static DEVICE_ATTR(available_clocksource, 0444,
 		   sysfs_show_available_clocksources, NULL);
 
-static struct sysdev_class clocksource_sysclass = {
+static struct bus_type clocksource_subsys = {
 	.name = "clocksource",
+	.dev_name = "clocksource",
 };
 
-static struct sys_device device_clocksource = {
+static struct device device_clocksource = {
 	.id	= 0,
-	.cls	= &clocksource_sysclass,
+	.bus	= &clocksource_subsys,
 };
 
 static int __init init_clocksource_sysfs(void)
 {
-	int error = sysdev_class_register(&clocksource_sysclass);
+	int error = subsys_system_register(&clocksource_subsys, NULL);
 
 	if (!error)
-		error = sysdev_register(&device_clocksource);
+		error = device_register(&device_clocksource);
 	if (!error)
-		error = sysdev_create_file(
+		error = device_create_file(
 				&device_clocksource,
-				&attr_current_clocksource);
+				&dev_attr_current_clocksource);
 	if (!error)
-		error = sysdev_create_file(
+		error = device_create_file(&device_clocksource,
+					   &dev_attr_unbind_clocksource);
+	if (!error)
+		error = device_create_file(
 				&device_clocksource,
-				&attr_available_clocksource);
+				&dev_attr_available_clocksource);
 	return error;
 }
 
@@ -949,18 +1025,6 @@ static int __init boot_override_clocksource(char* str)
 }
 
 __setup("clocksource=", boot_override_clocksource);
-
-/**
- * set_clocksource_failover - set the clocksource to fail when it is detected to
- * be unstable
- */
-static int __init set_clocksource_failover(char *str)
-{
-	clocksource_failover = 1;
-
-	return 1;
-}
-__setup("clocksource_failover", set_clocksource_failover);
 
 /**
  * boot_override_clock - Compatibility layer for deprecated boot option

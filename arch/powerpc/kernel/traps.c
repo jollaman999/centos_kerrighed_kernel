@@ -1,5 +1,6 @@
 /*
  *  Copyright (C) 1995-1996  Gary Thomas (gdt@linuxppc.org)
+ *  Copyright 2007-2010 Freescale Semiconductor, Inc.
  *
  *  This program is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU General Public License
@@ -21,7 +22,6 @@
 #include <linux/stddef.h>
 #include <linux/unistd.h>
 #include <linux/ptrace.h>
-#include <linux/slab.h>
 #include <linux/user.h>
 #include <linux/interrupt.h>
 #include <linux/init.h>
@@ -34,49 +34,59 @@
 #include <linux/bug.h>
 #include <linux/kdebug.h>
 #include <linux/debugfs.h>
+#include <linux/ratelimit.h>
+#include <linux/context_tracking.h>
+#include <linux/kmsg_dump.h>
 
 #include <asm/emulated_ops.h>
 #include <asm/pgtable.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <asm/io.h>
 #include <asm/machdep.h>
 #include <asm/rtas.h>
 #include <asm/pmc.h>
-#ifdef CONFIG_PPC32
 #include <asm/reg.h>
-#endif
 #ifdef CONFIG_PMAC_BACKLIGHT
 #include <asm/backlight.h>
 #endif
 #ifdef CONFIG_PPC64
 #include <asm/firmware.h>
 #include <asm/processor.h>
+#include <asm/tm.h>
 #endif
 #include <asm/kexec.h>
 #include <asm/ppc-opcode.h>
-#ifdef CONFIG_FSL_BOOKE
-#include <asm/dbell.h>
-#endif
+#include <asm/rio.h>
 #include <asm/fadump.h>
+#include <asm/switch_to.h>
+#include <asm/tm.h>
+#include <asm/debug.h>
 #include <asm/asm-prototypes.h>
+#include <asm/hmi.h>
 
 #if defined(CONFIG_DEBUGGER) || defined(CONFIG_KEXEC)
-int (*__debugger)(struct pt_regs *regs);
-int (*__debugger_ipi)(struct pt_regs *regs);
-int (*__debugger_bpt)(struct pt_regs *regs);
-int (*__debugger_sstep)(struct pt_regs *regs);
-int (*__debugger_iabr_match)(struct pt_regs *regs);
-int (*__debugger_dabr_match)(struct pt_regs *regs);
-int (*__debugger_fault_handler)(struct pt_regs *regs);
+int (*__debugger)(struct pt_regs *regs) __read_mostly;
+int (*__debugger_ipi)(struct pt_regs *regs) __read_mostly;
+int (*__debugger_bpt)(struct pt_regs *regs) __read_mostly;
+int (*__debugger_sstep)(struct pt_regs *regs) __read_mostly;
+int (*__debugger_iabr_match)(struct pt_regs *regs) __read_mostly;
+int (*__debugger_break_match)(struct pt_regs *regs) __read_mostly;
+int (*__debugger_fault_handler)(struct pt_regs *regs) __read_mostly;
 
 EXPORT_SYMBOL(__debugger);
 EXPORT_SYMBOL(__debugger_ipi);
 EXPORT_SYMBOL(__debugger_bpt);
 EXPORT_SYMBOL(__debugger_sstep);
 EXPORT_SYMBOL(__debugger_iabr_match);
-EXPORT_SYMBOL(__debugger_dabr_match);
+EXPORT_SYMBOL(__debugger_break_match);
 EXPORT_SYMBOL(__debugger_fault_handler);
+#endif
+
+/* Transactional Memory trap debug */
+#ifdef TM_DEBUG_SW
+#define TM_DEBUG(x...) printk(KERN_INFO x)
+#else
+#define TM_DEBUG(x...) do { } while(0)
 #endif
 
 /*
@@ -101,18 +111,14 @@ static void pmac_backlight_unblank(void)
 static inline void pmac_backlight_unblank(void) { }
 #endif
 
-int die(const char *str, struct pt_regs *regs, long err)
+static arch_spinlock_t die_lock = __ARCH_SPIN_LOCK_UNLOCKED;
+static int die_owner = -1;
+static unsigned int die_nest_count;
+static int die_counter;
+
+static unsigned __kprobes long oops_begin(struct pt_regs *regs)
 {
-	static struct {
-		spinlock_t lock;
-		u32 lock_owner;
-		int lock_owner_depth;
-	} die = {
-		.lock =			__SPIN_LOCK_UNLOCKED(die.lock),
-		.lock_owner =		-1,
-		.lock_owner_depth =	0
-	};
-	static int die_counter;
+	int cpu;
 	unsigned long flags;
 
 	if (debugger(regs))
@@ -120,62 +126,96 @@ int die(const char *str, struct pt_regs *regs, long err)
 
 	oops_enter();
 
-	if (die.lock_owner != raw_smp_processor_id()) {
-		console_verbose();
-		spin_lock_irqsave(&die.lock, flags);
-		die.lock_owner = smp_processor_id();
-		die.lock_owner_depth = 0;
-		bust_spinlocks(1);
-		if (machine_is(powermac))
-			pmac_backlight_unblank();
-	} else {
-		local_save_flags(flags);
+	/* racy, but better than risking deadlock. */
+	raw_local_irq_save(flags);
+	cpu = smp_processor_id();
+	if (!arch_spin_trylock(&die_lock)) {
+		if (cpu == die_owner)
+			/* nested oops. should stop eventually */;
+		else
+			arch_spin_lock(&die_lock);
 	}
+	die_nest_count++;
+	die_owner = cpu;
+	console_verbose();
+	bust_spinlocks(1);
+	if (machine_is(powermac))
+		pmac_backlight_unblank();
+	return flags;
+}
 
-	if (++die.lock_owner_depth < 3) {
-		printk("Oops: %s, sig: %ld [#%d]\n", str, err, ++die_counter);
-#ifdef CONFIG_PREEMPT
-		printk("PREEMPT ");
-#endif
-#ifdef CONFIG_SMP
-		printk("SMP NR_CPUS=%d ", NR_CPUS);
-#endif
-#ifdef CONFIG_DEBUG_PAGEALLOC
-		printk("DEBUG_PAGEALLOC ");
-#endif
-#ifdef CONFIG_NUMA
-		printk("NUMA ");
-#endif
-		printk("%s\n", ppc_md.name ? ppc_md.name : "");
-
-		print_modules();
-		show_regs(regs);
-	} else {
-		printk("Recursive die() failure, output suppressed\n");
-	}
-
+static void __kprobes oops_end(unsigned long flags, struct pt_regs *regs,
+			       int signr)
+{
 	bust_spinlocks(0);
-	die.lock_owner = -1;
-	add_taint(TAINT_DIE);
-	spin_unlock_irqrestore(&die.lock, flags);
+	die_owner = -1;
+	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
+	die_nest_count--;
+	oops_exit();
+	printk("\n");
+	if (!die_nest_count)
+		/* Nest count reaches zero, release the lock. */
+		arch_spin_unlock(&die_lock);
+	raw_local_irq_restore(flags);
 
-	crash_fadump(regs, str);
+	crash_fadump(regs, "die oops");
 
-	if (kexec_should_crash(current) ||
-		kexec_sr_activated(smp_processor_id()))
+	if (kexec_should_crash(current))
 		crash_kexec(regs);
-	crash_kexec_secondary(regs);
+
+	if (!signr)
+		return;
+
+	/*
+	 * While our oops output is serialised by a spinlock, output
+	 * from panic() called below can race and corrupt it. If we
+	 * know we are going to panic, delay for 1 second so we have a
+	 * chance to get clean backtraces from all CPUs that are oopsing.
+	 */
+	if (in_interrupt() || panic_on_oops || !current->pid ||
+	    is_global_init(current)) {
+		mdelay(MSEC_PER_SEC);
+	}
 
 	if (in_interrupt())
 		panic("Fatal exception in interrupt");
-
 	if (panic_on_oops)
 		panic("Fatal exception");
+	do_exit(signr);
+}
 
-	oops_exit();
-	do_exit(err);
+static int __kprobes __die(const char *str, struct pt_regs *regs, long err)
+{
+	printk("Oops: %s, sig: %ld [#%d]\n", str, err, ++die_counter);
+#ifdef CONFIG_PREEMPT
+	printk("PREEMPT ");
+#endif
+#ifdef CONFIG_SMP
+	printk("SMP NR_CPUS=%d ", NR_CPUS);
+#endif
+	if (debug_pagealloc_enabled())
+		printk("DEBUG_PAGEALLOC ");
+#ifdef CONFIG_NUMA
+	printk("NUMA ");
+#endif
+	printk("%s\n", ppc_md.name ? ppc_md.name : "");
+
+	if (notify_die(DIE_OOPS, str, regs, err, 255, SIGSEGV) == NOTIFY_STOP)
+		return 1;
+
+	print_modules();
+	show_regs(regs);
 
 	return 0;
+}
+
+void die(const char *str, struct pt_regs *regs, long err)
+{
+	unsigned long flags = oops_begin(regs);
+
+	if (__die(str, regs, err))
+		err = 0;
+	oops_end(flags, regs, err);
 }
 
 void user_single_step_siginfo(struct task_struct *tsk,
@@ -196,43 +236,25 @@ void _exception(int signr, struct pt_regs *regs, int code, unsigned long addr)
 			"at %016lx nip %016lx lr %016lx code %x\n";
 
 	if (!user_mode(regs)) {
-		if (die("Exception in kernel mode", regs, signr))
-			return;
-	} else if (show_unhandled_signals &&
-		    unhandled_signal(current, signr) &&
-		    printk_ratelimit()) {
-			printk(regs->msr & MSR_SF ? fmt64 : fmt32,
-				current->comm, current->pid, signr,
-				addr, regs->nip, regs->link, code);
-		}
+		die("Exception in kernel mode", regs, signr);
+		return;
+	}
 
+	if (show_unhandled_signals && unhandled_signal(current, signr)) {
+		printk_ratelimited(regs->msr & MSR_64BIT ? fmt64 : fmt32,
+				   current->comm, current->pid, signr,
+				   addr, regs->nip, regs->link, code);
+	}
+
+	if (arch_irqs_disabled() && !arch_irq_disabled_regs(regs))
+		local_irq_enable();
+
+	current->thread.trap_nr = code;
 	memset(&info, 0, sizeof(info));
 	info.si_signo = signr;
 	info.si_code = code;
 	info.si_addr = (void __user *) addr;
 	force_sig_info(signr, &info, current);
-
-	/*
-	 * Init gets no signals that it doesn't have a handler for.
-	 * That's all very well, but if it has caused a synchronous
-	 * exception and we ignore the resulting signal, it will just
-	 * generate the same exception over and over again and we get
-	 * nowhere.  Better to kill it and let the kernel panic.
-	 */
-	if (is_global_init(current)) {
-		__sighandler_t handler;
-
-		spin_lock_irq(&current->sighand->siglock);
-		handler = current->sighand->action[signr-1].sa.sa_handler;
-		spin_unlock_irq(&current->sighand->siglock);
-		if (handler == SIG_DFL) {
-			/* init has generated a synchronous exception
-			   and it doesn't have a handler for the signal */
-			printk(KERN_CRIT "init has generated signal %d "
-			       "but has no handler for it\n", signr);
-			do_exit(signr);
-		}
-	}
 }
 
 #ifdef CONFIG_PPC64
@@ -244,31 +266,74 @@ void system_reset_exception(struct pt_regs *regs)
 			return;
 	}
 
-#ifdef CONFIG_KEXEC
-	cpu_set(smp_processor_id(), cpus_in_sr);
-#endif
+	if (debugger(regs))
+		goto out;
 
-	die("System Reset", regs, SIGABRT);
+	kmsg_dump(KMSG_DUMP_OOPS);
+	/*
+	 * A system reset is a request to dump, so we always send
+	 * it through the crashdump code (if fadump or kdump are
+	 * registered).
+	 */
+	crash_fadump(regs, "System Reset");
+
+	crash_kexec(regs);
 
 	/*
-	 * Some CPUs when released from the debugger will execute this path.
-	 * These CPUs entered the debugger via a soft-reset. If the CPU was
-	 * hung before entering the debugger it will return to the hung
-	 * state when exiting this function.  This causes a problem in
-	 * kdump since the hung CPU(s) will not respond to the IPI sent
-	 * from kdump. To prevent the problem we call crash_kexec_secondary()
-	 * here. If a kdump had not been initiated or we exit the debugger
-	 * with the "exit and recover" command (x) crash_kexec_secondary()
-	 * will return after 5ms and the CPU returns to its previous state.
+	 * We aren't the primary crash CPU. We need to send it
+	 * to a holding pattern to avoid it ending up in the panic
+	 * code.
 	 */
 	crash_kexec_secondary(regs);
 
+	/*
+	 * No debugger or crash dump registered, print logs then
+	 * panic.
+	 */
+	die("System Reset", regs, SIGABRT);
+
+	mdelay(2*MSEC_PER_SEC); /* Wait a little while for others to print */
+	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
+	nmi_panic(regs, "System Reset");
+
+out:
 	/* Must die if the interrupt is not recoverable */
 	if (!(regs->msr & MSR_RI))
-		panic("Unrecoverable System Reset");
+		nmi_panic(regs, "Unrecoverable System Reset");
 
 	/* What should we do here? We could issue a shutdown or hard reset. */
 }
+
+/*
+ * This function is called in real mode. Strictly no printk's please.
+ *
+ * regs->nip and regs->msr contains srr0 and ssr1.
+ */
+long machine_check_early(struct pt_regs *regs)
+{
+	long handled = 0;
+
+	__get_cpu_var(irq_stat).mce_exceptions++;
+
+	if (cur_cpu_spec && cur_cpu_spec->machine_check_early)
+		handled = cur_cpu_spec->machine_check_early(regs);
+	return handled;
+}
+
+long hmi_exception_realmode(struct pt_regs *regs)
+{
+	__get_cpu_var(irq_stat).hmi_exceptions++;
+
+	wait_for_subcore_guest_exit();
+
+	if (ppc_md.hmi_exception_early)
+		ppc_md.hmi_exception_early(regs);
+
+	wait_for_tb_resync();
+
+	return 0;
+}
+
 #endif
 
 /*
@@ -320,14 +385,14 @@ static inline int check_io_access(struct pt_regs *regs)
 	return 0;
 }
 
-#if defined(CONFIG_4xx) || defined(CONFIG_BOOKE)
+#ifdef CONFIG_PPC_ADV_DEBUG_REGS
 /* On 4xx, the reason for the machine check or program exception
    is in the ESR. */
 #define get_reason(regs)	((regs)->dsisr)
 #ifndef CONFIG_FSL_BOOKE
 #define get_mc_reason(regs)	((regs)->dsisr)
 #else
-#define get_mc_reason(regs)	(mfspr(SPRN_MCSR) & MCSR_MASK)
+#define get_mc_reason(regs)	(mfspr(SPRN_MCSR))
 #endif
 #define REASON_FP		ESR_FP
 #define REASON_ILLEGAL		(ESR_PIL | ESR_PUO)
@@ -335,14 +400,15 @@ static inline int check_io_access(struct pt_regs *regs)
 #define REASON_TRAP		ESR_PTR
 
 /* single-step stuff */
-#define single_stepping(regs)	(current->thread.dbcr0 & DBCR0_IC)
-#define clear_single_step(regs)	(current->thread.dbcr0 &= ~DBCR0_IC)
+#define single_stepping(regs)	(current->thread.debug.dbcr0 & DBCR0_IC)
+#define clear_single_step(regs)	(current->thread.debug.dbcr0 &= ~DBCR0_IC)
 
 #else
 /* On non-4xx, the reason for the machine check or program
    exception is in the MSR. */
 #define get_reason(regs)	((regs)->msr)
 #define get_mc_reason(regs)	((regs)->msr)
+#define REASON_TM		0x200000
 #define REASON_FP		0x100000
 #define REASON_ILLEGAL		0x80000
 #define REASON_PRIVILEGED	0x40000
@@ -402,10 +468,154 @@ int machine_check_440A(struct pt_regs *regs)
 	}
 	return 0;
 }
+
+int machine_check_47x(struct pt_regs *regs)
+{
+	unsigned long reason = get_mc_reason(regs);
+	u32 mcsr;
+
+	printk(KERN_ERR "Machine check in kernel mode.\n");
+	if (reason & ESR_IMCP) {
+		printk(KERN_ERR
+		       "Instruction Synchronous Machine Check exception\n");
+		mtspr(SPRN_ESR, reason & ~ESR_IMCP);
+		return 0;
+	}
+	mcsr = mfspr(SPRN_MCSR);
+	if (mcsr & MCSR_IB)
+		printk(KERN_ERR "Instruction Read PLB Error\n");
+	if (mcsr & MCSR_DRB)
+		printk(KERN_ERR "Data Read PLB Error\n");
+	if (mcsr & MCSR_DWB)
+		printk(KERN_ERR "Data Write PLB Error\n");
+	if (mcsr & MCSR_TLBP)
+		printk(KERN_ERR "TLB Parity Error\n");
+	if (mcsr & MCSR_ICP) {
+		flush_instruction_cache();
+		printk(KERN_ERR "I-Cache Parity Error\n");
+	}
+	if (mcsr & MCSR_DCSP)
+		printk(KERN_ERR "D-Cache Search Parity Error\n");
+	if (mcsr & PPC47x_MCSR_GPR)
+		printk(KERN_ERR "GPR Parity Error\n");
+	if (mcsr & PPC47x_MCSR_FPR)
+		printk(KERN_ERR "FPR Parity Error\n");
+	if (mcsr & PPC47x_MCSR_IPR)
+		printk(KERN_ERR "Machine Check exception is imprecise\n");
+
+	/* Clear MCSR */
+	mtspr(SPRN_MCSR, mcsr);
+
+	return 0;
+}
 #elif defined(CONFIG_E500)
+int machine_check_e500mc(struct pt_regs *regs)
+{
+	unsigned long mcsr = mfspr(SPRN_MCSR);
+	unsigned long reason = mcsr;
+	int recoverable = 1;
+
+	if (reason & MCSR_LD) {
+		recoverable = fsl_rio_mcheck_exception(regs);
+		if (recoverable == 1)
+			goto silent_out;
+	}
+
+	printk("Machine check in kernel mode.\n");
+	printk("Caused by (from MCSR=%lx): ", reason);
+
+	if (reason & MCSR_MCP)
+		printk("Machine Check Signal\n");
+
+	if (reason & MCSR_ICPERR) {
+		printk("Instruction Cache Parity Error\n");
+
+		/*
+		 * This is recoverable by invalidating the i-cache.
+		 */
+		mtspr(SPRN_L1CSR1, mfspr(SPRN_L1CSR1) | L1CSR1_ICFI);
+		while (mfspr(SPRN_L1CSR1) & L1CSR1_ICFI)
+			;
+
+		/*
+		 * This will generally be accompanied by an instruction
+		 * fetch error report -- only treat MCSR_IF as fatal
+		 * if it wasn't due to an L1 parity error.
+		 */
+		reason &= ~MCSR_IF;
+	}
+
+	if (reason & MCSR_DCPERR_MC) {
+		printk("Data Cache Parity Error\n");
+
+		/*
+		 * In write shadow mode we auto-recover from the error, but it
+		 * may still get logged and cause a machine check.  We should
+		 * only treat the non-write shadow case as non-recoverable.
+		 */
+		if (!(mfspr(SPRN_L1CSR2) & L1CSR2_DCWS))
+			recoverable = 0;
+	}
+
+	if (reason & MCSR_L2MMU_MHIT) {
+		printk("Hit on multiple TLB entries\n");
+		recoverable = 0;
+	}
+
+	if (reason & MCSR_NMI)
+		printk("Non-maskable interrupt\n");
+
+	if (reason & MCSR_IF) {
+		printk("Instruction Fetch Error Report\n");
+		recoverable = 0;
+	}
+
+	if (reason & MCSR_LD) {
+		printk("Load Error Report\n");
+		recoverable = 0;
+	}
+
+	if (reason & MCSR_ST) {
+		printk("Store Error Report\n");
+		recoverable = 0;
+	}
+
+	if (reason & MCSR_LDG) {
+		printk("Guarded Load Error Report\n");
+		recoverable = 0;
+	}
+
+	if (reason & MCSR_TLBSYNC)
+		printk("Simultaneous tlbsync operations\n");
+
+	if (reason & MCSR_BSL2_ERR) {
+		printk("Level 2 Cache Error\n");
+		recoverable = 0;
+	}
+
+	if (reason & MCSR_MAV) {
+		u64 addr;
+
+		addr = mfspr(SPRN_MCAR);
+		addr |= (u64)mfspr(SPRN_MCARU) << 32;
+
+		printk("Machine Check %s Address: %#llx\n",
+		       reason & MCSR_MEA ? "Effective" : "Physical", addr);
+	}
+
+silent_out:
+	mtspr(SPRN_MCSR, mcsr);
+	return mfspr(SPRN_MCSR) == 0 && recoverable;
+}
+
 int machine_check_e500(struct pt_regs *regs)
 {
 	unsigned long reason = get_mc_reason(regs);
+
+	if (reason & MCSR_BUS_RBERR) {
+		if (fsl_rio_mcheck_exception(regs))
+			return 1;
+	}
 
 	printk("Machine check in kernel mode.\n");
 	printk("Caused by (from MCSR=%lx): ", reason);
@@ -435,6 +645,11 @@ int machine_check_e500(struct pt_regs *regs)
 	if (reason & MCSR_BUS_RPERR)
 		printk("Bus - Read Parity Error\n");
 
+	return 0;
+}
+
+int machine_check_generic(struct pt_regs *regs)
+{
 	return 0;
 }
 #elif defined(CONFIG_E200)
@@ -502,7 +717,10 @@ int machine_check_generic(struct pt_regs *regs)
 
 void machine_check_exception(struct pt_regs *regs)
 {
+	enum ctx_state prev_state = exception_enter();
 	int recover = 0;
+
+	__get_cpu_var(irq_stat).mce_exceptions++;
 
 	/* See if any machine dependent calls. In theory, we would want
 	 * to call the CPU first, and call the ppc_md. one if the CPU
@@ -516,13 +734,7 @@ void machine_check_exception(struct pt_regs *regs)
 		recover = cur_cpu_spec->machine_check(regs);
 
 	if (recover > 0)
-		return;
-
-	if (user_mode(regs)) {
-		regs->msr |= MSR_RI;
-		_exception(SIGBUS, regs, BUS_ADRERR, regs->nip);
-		return;
-	}
+		goto bail;
 
 #if defined(CONFIG_8xx) && defined(CONFIG_PCI)
 	/* the qspan pci read routines can cause machine checks -- Cort
@@ -532,24 +744,23 @@ void machine_check_exception(struct pt_regs *regs)
 	 * -- BenH
 	 */
 	bad_page_fault(regs, regs->dar, SIGBUS);
-	return;
+	goto bail;
 #endif
 
-	if (debugger_fault_handler(regs)) {
-		regs->msr |= MSR_RI;
-		return;
-	}
+	if (debugger_fault_handler(regs))
+		goto bail;
 
 	if (check_io_access(regs))
-		return;
+		goto bail;
 
-	if (debugger_fault_handler(regs))
-		return;
 	die("Machine check", regs, SIGBUS);
 
 	/* Must die if the interrupt is not recoverable */
 	if (!(regs->msr & MSR_RI))
 		panic("Unrecoverable Machine check");
+
+bail:
+	exception_exit(prev_state);
 }
 
 void SMIException(struct pt_regs *regs)
@@ -557,22 +768,45 @@ void SMIException(struct pt_regs *regs)
 	die("System Management Interrupt", regs, SIGABRT);
 }
 
+void handle_hmi_exception(struct pt_regs *regs)
+{
+	struct pt_regs *old_regs;
+
+	old_regs = set_irq_regs(regs);
+	irq_enter();
+
+	if (ppc_md.handle_hmi_exception)
+		ppc_md.handle_hmi_exception(regs);
+
+	irq_exit();
+	set_irq_regs(old_regs);
+}
+
 void unknown_exception(struct pt_regs *regs)
 {
+	enum ctx_state prev_state = exception_enter();
+
 	printk("Bad trap at PC: %lx, SR: %lx, vector=%lx\n",
 	       regs->nip, regs->msr, regs->trap);
 
 	_exception(SIGTRAP, regs, 0, 0);
+
+	exception_exit(prev_state);
 }
 
 void instruction_breakpoint_exception(struct pt_regs *regs)
 {
+	enum ctx_state prev_state = exception_enter();
+
 	if (notify_die(DIE_IABR_MATCH, "iabr_match", regs, 5,
 					5, SIGTRAP) == NOTIFY_STOP)
-		return;
+		goto bail;
 	if (debugger_iabr_match(regs))
-		return;
+		goto bail;
 	_exception(SIGTRAP, regs, TRAP_BRKPT, regs->nip);
+
+bail:
+	exception_exit(prev_state);
 }
 
 void RunModeException(struct pt_regs *regs)
@@ -582,15 +816,20 @@ void RunModeException(struct pt_regs *regs)
 
 void __kprobes single_step_exception(struct pt_regs *regs)
 {
-	regs->msr &= ~(MSR_SE | MSR_BE);  /* Turn off 'trace' bits */
+	enum ctx_state prev_state = exception_enter();
+
+	clear_single_step(regs);
 
 	if (notify_die(DIE_SSTEP, "single_step", regs, 5,
 					5, SIGTRAP) == NOTIFY_STOP)
-		return;
+		goto bail;
 	if (debugger_sstep(regs))
-		return;
+		goto bail;
 
 	_exception(SIGTRAP, regs, TRAP_TRACE, regs->nip);
+
+bail:
+	exception_exit(prev_state);
 }
 
 /*
@@ -601,10 +840,8 @@ void __kprobes single_step_exception(struct pt_regs *regs)
  */
 static void emulate_single_step(struct pt_regs *regs)
 {
-	if (single_stepping(regs)) {
-		clear_single_step(regs);
-		_exception(SIGTRAP, regs, TRAP_TRACE, 0);
-	}
+	if (single_stepping(regs))
+		single_step_exception(regs);
 }
 
 static inline int __parse_fpscr(unsigned long fpscr)
@@ -640,7 +877,7 @@ static void parse_fpe(struct pt_regs *regs)
 
 	flush_fp_to_thread(current);
 
-	code = __parse_fpscr(current->thread.fpscr.val);
+	code = __parse_fpscr(current->thread.fp_state.fpscr);
 
 	_exception(SIGFPE, regs, code, regs->nip);
 }
@@ -690,6 +927,10 @@ static int emulate_string_inst(struct pt_regs *regs, u32 instword)
 	{
 		u8 val;
 		u32 shift = 8 * (3 - (pos & 0x3));
+
+		/* if process is 32-bit, clear upper 32 bits of EA */
+		if ((regs->msr & MSR_64BIT) == 0)
+			EA &= 0xFFFFFFFF;
 
 		switch ((instword & PPC_INST_STRING_MASK)) {
 			case PPC_INST_LSWX:
@@ -758,12 +999,34 @@ static int emulate_isel(struct pt_regs *regs, u32 instword)
 	return 0;
 }
 
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+static inline bool tm_abort_check(struct pt_regs *regs, int cause)
+{
+        /* If we're emulating a load/store in an active transaction, we cannot
+         * emulate it as the kernel operates in transaction suspended context.
+         * We need to abort the transaction.  This creates a persistent TM
+         * abort so tell the user what caused it with a new code.
+	 */
+	if (MSR_TM_TRANSACTIONAL(regs->msr)) {
+		tm_enable();
+		tm_abort(cause);
+		return true;
+	}
+	return false;
+}
+#else
+static inline bool tm_abort_check(struct pt_regs *regs, int reason)
+{
+	return false;
+}
+#endif
+
 static int emulate_instruction(struct pt_regs *regs)
 {
 	u32 instword;
 	u32 rd;
 
-	if (!user_mode(regs) || (regs->msr & MSR_LE))
+	if (!user_mode(regs))
 		return -EINVAL;
 	CHECK_FULL_REGS(regs);
 
@@ -772,7 +1035,7 @@ static int emulate_instruction(struct pt_regs *regs)
 
 	/* Emulate the mfspr rD, PVR. */
 	if ((instword & PPC_INST_MFSPR_PVR_MASK) == PPC_INST_MFSPR_PVR) {
-		PPC_WARN_EMULATED(mfpvr);
+		PPC_WARN_EMULATED(mfpvr, regs);
 		rd = (instword >> 21) & 0x1f;
 		regs->gpr[rd] = mfspr(SPRN_PVR);
 		return 0;
@@ -780,7 +1043,7 @@ static int emulate_instruction(struct pt_regs *regs)
 
 	/* Emulating the dcba insn is just a no-op.  */
 	if ((instword & PPC_INST_DCBA_MASK) == PPC_INST_DCBA) {
-		PPC_WARN_EMULATED(dcba);
+		PPC_WARN_EMULATED(dcba, regs);
 		return 0;
 	}
 
@@ -789,7 +1052,7 @@ static int emulate_instruction(struct pt_regs *regs)
 		int shift = (instword >> 21) & 0x1c;
 		unsigned long msk = 0xf0000000UL >> shift;
 
-		PPC_WARN_EMULATED(mcrxr);
+		PPC_WARN_EMULATED(mcrxr, regs);
 		regs->ccr = (regs->ccr & ~msk) | ((regs->xer >> shift) & msk);
 		regs->xer &= ~0xf0000000UL;
 		return 0;
@@ -797,21 +1060,58 @@ static int emulate_instruction(struct pt_regs *regs)
 
 	/* Emulate load/store string insn. */
 	if ((instword & PPC_INST_STRING_GEN_MASK) == PPC_INST_STRING) {
-		PPC_WARN_EMULATED(string);
+		if (tm_abort_check(regs,
+				   TM_CAUSE_EMULATE | TM_CAUSE_PERSISTENT))
+			return -EINVAL;
+		PPC_WARN_EMULATED(string, regs);
 		return emulate_string_inst(regs, instword);
 	}
 
 	/* Emulate the popcntb (Population Count Bytes) instruction. */
 	if ((instword & PPC_INST_POPCNTB_MASK) == PPC_INST_POPCNTB) {
-		PPC_WARN_EMULATED(popcntb);
+		PPC_WARN_EMULATED(popcntb, regs);
 		return emulate_popcntb_inst(regs, instword);
 	}
 
 	/* Emulate isel (Integer Select) instruction */
 	if ((instword & PPC_INST_ISEL_MASK) == PPC_INST_ISEL) {
-		PPC_WARN_EMULATED(isel);
+		PPC_WARN_EMULATED(isel, regs);
 		return emulate_isel(regs, instword);
 	}
+
+	/* Emulate sync instruction variants */
+	if ((instword & PPC_INST_SYNC_MASK) == PPC_INST_SYNC) {
+		PPC_WARN_EMULATED(sync, regs);
+		asm volatile("sync");
+		return 0;
+	}
+
+#ifdef CONFIG_PPC64
+	/* Emulate the mfspr rD, DSCR. */
+	if ((((instword & PPC_INST_MFSPR_DSCR_USER_MASK) ==
+		PPC_INST_MFSPR_DSCR_USER) ||
+	     ((instword & PPC_INST_MFSPR_DSCR_MASK) ==
+		PPC_INST_MFSPR_DSCR)) &&
+			cpu_has_feature(CPU_FTR_DSCR)) {
+		PPC_WARN_EMULATED(mfdscr, regs);
+		rd = (instword >> 21) & 0x1f;
+		regs->gpr[rd] = mfspr(SPRN_DSCR);
+		return 0;
+	}
+	/* Emulate the mtspr DSCR, rD. */
+	if ((((instword & PPC_INST_MTSPR_DSCR_USER_MASK) ==
+		PPC_INST_MTSPR_DSCR_USER) ||
+	     ((instword & PPC_INST_MTSPR_DSCR_MASK) ==
+		PPC_INST_MTSPR_DSCR)) &&
+			cpu_has_feature(CPU_FTR_DSCR)) {
+		PPC_WARN_EMULATED(mtdscr, regs);
+		rd = (instword >> 21) & 0x1f;
+		current->thread.dscr = regs->gpr[rd];
+		current->thread.dscr_inherit = 1;
+		mtspr(SPRN_DSCR, current->thread.dscr);
+		return 0;
+	}
+#endif
 
 	return -EINVAL;
 }
@@ -823,6 +1123,7 @@ int is_valid_bugaddr(unsigned long addr)
 
 void __kprobes program_check_exception(struct pt_regs *regs)
 {
+	enum ctx_state prev_state = exception_enter();
 	unsigned int reason = get_reason(regs);
 	extern int do_mathemu(struct pt_regs *regs);
 
@@ -832,26 +1133,73 @@ void __kprobes program_check_exception(struct pt_regs *regs)
 	if (reason & REASON_FP) {
 		/* IEEE FP exception */
 		parse_fpe(regs);
-		return;
+		goto bail;
 	}
 	if (reason & REASON_TRAP) {
+		/* Debugger is first in line to stop recursive faults in
+		 * rcu_lock, notify_die, or atomic_notifier_call_chain */
+		if (debugger_bpt(regs))
+			goto bail;
+
 		/* trap exception */
 		if (notify_die(DIE_BPT, "breakpoint", regs, 5, 5, SIGTRAP)
 				== NOTIFY_STOP)
-			return;
-		if (debugger_bpt(regs))
-			return;
+			goto bail;
 
 		if (!(regs->msr & MSR_PR) &&  /* not user-mode */
 		    report_bug(regs->nip, regs) == BUG_TRAP_TYPE_WARN) {
 			regs->nip += 4;
-			return;
+			goto bail;
 		}
 		_exception(SIGTRAP, regs, TRAP_BRKPT, regs->nip);
-		return;
+		goto bail;
 	}
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+	if (reason & REASON_TM) {
+		/* This is a TM "Bad Thing Exception" program check.
+		 * This occurs when:
+		 * -  An rfid/hrfid/mtmsrd attempts to cause an illegal
+		 *    transition in TM states.
+		 * -  A trechkpt is attempted when transactional.
+		 * -  A treclaim is attempted when non transactional.
+		 * -  A tend is illegally attempted.
+		 * -  writing a TM SPR when transactional.
+		 */
+		if (!user_mode(regs) &&
+		    report_bug(regs->nip, regs) == BUG_TRAP_TYPE_WARN) {
+			regs->nip += 4;
+			goto bail;
+		}
+		/* If usermode caused this, it's done something illegal and
+		 * gets a SIGILL slap on the wrist.  We call it an illegal
+		 * operand to distinguish from the instruction just being bad
+		 * (e.g. executing a 'tend' on a CPU without TM!); it's an
+		 * illegal /placement/ of a valid instruction.
+		 */
+		if (user_mode(regs)) {
+			_exception(SIGILL, regs, ILL_ILLOPN, regs->nip);
+			goto bail;
+		} else {
+			printk(KERN_EMERG "Unexpected TM Bad Thing exception "
+			       "at %lx (msr 0x%x)\n", regs->nip, reason);
+			die("Unrecoverable exception", regs, SIGABRT);
+		}
+	}
+#endif
 
-	local_irq_enable();
+	/*
+	 * If we took the program check in the kernel skip down to sending a
+	 * SIGILL. The subsequent cases all relate to emulating instructions
+	 * which we should only do for userspace. We also do not want to enable
+	 * interrupts for kernel faults because that might lead to further
+	 * faults, and loose the context of the original exception.
+	 */
+	if (!user_mode(regs))
+		goto sigill;
+
+	/* We restore the interrupt state now */
+	if (!arch_irq_disabled_regs(regs))
+		local_irq_enable();
 
 #ifdef CONFIG_MATH_EMULATION
 	/* (reason & REASON_ILLEGAL) would be the obvious thing here,
@@ -860,20 +1208,21 @@ void __kprobes program_check_exception(struct pt_regs *regs)
 	 * ESR_DST (!?) or 0.  In the process of chasing this with the
 	 * hardware people - not sure if it can happen on any illegal
 	 * instruction or only on FP instructions, whether there is a
-	 * pattern to occurences etc. -dgibson 31/Mar/2003 */
+	 * pattern to occurrences etc. -dgibson 31/Mar/2003
+	 */
 	switch (do_mathemu(regs)) {
 	case 0:
 		emulate_single_step(regs);
-		return;
+		goto bail;
 	case 1: {
 			int code = 0;
-			code = __parse_fpscr(current->thread.fpscr.val);
+			code = __parse_fpscr(current->thread.fp_state.fpscr);
 			_exception(SIGFPE, regs, code, regs->nip);
-			return;
+			goto bail;
 		}
 	case -EFAULT:
 		_exception(SIGSEGV, regs, SEGV_MAPERR, regs->nip);
-		return;
+		goto bail;
 	}
 	/* fall through on any other errors */
 #endif /* CONFIG_MATH_EMULATION */
@@ -884,22 +1233,44 @@ void __kprobes program_check_exception(struct pt_regs *regs)
 		case 0:
 			regs->nip += 4;
 			emulate_single_step(regs);
-			return;
+			goto bail;
 		case -EFAULT:
 			_exception(SIGSEGV, regs, SEGV_MAPERR, regs->nip);
-			return;
+			goto bail;
 		}
 	}
 
+sigill:
 	if (reason & REASON_PRIVILEGED)
 		_exception(SIGILL, regs, ILL_PRVOPC, regs->nip);
 	else
 		_exception(SIGILL, regs, ILL_ILLOPC, regs->nip);
+
+bail:
+	exception_exit(prev_state);
+}
+
+/*
+ * This occurs when running in hypervisor mode on POWER6 or later
+ * and an illegal instruction is encountered.
+ */
+void __kprobes emulation_assist_interrupt(struct pt_regs *regs)
+{
+	regs->msr |= REASON_ILLEGAL;
+	program_check_exception(regs);
 }
 
 void alignment_exception(struct pt_regs *regs)
 {
+	enum ctx_state prev_state = exception_enter();
 	int sig, code, fixed = 0;
+
+	/* We restore the interrupt state now */
+	if (!arch_irq_disabled_regs(regs))
+		local_irq_enable();
+
+	if (tm_abort_check(regs, TM_CAUSE_ALIGNMENT | TM_CAUSE_PERSISTENT))
+		goto bail;
 
 	/* we don't implement logging of alignment exceptions */
 	if (!(current->thread.align_ctl & PR_UNALIGN_SIGBUS))
@@ -908,7 +1279,7 @@ void alignment_exception(struct pt_regs *regs)
 	if (fixed == 1) {
 		regs->nip += 4;	/* skip over emulated instruction */
 		emulate_single_step(regs);
-		return;
+		goto bail;
 	}
 
 	/* Operand address was bad */
@@ -923,6 +1294,9 @@ void alignment_exception(struct pt_regs *regs)
 		_exception(sig, regs, code, regs->dar);
 	else
 		bad_page_fault(regs, regs->dar, sig);
+
+bail:
+	exception_exit(prev_state);
 }
 
 void StackOverflow(struct pt_regs *regs)
@@ -951,23 +1325,32 @@ void trace_syscall(struct pt_regs *regs)
 
 void kernel_fp_unavailable_exception(struct pt_regs *regs)
 {
+	enum ctx_state prev_state = exception_enter();
+
 	printk(KERN_EMERG "Unrecoverable FP Unavailable Exception "
 			  "%lx at %lx\n", regs->trap, regs->nip);
 	die("Unrecoverable FP Unavailable Exception", regs, SIGABRT);
+
+	exception_exit(prev_state);
 }
 
 void altivec_unavailable_exception(struct pt_regs *regs)
 {
+	enum ctx_state prev_state = exception_enter();
+
 	if (user_mode(regs)) {
 		/* A user program has executed an altivec instruction,
 		   but this kernel doesn't support altivec. */
 		_exception(SIGILL, regs, ILL_ILLOPC, regs->nip);
-		return;
+		goto bail;
 	}
 
 	printk(KERN_EMERG "Unrecoverable VMX/Altivec Unavailable Exception "
 			"%lx at %lx\n", regs->trap, regs->nip);
 	die("Unrecoverable VMX/Altivec Unavailable Exception", regs, SIGABRT);
+
+bail:
+	exception_exit(prev_state);
 }
 
 void vsx_unavailable_exception(struct pt_regs *regs)
@@ -984,8 +1367,229 @@ void vsx_unavailable_exception(struct pt_regs *regs)
 	die("Unrecoverable VSX Unavailable Exception", regs, SIGABRT);
 }
 
+#ifdef CONFIG_PPC64
+static void tm_unavailable(struct pt_regs *regs)
+{
+	pr_emerg("Unrecoverable TM Unavailable Exception "
+			"%lx at %lx\n", regs->trap, regs->nip);
+	die("Unrecoverable TM Unavailable Exception", regs, SIGABRT);
+}
+
+void facility_unavailable_exception(struct pt_regs *regs)
+{
+	static char *facility_strings[] = {
+		[FSCR_FP_LG] = "FPU",
+		[FSCR_VECVSX_LG] = "VMX/VSX",
+		[FSCR_DSCR_LG] = "DSCR",
+		[FSCR_PM_LG] = "PMU SPRs",
+		[FSCR_BHRB_LG] = "BHRB",
+		[FSCR_TM_LG] = "TM",
+		[FSCR_EBB_LG] = "EBB",
+		[FSCR_TAR_LG] = "TAR",
+	};
+	char *facility = "unknown";
+	u64 value;
+	u32 instword, rd;
+	u8 status;
+	bool hv;
+
+	hv = (regs->trap == 0xf80);
+	if (hv)
+		value = mfspr(SPRN_HFSCR);
+	else
+		value = mfspr(SPRN_FSCR);
+
+	status = value >> 56;
+	if (status == FSCR_DSCR_LG) {
+		/*
+		 * User is accessing the DSCR register using the problem
+		 * state only SPR number (0x03) either through a mfspr or
+		 * a mtspr instruction. If it is a write attempt through
+		 * a mtspr, then we set the inherit bit. This also allows
+		 * the user to write or read the register directly in the
+		 * future by setting via the FSCR DSCR bit. But in case it
+		 * is a read DSCR attempt through a mfspr instruction, we
+		 * just emulate the instruction instead. This code path will
+		 * always emulate all the mfspr instructions till the user
+		 * has attempted atleast one mtspr instruction. This way it
+		 * preserves the same behaviour when the user is accessing
+		 * the DSCR through privilege level only SPR number (0x11)
+		 * which is emulated through illegal instruction exception.
+		 * We always leave HFSCR DSCR set.
+		 */
+		if (get_user(instword, (u32 __user *)(regs->nip))) {
+			pr_err("Failed to fetch the user instruction\n");
+			return;
+		}
+
+		/* Write into DSCR (mtspr 0x03, RS) */
+		if ((instword & PPC_INST_MTSPR_DSCR_USER_MASK)
+				== PPC_INST_MTSPR_DSCR_USER) {
+			rd = (instword >> 21) & 0x1f;
+			current->thread.dscr = regs->gpr[rd];
+			current->thread.dscr_inherit = 1;
+			mtspr(SPRN_FSCR, value | FSCR_DSCR);
+		}
+
+		/* Read from DSCR (mfspr RT, 0x03) */
+		if ((instword & PPC_INST_MFSPR_DSCR_USER_MASK)
+				== PPC_INST_MFSPR_DSCR_USER) {
+			if (emulate_instruction(regs)) {
+				pr_err("DSCR based mfspr emulation failed\n");
+				return;
+			}
+			regs->nip += 4;
+			emulate_single_step(regs);
+		}
+		return;
+	}
+
+	if (status == FSCR_TM_LG) {
+		/*
+		 * If we're here then the hardware is TM aware because it
+		 * generated an exception with FSRM_TM set.
+		 *
+		 * If cpu_has_feature(CPU_FTR_TM) is false, then either firmware
+		 * told us not to do TM, or the kernel is not built with TM
+		 * support.
+		 *
+		 * If both of those things are true, then userspace can spam the
+		 * console by triggering the printk() below just by continually
+		 * doing tbegin (or any TM instruction). So in that case just
+		 * send the process a SIGILL immediately.
+		 */
+		if (!cpu_has_feature(CPU_FTR_TM))
+			goto out;
+
+		tm_unavailable(regs);
+		return;
+	}
+
+	if ((status < ARRAY_SIZE(facility_strings)) &&
+	    facility_strings[status])
+		facility = facility_strings[status];
+
+	/* We restore the interrupt state now */
+	if (!arch_irq_disabled_regs(regs))
+		local_irq_enable();
+
+	pr_err_ratelimited(
+		"%sFacility '%s' unavailable, exception at 0x%lx, MSR=%lx\n",
+		hv ? "Hypervisor " : "", facility, regs->nip, regs->msr);
+
+out:
+	if (user_mode(regs)) {
+		_exception(SIGILL, regs, ILL_ILLOPC, regs->nip);
+		return;
+	}
+
+	die("Unexpected facility unavailable exception", regs, SIGABRT);
+}
+#endif
+
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+
+void fp_unavailable_tm(struct pt_regs *regs)
+{
+	/* Note:  This does not handle any kind of FP laziness. */
+
+	TM_DEBUG("FP Unavailable trap whilst transactional at 0x%lx, MSR=%lx\n",
+		 regs->nip, regs->msr);
+
+        /* We can only have got here if the task started using FP after
+         * beginning the transaction.  So, the transactional regs are just a
+         * copy of the checkpointed ones.  But, we still need to recheckpoint
+         * as we're enabling FP for the process; it will return, abort the
+         * transaction, and probably retry but now with FP enabled.  So the
+         * checkpointed FP registers need to be loaded.
+	 */
+	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+	/* Reclaim didn't save out any FPRs to transact_fprs. */
+
+	/* Enable FP for the task: */
+	regs->msr |= (MSR_FP | current->thread.fpexc_mode);
+
+	/* This loads and recheckpoints the FP registers from
+	 * thread.fpr[].  They will remain in registers after the
+	 * checkpoint so we don't need to reload them after.
+	 * If VMX is in use, the VRs now hold checkpointed values,
+	 * so we don't want to load the VRs from the thread_struct.
+	 */
+	tm_recheckpoint(&current->thread, MSR_FP);
+
+	/* If VMX is in use, get the transactional values back */
+	if (regs->msr & MSR_VEC) {
+		do_load_up_transact_altivec(&current->thread);
+		/* At this point all the VSX state is loaded, so enable it */
+		regs->msr |= MSR_VSX;
+	}
+}
+
+void altivec_unavailable_tm(struct pt_regs *regs)
+{
+	/* See the comments in fp_unavailable_tm().  This function operates
+	 * the same way.
+	 */
+
+	TM_DEBUG("Vector Unavailable trap whilst transactional at 0x%lx,"
+		 "MSR=%lx\n",
+		 regs->nip, regs->msr);
+	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+	regs->msr |= MSR_VEC;
+	tm_recheckpoint(&current->thread, MSR_VEC);
+	current->thread.used_vr = 1;
+
+	if (regs->msr & MSR_FP) {
+		do_load_up_transact_fpu(&current->thread);
+		regs->msr |= MSR_VSX;
+	}
+}
+
+void vsx_unavailable_tm(struct pt_regs *regs)
+{
+	unsigned long orig_msr = regs->msr;
+
+	/* See the comments in fp_unavailable_tm().  This works similarly,
+	 * though we're loading both FP and VEC registers in here.
+	 *
+	 * If FP isn't in use, load FP regs.  If VEC isn't in use, load VEC
+	 * regs.  Either way, set MSR_VSX.
+	 */
+
+	TM_DEBUG("VSX Unavailable trap whilst transactional at 0x%lx,"
+		 "MSR=%lx\n",
+		 regs->nip, regs->msr);
+
+	current->thread.used_vsr = 1;
+
+	/* If FP and VMX are already loaded, we have all the state we need */
+	if ((orig_msr & (MSR_FP | MSR_VEC)) == (MSR_FP | MSR_VEC)) {
+		regs->msr |= MSR_VSX;
+		return;
+	}
+
+	/* This reclaims FP and/or VR regs if they're already enabled */
+	tm_reclaim_current(TM_CAUSE_FAC_UNAV);
+
+	regs->msr |= MSR_VEC | MSR_FP | current->thread.fpexc_mode |
+		MSR_VSX;
+
+	/* This loads & recheckpoints FP and VRs; but we have
+	 * to be sure not to overwrite previously-valid state.
+	 */
+	tm_recheckpoint(&current->thread, regs->msr & ~orig_msr);
+
+	if (orig_msr & MSR_FP)
+		do_load_up_transact_fpu(&current->thread);
+	if (orig_msr & MSR_VEC)
+		do_load_up_transact_altivec(&current->thread);
+}
+#endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
+
 void performance_monitor_exception(struct pt_regs *regs)
 {
+	__get_cpu_var(irq_stat).pmu_irqs++;
+
 	perf_irq(regs);
 }
 
@@ -1008,7 +1612,7 @@ void SoftwareEmulation(struct pt_regs *regs)
 #ifdef CONFIG_MATH_EMULATION
 	errcode = do_mathemu(regs);
 	if (errcode >= 0)
-		PPC_WARN_EMULATED(math);
+		PPC_WARN_EMULATED(math, regs);
 
 	switch (errcode) {
 	case 0:
@@ -1031,7 +1635,7 @@ void SoftwareEmulation(struct pt_regs *regs)
 #elif defined(CONFIG_8XX_MINIMAL_FPEMU)
 	errcode = Soft_emulate_8xx(regs);
 	if (errcode >= 0)
-		PPC_WARN_EMULATED(8xx);
+		PPC_WARN_EMULATED(8xx, regs);
 
 	switch (errcode) {
 	case 0:
@@ -1050,10 +1654,70 @@ void SoftwareEmulation(struct pt_regs *regs)
 }
 #endif /* CONFIG_8xx */
 
-#if defined(CONFIG_40x) || defined(CONFIG_BOOKE)
+#ifdef CONFIG_PPC_ADV_DEBUG_REGS
+static void handle_debug(struct pt_regs *regs, unsigned long debug_status)
+{
+	int changed = 0;
+	/*
+	 * Determine the cause of the debug event, clear the
+	 * event flags and send a trap to the handler. Torez
+	 */
+	if (debug_status & (DBSR_DAC1R | DBSR_DAC1W)) {
+		dbcr_dac(current) &= ~(DBCR_DAC1R | DBCR_DAC1W);
+#ifdef CONFIG_PPC_ADV_DEBUG_DAC_RANGE
+		current->thread.debug.dbcr2 &= ~DBCR2_DAC12MODE;
+#endif
+		do_send_trap(regs, mfspr(SPRN_DAC1), debug_status, TRAP_HWBKPT,
+			     5);
+		changed |= 0x01;
+	}  else if (debug_status & (DBSR_DAC2R | DBSR_DAC2W)) {
+		dbcr_dac(current) &= ~(DBCR_DAC2R | DBCR_DAC2W);
+		do_send_trap(regs, mfspr(SPRN_DAC2), debug_status, TRAP_HWBKPT,
+			     6);
+		changed |= 0x01;
+	}  else if (debug_status & DBSR_IAC1) {
+		current->thread.debug.dbcr0 &= ~DBCR0_IAC1;
+		dbcr_iac_range(current) &= ~DBCR_IAC12MODE;
+		do_send_trap(regs, mfspr(SPRN_IAC1), debug_status, TRAP_HWBKPT,
+			     1);
+		changed |= 0x01;
+	}  else if (debug_status & DBSR_IAC2) {
+		current->thread.debug.dbcr0 &= ~DBCR0_IAC2;
+		do_send_trap(regs, mfspr(SPRN_IAC2), debug_status, TRAP_HWBKPT,
+			     2);
+		changed |= 0x01;
+	}  else if (debug_status & DBSR_IAC3) {
+		current->thread.debug.dbcr0 &= ~DBCR0_IAC3;
+		dbcr_iac_range(current) &= ~DBCR_IAC34MODE;
+		do_send_trap(regs, mfspr(SPRN_IAC3), debug_status, TRAP_HWBKPT,
+			     3);
+		changed |= 0x01;
+	}  else if (debug_status & DBSR_IAC4) {
+		current->thread.debug.dbcr0 &= ~DBCR0_IAC4;
+		do_send_trap(regs, mfspr(SPRN_IAC4), debug_status, TRAP_HWBKPT,
+			     4);
+		changed |= 0x01;
+	}
+	/*
+	 * At the point this routine was called, the MSR(DE) was turned off.
+	 * Check all other debug flags and see if that bit needs to be turned
+	 * back on or not.
+	 */
+	if (DBCR_ACTIVE_EVENTS(current->thread.debug.dbcr0,
+			       current->thread.debug.dbcr1))
+		regs->msr |= MSR_DE;
+	else
+		/* Make sure the IDM flag is off */
+		current->thread.debug.dbcr0 &= ~DBCR0_IDM;
+
+	if (changed & 0x01)
+		mtspr(SPRN_DBCR0, current->thread.debug.dbcr0);
+}
 
 void __kprobes DebugException(struct pt_regs *regs, unsigned long debug_status)
 {
+	current->thread.debug.dbsr = debug_status;
+
 	/* Hack alert: On BookE, Branch Taken stops on the branch itself, while
 	 * on server, it stops on the target of the branch. In order to simulate
 	 * the server behaviour, we thus restart right away with a single step
@@ -1069,8 +1733,8 @@ void __kprobes DebugException(struct pt_regs *regs, unsigned long debug_status)
 
 		/* Do the single step trick only when coming from userspace */
 		if (user_mode(regs)) {
-			current->thread.dbcr0 &= ~DBCR0_BT;
-			current->thread.dbcr0 |= DBCR0_IDM | DBCR0_IC;
+			current->thread.debug.dbcr0 &= ~DBCR0_BT;
+			current->thread.debug.dbcr0 |= DBCR0_IDM | DBCR0_IC;
 			regs->msr |= MSR_DE;
 			return;
 		}
@@ -1097,29 +1761,21 @@ void __kprobes DebugException(struct pt_regs *regs, unsigned long debug_status)
 		if (debugger_sstep(regs))
 			return;
 
-		if (user_mode(regs))
-			current->thread.dbcr0 &= ~(DBCR0_IC);
+		if (user_mode(regs)) {
+			current->thread.debug.dbcr0 &= ~DBCR0_IC;
+			if (DBCR_ACTIVE_EVENTS(current->thread.debug.dbcr0,
+					       current->thread.debug.dbcr1))
+				regs->msr |= MSR_DE;
+			else
+				/* Make sure the IDM bit is off */
+				current->thread.debug.dbcr0 &= ~DBCR0_IDM;
+		}
 
 		_exception(SIGTRAP, regs, TRAP_TRACE, regs->nip);
-	} else if (debug_status & (DBSR_DAC1R | DBSR_DAC1W)) {
-		regs->msr &= ~MSR_DE;
-
-		if (user_mode(regs)) {
-			current->thread.dbcr0 &= ~(DBSR_DAC1R | DBSR_DAC1W |
-								DBCR0_IDM);
-		} else {
-			/* Disable DAC interupts */
-			mtspr(SPRN_DBCR0, mfspr(SPRN_DBCR0) & ~(DBSR_DAC1R |
-						DBSR_DAC1W | DBCR0_IDM));
-
-			/* Clear the DAC event */
-			mtspr(SPRN_DBSR, (DBSR_DAC1R | DBSR_DAC1W));
-		}
-		/* Setup and send the trap to the handler */
-		do_dabr(regs, mfspr(SPRN_DAC1), debug_status);
-	}
+	} else
+		handle_debug(regs, debug_status);
 }
-#endif /* CONFIG_4xx || CONFIG_BOOKE */
+#endif /* CONFIG_PPC_ADV_DEBUG_REGS */
 
 #if !defined(CONFIG_TAU_INT)
 void TAUException(struct pt_regs *regs)
@@ -1142,7 +1798,7 @@ void altivec_assist_exception(struct pt_regs *regs)
 
 	flush_altivec_to_thread(current);
 
-	PPC_WARN_EMULATED(altivec);
+	PPC_WARN_EMULATED(altivec, regs);
 	err = emulate_altivec(regs);
 	if (err == 0) {
 		regs->nip += 4;		/* skip emulated instruction */
@@ -1156,10 +1812,9 @@ void altivec_assist_exception(struct pt_regs *regs)
 	} else {
 		/* didn't recognize the instruction */
 		/* XXX quick hack for now: set the non-Java bit in the VSCR */
-		if (printk_ratelimit())
-			printk(KERN_ERR "Unrecognized altivec instruction "
-			       "in %s at %lx\n", current->comm, regs->nip);
-		current->thread.vscr.u[3] |= 0x10000;
+		printk_ratelimited(KERN_ERR "Unrecognized altivec instruction "
+				   "in %s at %lx\n", current->comm, regs->nip);
+		current->thread.vr_state.vscr.u[3] |= 0x10000;
 	}
 }
 #endif /* CONFIG_ALTIVEC */
@@ -1180,24 +1835,6 @@ void vsx_assist_exception(struct pt_regs *regs)
 #endif /* CONFIG_VSX */
 
 #ifdef CONFIG_FSL_BOOKE
-
-void doorbell_exception(struct pt_regs *regs)
-{
-#ifdef CONFIG_SMP
-	int cpu = smp_processor_id();
-	int msg;
-
-	if (num_online_cpus() < 2)
-		return;
-
-	for (msg = 0; msg < 4; msg++)
-		if (test_and_clear_bit(msg, &dbell_smp_message[cpu]))
-			smp_message_recv(msg);
-#else
-	printk(KERN_WARNING "Received doorbell on non-smp system\n");
-#endif
-}
-
 void CacheLockingException(struct pt_regs *regs, unsigned long address,
 			   unsigned long error_code)
 {
@@ -1220,10 +1857,7 @@ void SPEFloatingPointException(struct pt_regs *regs)
 	int code = 0;
 	int err;
 
-	preempt_disable();
-	if (regs->msr & MSR_SPE)
-		giveup_spe(current);
-	preempt_enable();
+	flush_spe_to_thread(current);
 
 	spefscr = current->thread.spefscr;
 	fpexc_mode = current->thread.fpexc_mode;
@@ -1308,7 +1942,7 @@ void unrecoverable_exception(struct pt_regs *regs)
 	die("Unrecoverable exception", regs, SIGABRT);
 }
 
-#ifdef CONFIG_BOOKE_WDT
+#if defined(CONFIG_BOOKE_WDT) || defined(CONFIG_40x)
 /*
  * Default handler for a Watchdog exception,
  * spins until a reboot occurs
@@ -1361,6 +1995,7 @@ struct ppc_emulated ppc_emulated = {
 	WARN_EMULATED_SETUP(popcntb),
 	WARN_EMULATED_SETUP(spe),
 	WARN_EMULATED_SETUP(string),
+	WARN_EMULATED_SETUP(sync),
 	WARN_EMULATED_SETUP(unaligned),
 #ifdef CONFIG_MATH_EMULATION
 	WARN_EMULATED_SETUP(math),
@@ -1370,15 +2005,19 @@ struct ppc_emulated ppc_emulated = {
 #ifdef CONFIG_VSX
 	WARN_EMULATED_SETUP(vsx),
 #endif
+#ifdef CONFIG_PPC64
+	WARN_EMULATED_SETUP(mfdscr),
+	WARN_EMULATED_SETUP(mtdscr),
+	WARN_EMULATED_SETUP(lq_stq),
+#endif
 };
 
 u32 ppc_warn_emulated;
 
 void ppc_warn_emulated_print(const char *type)
 {
-	if (printk_ratelimit())
-		pr_warning("%s used emulated %s instruction\n", current->comm,
-			   type);
+	pr_warn_ratelimited("%s used emulated %s instruction\n", current->comm,
+			    type);
 }
 
 static int __init ppc_warn_emulated_init(void)

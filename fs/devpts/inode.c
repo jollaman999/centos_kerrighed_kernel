@@ -15,6 +15,7 @@
 #include <linux/fs.h>
 #include <linux/sched.h>
 #include <linux/namei.h>
+#include <linux/slab.h>
 #include <linux/mount.h>
 #include <linux/tty.h>
 #include <linux/mutex.h>
@@ -40,23 +41,29 @@
  * Otherwise one can eat up all kernel memory by opening /dev/ptmx repeatedly.
  */
 static int pty_limit = NR_UNIX98_PTY_DEFAULT;
+static int pty_reserve = NR_UNIX98_PTY_RESERVE;
 static int pty_limit_min;
-static int pty_limit_max = NR_UNIX98_PTY_MAX;
+static int pty_limit_max = INT_MAX;
 static int pty_count;
 
 static struct ctl_table pty_table[] = {
 	{
-		.ctl_name	= PTY_MAX,
 		.procname	= "max",
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
 		.data		= &pty_limit,
 		.proc_handler	= proc_dointvec_minmax,
-		.strategy	= &sysctl_intvec,
 		.extra1		= &pty_limit_min,
 		.extra2		= &pty_limit_max,
 	}, {
-		.ctl_name	= PTY_NR,
+		.procname	= "reserve",
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.data		= &pty_reserve,
+		.proc_handler	= proc_dointvec_minmax,
+		.extra1		= &pty_limit_min,
+		.extra2		= &pty_limit_max,
+	}, {
 		.procname	= "nr",
 		.maxlen		= sizeof(int),
 		.mode		= 0444,
@@ -68,7 +75,6 @@ static struct ctl_table pty_table[] = {
 
 static struct ctl_table pty_kern_table[] = {
 	{
-		.ctl_name	= KERN_PTY,
 		.procname	= "pty",
 		.mode		= 0555,
 		.child		= pty_table,
@@ -78,7 +84,6 @@ static struct ctl_table pty_kern_table[] = {
 
 static struct ctl_table pty_root_table[] = {
 	{
-		.ctl_name	= CTL_KERN,
 		.procname	= "kernel",
 		.mode		= 0555,
 		.child		= pty_kern_table,
@@ -93,15 +98,16 @@ static struct vfsmount *devpts_mnt;
 struct pts_mount_opts {
 	int setuid;
 	int setgid;
-	uid_t   uid;
-	gid_t   gid;
+	kuid_t   uid;
+	kgid_t   gid;
 	umode_t mode;
 	umode_t ptmxmode;
 	int newinstance;
+	int max;
 };
 
 enum {
-	Opt_uid, Opt_gid, Opt_mode, Opt_ptmxmode, Opt_newinstance,
+	Opt_uid, Opt_gid, Opt_mode, Opt_ptmxmode, Opt_newinstance,  Opt_max,
 	Opt_err
 };
 
@@ -112,6 +118,7 @@ static const match_table_t tokens = {
 #ifdef CONFIG_DEVPTS_MULTIPLE_INSTANCES
 	{Opt_ptmxmode, "ptmxmode=%o"},
 	{Opt_newinstance, "newinstance"},
+	{Opt_max, "max=%d"},
 #endif
 	{Opt_err, NULL}
 };
@@ -119,6 +126,7 @@ static const match_table_t tokens = {
 struct pts_fs_info {
 	struct ida allocated_ptys;
 	struct pts_mount_opts mount_opts;
+	struct super_block *sb;
 	struct dentry *ptmx_dentry;
 };
 
@@ -133,6 +141,8 @@ static inline struct super_block *pts_sb_from_inode(struct inode *inode)
 	if (inode->i_sb->s_magic == DEVPTS_SUPER_MAGIC)
 		return inode->i_sb;
 #endif
+	if (!devpts_mnt)
+		return NULL;
 	return devpts_mnt->mnt_sb;
 }
 
@@ -151,13 +161,16 @@ static inline struct super_block *pts_sb_from_inode(struct inode *inode)
 static int parse_mount_options(char *data, int op, struct pts_mount_opts *opts)
 {
 	char *p;
+	kuid_t uid;
+	kgid_t gid;
 
 	opts->setuid  = 0;
 	opts->setgid  = 0;
-	opts->uid     = 0;
-	opts->gid     = 0;
+	opts->uid     = GLOBAL_ROOT_UID;
+	opts->gid     = GLOBAL_ROOT_GID;
 	opts->mode    = DEVPTS_DEFAULT_MODE;
 	opts->ptmxmode = DEVPTS_DEFAULT_PTMX_MODE;
+	opts->max     = NR_UNIX98_PTY_MAX;
 
 	/* newinstance makes sense only on initial mount */
 	if (op == PARSE_MOUNT)
@@ -176,13 +189,19 @@ static int parse_mount_options(char *data, int op, struct pts_mount_opts *opts)
 		case Opt_uid:
 			if (match_int(&args[0], &option))
 				return -EINVAL;
-			opts->uid = option;
+			uid = make_kuid(current_user_ns(), option);
+			if (!uid_valid(uid))
+				return -EINVAL;
+			opts->uid = uid;
 			opts->setuid = 1;
 			break;
 		case Opt_gid:
 			if (match_int(&args[0], &option))
 				return -EINVAL;
-			opts->gid = option;
+			gid = make_kgid(current_user_ns(), option);
+			if (!gid_valid(gid))
+				return -EINVAL;
+			opts->gid = gid;
 			opts->setgid = 1;
 			break;
 		case Opt_mode:
@@ -200,6 +219,12 @@ static int parse_mount_options(char *data, int op, struct pts_mount_opts *opts)
 			/* newinstance makes sense only on initial mount */
 			if (op == PARSE_MOUNT)
 				opts->newinstance = 1;
+			break;
+		case Opt_max:
+			if (match_int(&args[0], &option) ||
+			    option < 0 || option > NR_UNIX98_PTY_MAX)
+				return -EINVAL;
+			opts->max = option;
 			break;
 #endif
 		default:
@@ -221,6 +246,8 @@ static int mknod_ptmx(struct super_block *sb)
 	struct dentry *root = sb->s_root;
 	struct pts_fs_info *fsi = DEVPTS_SB(sb);
 	struct pts_mount_opts *opts = &fsi->mount_opts;
+	kuid_t ptmx_uid = current_fsuid();
+	kgid_t ptmx_gid = current_fsgid();
 
 	mutex_lock(&root->d_inode->i_mutex);
 
@@ -251,6 +278,8 @@ static int mknod_ptmx(struct super_block *sb)
 
 	mode = S_IFCHR|opts->ptmxmode;
 	init_special_inode(inode, mode, MKDEV(TTYAUX_MAJOR, 2));
+	inode->i_uid = ptmx_uid;
+	inode->i_gid = ptmx_gid;
 
 	d_add(dentry, inode);
 
@@ -295,18 +324,20 @@ static int devpts_remount(struct super_block *sb, int *flags, char *data)
 	return err;
 }
 
-static int devpts_show_options(struct seq_file *seq, struct vfsmount *vfs)
+static int devpts_show_options(struct seq_file *seq, struct dentry *root)
 {
-	struct pts_fs_info *fsi = DEVPTS_SB(vfs->mnt_sb);
+	struct pts_fs_info *fsi = DEVPTS_SB(root->d_sb);
 	struct pts_mount_opts *opts = &fsi->mount_opts;
 
 	if (opts->setuid)
-		seq_printf(seq, ",uid=%u", opts->uid);
+		seq_printf(seq, ",uid=%u", from_kuid_munged(&init_user_ns, opts->uid));
 	if (opts->setgid)
-		seq_printf(seq, ",gid=%u", opts->gid);
+		seq_printf(seq, ",gid=%u", from_kgid_munged(&init_user_ns, opts->gid));
 	seq_printf(seq, ",mode=%03o", opts->mode);
 #ifdef CONFIG_DEVPTS_MULTIPLE_INSTANCES
 	seq_printf(seq, ",ptmxmode=%03o", opts->ptmxmode);
+	if (opts->max < NR_UNIX98_PTY_MAX)
+		seq_printf(seq, ",max=%d", opts->max);
 #endif
 
 	return 0;
@@ -318,7 +349,7 @@ static const struct super_operations devpts_sops = {
 	.show_options	= devpts_show_options,
 };
 
-static void *new_pts_fs_info(void)
+static void *new_pts_fs_info(struct super_block *sb)
 {
 	struct pts_fs_info *fsi;
 
@@ -329,6 +360,7 @@ static void *new_pts_fs_info(void)
 	ida_init(&fsi->allocated_ptys);
 	fsi->mount_opts.mode = DEVPTS_DEFAULT_MODE;
 	fsi->mount_opts.ptmxmode = DEVPTS_DEFAULT_PTMX_MODE;
+	fsi->sb = sb;
 
 	return fsi;
 }
@@ -338,35 +370,33 @@ devpts_fill_super(struct super_block *s, void *data, int silent)
 {
 	struct inode *inode;
 
+	s->s_iflags &= ~SB_I_NODEV;
 	s->s_blocksize = 1024;
 	s->s_blocksize_bits = 10;
 	s->s_magic = DEVPTS_SUPER_MAGIC;
 	s->s_op = &devpts_sops;
 	s->s_time_gran = 1;
 
-	s->s_fs_info = new_pts_fs_info();
+	s->s_fs_info = new_pts_fs_info(s);
 	if (!s->s_fs_info)
 		goto fail;
 
 	inode = new_inode(s);
 	if (!inode)
-		goto free_fsi;
+		goto fail;
 	inode->i_ino = 1;
 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
 	inode->i_mode = S_IFDIR | S_IRUGO | S_IXUGO | S_IWUSR;
 	inode->i_op = &simple_dir_inode_operations;
 	inode->i_fop = &simple_dir_operations;
-	inode->i_nlink = 2;
+	set_nlink(inode, 2);
 
-	s->s_root = d_alloc_root(inode);
+	s->s_root = d_make_root(inode);
 	if (s->s_root)
 		return 0;
 
 	printk(KERN_ERR "devpts: get root dentry failed\n");
-	iput(inode);
 
-free_fsi:
-	kfree(s->s_fs_info);
 fail:
 	return -ENOMEM;
 }
@@ -380,7 +410,7 @@ static int compare_init_pts_sb(struct super_block *s, void *p)
 }
 
 /*
- * devpts_get_sb()
+ * devpts_mount()
  *
  *     If the '-o newinstance' mount option was specified, mount a new
  *     (private) instance of devpts.  PTYs created in this instance are
@@ -394,20 +424,20 @@ static int compare_init_pts_sb(struct super_block *s, void *p)
  *     semantics in devpts while preserving backward compatibility of the
  *     current 'single-namespace' semantics. i.e all mounts of devpts
  *     without the 'newinstance' mount option should bind to the initial
- *     kernel mount, like get_sb_single().
+ *     kernel mount, like mount_single().
  *
  *     Mounts with 'newinstance' option create a new, private namespace.
  *
  *     NOTE:
  *
- *     For single-mount semantics, devpts cannot use get_sb_single(),
- *     because get_sb_single()/sget() find and use the super-block from
+ *     For single-mount semantics, devpts cannot use mount_single(),
+ *     because mount_single()/sget() find and use the super-block from
  *     the most recent mount of devpts. But that recent mount may be a
- *     'newinstance' mount and get_sb_single() would pick the newinstance
+ *     'newinstance' mount and mount_single() would pick the newinstance
  *     super-block instead of the initial super-block.
  */
-static int devpts_get_sb(struct file_system_type *fs_type,
-	int flags, const char *dev_name, void *data, struct vfsmount *mnt)
+static struct dentry *devpts_mount(struct file_system_type *fs_type,
+	int flags, const char *dev_name, void *data)
 {
 	int error;
 	struct pts_mount_opts opts;
@@ -415,40 +445,41 @@ static int devpts_get_sb(struct file_system_type *fs_type,
 
 	error = parse_mount_options(data, PARSE_MOUNT, &opts);
 	if (error)
-		return error;
+		return ERR_PTR(error);
+
+	/* Require newinstance for all user namespace mounts to ensure
+	 * the mount options are not changed.
+	 */
+	if ((current_user_ns() != &init_user_ns) && !opts.newinstance)
+		return ERR_PTR(-EINVAL);
 
 	if (opts.newinstance)
-		s = sget(fs_type, NULL, set_anon_super, NULL);
+		s = sget(fs_type, NULL, set_anon_super, flags, NULL);
 	else
-		s = sget(fs_type, compare_init_pts_sb, set_anon_super, NULL);
+		s = sget(fs_type, compare_init_pts_sb, set_anon_super, flags,
+			 NULL);
 
 	if (IS_ERR(s))
-		return PTR_ERR(s);
+		return ERR_CAST(s);
 
 	if (!s->s_root) {
-		s->s_flags = flags;
 		error = devpts_fill_super(s, data, flags & MS_SILENT ? 1 : 0);
 		if (error)
 			goto out_undo_sget;
 		s->s_flags |= MS_ACTIVE;
 	}
 
-	simple_set_mnt(mnt, s);
-
 	memcpy(&(DEVPTS_SB(s))->mount_opts, &opts, sizeof(opts));
 
 	error = mknod_ptmx(s);
 	if (error)
-		goto out_dput;
+		goto out_undo_sget;
 
-	return 0;
-
-out_dput:
-	dput(s->s_root); /* undo dget() in simple_set_mnt() */
+	return dget(s->s_root);
 
 out_undo_sget:
 	deactivate_locked_super(s);
-	return error;
+	return ERR_PTR(error);
 }
 
 #else
@@ -456,10 +487,10 @@ out_undo_sget:
  * This supports only the legacy single-instance semantics (no
  * multiple-instance semantics)
  */
-static int devpts_get_sb(struct file_system_type *fs_type, int flags,
-		const char *dev_name, void *data, struct vfsmount *mnt)
+static struct dentry *devpts_mount(struct file_system_type *fs_type, int flags,
+		const char *dev_name, void *data)
 {
-	return get_sb_single(fs_type, flags, data, devpts_fill_super, mnt);
+	return mount_single(fs_type, flags, data, devpts_fill_super);
 }
 #endif
 
@@ -467,15 +498,19 @@ static void devpts_kill_sb(struct super_block *sb)
 {
 	struct pts_fs_info *fsi = DEVPTS_SB(sb);
 
-	ida_destroy(&fsi->allocated_ptys);
+	if (fsi)
+		ida_destroy(&fsi->allocated_ptys);
 	kfree(fsi);
 	kill_litter_super(sb);
 }
 
 static struct file_system_type devpts_fs_type = {
 	.name		= "devpts",
-	.get_sb		= devpts_get_sb,
+	.mount		= devpts_mount,
 	.kill_sb	= devpts_kill_sb,
+#ifdef CONFIG_DEVPTS_MULTIPLE_INSTANCES
+	.fs_flags	= FS_USERNS_MOUNT,
+#endif
 };
 
 /*
@@ -483,18 +518,25 @@ static struct file_system_type devpts_fs_type = {
  * to the System V naming convention
  */
 
-int devpts_new_index(struct inode *ptmx_inode)
+int devpts_new_index(struct pts_fs_info *fsi)
 {
-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
-	struct pts_fs_info *fsi = DEVPTS_SB(sb);
 	int index;
 	int ida_ret;
+
+	if (!fsi)
+		return -ENODEV;
 
 retry:
 	if (!ida_pre_get(&fsi->allocated_ptys, GFP_KERNEL))
 		return -ENOMEM;
 
 	mutex_lock(&allocated_ptys_lock);
+	if (pty_count >= pty_limit -
+			(fsi->mount_opts.newinstance ? pty_reserve : 0)) {
+		mutex_unlock(&allocated_ptys_lock);
+		return -ENOSPC;
+	}
+
 	ida_ret = ida_get_new(&fsi->allocated_ptys, &index);
 	if (ida_ret < 0) {
 		mutex_unlock(&allocated_ptys_lock);
@@ -503,75 +545,113 @@ retry:
 		return -EIO;
 	}
 
-	if (index >= pty_limit) {
+	if (index >= fsi->mount_opts.max) {
 		ida_remove(&fsi->allocated_ptys, index);
 		mutex_unlock(&allocated_ptys_lock);
-		return -EIO;
+		return -ENOSPC;
 	}
 	pty_count++;
 	mutex_unlock(&allocated_ptys_lock);
 	return index;
 }
 
-void devpts_kill_index(struct inode *ptmx_inode, int idx)
+void devpts_kill_index(struct pts_fs_info *fsi, int idx)
 {
-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
-	struct pts_fs_info *fsi = DEVPTS_SB(sb);
-
 	mutex_lock(&allocated_ptys_lock);
 	ida_remove(&fsi->allocated_ptys, idx);
 	pty_count--;
 	mutex_unlock(&allocated_ptys_lock);
 }
 
-int devpts_pty_new(struct inode *ptmx_inode, struct tty_struct *tty)
+/*
+ * pty code needs to hold extra references in case of last /dev/tty close
+ */
+struct pts_fs_info *devpts_get_ref(struct inode *ptmx_inode, struct file *file)
 {
-	/* tty layer puts index from devpts_new_index() in here */
-	int number = tty->index;
-	struct tty_driver *driver = tty->driver;
-	dev_t device = MKDEV(driver->major, driver->minor_start+number);
+	struct super_block *sb;
+	struct pts_fs_info *fsi;
+
+	sb = pts_sb_from_inode(ptmx_inode);
+	if (!sb)
+		return NULL;
+	fsi = DEVPTS_SB(sb);
+	if (!fsi)
+		return NULL;
+
+	atomic_inc(&sb->s_active);
+	return fsi;
+}
+
+void devpts_put_ref(struct pts_fs_info *fsi)
+{
+	deactivate_super(fsi->sb);
+}
+
+/**
+ * devpts_pty_new -- create a new inode in /dev/pts/
+ * @ptmx_inode: inode of the master
+ * @device: major+minor of the node to be created
+ * @index: used as a name of the node
+ * @priv: what's given back by devpts_get_priv
+ *
+ * The created inode is returned. Remove it from /dev/pts/ by devpts_pty_kill.
+ */
+struct inode *devpts_pty_new(struct pts_fs_info *fsi, dev_t device, int index,
+		void *priv)
+{
 	struct dentry *dentry;
-	struct super_block *sb = pts_sb_from_inode(ptmx_inode);
-	struct inode *inode = new_inode(sb);
-	struct dentry *root = sb->s_root;
-	struct pts_fs_info *fsi = DEVPTS_SB(sb);
-	struct pts_mount_opts *opts = &fsi->mount_opts;
+	struct super_block *sb;
+	struct inode *inode;
+	struct dentry *root;
+	struct pts_mount_opts *opts;
 	char s[12];
 
-	/* We're supposed to be given the slave end of a pty */
-	BUG_ON(driver->type != TTY_DRIVER_TYPE_PTY);
-	BUG_ON(driver->subtype != PTY_TYPE_SLAVE);
+	if (!fsi)
+		return ERR_PTR(-ENODEV);
 
+	sb = fsi->sb;
+	root = sb->s_root;
+	opts = &fsi->mount_opts;
+
+	inode = new_inode(sb);
 	if (!inode)
-		return -ENOMEM;
+		return ERR_PTR(-ENOMEM);
 
-	inode->i_ino = number + 3;
+	inode->i_ino = index + 3;
 	inode->i_uid = opts->setuid ? opts->uid : current_fsuid();
 	inode->i_gid = opts->setgid ? opts->gid : current_fsgid();
 	inode->i_mtime = inode->i_atime = inode->i_ctime = CURRENT_TIME;
 	init_special_inode(inode, S_IFCHR|opts->mode, device);
-	inode->i_private = tty;
-	tty->driver_data = inode;
+	inode->i_private = priv;
 
-	sprintf(s, "%d", number);
+	sprintf(s, "%d", index);
 
 	mutex_lock(&root->d_inode->i_mutex);
 
 	dentry = d_alloc_name(root, s);
-	if (!IS_ERR(dentry)) {
+	if (dentry) {
 		d_add(dentry, inode);
 		fsnotify_create(root->d_inode, dentry);
+	} else {
+		iput(inode);
+		inode = ERR_PTR(-ENOMEM);
 	}
 
 	mutex_unlock(&root->d_inode->i_mutex);
 
-	return 0;
+	return inode;
 }
 
-struct tty_struct *devpts_get_tty(struct inode *pts_inode, int number)
+/**
+ * devpts_get_priv -- get private data for a slave
+ * @pts_inode: inode of the slave
+ *
+ * Returns whatever was passed as priv in devpts_pty_new for a given inode.
+ */
+void *devpts_get_priv(struct inode *pts_inode)
 {
 	struct dentry *dentry;
-	struct tty_struct *tty;
+	void *priv = NULL;
 
 	BUG_ON(pts_inode->i_rdev == MKDEV(TTYAUX_MAJOR, PTMX_MINOR));
 
@@ -580,18 +660,22 @@ struct tty_struct *devpts_get_tty(struct inode *pts_inode, int number)
 	if (!dentry)
 		return NULL;
 
-	tty = NULL;
 	if (pts_inode->i_sb->s_magic == DEVPTS_SUPER_MAGIC)
-		tty = (struct tty_struct *)pts_inode->i_private;
+		priv = pts_inode->i_private;
 
 	dput(dentry);
 
-	return tty;
+	return priv;
 }
 
-void devpts_pty_kill(struct tty_struct *tty)
+/**
+ * devpts_pty_kill -- remove inode form /dev/pts/
+ * @inode: inode of the slave to be removed
+ *
+ * This is an inverse operation of devpts_pty_new.
+ */
+void devpts_pty_kill(struct inode *inode)
 {
-	struct inode *inode = tty->driver_data;
 	struct super_block *sb = pts_sb_from_inode(inode);
 	struct dentry *root = sb->s_root;
 	struct dentry *dentry;
@@ -601,17 +685,12 @@ void devpts_pty_kill(struct tty_struct *tty)
 	mutex_lock(&root->d_inode->i_mutex);
 
 	dentry = d_find_alias(inode);
-	if (IS_ERR(dentry))
-		goto out;
 
-	if (dentry) {
-		inode->i_nlink--;
-		d_delete(dentry);
-		dput(dentry);	/* d_alloc_name() in devpts_pty_new() */
-	}
-
+	drop_nlink(inode);
+	d_delete(dentry);
+	dput(dentry);	/* d_alloc_name() in devpts_pty_new() */
 	dput(dentry);		/* d_find_alias above */
-out:
+
 	mutex_unlock(&root->d_inode->i_mutex);
 }
 
@@ -621,12 +700,16 @@ static int __init init_devpts_fs(void)
 	struct ctl_table_header *table;
 
 	if (!err) {
+		struct vfsmount *mnt;
+
 		table = register_sysctl_table(pty_root_table);
-		devpts_mnt = kern_mount(&devpts_fs_type);
-		if (IS_ERR(devpts_mnt)) {
-			err = PTR_ERR(devpts_mnt);
+		mnt = kern_mount(&devpts_fs_type);
+		if (IS_ERR(mnt)) {
+			err = PTR_ERR(mnt);
 			unregister_filesystem(&devpts_fs_type);
 			unregister_sysctl_table(table);
+		} else {
+			devpts_mnt = mnt;
 		}
 	}
 	return err;

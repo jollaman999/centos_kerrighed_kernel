@@ -6,30 +6,29 @@
 #include <linux/security.h>
 #include <linux/pid.h>
 #include <linux/nsproxy.h>
-#ifndef __GENKSYMS__
-#include <linux/user_namespace.h>
-#endif
 
 /* Well, we should have at least one descriptor open
  * to accept passed FDs 8)
  */
-#define SCM_MAX_FD	255
+#define SCM_MAX_FD	253
 
-struct scm_fp_list
-{
-	struct list_head	list;
-	short                   count;
-	short                   max;
+struct scm_creds {
+	u32	pid;
+	kuid_t	uid;
+	kgid_t	gid;
+};
+
+struct scm_fp_list {
+	short			count;
+	short			max;
 	struct user_struct	*user;
 	struct file		*fp[SCM_MAX_FD];
 };
 
-struct scm_cookie
-{
+struct scm_cookie {
 	struct pid		*pid;		/* Skb credentials */
-	const struct cred	*cred;
 	struct scm_fp_list	*fp;		/* Passed files		*/
-	struct ucred		creds;		/* Skb credentials	*/
+	struct scm_creds	creds;		/* Skb credentials	*/
 #ifdef CONFIG_SECURITY_NETWORK
 	u32			secid;		/* Passed security ID 	*/
 #endif
@@ -52,31 +51,24 @@ static __inline__ void unix_get_peersec_dgram(struct socket *sock, struct scm_co
 #endif /* CONFIG_SECURITY_NETWORK */
 
 static __inline__ void scm_set_cred(struct scm_cookie *scm,
-				    struct pid *pid, const struct cred *cred)
+				    struct pid *pid, kuid_t uid, kgid_t gid)
 {
-	struct user_namespace *current_ns = current_user_ns();
-
 	scm->pid  = get_pid(pid);
-	scm->cred = cred ? get_cred(cred) : NULL;
 	scm->creds.pid = pid_vnr(pid);
-	scm->creds.uid = cred ? user_ns_map_uid(current_ns, cred, cred->uid) : -1;
-	scm->creds.gid = cred ? user_ns_map_gid(current_ns, cred, cred->gid) : -1;
+	scm->creds.uid = uid;
+	scm->creds.gid = gid;
 }
 
 static __inline__ void scm_destroy_cred(struct scm_cookie *scm)
 {
 	put_pid(scm->pid);
 	scm->pid  = NULL;
-
-	if (scm->cred)
-		put_cred(scm->cred);
-	scm->cred = NULL;
 }
 
 static __inline__ void scm_destroy(struct scm_cookie *scm)
 {
 	scm_destroy_cred(scm);
-	if (scm && scm->fp)
+	if (scm->fp)
 		__scm_destroy(scm);
 }
 
@@ -84,8 +76,10 @@ static __inline__ int scm_send(struct socket *sock, struct msghdr *msg,
 			       struct scm_cookie *scm, bool forcecreds)
 {
 	memset(scm, 0, sizeof(*scm));
+	scm->creds.uid = INVALID_UID;
+	scm->creds.gid = INVALID_GID;
 	if (forcecreds)
-		scm_set_cred(scm, task_tgid(current), current_cred());
+		scm_set_cred(scm, task_tgid(current), current_uid(), current_gid());
 	unix_get_peersec_dgram(sock, scm);
 	if (msg->msg_controllen <= 0)
 		return 0;
@@ -116,16 +110,22 @@ static inline void scm_passec(struct socket *sock, struct msghdr *msg, struct sc
 static __inline__ void scm_recv(struct socket *sock, struct msghdr *msg,
 				struct scm_cookie *scm, int flags)
 {
-	if (!msg->msg_control)
-	{
+	if (!msg->msg_control) {
 		if (test_bit(SOCK_PASSCRED, &sock->flags) || scm->fp)
 			msg->msg_flags |= MSG_CTRUNC;
 		scm_destroy(scm);
 		return;
 	}
 
-	if (test_bit(SOCK_PASSCRED, &sock->flags))
-		put_cmsg(msg, SOL_SOCKET, SCM_CREDENTIALS, sizeof(scm->creds), &scm->creds);
+	if (test_bit(SOCK_PASSCRED, &sock->flags)) {
+		struct user_namespace *current_ns = current_user_ns();
+		struct ucred ucreds = {
+			.pid = scm->creds.pid,
+			.uid = from_kuid_munged(current_ns, scm->creds.uid),
+			.gid = from_kgid_munged(current_ns, scm->creds.gid),
+		};
+		put_cmsg(msg, SOL_SOCKET, SCM_CREDENTIALS, sizeof(ucreds), &ucreds);
+	}
 
 	scm_destroy_cred(scm);
 

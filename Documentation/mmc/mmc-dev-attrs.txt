@@ -1,3 +1,13 @@
+SD and MMC Block Device Attributes
+==================================
+
+These attributes are defined for the block devices associated with the
+SD or MMC device.
+
+The following attributes are read/write.
+
+	force_ro		Enforce read-only access even if write protect switch is off.
+
 SD and MMC Device Attributes
 ============================
 
@@ -12,9 +22,15 @@ All attributes are read-only.
 	manfid			Manufacturer ID (from CID Register)
 	name			Product Name (from CID Register)
 	oemid			OEM/Application ID (from CID Register)
+	prv			Product Revision (from CID Register) (SD and MMCv4 only)
 	serial			Product Serial Number (from CID Register)
 	erase_size		Erase group size
 	preferred_erase_size	Preferred erase size
+	raw_rpmb_size_mult	RPMB partition size
+	rel_sectors		Reliable write sector count
+	ocr 			Operation Conditions Register
+	dsr			Driver Stage Register
+	cmdq_en			Command Queue enabled: 1 => enabled, 0 => not enabled
 
 Note on Erase Size and Preferred Erase Size:
 
@@ -54,3 +70,8 @@ Note on Erase Size and Preferred Erase Size:
 	size specified by the card.
 
 	"preferred_erase_size" is in bytes.
+
+Note on raw_rpmb_size_mult:
+	"raw_rpmb_size_mult" is a mutliple of 128kB block.
+	RPMB size in byte is calculated by using the following equation:
+	RPMB partition size = 128kB x raw_rpmb_size_mult

@@ -28,7 +28,6 @@
 #include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/string.h>
 #include <linux/types.h>
@@ -71,7 +70,7 @@ static int __init find_ibft_in_mem(void)
 		virt = isa_bus_to_virt(pos);
 
 		for (i = 0; i < ARRAY_SIZE(ibft_signs); i++) {
-			if (memcmp(virt, ibft_signs[i].sign, IBFT_SIGN_LEN) == 
+			if (memcmp(virt, ibft_signs[i].sign, IBFT_SIGN_LEN) ==
 			    0) {
 				unsigned long *addr =
 				    (unsigned long *)isa_bus_to_virt(pos + 4);
@@ -100,7 +99,7 @@ unsigned long __init find_ibft_region(unsigned long *sizep)
 	/* iBFT 1.03 section 1.4.3.1 mandates that UEFI machines will
 	 * only use ACPI for this */
 
-	if (!efi_enabled)
+	if (!efi_enabled(EFI_BOOT))
 		find_ibft_in_mem();
 
 	if (ibft_addr) {

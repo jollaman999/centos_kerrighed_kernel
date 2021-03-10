@@ -21,7 +21,6 @@
  *
  */
 
-#include <asm/io.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/init.h>
@@ -418,13 +417,7 @@ static int cs_source_info(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_inf
 		"Optical",	/* RXP1 */
 		"CD",		/* RXP2 */
 	};
-	uinfo->type = SNDRV_CTL_ELEM_TYPE_ENUMERATED;
-	uinfo->count = 1;
-	uinfo->value.enumerated.items = 3;
-	if (uinfo->value.enumerated.item >= uinfo->value.enumerated.items)
-		uinfo->value.enumerated.item = uinfo->value.enumerated.items - 1;
-	strcpy(uinfo->value.enumerated.name, texts[uinfo->value.enumerated.item]);
-	return 0;
+	return snd_ctl_enum_info(uinfo, 1, 3, texts);
 }
 
 static int cs_source_get(struct snd_kcontrol *kcontrol, struct snd_ctl_elem_value *ucontrol)
@@ -550,7 +543,7 @@ static const DECLARE_TLV_DB_SCALE(db_scale_volume, -6400, 50, 1);
  * mixers
  */
 
-static struct snd_kcontrol_new pontis_controls[] __devinitdata = {
+static struct snd_kcontrol_new pontis_controls[] = {
 	{
 		.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
 		.access = (SNDRV_CTL_ELEM_ACCESS_READWRITE |
@@ -638,7 +631,7 @@ static struct snd_kcontrol_new pontis_controls[] __devinitdata = {
  */
 static void wm_proc_regs_write(struct snd_info_entry *entry, struct snd_info_buffer *buffer)
 {
-	struct snd_ice1712 *ice = (struct snd_ice1712 *)entry->private_data;
+	struct snd_ice1712 *ice = entry->private_data;
 	char line[64];
 	unsigned int reg, val;
 	mutex_lock(&ice->gpio_mutex);
@@ -653,7 +646,7 @@ static void wm_proc_regs_write(struct snd_info_entry *entry, struct snd_info_buf
 
 static void wm_proc_regs_read(struct snd_info_entry *entry, struct snd_info_buffer *buffer)
 {
-	struct snd_ice1712 *ice = (struct snd_ice1712 *)entry->private_data;
+	struct snd_ice1712 *ice = entry->private_data;
 	int reg, val;
 
 	mutex_lock(&ice->gpio_mutex);
@@ -666,17 +659,13 @@ static void wm_proc_regs_read(struct snd_info_entry *entry, struct snd_info_buff
 
 static void wm_proc_init(struct snd_ice1712 *ice)
 {
-	struct snd_info_entry *entry;
-	if (! snd_card_proc_new(ice->card, "wm_codec", &entry)) {
-		snd_info_set_text_ops(entry, ice, wm_proc_regs_read);
-		entry->mode |= S_IWUSR;
-		entry->c.text.write = wm_proc_regs_write;
-	}
+	snd_card_rw_proc_new(ice->card, "wm_codec", ice, wm_proc_regs_read,
+			     wm_proc_regs_write);
 }
 
 static void cs_proc_regs_read(struct snd_info_entry *entry, struct snd_info_buffer *buffer)
 {
-	struct snd_ice1712 *ice = (struct snd_ice1712 *)entry->private_data;
+	struct snd_ice1712 *ice = entry->private_data;
 	int reg, val;
 
 	mutex_lock(&ice->gpio_mutex);
@@ -691,13 +680,11 @@ static void cs_proc_regs_read(struct snd_info_entry *entry, struct snd_info_buff
 
 static void cs_proc_init(struct snd_ice1712 *ice)
 {
-	struct snd_info_entry *entry;
-	if (! snd_card_proc_new(ice->card, "cs_codec", &entry))
-		snd_info_set_text_ops(entry, ice, cs_proc_regs_read);
+	snd_card_ro_proc_new(ice->card, "cs_codec", ice, cs_proc_regs_read);
 }
 
 
-static int __devinit pontis_add_controls(struct snd_ice1712 *ice)
+static int pontis_add_controls(struct snd_ice1712 *ice)
 {
 	unsigned int i;
 	int err;
@@ -718,7 +705,7 @@ static int __devinit pontis_add_controls(struct snd_ice1712 *ice)
 /*
  * initialize the chip
  */
-static int __devinit pontis_init(struct snd_ice1712 *ice)
+static int pontis_init(struct snd_ice1712 *ice)
 {
 	static const unsigned short wm_inits[] = {
 		/* These come first to reduce init pop noise */
@@ -768,7 +755,7 @@ static int __devinit pontis_init(struct snd_ice1712 *ice)
 	ice->num_total_dacs = 2;
 	ice->num_total_adcs = 2;
 
-	/* to remeber the register values */
+	/* to remember the register values */
 	ice->akm = kzalloc(sizeof(struct snd_akm4xxx), GFP_KERNEL);
 	if (! ice->akm)
 		return -ENOMEM;
@@ -805,7 +792,7 @@ static int __devinit pontis_init(struct snd_ice1712 *ice)
  * hence the driver needs to sets up it properly.
  */
 
-static unsigned char pontis_eeprom[] __devinitdata = {
+static unsigned char pontis_eeprom[] = {
 	[ICE_EEP2_SYSCONF]     = 0x08,	/* clock 256, mpu401, spdif-in/ADC, 1DAC */
 	[ICE_EEP2_ACLINK]      = 0x80,	/* I2S */
 	[ICE_EEP2_I2S]         = 0xf8,	/* vol, 96k, 24bit, 192k */
@@ -822,7 +809,7 @@ static unsigned char pontis_eeprom[] __devinitdata = {
 };
 
 /* entry point */
-struct snd_ice1712_card_info snd_vt1720_pontis_cards[] __devinitdata = {
+struct snd_ice1712_card_info snd_vt1720_pontis_cards[] = {
 	{
 		.subvendor = VT1720_SUBDEVICE_PONTIS_MS300,
 		.name = "Pontis MS300",

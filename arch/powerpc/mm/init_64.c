@@ -40,7 +40,9 @@
 #include <linux/nodemask.h>
 #include <linux/module.h>
 #include <linux/poison.h>
-#include <linux/lmb.h>
+#include <linux/memblock.h>
+#include <linux/hugetlb.h>
+#include <linux/slab.h>
 
 #include <asm/pgalloc.h>
 #include <asm/page.h>
@@ -59,9 +61,7 @@
 #include <asm/mmzone.h>
 #include <asm/cputable.h>
 #include <asm/sections.h>
-#include <asm/system.h>
 #include <asm/iommu.h>
-#include <asm/abs_addr.h>
 #include <asm/vdso.h>
 
 #include "mmu_decl.h"
@@ -81,36 +81,6 @@ EXPORT_SYMBOL_GPL(memstart_addr);
 phys_addr_t kernstart_addr;
 EXPORT_SYMBOL_GPL(kernstart_addr);
 
-void free_initmem(void)
-{
-	unsigned long addr;
-
-	addr = (unsigned long)__init_begin;
-	for (; addr < (unsigned long)__init_end; addr += PAGE_SIZE) {
-		memset((void *)addr, POISON_FREE_INITMEM, PAGE_SIZE);
-		ClearPageReserved(virt_to_page(addr));
-		init_page_count(virt_to_page(addr));
-		free_page(addr);
-		totalram_pages++;
-	}
-	printk ("Freeing unused kernel memory: %luk freed\n",
-		((unsigned long)__init_end - (unsigned long)__init_begin) >> 10);
-}
-
-#ifdef CONFIG_BLK_DEV_INITRD
-void free_initrd_mem(unsigned long start, unsigned long end)
-{
-	if (start < end)
-		printk ("Freeing initrd memory: %ldk freed\n", (end - start) >> 10);
-	for (; start < end; start += PAGE_SIZE) {
-		ClearPageReserved(virt_to_page(start));
-		init_page_count(virt_to_page(start));
-		free_page(start);
-		totalram_pages++;
-	}
-}
-#endif
-
 static void pgd_ctor(void *addr)
 {
 	memset(addr, 0, PGD_TABLE_SIZE);
@@ -118,33 +88,69 @@ static void pgd_ctor(void *addr)
 
 static void pmd_ctor(void *addr)
 {
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+	memset(addr, 0, PMD_TABLE_SIZE * 2);
+#else
 	memset(addr, 0, PMD_TABLE_SIZE);
+#endif
 }
 
-static const unsigned int pgtable_cache_size[2] = {
-	PGD_TABLE_SIZE, PMD_TABLE_SIZE
-};
-static const char *pgtable_cache_name[ARRAY_SIZE(pgtable_cache_size)] = {
-#ifdef CONFIG_PPC_64K_PAGES
-	"pgd_cache", "pmd_cache",
-#else
-	"pgd_cache", "pud_pmd_cache",
-#endif /* CONFIG_PPC_64K_PAGES */
-};
+struct kmem_cache *pgtable_cache[MAX_PGTABLE_INDEX_SIZE];
 
-#ifdef CONFIG_HUGETLB_PAGE
-/* Hugepages need an extra cache per hugepagesize, initialized in
- * hugetlbpage.c.  We can't put into the tables above, because HPAGE_SHIFT
- * is not compile time constant. */
-struct kmem_cache *pgtable_cache[ARRAY_SIZE(pgtable_cache_size)+MMU_PAGE_COUNT];
-#else
-struct kmem_cache *pgtable_cache[ARRAY_SIZE(pgtable_cache_size)];
-#endif
+/*
+ * Create a kmem_cache() for pagetables.  This is not used for PTE
+ * pages - they're linked to struct page, come from the normal free
+ * pages pool and have a different entry size (see real_pte_t) to
+ * everything else.  Caches created by this function are used for all
+ * the higher level pagetables, and for hugepage pagetables.
+ */
+void pgtable_cache_add(unsigned shift, void (*ctor)(void *))
+{
+	char *name;
+	unsigned long table_size = sizeof(void *) << shift;
+	unsigned long align = table_size;
+
+	/* When batching pgtable pointers for RCU freeing, we store
+	 * the index size in the low bits.  Table alignment must be
+	 * big enough to fit it.
+	 *
+	 * Likewise, hugeapge pagetable pointers contain a (different)
+	 * shift value in the low bits.  All tables must be aligned so
+	 * as to leave enough 0 bits in the address to contain it. */
+	unsigned long minalign = max(MAX_PGTABLE_INDEX_SIZE + 1,
+				     HUGEPD_SHIFT_MASK + 1);
+	struct kmem_cache *new;
+
+	/* It would be nice if this was a BUILD_BUG_ON(), but at the
+	 * moment, gcc doesn't seem to recognize is_power_of_2 as a
+	 * constant expression, so so much for that. */
+	BUG_ON(!is_power_of_2(minalign));
+	BUG_ON((shift < 1) || (shift > MAX_PGTABLE_INDEX_SIZE));
+
+	if (PGT_CACHE(shift))
+		return; /* Already have a cache of this size */
+
+	align = max_t(unsigned long, align, minalign);
+	name = kasprintf(GFP_KERNEL, "pgtable-2^%d", shift);
+	new = kmem_cache_create(name, table_size, align, 0, ctor);
+	kfree(name);
+	pgtable_cache[shift - 1] = new;
+	pr_debug("Allocated pgtable cache for order %d\n", shift);
+}
+
 
 void pgtable_cache_init(void)
 {
-	pgtable_cache[0] = kmem_cache_create(pgtable_cache_name[0], PGD_TABLE_SIZE, PGD_TABLE_SIZE, SLAB_PANIC, pgd_ctor);
-	pgtable_cache[1] = kmem_cache_create(pgtable_cache_name[1], PMD_TABLE_SIZE, PMD_TABLE_SIZE, SLAB_PANIC, pmd_ctor);
+	pgtable_cache_add(PGD_INDEX_SIZE, pgd_ctor);
+	pgtable_cache_add(PMD_CACHE_INDEX, pmd_ctor);
+	if (!PGT_CACHE(PGD_INDEX_SIZE) || !PGT_CACHE(PMD_CACHE_INDEX))
+		panic("Couldn't allocate pgtable caches");
+	/* In all current configs, when the PUD index exists it's the
+	 * same size as either the pgd or pmd index.  Verify that the
+	 * initialization above has also created a PUD cache.  This
+	 * will need re-examiniation if we add new possibilities for
+	 * the pagetable layout. */
+	BUG_ON(PUD_INDEX_SIZE && !PGT_CACHE(PUD_INDEX_SIZE));
 }
 
 #ifdef CONFIG_SPARSEMEM_VMEMMAP
@@ -170,9 +176,10 @@ static unsigned long __meminit vmemmap_section_start(unsigned long page)
 static int __meminit vmemmap_populated(unsigned long start, int page_size)
 {
 	unsigned long end = start + page_size;
+	start = (unsigned long)(pfn_to_page(vmemmap_section_start(start)));
 
 	for (; start < end; start += (PAGES_PER_SECTION * sizeof(struct page)))
-		if (pfn_valid(vmemmap_section_start(start)))
+		if (pfn_valid(page_to_pfn((struct page *)start)))
 			return 1;
 
 	return 0;
@@ -207,27 +214,60 @@ static void __meminit vmemmap_create_mapping(unsigned long start,
 	for (i = 0; i < page_size; i += PAGE_SIZE)
 		BUG_ON(map_kernel_page(start + i, phys, flags));
 }
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+static void vmemmap_remove_mapping(unsigned long start,
+				   unsigned long page_size)
+{
+}
+#endif
 #else /* CONFIG_PPC_BOOK3E */
 static void __meminit vmemmap_create_mapping(unsigned long start,
 					     unsigned long page_size,
 					     unsigned long phys)
 {
 	int  mapped = htab_bolt_mapping(start, start + page_size, phys,
-					PAGE_KERNEL, mmu_vmemmap_psize,
+					pgprot_val(PAGE_KERNEL),
+					mmu_vmemmap_psize,
 					mmu_kernel_ssize);
 	BUG_ON(mapped < 0);
 }
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+extern int htab_remove_mapping(unsigned long vstart, unsigned long vend,
+			int psize, int ssize);
+
+static void vmemmap_remove_mapping(unsigned long start,
+				   unsigned long page_size)
+{
+	int mapped = htab_remove_mapping(start, start + page_size,
+					 mmu_vmemmap_psize,
+					 mmu_kernel_ssize);
+	BUG_ON(mapped < 0);
+}
+#endif
+
 #endif /* CONFIG_PPC_BOOK3E */
 
 struct vmemmap_backing *vmemmap_list;
+static struct vmemmap_backing *next;
+static int num_left;
+static int num_freed;
 
 static __meminit struct vmemmap_backing * vmemmap_list_alloc(int node)
 {
-	static struct vmemmap_backing *next;
-	static int num_left;
+	struct vmemmap_backing *vmem_back;
+	/* get from freed entries first */
+	if (num_freed) {
+		num_freed--;
+		vmem_back = next;
+		next = next->list;
+
+		return vmem_back;
+	}
 
 	/* allocate a page when required and hand out chunks */
-	if (!next || !num_left) {
+	if (!num_left) {
 		next = vmemmap_alloc_block(PAGE_SIZE, node);
 		if (unlikely(!next)) {
 			WARN_ON(1);
@@ -260,7 +300,8 @@ static __meminit void vmemmap_list_populate(unsigned long phys,
 	vmemmap_list = vmem_back;
 }
 
-int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
+int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node,
+		struct vmem_altmap *altmap)
 {
 	unsigned long page_size = 1 << mmu_psize_defs[mmu_vmemmap_psize].shift;
 
@@ -289,4 +330,90 @@ int __meminit vmemmap_populate(unsigned long start, unsigned long end, int node)
 
 	return 0;
 }
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+static unsigned long vmemmap_list_free(unsigned long start)
+{
+	struct vmemmap_backing *vmem_back, *vmem_back_prev;
+
+	vmem_back_prev = vmem_back = vmemmap_list;
+
+	/* look for it with prev pointer recorded */
+	for (; vmem_back; vmem_back = vmem_back->list) {
+		if (vmem_back->virt_addr == start)
+			break;
+		vmem_back_prev = vmem_back;
+	}
+
+	if (unlikely(!vmem_back)) {
+		WARN_ON(1);
+		return 0;
+	}
+
+	/* remove it from vmemmap_list */
+	if (vmem_back == vmemmap_list) /* remove head */
+		vmemmap_list = vmem_back->list;
+	else
+		vmem_back_prev->list = vmem_back->list;
+
+	/* next point to this freed entry */
+	vmem_back->list = next;
+	next = vmem_back;
+	num_freed++;
+
+	return vmem_back->phys;
+}
+
+void __ref vmemmap_free(unsigned long start, unsigned long end,
+		struct vmem_altmap *altmap)
+{
+	unsigned long page_size = 1 << mmu_psize_defs[mmu_vmemmap_psize].shift;
+
+	start = _ALIGN_DOWN(start, page_size);
+
+	pr_debug("vmemmap_free %lx...%lx\n", start, end);
+
+	for (; start < end; start += page_size) {
+		unsigned long addr;
+
+		/*
+		 * the section has already be marked as invalid, so
+		 * vmemmap_populated() true means some other sections still
+		 * in this page, so skip it.
+		 */
+		if (vmemmap_populated(start, page_size))
+			continue;
+
+		addr = vmemmap_list_free(start);
+		if (addr) {
+			struct page *page = pfn_to_page(addr >> PAGE_SHIFT);
+
+			if (PageReserved(page)) {
+				/* allocated from bootmem */
+				if (page_size < PAGE_SIZE) {
+					/*
+					 * this shouldn't happen, but if it is
+					 * the case, leave the memory there
+					 */
+					WARN_ON_ONCE(1);
+				} else {
+					unsigned int nr_pages =
+						1 << get_order(page_size);
+					while (nr_pages--)
+						free_reserved_page(page++);
+				}
+			} else
+				free_pages((unsigned long)(__va(addr)),
+							get_order(page_size));
+
+			vmemmap_remove_mapping(start, page_size);
+		}
+	}
+}
+#endif
+void register_page_bootmem_memmap(unsigned long section_nr,
+				  struct page *start_page, unsigned long size)
+{
+}
 #endif /* CONFIG_SPARSEMEM_VMEMMAP */
+

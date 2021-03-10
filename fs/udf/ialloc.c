@@ -20,7 +20,6 @@
 
 #include "udfdecl.h"
 #include <linux/fs.h>
-#include <linux/quotaops.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
 
@@ -31,15 +30,6 @@ void udf_free_inode(struct inode *inode)
 {
 	struct super_block *sb = inode->i_sb;
 	struct udf_sb_info *sbi = UDF_SB(sb);
-
-	/*
-	 * Note: we must free any quota before locking the superblock,
-	 * as writing the quota to disk may need the lock as well.
-	 */
-	vfs_dq_free_inode(inode);
-	vfs_dq_drop(inode);
-
-	clear_inode(inode);
 
 	mutex_lock(&sbi->s_alloc_mutex);
 	if (sbi->s_lvid_bh) {
@@ -56,7 +46,7 @@ void udf_free_inode(struct inode *inode)
 	udf_free_blocks(sb, NULL, &UDF_I(inode)->i_location, 0, 1);
 }
 
-struct inode *udf_new_inode(struct inode *dir, int mode, int *err)
+struct inode *udf_new_inode(struct inode *dir, umode_t mode, int *err)
 {
 	struct super_block *sb = dir->i_sb;
 	struct udf_sb_info *sbi = UDF_SB(sb);
@@ -102,28 +92,19 @@ struct inode *udf_new_inode(struct inode *dir, int mode, int *err)
 		return NULL;
 	}
 
-	mutex_lock(&sbi->s_alloc_mutex);
 	if (sbi->s_lvid_bh) {
-		struct logicalVolIntegrityDesc *lvid =
-			(struct logicalVolIntegrityDesc *)
-			sbi->s_lvid_bh->b_data;
-		struct logicalVolIntegrityDescImpUse *lvidiu =
-							udf_sb_lvidiu(sbi);
-		struct logicalVolHeaderDesc *lvhd;
-		uint64_t uniqueID;
-		lvhd = (struct logicalVolHeaderDesc *)
-				(lvid->logicalVolContentsUse);
+		struct logicalVolIntegrityDescImpUse *lvidiu;
+
+		iinfo->i_unique = lvid_get_unique_id(sb);
+		mutex_lock(&sbi->s_alloc_mutex);
+		lvidiu = udf_sb_lvidiu(sbi);
 		if (S_ISDIR(mode))
 			le32_add_cpu(&lvidiu->numDirs, 1);
 		else
 			le32_add_cpu(&lvidiu->numFiles, 1);
-		iinfo->i_unique = uniqueID = le64_to_cpu(lvhd->uniqueID);
-		if (!(++uniqueID & 0x00000000FFFFFFFFUL))
-			uniqueID += 16;
-		lvhd->uniqueID = cpu_to_le64(uniqueID);
 		udf_updated_lvid(sb);
+		mutex_unlock(&sbi->s_alloc_mutex);
 	}
-	mutex_unlock(&sbi->s_alloc_mutex);
 
 	inode_init_owner(inode, dir, mode);
 
@@ -135,6 +116,7 @@ struct inode *udf_new_inode(struct inode *dir, int mode, int *err)
 	iinfo->i_lenEAttr = 0;
 	iinfo->i_lenAlloc = 0;
 	iinfo->i_use = 0;
+	iinfo->i_checkpoint = 1;
 	if (UDF_QUERY_FLAG(inode->i_sb, UDF_FLAG_USE_AD_IN_ICB))
 		iinfo->i_alloc_type = ICBTAG_FLAG_AD_IN_ICB;
 	else if (UDF_QUERY_FLAG(inode->i_sb, UDF_FLAG_USE_SHORT_AD))
@@ -143,17 +125,13 @@ struct inode *udf_new_inode(struct inode *dir, int mode, int *err)
 		iinfo->i_alloc_type = ICBTAG_FLAG_AD_LONG;
 	inode->i_mtime = inode->i_atime = inode->i_ctime =
 		iinfo->i_crtime = current_fs_time(inode->i_sb);
-	insert_inode_hash(inode);
-	mark_inode_dirty(inode);
-
-	if (vfs_dq_alloc_inode(inode)) {
-		vfs_dq_drop(inode);
-		inode->i_flags |= S_NOQUOTA;
-		inode->i_nlink = 0;
+	if (unlikely(insert_inode_locked(inode) < 0)) {
+		make_bad_inode(inode);
 		iput(inode);
-		*err = -EDQUOT;
+		*err = -EIO;
 		return NULL;
 	}
+	mark_inode_dirty(inode);
 
 	*err = 0;
 	return inode;

@@ -34,107 +34,12 @@
 #include <linux/ipc.h>
 #include <linux/utsname.h>
 #include <linux/file.h>
-#include <linux/init.h>
 #include <linux/personality.h>
 
 #include <asm/uaccess.h>
 #include <asm/syscalls.h>
 #include <asm/time.h>
 #include <asm/unistd.h>
-
-/*
- * sys_ipc() is the de-multiplexer for the SysV IPC calls..
- *
- * This is really horribly ugly.
- */
-int sys_ipc(uint call, int first, unsigned long second, long third,
-	    void __user *ptr, long fifth)
-{
-	int version, ret;
-
-	version = call >> 16; /* hack for backward compatibility */
-	call &= 0xffff;
-
-	ret = -ENOSYS;
-	switch (call) {
-	case SEMOP:
-		ret = sys_semtimedop(first, (struct sembuf __user *)ptr,
-				      (unsigned)second, NULL);
-		break;
-	case SEMTIMEDOP:
-		ret = sys_semtimedop(first, (struct sembuf __user *)ptr,
-				      (unsigned)second,
-				      (const struct timespec __user *) fifth);
-		break;
-	case SEMGET:
-		ret = sys_semget (first, (int)second, third);
-		break;
-	case SEMCTL: {
-		union semun fourth;
-
-		ret = -EINVAL;
-		if (!ptr)
-			break;
-		if ((ret = get_user(fourth.__pad, (void __user * __user *)ptr)))
-			break;
-		ret = sys_semctl(first, (int)second, third, fourth);
-		break;
-	}
-	case MSGSND:
-		ret = sys_msgsnd(first, (struct msgbuf __user *)ptr,
-				 (size_t)second, third);
-		break;
-	case MSGRCV:
-		switch (version) {
-		case 0: {
-			struct ipc_kludge tmp;
-
-			ret = -EINVAL;
-			if (!ptr)
-				break;
-			if ((ret = copy_from_user(&tmp,
-						(struct ipc_kludge __user *) ptr,
-						sizeof (tmp)) ? -EFAULT : 0))
-				break;
-			ret = sys_msgrcv(first, tmp.msgp, (size_t) second,
-					  tmp.msgtyp, third);
-			break;
-		}
-		default:
-			ret = sys_msgrcv (first, (struct msgbuf __user *) ptr,
-					  (size_t)second, fifth, third);
-			break;
-		}
-		break;
-	case MSGGET:
-		ret = sys_msgget((key_t)first, (int)second);
-		break;
-	case MSGCTL:
-		ret = sys_msgctl(first, (int)second,
-				  (struct msqid_ds __user *)ptr);
-		break;
-	case SHMAT: {
-		ulong raddr;
-		ret = do_shmat(first, (char __user *)ptr, (int)second, &raddr);
-		if (ret)
-			break;
-		ret = put_user(raddr, (ulong __user *) third);
-		break;
-	}
-	case SHMDT:
-		ret = sys_shmdt((char __user *)ptr);
-		break;
-	case SHMGET:
-		ret = sys_shmget(first, (size_t)second, third);
-		break;
-	case SHMCTL:
-		ret = sys_shmctl(first, (int)second,
-				 (struct shmid_ds __user *)ptr);
-		break;
-	}
-
-	return ret;
-}
 
 static inline unsigned long do_mmap2(unsigned long addr, size_t len,
 			unsigned long prot, unsigned long flags,
@@ -201,84 +106,14 @@ long ppc64_personality(unsigned long personality)
 	long ret;
 
 	if (personality(current->personality) == PER_LINUX32
-	    && personality == PER_LINUX)
-		personality = PER_LINUX32;
+	    && personality(personality) == PER_LINUX)
+		personality = (personality & ~PER_MASK) | PER_LINUX32;
 	ret = sys_personality(personality);
-	if (ret == PER_LINUX32)
-		ret = PER_LINUX;
+	if (personality(ret) == PER_LINUX32)
+		ret = (ret & ~PER_MASK) | PER_LINUX;
 	return ret;
 }
 #endif
-
-#ifdef CONFIG_PPC64
-#define OVERRIDE_MACHINE    (personality(current->personality) == PER_LINUX32)
-#else
-#define OVERRIDE_MACHINE    0
-#endif
-
-static inline int override_machine(char __user *mach)
-{
-	if (OVERRIDE_MACHINE) {
-		/* change ppc64 to ppc */
-		if (__put_user(0, mach+3) || __put_user(0, mach+4))
-			return -EFAULT;
-	}
-	return 0;
-}
-
-long ppc_newuname(struct new_utsname __user * name)
-{
-	int err = 0;
-
-	down_read(&uts_sem);
-	if (copy_to_user(name, utsname(), sizeof(*name)))
-		err = -EFAULT;
-	up_read(&uts_sem);
-	if (!err)
-		err = override_machine(name->machine);
-	return err;
-}
-
-int sys_uname(struct old_utsname __user *name)
-{
-	int err = 0;
-	
-	down_read(&uts_sem);
-	if (copy_to_user(name, utsname(), sizeof(*name)))
-		err = -EFAULT;
-	up_read(&uts_sem);
-	if (!err)
-		err = override_machine(name->machine);
-	return err;
-}
-
-int sys_olduname(struct oldold_utsname __user *name)
-{
-	int error;
-
-	if (!access_ok(VERIFY_WRITE, name, sizeof(struct oldold_utsname)))
-		return -EFAULT;
-  
-	down_read(&uts_sem);
-	error = __copy_to_user(&name->sysname, &utsname()->sysname,
-			       __OLD_UTS_LEN);
-	error |= __put_user(0, name->sysname + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->nodename, &utsname()->nodename,
-				__OLD_UTS_LEN);
-	error |= __put_user(0, name->nodename + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->release, &utsname()->release,
-				__OLD_UTS_LEN);
-	error |= __put_user(0, name->release + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->version, &utsname()->version,
-				__OLD_UTS_LEN);
-	error |= __put_user(0, name->version + __OLD_UTS_LEN);
-	error |= __copy_to_user(&name->machine, &utsname()->machine,
-				__OLD_UTS_LEN);
-	error |= override_machine(name->machine);
-	up_read(&uts_sem);
-
-	return error? -EFAULT: 0;
-}
 
 long ppc_fadvise64_64(int fd, int advice, u32 offset_high, u32 offset_low,
 		      u32 len_high, u32 len_low)
@@ -287,16 +122,19 @@ long ppc_fadvise64_64(int fd, int advice, u32 offset_high, u32 offset_low,
 			     (u64)len_high << 32 | len_low, advice);
 }
 
-void do_show_syscall(unsigned long r3, unsigned long r4, unsigned long r5,
-		     unsigned long r6, unsigned long r7, unsigned long r8,
-		     struct pt_regs *regs)
+long sys_switch_endian(void)
 {
-	printk("syscall %ld(%lx, %lx, %lx, %lx, %lx, %lx) regs=%p current=%p"
-	       " cpu=%d\n", regs->gpr[0], r3, r4, r5, r6, r7, r8, regs,
-	       current, smp_processor_id());
-}
+	struct thread_info *ti;
 
-void do_show_syscall_exit(unsigned long r3)
-{
-	printk(" -> %lx, current=%p cpu=%d\n", r3, current, smp_processor_id());
+	current->thread.regs->msr ^= MSR_LE;
+
+	/*
+	 * Set TIF_RESTOREALL so that r3 isn't clobbered on return to
+	 * userspace. That also has the effect of restoring the non-volatile
+	 * GPRs, so we saved them on the way in here.
+	 */
+	ti = current_thread_info();
+	ti->flags |= _TIF_RESTOREALL;
+
+	return 0;
 }

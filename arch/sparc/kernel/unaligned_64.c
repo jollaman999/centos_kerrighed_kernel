@@ -16,13 +16,13 @@
 #include <asm/ptrace.h>
 #include <asm/pstate.h>
 #include <asm/processor.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <linux/smp.h>
 #include <linux/bitops.h>
+#include <linux/perf_event.h>
+#include <linux/ratelimit.h>
 #include <asm/fpumacro.h>
-
-/* #define DEBUG_MNA */
+#include <asm/cacheflush.h>
 
 enum direction {
 	load,    /* ld, ldd, ldh, ldsh */
@@ -32,12 +32,6 @@ enum direction {
 	fpst,
 	invalid,
 };
-
-#ifdef DEBUG_MNA
-static char *dirstrings[] = {
-  "load", "store", "both", "fpload", "fpstore", "invalid"
-};
-#endif
 
 static inline enum direction decode_direction(unsigned int insn)
 {
@@ -56,7 +50,7 @@ static inline enum direction decode_direction(unsigned int insn)
 }
 
 /* 16 = double-word, 8 = extra-word, 4 = word, 2 = half-word */
-static inline int decode_access_size(unsigned int insn)
+static inline int decode_access_size(struct pt_regs *regs, unsigned int insn)
 {
 	unsigned int tmp;
 
@@ -72,7 +66,7 @@ static inline int decode_access_size(unsigned int insn)
 		return 2;
 	else {
 		printk("Impossible unaligned trap. insn=%08x\n", insn);
-		die_if_kernel("Byte sized unaligned access?!?!", current_thread_info()->kregs);
+		die_if_kernel("Byte sized unaligned access?!?!", regs);
 
 		/* GCC should never warn that control reaches the end
 		 * of this function without returning a value because
@@ -119,21 +113,24 @@ static inline long sign_extend_imm13(long imm)
 
 static unsigned long fetch_reg(unsigned int reg, struct pt_regs *regs)
 {
-	unsigned long value;
+	unsigned long value, fp;
 	
 	if (reg < 16)
 		return (!reg ? 0 : regs->u_regs[reg]);
+
+	fp = regs->u_regs[UREG_FP];
+
 	if (regs->tstate & TSTATE_PRIV) {
 		struct reg_window *win;
-		win = (struct reg_window *)(regs->u_regs[UREG_FP] + STACK_BIAS);
+		win = (struct reg_window *)(fp + STACK_BIAS);
 		value = win->locals[reg - 16];
-	} else if (test_thread_flag(TIF_32BIT)) {
+	} else if (!test_thread_64bit_stack(fp)) {
 		struct reg_window32 __user *win32;
-		win32 = (struct reg_window32 __user *)((unsigned long)((u32)regs->u_regs[UREG_FP]));
+		win32 = (struct reg_window32 __user *)((unsigned long)((u32)fp));
 		get_user(value, &win32->locals[reg - 16]);
 	} else {
 		struct reg_window __user *win;
-		win = (struct reg_window __user *)(regs->u_regs[UREG_FP] + STACK_BIAS);
+		win = (struct reg_window __user *)(fp + STACK_BIAS);
 		get_user(value, &win->locals[reg - 16]);
 	}
 	return value;
@@ -141,19 +138,24 @@ static unsigned long fetch_reg(unsigned int reg, struct pt_regs *regs)
 
 static unsigned long *fetch_reg_addr(unsigned int reg, struct pt_regs *regs)
 {
+	unsigned long fp;
+
 	if (reg < 16)
 		return &regs->u_regs[reg];
+
+	fp = regs->u_regs[UREG_FP];
+
 	if (regs->tstate & TSTATE_PRIV) {
 		struct reg_window *win;
-		win = (struct reg_window *)(regs->u_regs[UREG_FP] + STACK_BIAS);
+		win = (struct reg_window *)(fp + STACK_BIAS);
 		return &win->locals[reg - 16];
-	} else if (test_thread_flag(TIF_32BIT)) {
+	} else if (!test_thread_64bit_stack(fp)) {
 		struct reg_window32 *win32;
-		win32 = (struct reg_window32 *)((unsigned long)((u32)regs->u_regs[UREG_FP]));
+		win32 = (struct reg_window32 *)((unsigned long)((u32)fp));
 		return (unsigned long *)&win32->locals[reg - 16];
 	} else {
 		struct reg_window *win;
-		win = (struct reg_window *)(regs->u_regs[UREG_FP] + STACK_BIAS);
+		win = (struct reg_window *)(fp + STACK_BIAS);
 		return &win->locals[reg - 16];
 	}
 }
@@ -217,7 +219,7 @@ static inline int do_int_store(int reg_num, int size, unsigned long *dst_addr,
 		default:
 			BUG();
 			break;
-		};
+		}
 	}
 	return __do_int_store(dst_addr, size, src_val, asi);
 }
@@ -281,13 +283,9 @@ static void kernel_mna_trap_fault(int fixup_tstate_asi)
 
 static void log_unaligned(struct pt_regs *regs)
 {
-	static unsigned long count, last_time;
+	static DEFINE_RATELIMIT_STATE(ratelimit, 5 * HZ, 5);
 
-	if (time_after(jiffies, last_time + 5 * HZ))
-		count = 0;
-	if (count < 5) {
-		last_time = jiffies;
-		count++;
+	if (__ratelimit(&ratelimit)) {
 		printk("Kernel unaligned access at TPC[%lx] %pS\n",
 		       regs->tpc, (void *) regs->tpc);
 	}
@@ -296,7 +294,7 @@ static void log_unaligned(struct pt_regs *regs)
 asmlinkage void kernel_unaligned_trap(struct pt_regs *regs, unsigned int insn)
 {
 	enum direction dir = decode_direction(insn);
-	int size = decode_access_size(insn);
+	int size = decode_access_size(regs, insn);
 	int orig_asi, asi;
 
 	current_thread_info()->kern_una_regs = regs;
@@ -327,12 +325,7 @@ asmlinkage void kernel_unaligned_trap(struct pt_regs *regs, unsigned int insn)
 
 		addr = compute_effective_address(regs, insn,
 						 ((insn >> 25) & 0x1f));
-#ifdef DEBUG_MNA
-		printk("KMNA: pc=%016lx [dir=%s addr=%016lx size=%d] "
-		       "retpc[%016lx]\n",
-		       regs->tpc, dirstrings[dir], addr, size,
-		       regs->u_regs[UREG_RETPC]);
-#endif
+		perf_sw_event(PERF_COUNT_SW_ALIGNMENT_FAULTS, 1, regs, addr);
 		switch (asi) {
 		case ASI_NL:
 		case ASI_AIUPL:
@@ -343,7 +336,7 @@ asmlinkage void kernel_unaligned_trap(struct pt_regs *regs, unsigned int insn)
 		case ASI_SNFL:
 			asi &= ~0x08;
 			break;
-		};
+		}
 		switch (dir) {
 		case load:
 			reg_addr = fetch_reg_addr(((insn>>25)&0x1f), regs);
@@ -366,7 +359,7 @@ asmlinkage void kernel_unaligned_trap(struct pt_regs *regs, unsigned int insn)
 				default:
 					BUG();
 					break;
-				};
+				}
 				*reg_addr = val_in;
 			}
 			break;
@@ -388,17 +381,13 @@ asmlinkage void kernel_unaligned_trap(struct pt_regs *regs, unsigned int insn)
 	}
 }
 
-static char popc_helper[] = {
-0, 1, 1, 2, 1, 2, 2, 3,
-1, 2, 2, 3, 2, 3, 3, 4, 
-};
-
 int handle_popc(u32 insn, struct pt_regs *regs)
 {
-	u64 value;
-	int ret, i, rd = ((insn >> 25) & 0x1f);
 	int from_kernel = (regs->tstate & TSTATE_PRIV) != 0;
+	int ret, rd = ((insn >> 25) & 0x1f);
+	u64 value;
 	                        
+	perf_sw_event(PERF_COUNT_SW_EMULATION_FAULTS, 1, regs, 0);
 	if (insn & 0x2000) {
 		maybe_flush_windows(0, 0, rd, from_kernel);
 		value = sign_extend_imm13(insn);
@@ -406,21 +395,20 @@ int handle_popc(u32 insn, struct pt_regs *regs)
 		maybe_flush_windows(0, insn & 0x1f, rd, from_kernel);
 		value = fetch_reg(insn & 0x1f, regs);
 	}
-	for (ret = 0, i = 0; i < 16; i++) {
-		ret += popc_helper[value & 0xf];
-		value >>= 4;
-	}
+	ret = hweight64(value);
 	if (rd < 16) {
 		if (rd)
 			regs->u_regs[rd] = ret;
 	} else {
-		if (test_thread_flag(TIF_32BIT)) {
+		unsigned long fp = regs->u_regs[UREG_FP];
+
+		if (!test_thread_64bit_stack(fp)) {
 			struct reg_window32 __user *win32;
-			win32 = (struct reg_window32 __user *)((unsigned long)((u32)regs->u_regs[UREG_FP]));
+			win32 = (struct reg_window32 __user *)((unsigned long)((u32)fp));
 			put_user(ret, &win32->locals[rd - 16]);
 		} else {
 			struct reg_window __user *win;
-			win = (struct reg_window __user *)(regs->u_regs[UREG_FP] + STACK_BIAS);
+			win = (struct reg_window __user *)(fp + STACK_BIAS);
 			put_user(ret, &win->locals[rd - 16]);
 		}
 	}
@@ -444,6 +432,8 @@ int handle_ldf_stq(u32 insn, struct pt_regs *regs)
 	struct fpustate *f = FPUSTATE;
 	int asi = decode_asi(insn, regs);
 	int flag = (freg < 32) ? FPRS_DL : FPRS_DU;
+
+	perf_sw_event(PERF_COUNT_SW_EMULATION_FAULTS, 1, regs, 0);
 
 	save_and_clear_fpu();
 	current_thread_info()->xfsr[0] &= ~0x1c000;
@@ -566,13 +556,15 @@ void handle_ld_nf(u32 insn, struct pt_regs *regs)
 	int from_kernel = (regs->tstate & TSTATE_PRIV) != 0;
 	unsigned long *reg;
 	                        
+	perf_sw_event(PERF_COUNT_SW_EMULATION_FAULTS, 1, regs, 0);
+
 	maybe_flush_windows(0, 0, rd, from_kernel);
 	reg = fetch_reg_addr(rd, regs);
 	if (from_kernel || rd < 16) {
 		reg[0] = 0;
 		if ((insn & 0x780000) == 0x180000)
 			reg[1] = 0;
-	} else if (test_thread_flag(TIF_32BIT)) {
+	} else if (!test_thread_64bit_stack(regs->u_regs[UREG_FP])) {
 		put_user(0, (int __user *) reg);
 		if ((insn & 0x780000) == 0x180000)
 			put_user(0, ((int __user *) reg) + 1);
@@ -596,6 +588,7 @@ void handle_lddfmna(struct pt_regs *regs, unsigned long sfar, unsigned long sfsr
 
 	if (tstate & TSTATE_PRIV)
 		die_if_kernel("lddfmna from kernel", regs);
+	perf_sw_event(PERF_COUNT_SW_ALIGNMENT_FAULTS, 1, regs, sfar);
 	if (test_thread_flag(TIF_32BIT))
 		pc = (u32)pc;
 	if (get_user(insn, (u32 __user *) pc) != -EFAULT) {
@@ -642,7 +635,6 @@ daex:
 		return;
 	}
 	advance(regs);
-	return;
 }
 
 void handle_stdfmna(struct pt_regs *regs, unsigned long sfar, unsigned long sfsr)
@@ -657,6 +649,7 @@ void handle_stdfmna(struct pt_regs *regs, unsigned long sfar, unsigned long sfsr
 
 	if (tstate & TSTATE_PRIV)
 		die_if_kernel("stdfmna from kernel", regs);
+	perf_sw_event(PERF_COUNT_SW_ALIGNMENT_FAULTS, 1, regs, sfar);
 	if (test_thread_flag(TIF_32BIT))
 		pc = (u32)pc;
 	if (get_user(insn, (u32 __user *) pc) != -EFAULT) {
@@ -690,5 +683,4 @@ daex:
 		return;
 	}
 	advance(regs);
-	return;
 }

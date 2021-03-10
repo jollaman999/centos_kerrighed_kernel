@@ -42,7 +42,7 @@
 
 #define HEST_PFX "HEST: "
 
-int hest_disable;
+bool hest_disable;
 EXPORT_SYMBOL_GPL(hest_disable);
 
 /* HEST table parsing */
@@ -128,7 +128,6 @@ EXPORT_SYMBOL_GPL(apei_hest_parse);
  */
 static int __init hest_parse_cmc(struct acpi_hest_header *hest_hdr, void *data)
 {
-#ifdef CONFIG_X86_MCE
 	int i;
 	struct acpi_hest_ia_corrected *cmc;
 	struct acpi_hest_ia_error_bank *mc_bank;
@@ -153,7 +152,7 @@ static int __init hest_parse_cmc(struct acpi_hest_header *hest_hdr, void *data)
 	mc_bank = (struct acpi_hest_ia_error_bank *)(cmc + 1);
 	for (i = 0; i < cmc->num_hardware_banks; i++, mc_bank++)
 		mce_disable_bank(mc_bank->bank_number);
-#endif
+
 	return 1;
 }
 

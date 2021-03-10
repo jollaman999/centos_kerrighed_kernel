@@ -26,7 +26,7 @@
 #define LX6464ES_H
 
 #include <linux/spinlock.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 
 #include <sound/core.h>
 #include <sound/pcm.h>
@@ -60,7 +60,7 @@ struct lx_stream {
 	snd_pcm_uframes_t          frame_pos;
 	enum lx_stream_status      status; /* free, open, running, draining
 					    * pause */
-	int                        is_capture:1;
+	unsigned int               is_capture:1;
 };
 
 
@@ -69,13 +69,11 @@ struct lx6464es {
 	struct pci_dev         *pci;
 	int			irq;
 
-	spinlock_t		lock;        /* interrupt spinlock */
+	u8			mac_address[6];
+
+	struct mutex		lock;        /* interrupt lock */
 	struct mutex            setup_mutex; /* mutex used in hw_params, open
 					      * and close */
-
-	struct tasklet_struct   trigger_tasklet; /* trigger tasklet */
-	struct tasklet_struct   tasklet_capture;
-	struct tasklet_struct   tasklet_playback;
 
 	/* ports */
 	unsigned long		port_plx;	   /* io port (size=256) */
@@ -85,8 +83,9 @@ struct lx6464es {
 						    * size=8K) */
 
 	/* messaging */
-	spinlock_t		msg_lock;          /* message spinlock */
+	struct mutex		msg_lock;          /* message lock */
 	struct lx_rmh           rmh;
+	u32			irqsrc;
 
 	/* configuration */
 	uint			freq_ratio : 2;

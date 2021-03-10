@@ -9,25 +9,31 @@
  *
  */
 #include <asm/apic.h>
+#include <asm/nmi.h>
 
 #include <linux/cpumask.h>
 #include <linux/kdebug.h>
 #include <linux/notifier.h>
 #include <linux/kprobes.h>
 #include <linux/nmi.h>
+#include <linux/cpu.h>
 #include <linux/module.h>
+#include <linux/delay.h>
 #include <linux/seq_buf.h>
 
-u64 hw_nmi_get_sample_period(void)
+#ifdef CONFIG_HARDLOCKUP_DETECTOR
+u64 hw_nmi_get_sample_period(int watchdog_thresh)
 {
-	return (u64)(cpu_khz) * 1000 * 60;
+	return (u64)(cpu_khz) * 1000 * watchdog_thresh;
 }
+#endif
 
+#ifdef arch_trigger_all_cpu_backtrace
 /* For reliability, we're prepared to waste bits here. */
 static DECLARE_BITMAP(backtrace_mask, NR_CPUS) __read_mostly;
 static cpumask_t printtrace_mask;
 
-#define NMI_BUF_SIZE		4096
+#define NMI_BUF_SIZE		8192
 
 struct nmi_seq_buf {
 	unsigned char		buffer[NMI_BUF_SIZE];
@@ -119,7 +125,7 @@ void arch_trigger_all_cpu_backtrace(bool include_self)
 	}
 
 	clear_bit(0, &backtrace_flag);
-	smp_mb__after_clear_bit();
+	smp_mb__after_atomic();
 	put_cpu();
 }
 
@@ -137,7 +143,7 @@ void arch_trigger_all_cpu_backtrace(bool include_self)
  */
 static int nmi_vprintk(const char *fmt, va_list args)
 {
-	struct nmi_seq_buf *s = &__get_cpu_var(nmi_print_seq);
+	struct nmi_seq_buf *s = this_cpu_ptr(&nmi_print_seq);
 	unsigned int len = seq_buf_used(&s->seq);
 
 	seq_buf_vprintf(&s->seq, fmt, args);
@@ -145,65 +151,38 @@ static int nmi_vprintk(const char *fmt, va_list args)
 }
 
 static int __kprobes
-arch_trigger_all_cpu_backtrace_handler(struct notifier_block *self,
-			 unsigned long cmd, void *__args)
+arch_trigger_all_cpu_backtrace_handler(unsigned int cmd, struct pt_regs *regs)
 {
-	struct die_args *args = __args;
-	struct pt_regs *regs;
-	int cpu = smp_processor_id();
+	int cpu;
 
-	switch (cmd) {
-	case DIE_NMI:
-	case DIE_NMI_IPI:
-		break;
-
-	default:
-		return NOTIFY_DONE;
-	}
-
-	regs = args->regs;
+	cpu = smp_processor_id();
 
 	if (cpumask_test_cpu(cpu, to_cpumask(backtrace_mask))) {
-		printk_func_t printk_func_save = __get_cpu_var(printk_func);
+		printk_func_t printk_func_save = this_cpu_read(printk_func);
 
 		/* Replace printk to write into the NMI seq */
-		__get_cpu_var(printk_func) = nmi_vprintk;
-		printk(KERN_WARNING "NMI backtrace for cpu %d\n", cpu);
-		show_regs(regs);
-		dump_stack();
-		__get_cpu_var(printk_func) = printk_func_save;
+		this_cpu_write(printk_func, nmi_vprintk);
+		if (regs && cpu_in_idle(instruction_pointer(regs))) {
+			pr_warn("NMI backtrace for cpu %d skipped: idling at pc %#lx\n",
+				cpu, instruction_pointer(regs));
+		} else {
+			printk(KERN_WARNING "NMI backtrace for cpu %d\n", cpu);
+			show_regs(regs);
+		}
+		this_cpu_write(printk_func, printk_func_save);
 
 		cpumask_clear_cpu(cpu, to_cpumask(backtrace_mask));
-		return NOTIFY_STOP;
+		return NMI_HANDLED;
 	}
 
-	return NOTIFY_DONE;
+	return NMI_DONE;
 }
-
-static __read_mostly struct notifier_block backtrace_notifier = {
-	.notifier_call          = arch_trigger_all_cpu_backtrace_handler,
-	.next                   = NULL,
-	.priority               = NMI_LOCAL_LOW_PRIOR,
-};
 
 static int __init register_trigger_all_cpu_backtrace(void)
 {
-	register_die_notifier(&backtrace_notifier);
+	register_nmi_handler(NMI_LOCAL, arch_trigger_all_cpu_backtrace_handler,
+				0, "arch_bt");
 	return 0;
 }
 early_initcall(register_trigger_all_cpu_backtrace);
-
-/* STUB calls to mimic old nmi_watchdog behaviour */
-#if defined(CONFIG_X86_LOCAL_APIC)
-unsigned int nmi_watchdog = NMI_NONE;
-EXPORT_SYMBOL(nmi_watchdog);
-void acpi_nmi_enable(void) { return; }
-void acpi_nmi_disable(void) { return; }
 #endif
-atomic_t nmi_active = ATOMIC_INIT(0);           /* oprofile uses this */
-EXPORT_SYMBOL(nmi_active);
-void cpu_nmi_set_wd_enabled(void) { return; }
-void stop_apic_nmi_watchdog(void *unused) { return; }
-void setup_apic_nmi_watchdog(void *unused) { return; }
-int __init check_nmi_watchdog(void) { return 0; }
-void __cpuinit nmi_watchdog_default(void) { return; }

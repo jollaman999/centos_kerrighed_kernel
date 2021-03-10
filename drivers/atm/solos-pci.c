@@ -40,8 +40,10 @@
 #include <linux/firmware.h>
 #include <linux/ctype.h>
 #include <linux/swab.h>
+#include <linux/slab.h>
 
-#define VERSION "0.07"
+#define VERSION "1.04"
+#define DRIVER_VERSION 0x01
 #define PTAG "solos-pci"
 
 #define CONFIG_RAM_SIZE	128
@@ -55,16 +57,21 @@
 #define FLASH_BUSY	0x60
 #define FPGA_MODE	0x5C
 #define FLASH_MODE	0x58
+#define GPIO_STATUS	0x54
+#define DRIVER_VER	0x50
 #define TX_DMA_ADDR(port)	(0x40 + (4 * (port)))
 #define RX_DMA_ADDR(port)	(0x30 + (4 * (port)))
 
 #define DATA_RAM_SIZE	32768
 #define BUF_SIZE	2048
 #define OLD_BUF_SIZE	4096 /* For FPGA versions <= 2*/
-#define FPGA_PAGE	528 /* FPGA flash page size*/
-#define SOLOS_PAGE	512 /* Solos flash page size*/
-#define FPGA_BLOCK	(FPGA_PAGE * 8) /* FPGA flash block size*/
-#define SOLOS_BLOCK	(SOLOS_PAGE * 8) /* Solos flash block size*/
+/* Old boards use ATMEL AD45DB161D flash */
+#define ATMEL_FPGA_PAGE	528 /* FPGA flash page size*/
+#define ATMEL_SOLOS_PAGE	512 /* Solos flash page size*/
+#define ATMEL_FPGA_BLOCK	(ATMEL_FPGA_PAGE * 8) /* FPGA block size*/
+#define ATMEL_SOLOS_BLOCK	(ATMEL_SOLOS_PAGE * 8) /* Solos block size*/
+/* Current boards use M25P/M25PE SPI flash */
+#define SPI_FLASH_BLOCK	(256 * 64)
 
 #define RX_BUF(card, nr) ((card->buffers) + (nr)*(card->buffer_size)*2)
 #define TX_BUF(card, nr) ((card->buffers) + (nr)*(card->buffer_size)*2 + (card->buffer_size))
@@ -121,11 +128,14 @@ struct solos_card {
 	struct sk_buff_head cli_queue[4];
 	struct sk_buff *tx_skb[4];
 	struct sk_buff *rx_skb[4];
+	unsigned char *dma_bounce;
 	wait_queue_head_t param_wq;
 	wait_queue_head_t fw_wq;
 	int using_dma;
+	int dma_alignment;
 	int fpga_version;
 	int buffer_size;
+	int atmel_flash;
 };
 
 
@@ -142,6 +152,9 @@ MODULE_AUTHOR("Traverse Technologies <support@traverse.com.au>");
 MODULE_DESCRIPTION("Solos PCI driver");
 MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");
+MODULE_FIRMWARE("solos-FPGA.bin");
+MODULE_FIRMWARE("solos-Firmware.bin");
+MODULE_FIRMWARE("solos-db-FPGA.bin");
 MODULE_PARM_DESC(reset, "Reset Solos chips on startup");
 MODULE_PARM_DESC(atmdebug, "Print ATM data");
 MODULE_PARM_DESC(firmware_upgrade, "Initiate Solos firmware upgrade");
@@ -160,9 +173,7 @@ static void fpga_queue(struct solos_card *card, int port, struct sk_buff *skb,
 static uint32_t fpga_tx(struct solos_card *);
 static irqreturn_t solos_irq(int irq, void *dev_id);
 static struct atm_vcc* find_vcc(struct atm_dev *dev, short vpi, int vci);
-static int list_vccs(int vci);
-static void release_vccs(struct atm_dev *dev);
-static int atm_init(struct solos_card *);
+static int atm_init(struct solos_card *, struct device *);
 static void atm_remove(struct solos_card *);
 static int send_command(struct solos_card *card, int dev, const char *buf, size_t size);
 static void solos_bh(unsigned long);
@@ -379,8 +390,7 @@ static int process_status(struct solos_card *card, int port, struct sk_buff *skb
 
 	/* Anything but 'Showtime' is down */
 	if (strcmp(state_str, "Showtime")) {
-		card->atmdev[port]->signal = ATM_PHY_SIG_LOST;
-		release_vccs(card->atmdev[port]);
+		atm_dev_signal_change(card->atmdev[port], ATM_PHY_SIG_LOST);
 		dev_info(&card->dev->dev, "Port %d: %s\n", port, state_str);
 		return 0;
 	}
@@ -397,7 +407,7 @@ static int process_status(struct solos_card *card, int port, struct sk_buff *skb
 		 snr[0]?", SNR ":"", snr, attn[0]?", Attn ":"", attn);
 	
 	card->atmdev[port]->link_rate = rate_down / 424;
-	card->atmdev[port]->signal = ATM_PHY_SIG_FOUND;
+	atm_dev_signal_change(card->atmdev[port], ATM_PHY_SIG_FOUND);
 
 	return 0;
 }
@@ -440,6 +450,7 @@ static ssize_t console_show(struct device *dev, struct device_attribute *attr,
 	struct atm_dev *atmdev = container_of(dev, struct atm_dev, class_dev);
 	struct solos_card *card = atmdev->dev_data;
 	struct sk_buff *skb;
+	unsigned int len;
 
 	spin_lock(&card->cli_queue_lock);
 	skb = skb_dequeue(&card->cli_queue[SOLOS_CHAN(atmdev)]);
@@ -447,11 +458,11 @@ static ssize_t console_show(struct device *dev, struct device_attribute *attr,
 	if(skb == NULL)
 		return sprintf(buf, "No data.\n");
 
-	memcpy(buf, skb->data, skb->len);
-	dev_dbg(&card->dev->dev, "len: %d\n", skb->len);
+	len = skb->len;
+	memcpy(buf, skb->data, len);
 
 	kfree_skb(skb);
-	return skb->len;
+	return len;
 }
 
 static int send_command(struct solos_card *card, int dev, const char *buf, size_t size)
@@ -495,6 +506,78 @@ static ssize_t console_store(struct device *dev, struct device_attribute *attr,
 	return err?:count;
 }
 
+struct geos_gpio_attr {
+	struct device_attribute attr;
+	int offset;
+};
+
+#define SOLOS_GPIO_ATTR(_name, _mode, _show, _store, _offset)	\
+	struct geos_gpio_attr gpio_attr_##_name = {		\
+		.attr = __ATTR(_name, _mode, _show, _store),	\
+		.offset = _offset }
+
+static ssize_t geos_gpio_store(struct device *dev, struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
+	struct geos_gpio_attr *gattr = container_of(attr, struct geos_gpio_attr, attr);
+	struct solos_card *card = pci_get_drvdata(pdev);
+	uint32_t data32;
+
+	if (count != 1 && (count != 2 || buf[1] != '\n'))
+		return -EINVAL;
+
+	spin_lock_irq(&card->param_queue_lock);
+	data32 = ioread32(card->config_regs + GPIO_STATUS);
+	if (buf[0] == '1') {
+		data32 |= 1 << gattr->offset;
+		iowrite32(data32, card->config_regs + GPIO_STATUS);
+	} else if (buf[0] == '0') {
+		data32 &= ~(1 << gattr->offset);
+		iowrite32(data32, card->config_regs + GPIO_STATUS);
+	} else {
+		count = -EINVAL;
+	}
+	spin_unlock_irq(&card->param_queue_lock);
+	return count;
+}
+
+static ssize_t geos_gpio_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
+	struct geos_gpio_attr *gattr = container_of(attr, struct geos_gpio_attr, attr);
+	struct solos_card *card = pci_get_drvdata(pdev);
+	uint32_t data32;
+
+	data32 = ioread32(card->config_regs + GPIO_STATUS);
+	data32 = (data32 >> gattr->offset) & 1;
+
+	return sprintf(buf, "%d\n", data32);
+}
+
+static ssize_t hardware_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct pci_dev *pdev = container_of(dev, struct pci_dev, dev);
+	struct geos_gpio_attr *gattr = container_of(attr, struct geos_gpio_attr, attr);
+	struct solos_card *card = pci_get_drvdata(pdev);
+	uint32_t data32;
+
+	data32 = ioread32(card->config_regs + GPIO_STATUS);
+	switch (gattr->offset) {
+	case 0:
+		/* HardwareVersion */
+		data32 = data32 & 0x1F;
+		break;
+	case 1:
+		/* HardwareVariant */
+		data32 = (data32 >> 5) & 0x0F;
+		break;
+	}
+	return sprintf(buf, "%d\n", data32);
+}
+
 static DEVICE_ATTR(console, 0644, console_show, console_store);
 
 
@@ -503,6 +586,14 @@ static DEVICE_ATTR(console, 0644, console_show, console_store);
 
 #include "solos-attrlist.c"
 
+static SOLOS_GPIO_ATTR(GPIO1, 0644, geos_gpio_show, geos_gpio_store, 9);
+static SOLOS_GPIO_ATTR(GPIO2, 0644, geos_gpio_show, geos_gpio_store, 10);
+static SOLOS_GPIO_ATTR(GPIO3, 0644, geos_gpio_show, geos_gpio_store, 11);
+static SOLOS_GPIO_ATTR(GPIO4, 0644, geos_gpio_show, geos_gpio_store, 12);
+static SOLOS_GPIO_ATTR(GPIO5, 0644, geos_gpio_show, geos_gpio_store, 13);
+static SOLOS_GPIO_ATTR(PushButton, 0444, geos_gpio_show, NULL, 14);
+static SOLOS_GPIO_ATTR(HardwareVersion, 0444, hardware_show, NULL, 0);
+static SOLOS_GPIO_ATTR(HardwareVariant, 0444, hardware_show, NULL, 1);
 #undef SOLOS_ATTR_RO
 #undef SOLOS_ATTR_RW
 
@@ -519,43 +610,74 @@ static struct attribute_group solos_attr_group = {
 	.name = "parameters",
 };
 
+static struct attribute *gpio_attrs[] = {
+	&gpio_attr_GPIO1.attr.attr,
+	&gpio_attr_GPIO2.attr.attr,
+	&gpio_attr_GPIO3.attr.attr,
+	&gpio_attr_GPIO4.attr.attr,
+	&gpio_attr_GPIO5.attr.attr,
+	&gpio_attr_PushButton.attr.attr,
+	&gpio_attr_HardwareVersion.attr.attr,
+	&gpio_attr_HardwareVariant.attr.attr,
+	NULL
+};
+
+static struct attribute_group gpio_attr_group = {
+	.attrs = gpio_attrs,
+	.name = "gpio",
+};
+
 static int flash_upgrade(struct solos_card *card, int chip)
 {
 	const struct firmware *fw;
 	const char *fw_name;
-	uint32_t data32 = 0;
 	int blocksize = 0;
 	int numblocks = 0;
 	int offset;
 
-	if (chip == 0) {
+	switch (chip) {
+	case 0:
 		fw_name = "solos-FPGA.bin";
-		blocksize = FPGA_BLOCK;
-	} 
-	
-	if (chip == 1) {
+		if (card->atmel_flash)
+			blocksize = ATMEL_FPGA_BLOCK;
+		else
+			blocksize = SPI_FLASH_BLOCK;
+		break;
+	case 1:
 		fw_name = "solos-Firmware.bin";
-		blocksize = SOLOS_BLOCK;
-	}
-	
-	if (chip == 2){
+		if (card->atmel_flash)
+			blocksize = ATMEL_SOLOS_BLOCK;
+		else
+			blocksize = SPI_FLASH_BLOCK;
+		break;
+	case 2:
 		if (card->fpga_version > LEGACY_BUFFERS){
 			fw_name = "solos-db-FPGA.bin";
-			blocksize = FPGA_BLOCK;
+			if (card->atmel_flash)
+				blocksize = ATMEL_FPGA_BLOCK;
+			else
+				blocksize = SPI_FLASH_BLOCK;
 		} else {
-			dev_info(&card->dev->dev, "FPGA version doesn't support daughter board upgrades\n");
+			dev_info(&card->dev->dev, "FPGA version doesn't support"
+					" daughter board upgrades\n");
 			return -EPERM;
 		}
-	}
-	
-	if (chip == 3){
+		break;
+	case 3:
 		if (card->fpga_version > LEGACY_BUFFERS){
 			fw_name = "solos-Firmware.bin";
-			blocksize = SOLOS_BLOCK;
+			if (card->atmel_flash)
+				blocksize = ATMEL_SOLOS_BLOCK;
+			else
+				blocksize = SPI_FLASH_BLOCK;
 		} else {
-		dev_info(&card->dev->dev, "FPGA version doesn't support daughter board upgrades\n");
-		return -EPERM;
+			dev_info(&card->dev->dev, "FPGA version doesn't support"
+					" daughter board upgrades\n");
+			return -EPERM;
 		}
+		break;
+	default:
+		return -ENODEV;
 	}
 
 	if (request_firmware(&fw, fw_name, &card->dev->dev))
@@ -563,13 +685,16 @@ static int flash_upgrade(struct solos_card *card, int chip)
 
 	dev_info(&card->dev->dev, "Flash upgrade starting\n");
 
+	/* New FPGAs require driver version before permitting flash upgrades */
+	iowrite32(DRIVER_VERSION, card->config_regs + DRIVER_VER);
+
 	numblocks = fw->size / blocksize;
 	dev_info(&card->dev->dev, "Firmware size: %zd\n", fw->size);
 	dev_info(&card->dev->dev, "Number of blocks: %d\n", numblocks);
 	
 	dev_info(&card->dev->dev, "Changing FPGA to Update mode\n");
 	iowrite32(1, card->config_regs + FPGA_MODE);
-	data32 = ioread32(card->config_regs + FPGA_MODE); 
+	(void) ioread32(card->config_regs + FPGA_MODE); 
 
 	/* Set mode to Chip Erase */
 	if(chip == 0 || chip == 2)
@@ -592,9 +717,13 @@ static int flash_upgrade(struct solos_card *card, int chip)
 		/* dev_info(&card->dev->dev, "Set FPGA Flash mode to Block Write\n"); */
 		iowrite32(((chip * 2) + 1), card->config_regs + FLASH_MODE);
 
-		/* Copy block to buffer, swapping each 16 bits */
+		/* Copy block to buffer, swapping each 16 bits for Atmel flash */
 		for(i = 0; i < blocksize; i += 4) {
-			uint32_t word = swahb32p((uint32_t *)(fw->data + offset + i));
+			uint32_t word;
+			if (card->atmel_flash)
+				word = swahb32p((uint32_t *)(fw->data + offset + i));
+			else
+				word = *(uint32_t *)(fw->data + offset + i);
 			if(card->fpga_version > LEGACY_BUFFERS)
 				iowrite32(word, FLASH_BUF + i);
 			else
@@ -688,7 +817,7 @@ void solos_bh(unsigned long card_arg)
 					      size);
 			}
 			if (atmdebug) {
-				dev_info(&card->dev->dev, "Received: device %d\n", port);
+				dev_info(&card->dev->dev, "Received: port %d\n", port);
 				dev_info(&card->dev->dev, "size: %d VPI: %d VCI: %d\n",
 					 size, le16_to_cpu(header->vpi),
 					 le16_to_cpu(header->vci));
@@ -701,10 +830,11 @@ void solos_bh(unsigned long card_arg)
 					       le16_to_cpu(header->vci));
 				if (!vcc) {
 					if (net_ratelimit())
-						dev_warn(&card->dev->dev, "Received packet for unknown VCI.VPI %d.%d on port %d\n",
-							 le16_to_cpu(header->vci), le16_to_cpu(header->vpi),
+						dev_warn(&card->dev->dev, "Received packet for unknown VPI.VCI %d.%d on port %d\n",
+							 le16_to_cpu(header->vpi), le16_to_cpu(header->vci),
 							 port);
-					continue;
+					dev_kfree_skb_any(skb);
+					break;
 				}
 				atm_charge(vcc, skb->truesize);
 				vcc->push(vcc, skb);
@@ -766,15 +896,15 @@ static struct atm_vcc *find_vcc(struct atm_dev *dev, short vpi, int vci)
 {
 	struct hlist_head *head;
 	struct atm_vcc *vcc = NULL;
-	struct hlist_node *node;
 	struct sock *s;
 
 	read_lock(&vcc_sklist_lock);
 	head = &vcc_hash[vci & (VCC_HTABLE_SIZE -1)];
-	sk_for_each(s, node, head) {
+	sk_for_each(s, head) {
 		vcc = atm_sk(s);
 		if (vcc->dev == dev && vcc->vci == vci &&
-		    vcc->vpi == vpi && vcc->qos.rxtp.traffic_class != ATM_NONE)
+		    vcc->vpi == vpi && vcc->qos.rxtp.traffic_class != ATM_NONE &&
+		    test_bit(ATM_VF_READY, &vcc->flags))
 			goto out;
 	}
 	vcc = NULL;
@@ -782,66 +912,6 @@ static struct atm_vcc *find_vcc(struct atm_dev *dev, short vpi, int vci)
 	read_unlock(&vcc_sklist_lock);
 	return vcc;
 }
-
-static int list_vccs(int vci)
-{
-	struct hlist_head *head;
-	struct atm_vcc *vcc;
-	struct hlist_node *node;
-	struct sock *s;
-	int num_found = 0;
-	int i;
-
-	read_lock(&vcc_sklist_lock);
-	if (vci != 0){
-		head = &vcc_hash[vci & (VCC_HTABLE_SIZE -1)];
-		sk_for_each(s, node, head) {
-			num_found ++;
-			vcc = atm_sk(s);
-			printk(KERN_DEBUG "Device: %d Vpi: %d Vci: %d\n",
-			       vcc->dev->number,
-			       vcc->vpi,
-			       vcc->vci);
-		}
-	} else {
-		for(i = 0; i < VCC_HTABLE_SIZE; i++){
-			head = &vcc_hash[i];
-			sk_for_each(s, node, head) {
-				num_found ++;
-				vcc = atm_sk(s);
-				printk(KERN_DEBUG "Device: %d Vpi: %d Vci: %d\n",
-				       vcc->dev->number,
-				       vcc->vpi,
-				       vcc->vci);
-			}
-		}
-	}
-	read_unlock(&vcc_sklist_lock);
-	return num_found;
-}
-
-static void release_vccs(struct atm_dev *dev)
-{
-        int i;
-
-        write_lock_irq(&vcc_sklist_lock);
-        for (i = 0; i < VCC_HTABLE_SIZE; i++) {
-                struct hlist_head *head = &vcc_hash[i];
-                struct hlist_node *node, *tmp;
-                struct sock *s;
-                struct atm_vcc *vcc;
-
-                sk_for_each_safe(s, node, tmp, head) {
-                        vcc = atm_sk(s);
-                        if (vcc->dev == dev) {
-                                vcc_release_async(vcc, -EPIPE);
-                                sk_del_node_init(s);
-                        }
-                }
-        }
-        write_unlock_irq(&vcc_sklist_lock);
-}
-
 
 static int popen(struct atm_vcc *vcc)
 {
@@ -855,9 +925,10 @@ static int popen(struct atm_vcc *vcc)
 		return -EINVAL;
 	}
 
-	skb = alloc_skb(sizeof(*header), GFP_ATOMIC);
-	if (!skb && net_ratelimit()) {
-		dev_warn(&card->dev->dev, "Failed to allocate sk_buff in popen()\n");
+	skb = alloc_skb(sizeof(*header), GFP_KERNEL);
+	if (!skb) {
+		if (net_ratelimit())
+			dev_warn(&card->dev->dev, "Failed to allocate sk_buff in popen()\n");
 		return -ENOMEM;
 	}
 	header = (void *)skb_put(skb, sizeof(*header));
@@ -871,8 +942,6 @@ static int popen(struct atm_vcc *vcc)
 
 	set_bit(ATM_VF_ADDR, &vcc->flags);
 	set_bit(ATM_VF_READY, &vcc->flags);
-	list_vccs(0);
-
 
 	return 0;
 }
@@ -880,10 +949,21 @@ static int popen(struct atm_vcc *vcc)
 static void pclose(struct atm_vcc *vcc)
 {
 	struct solos_card *card = vcc->dev->dev_data;
-	struct sk_buff *skb;
+	unsigned char port = SOLOS_CHAN(vcc->dev);
+	struct sk_buff *skb, *tmpskb;
 	struct pkt_hdr *header;
 
-	skb = alloc_skb(sizeof(*header), GFP_ATOMIC);
+	/* Remove any yet-to-be-transmitted packets from the pending queue */
+	spin_lock(&card->tx_queue_lock);
+	skb_queue_walk_safe(&card->tx_queue[port], skb, tmpskb) {
+		if (SKB_CB(skb)->vcc == vcc) {
+			skb_unlink(skb, &card->tx_queue[port]);
+			solos_pop(vcc, skb);
+		}
+	}
+	spin_unlock(&card->tx_queue_lock);
+
+	skb = alloc_skb(sizeof(*header), GFP_KERNEL);
 	if (!skb) {
 		dev_warn(&card->dev->dev, "Failed to allocate sk_buff in pclose()\n");
 		return;
@@ -895,10 +975,21 @@ static void pclose(struct atm_vcc *vcc)
 	header->vci = cpu_to_le16(vcc->vci);
 	header->type = cpu_to_le16(PKT_PCLOSE);
 
-	fpga_queue(card, SOLOS_CHAN(vcc->dev), skb, NULL);
+	skb_get(skb);
+	fpga_queue(card, port, skb, NULL);
+
+	if (!wait_event_timeout(card->param_wq, !skb_shared(skb), 5 * HZ))
+		dev_warn(&card->dev->dev,
+			 "Timeout waiting for VCC close on port %d\n", port);
+
+	dev_kfree_skb(skb);
+
+	/* Hold up vcc_destroy_socket() (our caller) until solos_bh() in the
+	   tasklet has finished processing any incoming packets (and, more to
+	   the point, using the vcc pointer). */
+	tasklet_unlock_wait(&card->tlet);
 
 	clear_bit(ATM_VF_ADDR, &vcc->flags);
-	clear_bit(ATM_VF_READY, &vcc->flags);
 
 	return;
 }
@@ -977,10 +1068,11 @@ static uint32_t fpga_tx(struct solos_card *card)
 	for (port = 0; tx_pending; tx_pending >>= 1, port++) {
 		if (tx_pending & 1) {
 			struct sk_buff *oldskb = card->tx_skb[port];
-			if (oldskb)
+			if (oldskb) {
 				pci_unmap_single(card->dev, SKB_CB(oldskb)->dma_addr,
 						 oldskb->len, PCI_DMA_TODEVICE);
-
+				card->tx_skb[port] = NULL;
+			}
 			spin_lock(&card->tx_queue_lock);
 			skb = skb_dequeue(&card->tx_queue[port]);
 			if (!skb)
@@ -992,8 +1084,14 @@ static uint32_t fpga_tx(struct solos_card *card)
 				tx_started |= 1 << port;
 				oldskb = skb; /* We're done with this skb already */
 			} else if (skb && card->using_dma) {
-				SKB_CB(skb)->dma_addr = pci_map_single(card->dev, skb->data,
+				unsigned char *data = skb->data;
+				if ((unsigned long)data & card->dma_alignment) {
+					data = card->dma_bounce + (BUF_SIZE * port);
+					memcpy(data, skb->data, skb->len);
+				}
+				SKB_CB(skb)->dma_addr = pci_map_single(card->dev, data,
 								       skb->len, PCI_DMA_TODEVICE);
+				card->tx_skb[port] = skb;
 				iowrite32(SKB_CB(skb)->dma_addr,
 					  card->config_regs + TX_DMA_ADDR(port));
 			}
@@ -1003,8 +1101,15 @@ static uint32_t fpga_tx(struct solos_card *card)
 
 			/* Clean up and free oldskb now it's gone */
 			if (atmdebug) {
+				struct pkt_hdr *header = (void *)oldskb->data;
+				int size = le16_to_cpu(header->size);
+
+				skb_pull(oldskb, sizeof(*header));
 				dev_info(&card->dev->dev, "Transmitted: port %d\n",
 					 port);
+				dev_info(&card->dev->dev, "size: %d VPI: %d VCI: %d\n",
+					 size, le16_to_cpu(header->vpi),
+					 le16_to_cpu(header->vci));
 				print_buffer(oldskb);
 			}
 
@@ -1013,9 +1118,10 @@ static uint32_t fpga_tx(struct solos_card *card)
 			if (vcc) {
 				atomic_inc(&vcc->stats->tx);
 				solos_pop(vcc, oldskb);
-			} else
+			} else {
 				dev_kfree_skb_irq(oldskb);
-
+				wake_up(&card->param_wq);
+			}
 		}
 	}
 	/* For non-DMA TX, write the 'TX start' bit for all four ports simultaneously */
@@ -1147,16 +1253,40 @@ static int fpga_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	dev_info(&dev->dev, "Solos FPGA Version %d.%02d svn-%d\n",
 		 major_ver, minor_ver, fpga_ver);
 
-	if (card->fpga_version >= DMA_SUPPORTED){
+	if (fpga_ver < 37 && (fpga_upgrade || firmware_upgrade ||
+			      db_fpga_upgrade || db_firmware_upgrade)) {
+		dev_warn(&dev->dev,
+			 "FPGA too old; cannot upgrade flash. Use JTAG.\n");
+		fpga_upgrade = firmware_upgrade = 0;
+		db_fpga_upgrade = db_firmware_upgrade = 0;
+	}
+
+	/* Stopped using Atmel flash after 0.03-38 */
+	if (fpga_ver < 39)
+		card->atmel_flash = 1;
+	else
+		card->atmel_flash = 0;
+
+	data32 = ioread32(card->config_regs + PORTS);
+	card->nr_ports = (data32 & 0x000000FF);
+
+	if (card->fpga_version >= DMA_SUPPORTED) {
+		pci_set_master(dev);
 		card->using_dma = 1;
+		if (1) { /* All known FPGA versions so far */
+			card->dma_alignment = 3;
+			card->dma_bounce = kmalloc(card->nr_ports * BUF_SIZE, GFP_KERNEL);
+			if (!card->dma_bounce) {
+				dev_warn(&card->dev->dev, "Failed to allocate DMA bounce buffers\n");
+				/* Fallback to MMIO doesn't work */
+				goto out_unmap_both;
+			}
+		}
 	} else {
 		card->using_dma = 0;
 		/* Set RX empty flag for all ports */
 		iowrite32(0xF0, card->config_regs + FLAGS_ADDR);
 	}
-
-	data32 = ioread32(card->config_regs + PORTS);
-	card->nr_ports = (data32 & 0x000000FF);
 
 	pci_set_drvdata(dev, card);
 
@@ -1188,9 +1318,13 @@ static int fpga_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	if (db_firmware_upgrade)
 		flash_upgrade(card, 3);
 
-	err = atm_init(card);
+	err = atm_init(card, &dev->dev);
 	if (err)
 		goto out_free_irq;
+
+	if (card->fpga_version >= DMA_SUPPORTED &&
+	    sysfs_create_group(&card->dev->dev.kobj, &gpio_attr_group))
+		dev_err(&card->dev->dev, "Could not register parameter group for GPIOs\n");
 
 	return 0;
 
@@ -1200,10 +1334,11 @@ static int fpga_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	tasklet_kill(&card->tlet);
 	
  out_unmap_both:
+	kfree(card->dma_bounce);
 	pci_set_drvdata(dev, NULL);
-	pci_iounmap(dev, card->config_regs);
- out_unmap_config:
 	pci_iounmap(dev, card->buffers);
+ out_unmap_config:
+	pci_iounmap(dev, card->config_regs);
  out_release_regions:
 	pci_release_regions(dev);
  out:
@@ -1211,7 +1346,7 @@ static int fpga_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	return err;
 }
 
-static int atm_init(struct solos_card *card)
+static int atm_init(struct solos_card *card, struct device *parent)
 {
 	int i;
 
@@ -1222,7 +1357,7 @@ static int atm_init(struct solos_card *card)
 		skb_queue_head_init(&card->tx_queue[i]);
 		skb_queue_head_init(&card->cli_queue[i]);
 
-		card->atmdev[i] = atm_dev_register("solos-pci", &fpga_ops, -1, NULL);
+		card->atmdev[i] = atm_dev_register("solos-pci", parent, &fpga_ops, -1, NULL);
 		if (!card->atmdev[i]) {
 			dev_err(&card->dev->dev, "Could not register ATM device %d\n", i);
 			atm_remove(card);
@@ -1239,9 +1374,9 @@ static int atm_init(struct solos_card *card)
 		card->atmdev[i]->ci_range.vci_bits = 16;
 		card->atmdev[i]->dev_data = card;
 		card->atmdev[i]->phy_data = (void *)(unsigned long)i;
-		card->atmdev[i]->signal = ATM_PHY_SIG_UNKNOWN;
+		atm_dev_signal_change(card->atmdev[i], ATM_PHY_SIG_FOUND);
 
-		skb = alloc_skb(sizeof(*header), GFP_ATOMIC);
+		skb = alloc_skb(sizeof(*header), GFP_KERNEL);
 		if (!skb) {
 			dev_warn(&card->dev->dev, "Failed to allocate sk_buff in atm_init()\n");
 			continue;
@@ -1302,10 +1437,15 @@ static void fpga_remove(struct pci_dev *dev)
 	iowrite32(1, card->config_regs + FPGA_MODE);
 	(void)ioread32(card->config_regs + FPGA_MODE); 
 
+	if (card->fpga_version >= DMA_SUPPORTED)
+		sysfs_remove_group(&card->dev->dev.kobj, &gpio_attr_group);
+
 	atm_remove(card);
 
 	free_irq(dev->irq, card);
 	tasklet_kill(&card->tlet);
+
+	kfree(card->dma_bounce);
 
 	/* Release device from reset */
 	iowrite32(0, card->config_regs + FPGA_MODE);
@@ -1321,7 +1461,7 @@ static void fpga_remove(struct pci_dev *dev)
 	kfree(card);
 }
 
-static struct pci_device_id fpga_pci_tbl[] __devinitdata = {
+static struct pci_device_id fpga_pci_tbl[] = {
 	{ 0x10ee, 0x0300, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
 	{ 0, }
 };
@@ -1338,6 +1478,8 @@ static struct pci_driver fpga_driver = {
 
 static int __init solos_pci_init(void)
 {
+	BUILD_BUG_ON(sizeof(struct solos_skb_cb) > sizeof(((struct sk_buff *)0)->cb));
+
 	printk(KERN_INFO "Solos PCI Driver Version %s\n", VERSION);
 	return pci_register_driver(&fpga_driver);
 }

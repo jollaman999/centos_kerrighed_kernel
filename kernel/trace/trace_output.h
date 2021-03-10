@@ -5,6 +5,8 @@
 #include "trace.h"
 
 extern enum print_line_t
+trace_print_bputs_msg_only(struct trace_iterator *iter);
+extern enum print_line_t
 trace_print_bprintk_msg_only(struct trace_iterator *iter);
 extern enum print_line_t
 trace_print_printk_msg_only(struct trace_iterator *iter);
@@ -25,29 +27,22 @@ extern void trace_event_read_unlock(void);
 extern struct trace_event *ftrace_find_event(int type);
 
 extern enum print_line_t trace_nop_print(struct trace_iterator *iter,
-					 int flags);
+					 int flags, struct trace_event *event);
 extern int
 trace_print_lat_fmt(struct trace_seq *s, struct trace_entry *entry);
 
 /* used by module unregistering */
 extern int __unregister_ftrace_event(struct trace_event *event);
-extern struct rw_semaphore trace_event_mutex;
+extern struct rw_semaphore trace_event_sem;
 
 #define MAX_MEMHEX_BYTES	8
 #define HEX_CHARS		(MAX_MEMHEX_BYTES*2 + 1)
 
-#define SEQ_PUT_FIELD_RET(s, x)				\
-do {							\
-	if (!trace_seq_putmem(s, &(x), sizeof(x)))	\
-		return TRACE_TYPE_PARTIAL_LINE;		\
-} while (0)
+#define SEQ_PUT_FIELD(s, x)				\
+	trace_seq_putmem(s, &(x), sizeof(x))
 
-#define SEQ_PUT_HEX_FIELD_RET(s, x)			\
-do {							\
-	BUILD_BUG_ON(sizeof(x) > MAX_MEMHEX_BYTES);	\
-	if (!trace_seq_putmem_hex(s, &(x), sizeof(x)))	\
-		return TRACE_TYPE_PARTIAL_LINE;		\
-} while (0)
+#define SEQ_PUT_HEX_FIELD(s, x)				\
+	trace_seq_putmem_hex(s, &(x), sizeof(x))
 
 #endif
 

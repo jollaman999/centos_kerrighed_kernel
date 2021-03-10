@@ -12,29 +12,41 @@
 /* #define VERBOSE_DEBUG */
 
 #include <linux/kernel.h>
-#include <linux/utsname.h>
+#include <linux/module.h>
+#include <linux/usb/composite.h>
 
-#include "u_audio.h"
-
+#include "gadget_chips.h"
 #define DRIVER_DESC		"Linux USB Audio Gadget"
-#define DRIVER_VERSION		"Dec 18, 2008"
+#define DRIVER_VERSION		"Feb 2, 2012"
 
-/*-------------------------------------------------------------------------*/
+USB_GADGET_COMPOSITE_OPTIONS();
 
-/*
- * Kbuild is not very cooperative with respect to linking separately
- * compiled library objects into one module.  So for now we won't use
- * separate compilation ... ensuring init/exit sections work to shrink
- * the runtime footprint, and giving us at least some parts of what
- * a "gcc --combine ... part1.c part2.c part3.c ... " build would.
- */
-#include "composite.c"
-#include "usbstring.c"
-#include "config.c"
-#include "epautoconf.c"
+/* string IDs are assigned dynamically */
 
-#include "u_audio.c"
-#include "f_audio.c"
+static struct usb_string strings_dev[] = {
+	[USB_GADGET_MANUFACTURER_IDX].s = "",
+	[USB_GADGET_PRODUCT_IDX].s = DRIVER_DESC,
+	[USB_GADGET_SERIAL_IDX].s = "",
+	{  } /* end of list */
+};
+
+static struct usb_gadget_strings stringtab_dev = {
+	.language = 0x0409,	/* en-us */
+	.strings = strings_dev,
+};
+
+static struct usb_gadget_strings *audio_strings[] = {
+	&stringtab_dev,
+	NULL,
+};
+
+#ifdef CONFIG_GADGET_UAC1
+#include "u_uac1.h"
+#include "u_uac1.c"
+#include "f_uac1.c"
+#else
+#include "f_uac2.c"
+#endif
 
 /*-------------------------------------------------------------------------*/
 
@@ -54,9 +66,15 @@ static struct usb_device_descriptor device_desc = {
 
 	.bcdUSB =		__constant_cpu_to_le16(0x200),
 
+#ifdef CONFIG_GADGET_UAC1
 	.bDeviceClass =		USB_CLASS_PER_INTERFACE,
 	.bDeviceSubClass =	0,
 	.bDeviceProtocol =	0,
+#else
+	.bDeviceClass =		USB_CLASS_MISC,
+	.bDeviceSubClass =	0x02,
+	.bDeviceProtocol =	0x01,
+#endif
 	/* .bMaxPacketSize0 = f(hardware) */
 
 	/* Vendor and product id defaults change according to what configs
@@ -89,120 +107,6 @@ static const struct usb_descriptor_header *otg_desc[] = {
 
 /*-------------------------------------------------------------------------*/
 
-/**
- * Handle USB audio endpoint set/get command in setup class request
- */
-
-static int audio_set_endpoint_req(struct usb_configuration *c,
-		const struct usb_ctrlrequest *ctrl)
-{
-	struct usb_composite_dev *cdev = c->cdev;
-	int			value = -EOPNOTSUPP;
-	u16			ep = le16_to_cpu(ctrl->wIndex);
-	u16			len = le16_to_cpu(ctrl->wLength);
-	u16			w_value = le16_to_cpu(ctrl->wValue);
-
-	DBG(cdev, "bRequest 0x%x, w_value 0x%04x, len %d, endpoint %d\n",
-			ctrl->bRequest, w_value, len, ep);
-
-	switch (ctrl->bRequest) {
-	case UAC_SET_CUR:
-		value = 0;
-		break;
-
-	case UAC_SET_MIN:
-		break;
-
-	case UAC_SET_MAX:
-		break;
-
-	case UAC_SET_RES:
-		break;
-
-	case UAC_SET_MEM:
-		break;
-
-	default:
-		break;
-	}
-
-	return value;
-}
-
-static int audio_get_endpoint_req(struct usb_configuration *c,
-		const struct usb_ctrlrequest *ctrl)
-{
-	struct usb_composite_dev *cdev = c->cdev;
-	int value = -EOPNOTSUPP;
-	u8 ep = ((le16_to_cpu(ctrl->wIndex) >> 8) & 0xFF);
-	u16 len = le16_to_cpu(ctrl->wLength);
-	u16 w_value = le16_to_cpu(ctrl->wValue);
-
-	DBG(cdev, "bRequest 0x%x, w_value 0x%04x, len %d, endpoint %d\n",
-			ctrl->bRequest, w_value, len, ep);
-
-	switch (ctrl->bRequest) {
-	case UAC_GET_CUR:
-	case UAC_GET_MIN:
-	case UAC_GET_MAX:
-	case UAC_GET_RES:
-		value = 3;
-		break;
-	case UAC_GET_MEM:
-		break;
-	default:
-		break;
-	}
-
-	return value;
-}
-
-static int
-audio_setup(struct usb_configuration *c, const struct usb_ctrlrequest *ctrl)
-{
-	struct usb_composite_dev *cdev = c->cdev;
-	struct usb_request *req = cdev->req;
-	int value = -EOPNOTSUPP;
-	u16 w_index = le16_to_cpu(ctrl->wIndex);
-	u16 w_value = le16_to_cpu(ctrl->wValue);
-	u16 w_length = le16_to_cpu(ctrl->wLength);
-
-	/* composite driver infrastructure handles everything except
-	 * Audio class messages; interface activation uses set_alt().
-	 */
-	switch (ctrl->bRequestType) {
-	case USB_DIR_OUT | USB_TYPE_CLASS | USB_RECIP_ENDPOINT:
-		value = audio_set_endpoint_req(c, ctrl);
-		break;
-
-	case USB_DIR_IN | USB_TYPE_CLASS | USB_RECIP_ENDPOINT:
-		value = audio_get_endpoint_req(c, ctrl);
-		break;
-
-	default:
-		ERROR(cdev, "Invalid control req%02x.%02x v%04x i%04x l%d\n",
-			ctrl->bRequestType, ctrl->bRequest,
-			w_value, w_index, w_length);
-	}
-
-	/* respond with data transfer or status phase? */
-	if (value >= 0) {
-		DBG(cdev, "Audio req%02x.%02x v%04x i%04x l%d\n",
-			ctrl->bRequestType, ctrl->bRequest,
-			w_value, w_index, w_length);
-		req->zero = 0;
-		req->length = value;
-		value = usb_ep_queue(cdev->gadget->ep0, req, GFP_ATOMIC);
-		if (value < 0)
-			ERROR(cdev, "Audio response on err %d\n", value);
-	}
-
-	/* device either stalls (value < 0) or reports success */
-	return value;
-}
-
-/*-------------------------------------------------------------------------*/
-
 static int __init audio_do_config(struct usb_configuration *c)
 {
 	/* FIXME alloc iConfiguration string, set it in c->strings */
@@ -219,50 +123,30 @@ static int __init audio_do_config(struct usb_configuration *c)
 
 static struct usb_configuration audio_config_driver = {
 	.label			= DRIVER_DESC,
-	.bind			= audio_do_config,
-	.setup			= audio_setup,
 	.bConfigurationValue	= 1,
 	/* .iConfiguration = DYNAMIC */
 	.bmAttributes		= USB_CONFIG_ATT_SELFPOWER,
+#ifndef CONFIG_GADGET_UAC1
+	.unbind			= uac2_unbind_config,
+#endif
 };
 
 /*-------------------------------------------------------------------------*/
 
 static int __init audio_bind(struct usb_composite_dev *cdev)
 {
-	int			gcnum;
 	int			status;
 
-	gcnum = usb_gadget_controller_number(cdev->gadget);
-	if (gcnum >= 0)
-		device_desc.bcdDevice = cpu_to_le16(0x0300 | gcnum);
-	else {
-		ERROR(cdev, "controller '%s' not recognized; trying %s\n",
-			cdev->gadget->name,
-			audio_config_driver.label);
-		device_desc.bcdDevice =
-			__constant_cpu_to_le16(0x0300 | 0x0099);
-	}
-
-	/* device descriptor strings: manufacturer, product */
-	snprintf(manufacturer, sizeof manufacturer, "%s %s with %s",
-		init_utsname()->sysname, init_utsname()->release,
-		cdev->gadget->name);
-	status = usb_string_id(cdev);
+	status = usb_string_ids_tab(cdev, strings_dev);
 	if (status < 0)
 		goto fail;
-	strings_dev[STRING_MANUFACTURER_IDX].id = status;
-	device_desc.iManufacturer = status;
+	device_desc.iManufacturer = strings_dev[USB_GADGET_MANUFACTURER_IDX].id;
+	device_desc.iProduct = strings_dev[USB_GADGET_PRODUCT_IDX].id;
 
-	status = usb_string_id(cdev);
+	status = usb_add_config(cdev, &audio_config_driver, audio_do_config);
 	if (status < 0)
 		goto fail;
-	strings_dev[STRING_PRODUCT_IDX].id = status;
-	device_desc.iProduct = status;
-
-	status = usb_add_config(cdev, &audio_config_driver);
-	if (status < 0)
-		goto fail;
+	usb_composite_overwrite_options(cdev, &coverwrite);
 
 	INFO(cdev, "%s, version: %s\n", DRIVER_DESC, DRIVER_VERSION);
 	return 0;
@@ -273,20 +157,24 @@ fail:
 
 static int __exit audio_unbind(struct usb_composite_dev *cdev)
 {
+#ifdef CONFIG_GADGET_UAC1
+	gaudio_cleanup();
+#endif
 	return 0;
 }
 
-static struct usb_composite_driver audio_driver = {
+static __refdata struct usb_composite_driver audio_driver = {
 	.name		= "g_audio",
 	.dev		= &device_desc,
 	.strings	= audio_strings,
+	.max_speed	= USB_SPEED_HIGH,
 	.bind		= audio_bind,
 	.unbind		= __exit_p(audio_unbind),
 };
 
 static int __init init(void)
 {
-	return usb_composite_register(&audio_driver);
+	return usb_composite_probe(&audio_driver);
 }
 module_init(init);
 

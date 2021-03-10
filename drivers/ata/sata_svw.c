@@ -39,7 +39,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -257,7 +256,7 @@ static void k2_bmdma_setup_mmio(struct ata_queued_cmd *qc)
 
 	/* load PRD table addr. */
 	mb();	/* make sure PRD table writes are visible to controller */
-	writel(ap->prd_dma, mmio + ATA_DMA_TABLE_OFS);
+	writel(ap->bmdma_prd_dma, mmio + ATA_DMA_TABLE_OFS);
 
 	/* specify data direction, triple-check start bit is clear */
 	dmactl = readb(mmio + ATA_DMA_CMD);
@@ -322,23 +321,11 @@ static u8 k2_stat_check_status(struct ata_port *ap)
 }
 
 #ifdef CONFIG_PPC_OF
-/*
- * k2_sata_proc_info
- * inout : decides on the direction of the dataflow and the meaning of the
- *	   variables
- * buffer: If inout==FALSE data is being written to it else read from it
- * *start: If inout==FALSE start of the valid data in the buffer
- * offset: If inout==FALSE offset from the beginning of the imaginary file
- *	   from which we start writing into the buffer
- * length: If inout==FALSE max number of bytes to be written into the buffer
- *	   else number of bytes in the buffer
- */
-static int k2_sata_proc_info(struct Scsi_Host *shost, char *page, char **start,
-			     off_t offset, int count, int inout)
+static int k2_sata_show_info(struct seq_file *m, struct Scsi_Host *shost)
 {
 	struct ata_port *ap;
 	struct device_node *np;
-	int len, index;
+	int index;
 
 	/* Find  the ata_port */
 	ap = ata_shost_to_port(shost);
@@ -356,15 +343,12 @@ static int k2_sata_proc_info(struct Scsi_Host *shost, char *page, char **start,
 		const u32 *reg = of_get_property(np, "reg", NULL);
 		if (!reg)
 			continue;
-		if (index == *reg)
+		if (index == *reg) {
+			seq_printf(m, "devspec: %s\n", np->full_name);
 			break;
+		}
 	}
-	if (np == NULL)
-		return 0;
-
-	len = sprintf(page, "devspec: %s\n", np->full_name);
-
-	return len;
+	return 0;
 }
 #endif /* CONFIG_PPC_OF */
 
@@ -372,7 +356,7 @@ static int k2_sata_proc_info(struct Scsi_Host *shost, char *page, char **start,
 static struct scsi_host_template k2_sata_sht = {
 	ATA_BMDMA_SHT(DRV_NAME),
 #ifdef CONFIG_PPC_OF
-	.proc_info		= k2_sata_proc_info,
+	.show_info		= k2_sata_show_info,
 #endif
 };
 
@@ -394,8 +378,7 @@ static struct ata_port_operations k2_sata_ops = {
 static const struct ata_port_info k2_port_info[] = {
 	/* chip_svw4 */
 	{
-		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
-				  ATA_FLAG_MMIO | K2_FLAG_NO_ATAPI_DMA,
+		.flags		= ATA_FLAG_SATA | K2_FLAG_NO_ATAPI_DMA,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
@@ -403,8 +386,7 @@ static const struct ata_port_info k2_port_info[] = {
 	},
 	/* chip_svw8 */
 	{
-		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
-				  ATA_FLAG_MMIO | K2_FLAG_NO_ATAPI_DMA |
+		.flags		= ATA_FLAG_SATA | K2_FLAG_NO_ATAPI_DMA |
 				  K2_FLAG_SATA_8_PORTS,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
@@ -413,8 +395,7 @@ static const struct ata_port_info k2_port_info[] = {
 	},
 	/* chip_svw42 */
 	{
-		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
-				  ATA_FLAG_MMIO | K2_FLAG_BAR_POS_3,
+		.flags		= ATA_FLAG_SATA | K2_FLAG_BAR_POS_3,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
@@ -422,8 +403,7 @@ static const struct ata_port_info k2_port_info[] = {
 	},
 	/* chip_svw43 */
 	{
-		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
-				  ATA_FLAG_MMIO,
+		.flags		= ATA_FLAG_SATA,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
@@ -453,15 +433,13 @@ static void k2_sata_setup_port(struct ata_ioports *port, void __iomem *base)
 
 static int k2_sata_init_one(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
-	static int printed_version;
 	const struct ata_port_info *ppi[] =
 		{ &k2_port_info[ent->driver_data], NULL };
 	struct ata_host *host;
 	void __iomem *mmio_base;
 	int n_ports, i, rc, bar_pos;
 
-	if (!printed_version++)
-		dev_printk(KERN_DEBUG, &pdev->dev, "version " DRV_VERSION "\n");
+	ata_print_version_once(&pdev->dev, DRV_VERSION);
 
 	/* allocate host */
 	n_ports = 4;
@@ -537,7 +515,7 @@ static int k2_sata_init_one(struct pci_dev *pdev, const struct pci_device_id *en
 	writel(0x0, mmio_base + K2_SATA_SIM_OFFSET);
 
 	pci_set_master(pdev);
-	return ata_host_activate(host, pdev->irq, ata_sff_interrupt,
+	return ata_host_activate(host, pdev->irq, ata_bmdma_interrupt,
 				 IRQF_SHARED, &k2_sata_sht);
 }
 
@@ -566,21 +544,10 @@ static struct pci_driver k2_sata_pci_driver = {
 	.remove			= ata_pci_remove_one,
 };
 
-static int __init k2_sata_init(void)
-{
-	return pci_register_driver(&k2_sata_pci_driver);
-}
-
-static void __exit k2_sata_exit(void)
-{
-	pci_unregister_driver(&k2_sata_pci_driver);
-}
+module_pci_driver(k2_sata_pci_driver);
 
 MODULE_AUTHOR("Benjamin Herrenschmidt");
 MODULE_DESCRIPTION("low-level driver for K2 SATA controller");
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, k2_sata_pci_tbl);
 MODULE_VERSION(DRV_VERSION);
-
-module_init(k2_sata_init);
-module_exit(k2_sata_exit);

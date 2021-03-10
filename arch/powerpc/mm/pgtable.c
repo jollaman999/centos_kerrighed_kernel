@@ -22,113 +22,16 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/gfp.h>
 #include <linux/mm.h>
-#include <linux/init.h>
 #include <linux/percpu.h>
 #include <linux/hardirq.h>
+#include <linux/hugetlb.h>
 #include <asm/pgalloc.h>
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 
 #include "mmu_decl.h"
-
-DEFINE_PER_CPU(struct mmu_gather, mmu_gathers);
-
-#ifdef CONFIG_SMP
-
-/*
- * Handle batching of page table freeing on SMP. Page tables are
- * queued up and send to be freed later by RCU in order to avoid
- * freeing a page table page that is being walked without locks
- */
-
-static DEFINE_PER_CPU(struct pte_freelist_batch *, pte_freelist_cur);
-static unsigned long pte_freelist_forced_free;
-
-struct pte_freelist_batch
-{
-	struct rcu_head	rcu;
-	unsigned int	index;
-	pgtable_free_t	tables[0];
-};
-
-#define PTE_FREELIST_SIZE \
-	((PAGE_SIZE - sizeof(struct pte_freelist_batch)) \
-	  / sizeof(pgtable_free_t))
-
-static void pte_free_smp_sync(void *arg)
-{
-	/* Do nothing, just ensure we sync with all CPUs */
-}
-
-/* This is only called when we are critically out of memory
- * (and fail to get a page in pte_free_tlb).
- */
-static void pgtable_free_now(pgtable_free_t pgf)
-{
-	pte_freelist_forced_free++;
-
-	smp_call_function(pte_free_smp_sync, NULL, 1);
-
-	pgtable_free(pgf);
-}
-
-static void pte_free_rcu_callback(struct rcu_head *head)
-{
-	struct pte_freelist_batch *batch =
-		container_of(head, struct pte_freelist_batch, rcu);
-	unsigned int i;
-
-	for (i = 0; i < batch->index; i++)
-		pgtable_free(batch->tables[i]);
-
-	free_page((unsigned long)batch);
-}
-
-static void pte_free_submit(struct pte_freelist_batch *batch)
-{
-	INIT_RCU_HEAD(&batch->rcu);
-	call_rcu(&batch->rcu, pte_free_rcu_callback);
-}
-
-void pgtable_free_tlb(struct mmu_gather *tlb, pgtable_free_t pgf)
-{
-	/* This is safe since tlb_gather_mmu has disabled preemption */
-	struct pte_freelist_batch **batchp = &__get_cpu_var(pte_freelist_cur);
-
-	if (atomic_read(&tlb->mm->mm_users) < 2 ||
-	    cpumask_equal(mm_cpumask(tlb->mm), cpumask_of(smp_processor_id()))){
-		pgtable_free(pgf);
-		return;
-	}
-
-	if (*batchp == NULL) {
-		*batchp = (struct pte_freelist_batch *)__get_free_page(GFP_ATOMIC);
-		if (*batchp == NULL) {
-			pgtable_free_now(pgf);
-			return;
-		}
-		(*batchp)->index = 0;
-	}
-	(*batchp)->tables[(*batchp)->index++] = pgf;
-	if ((*batchp)->index == PTE_FREELIST_SIZE) {
-		pte_free_submit(*batchp);
-		*batchp = NULL;
-	}
-}
-
-void pte_free_finish(void)
-{
-	/* This is safe since tlb_gather_mmu has disabled preemption */
-	struct pte_freelist_batch **batchp = &__get_cpu_var(pte_freelist_cur);
-
-	if (*batchp == NULL)
-		return;
-	pte_free_submit(*batchp);
-	*batchp = NULL;
-}
-
-#endif /* CONFIG_SMP */
 
 static inline int is_exec_fault(void)
 {
@@ -283,7 +186,7 @@ void set_pte_at(struct mm_struct *mm, unsigned long addr, pte_t *ptep,
 		pte_t pte)
 {
 #ifdef CONFIG_DEBUG_VM
-	WARN_ON(pte_present(*ptep));
+	WARN_ON(pte_val(*ptep) & _PAGE_PRESENT);
 #endif
 	/* Note: mm->context.id might not yet have been assigned as
 	 * this context might not have been activated yet when this
@@ -309,7 +212,7 @@ int ptep_set_access_flags(struct vm_area_struct *vma, unsigned long address,
 	entry = set_access_flags_filter(entry, vma, dirty);
 	changed = !pte_same(*(ptep), entry);
 	if (changed) {
-		if (!(vma->vm_flags & VM_HUGETLB))
+		if (!is_vm_hugetlb_page(vma))
 			assert_pte_locked(vma->vm_mm, address);
 		__ptep_set_access_flags(ptep, entry);
 		flush_tlb_page_nohash(vma, address);
@@ -331,8 +234,24 @@ void assert_pte_locked(struct mm_struct *mm, unsigned long addr)
 	pud = pud_offset(pgd, addr);
 	BUG_ON(pud_none(*pud));
 	pmd = pmd_offset(pud, addr);
+	/*
+	 * khugepaged to collapse normal pages to hugepage, first set
+	 * pmd to none to force page fault/gup to take mmap_sem. After
+	 * pmd is set to none, we do a pte_clear which does this assertion
+	 * so if we find pmd none, return.
+	 */
+	if (pmd_none(*pmd))
+		return;
 	BUG_ON(!pmd_present(*pmd));
 	assert_spin_locked(pte_lockptr(mm, pmd));
 }
 #endif /* CONFIG_DEBUG_VM */
 
+unsigned long vmalloc_to_phys(void *va)
+{
+	unsigned long pfn = vmalloc_to_pfn(va);
+
+	BUG_ON(!pfn);
+	return __pa(pfn_to_kaddr(pfn)) + offset_in_page(va);
+}
+EXPORT_SYMBOL_GPL(vmalloc_to_phys);

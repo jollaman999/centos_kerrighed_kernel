@@ -16,7 +16,6 @@
 #include <linux/timex.h>
 #include <linux/preempt.h>
 #include <linux/delay.h>
-#include <linux/init.h>
 
 #include <asm/processor.h>
 #include <asm/delay.h>
@@ -48,18 +47,16 @@ static void delay_loop(unsigned long loops)
 }
 
 /* TSC based delay: */
-static void delay_tsc(unsigned long loops)
+static void delay_tsc(unsigned long __loops)
 {
-	unsigned long bclock, now;
+	u64 bclock, now, loops = __loops;
 	int cpu;
 
 	preempt_disable();
 	cpu = smp_processor_id();
-	rdtsc_barrier();
-	rdtscl(bclock);
+	bclock = rdtsc_ordered();
 	for (;;) {
-		rdtsc_barrier();
-		rdtscl(now);
+		now = rdtsc_ordered();
 		if ((now - bclock) >= loops)
 			break;
 
@@ -80,8 +77,7 @@ static void delay_tsc(unsigned long loops)
 		if (unlikely(cpu != smp_processor_id())) {
 			loops -= (now - bclock);
 			cpu = smp_processor_id();
-			rdtsc_barrier();
-			rdtscl(bclock);
+			bclock = rdtsc_ordered();
 		}
 	}
 	preempt_enable();
@@ -98,10 +94,10 @@ void use_tsc_delay(void)
 	delay_fn = delay_tsc;
 }
 
-int __devinit read_current_timer(unsigned long *timer_val)
+int read_current_timer(unsigned long *timer_val)
 {
 	if (delay_fn == delay_tsc) {
-		rdtscll(*timer_val);
+		*timer_val = rdtsc();
 		return 0;
 	}
 	return -1;
@@ -121,7 +117,7 @@ inline void __const_udelay(unsigned long xloops)
 	asm("mull %%edx"
 		:"=d" (xloops), "=&a" (d0)
 		:"1" (xloops), "0"
-		(cpu_data(raw_smp_processor_id()).loops_per_jiffy * (HZ/4)));
+		(this_cpu_read(cpu_info.loops_per_jiffy) * (HZ/4)));
 
 	__delay(++xloops);
 }

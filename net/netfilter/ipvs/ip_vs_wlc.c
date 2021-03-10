@@ -27,27 +27,12 @@
 
 #include <net/ip_vs.h>
 
-
-static inline unsigned int
-ip_vs_wlc_dest_overhead(struct ip_vs_dest *dest)
-{
-	/*
-	 * We think the overhead of processing active connections is 256
-	 * times higher than that of inactive connections in average. (This
-	 * 256 times might not be accurate, we will change it later) We
-	 * use the following formula to estimate the overhead now:
-	 *		  dest->activeconns*256 + dest->inactconns
-	 */
-	return (atomic_read(&dest->activeconns) << 8) +
-		atomic_read(&dest->inactconns);
-}
-
-
 /*
  *	Weighted Least Connection scheduling
  */
 static struct ip_vs_dest *
-ip_vs_wlc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
+ip_vs_wlc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb,
+		   struct ip_vs_iphdr *iph)
 {
 	struct ip_vs_dest *dest, *least;
 	unsigned int loh, doh;
@@ -67,25 +52,25 @@ ip_vs_wlc_schedule(struct ip_vs_service *svc, const struct sk_buff *skb)
 	 * new connections.
 	 */
 
-	list_for_each_entry(dest, &svc->destinations, n_list) {
+	list_for_each_entry_rcu(dest, &svc->destinations, n_list) {
 		if (!(dest->flags & IP_VS_DEST_F_OVERLOAD) &&
 		    atomic_read(&dest->weight) > 0) {
 			least = dest;
-			loh = ip_vs_wlc_dest_overhead(least);
+			loh = ip_vs_dest_conn_overhead(least);
 			goto nextstage;
 		}
 	}
-	IP_VS_ERR_RL("WLC: no destination available\n");
+	ip_vs_scheduler_err(svc, "no destination available");
 	return NULL;
 
 	/*
 	 *    Find the destination with the least load.
 	 */
   nextstage:
-	list_for_each_entry_continue(dest, &svc->destinations, n_list) {
+	list_for_each_entry_continue_rcu(dest, &svc->destinations, n_list) {
 		if (dest->flags & IP_VS_DEST_F_OVERLOAD)
 			continue;
-		doh = ip_vs_wlc_dest_overhead(dest);
+		doh = ip_vs_dest_conn_overhead(dest);
 		if (loh * atomic_read(&dest->weight) >
 		    doh * atomic_read(&least->weight)) {
 			least = dest;
@@ -122,6 +107,7 @@ static int __init ip_vs_wlc_init(void)
 static void __exit ip_vs_wlc_cleanup(void)
 {
 	unregister_ip_vs_scheduler(&ip_vs_wlc_scheduler);
+	synchronize_rcu();
 }
 
 module_init(ip_vs_wlc_init);

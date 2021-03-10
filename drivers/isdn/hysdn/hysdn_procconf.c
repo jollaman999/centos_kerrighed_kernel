@@ -16,12 +16,13 @@
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
 #include <linux/pci.h>
-#include <linux/smp_lock.h>
+#include <linux/slab.h>
+#include <linux/mutex.h>
 #include <net/net_namespace.h>
 
 #include "hysdn_defs.h"
 
-static char *hysdn_procconf_revision = "$Revision: 1.8.6.4 $";
+static DEFINE_MUTEX(hysdn_conf_mutex);
 
 #define INFO_OUT_LEN 80		/* length of info line including lf */
 
@@ -90,7 +91,7 @@ process_line(struct conf_writedata *cnf)
 /* write conf file -> boot or send cfg line to card */
 /****************************************************/
 static ssize_t
-hysdn_conf_write(struct file *file, const char __user *buf, size_t count, loff_t * off)
+hysdn_conf_write(struct file *file, const char __user *buf, size_t count, loff_t *off)
 {
 	struct conf_writedata *cnf;
 	int i;
@@ -228,23 +229,12 @@ static int
 hysdn_conf_open(struct inode *ino, struct file *filep)
 {
 	hysdn_card *card;
-	struct proc_dir_entry *pd;
 	struct conf_writedata *cnf;
 	char *cp, *tmp;
 
 	/* now search the addressed card */
-	lock_kernel();
-	card = card_root;
-	while (card) {
-		pd = card->procconf;
-		if (pd == PDE(ino))
-			break;
-		card = card->next;	/* search next entry */
-	}
-	if (!card) {
-		unlock_kernel();
-		return (-ENODEV);	/* device is unknown/invalid */
-	}
+	mutex_lock(&hysdn_conf_mutex);
+	card = PDE_DATA(ino);
 	if (card->debug_flags & (LOG_PROC_OPEN | LOG_PROC_ALL))
 		hysdn_addlog(card, "config open for uid=%d gid=%d mode=0x%x",
 			     filep->f_cred->fsuid, filep->f_cred->fsgid,
@@ -254,7 +244,7 @@ hysdn_conf_open(struct inode *ino, struct file *filep)
 		/* write only access -> write boot file or conf line */
 
 		if (!(cnf = kmalloc(sizeof(struct conf_writedata), GFP_KERNEL))) {
-			unlock_kernel();
+			mutex_unlock(&hysdn_conf_mutex);
 			return (-EFAULT);
 		}
 		cnf->card = card;
@@ -266,7 +256,7 @@ hysdn_conf_open(struct inode *ino, struct file *filep)
 		/* read access -> output card info data */
 
 		if (!(tmp = kmalloc(INFO_OUT_LEN * 2 + 2, GFP_KERNEL))) {
-			unlock_kernel();
+			mutex_unlock(&hysdn_conf_mutex);
 			return (-EFAULT);	/* out of memory */
 		}
 		filep->private_data = tmp;	/* start of string */
@@ -300,10 +290,10 @@ hysdn_conf_open(struct inode *ino, struct file *filep)
 		*cp++ = '\n';
 		*cp = 0;	/* end of string */
 	} else {		/* simultaneous read/write access forbidden ! */
-		unlock_kernel();
+		mutex_unlock(&hysdn_conf_mutex);
 		return (-EPERM);	/* no permission this time */
 	}
-	unlock_kernel();
+	mutex_unlock(&hysdn_conf_mutex);
 	return nonseekable_open(ino, filep);
 }				/* hysdn_conf_open */
 
@@ -316,21 +306,9 @@ hysdn_conf_close(struct inode *ino, struct file *filep)
 	hysdn_card *card;
 	struct conf_writedata *cnf;
 	int retval = 0;
-	struct proc_dir_entry *pd;
 
-	lock_kernel();
-	/* search the addressed card */
-	card = card_root;
-	while (card) {
-		pd = card->procconf;
-		if (pd == PDE(ino))
-			break;
-		card = card->next;	/* search next entry */
-	}
-	if (!card) {
-		unlock_kernel();
-		return (-ENODEV);	/* device is unknown/invalid */
-	}
+	mutex_lock(&hysdn_conf_mutex);
+	card = PDE_DATA(ino);
 	if (card->debug_flags & (LOG_PROC_OPEN | LOG_PROC_ALL))
 		hysdn_addlog(card, "config close for uid=%d gid=%d mode=0x%x",
 			     filep->f_cred->fsuid, filep->f_cred->fsgid,
@@ -351,7 +329,7 @@ hysdn_conf_close(struct inode *ino, struct file *filep)
 
 		kfree(filep->private_data);	/* release memory */
 	}
-	unlock_kernel();
+	mutex_unlock(&hysdn_conf_mutex);
 	return (retval);
 }				/* hysdn_conf_close */
 
@@ -365,7 +343,7 @@ static const struct file_operations conf_fops =
 	.read           = hysdn_conf_read,
 	.write          = hysdn_conf_write,
 	.open           = hysdn_conf_open,
-	.release        = hysdn_conf_close,                                       
+	.release        = hysdn_conf_close,
 };
 
 /*****************************/
@@ -393,16 +371,17 @@ hysdn_procconf_init(void)
 	while (card) {
 
 		sprintf(conf_name, "%s%d", PROC_CONF_BASENAME, card->myid);
-		if ((card->procconf = (void *) proc_create(conf_name,
-						S_IFREG | S_IRUGO | S_IWUSR,
-						hysdn_proc_entry,
-						&conf_fops)) != NULL) {
+		if ((card->procconf = (void *) proc_create_data(conf_name,
+							   S_IFREG | S_IRUGO | S_IWUSR,
+							   hysdn_proc_entry,
+							   &conf_fops,
+							   card)) != NULL) {
 			hysdn_proclog_init(card);	/* init the log file entry */
 		}
 		card = card->next;	/* next entry */
 	}
 
-	printk(KERN_NOTICE "HYSDN: procfs Rev. %s initialised\n", hysdn_getrev(hysdn_procconf_revision));
+	printk(KERN_NOTICE "HYSDN: procfs initialised\n");
 	return (0);
 }				/* hysdn_procconf_init */
 

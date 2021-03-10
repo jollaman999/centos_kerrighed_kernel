@@ -141,7 +141,7 @@ struct iucv_skb_cb {
 /* iucv socket options (SOL_IUCV) */
 #define SO_IPRMDATA_MSG	0x0080		/* send/recv IPRM_DATA msgs */
 #define SO_MSGLIMIT	0x1000		/* get/set IUCV MSGLIMIT */
-#define SO_MSGSIZE      0x0800		/* get maximum msgsize */
+#define SO_MSGSIZE	0x0800		/* get maximum msgsize */
 
 /* iucv related control messages (scm) */
 #define SCM_IUCV_TRGCLS	0x0001		/* target class control message */
@@ -156,7 +156,6 @@ unsigned int iucv_sock_poll(struct file *file, struct socket *sock,
 			    poll_table *wait);
 void iucv_sock_link(struct iucv_sock_list *l, struct sock *s);
 void iucv_sock_unlink(struct iucv_sock_list *l, struct sock *s);
-int  iucv_sock_wait_cnt(struct sock *sk, unsigned long timeo);
 void iucv_accept_enqueue(struct sock *parent, struct sock *sk);
 void iucv_accept_unlink(struct sock *sk);
 struct sock *iucv_accept_dequeue(struct sock *parent, struct socket *newsock);

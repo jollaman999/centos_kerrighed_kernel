@@ -1,12 +1,10 @@
 #ifndef __CODA_PSDEV_H
 #define __CODA_PSDEV_H
 
-#include <linux/magic.h>
+#include <linux/backing-dev.h>
+#include <linux/mutex.h>
+#include <uapi/linux/coda_psdev.h>
 
-#define CODA_PSDEV_MAJOR 67
-#define MAX_CODADEVS  5	   /* how many do we allow */
-
-#ifdef __KERNEL__
 struct kstatfs;
 
 /* communication pending/processing queues */
@@ -17,6 +15,8 @@ struct venus_comm {
 	struct list_head    vc_processing;
 	int                 vc_inuse;
 	struct super_block *vc_sb;
+	struct backing_dev_info bdi;
+	struct mutex	    vc_mutex;
 };
 
 
@@ -34,7 +34,7 @@ int venus_lookup(struct super_block *sb, struct CodaFid *fid,
 		 const char *name, int length, int *type, 
 		 struct CodaFid *resfid);
 int venus_close(struct super_block *sb, struct CodaFid *fid, int flags,
-		vuid_t uid);
+		kuid_t uid);
 int venus_open(struct super_block *sb, struct CodaFid *fid, int flags,
 	       struct file **f);
 int venus_mkdir(struct super_block *sb, struct CodaFid *dirfid, 
@@ -60,7 +60,7 @@ int venus_symlink(struct super_block *sb, struct CodaFid *fid,
 int venus_access(struct super_block *sb, struct CodaFid *fid, int mask);
 int venus_pioctl(struct super_block *sb, struct CodaFid *fid,
 		 unsigned int cmd, struct PioctlData *data);
-int coda_downcall(int opcode, union outputArgs *out, struct super_block *sb);
+int coda_downcall(struct venus_comm *vcp, int opcode, union outputArgs *out);
 int venus_fsync(struct super_block *sb, struct CodaFid *fid);
 int venus_statfs(struct dentry *dentry, struct kstatfs *sfs);
 
@@ -69,23 +69,4 @@ int venus_statfs(struct dentry *dentry, struct kstatfs *sfs);
  */
 
 extern struct venus_comm coda_comms[];
-#endif /* __KERNEL__ */
-
-/* messages between coda filesystem in kernel and Venus */
-struct upc_req {
-	struct list_head    uc_chain;
-	caddr_t	            uc_data;
-	u_short	            uc_flags;
-	u_short             uc_inSize;  /* Size is at most 5000 bytes */
-	u_short	            uc_outSize;
-	u_short	            uc_opcode;  /* copied from data to save lookup */
-	int		    uc_unique;
-	wait_queue_head_t   uc_sleep;   /* process' wait queue */
-};
-
-#define REQ_ASYNC  0x1
-#define REQ_READ   0x2
-#define REQ_WRITE  0x4
-#define REQ_ABORT  0x8
-
 #endif

@@ -1,4 +1,4 @@
-/* 
+/*
  * Cryptographic API.
  *
  * AES Cipher Algorithm.
@@ -1127,7 +1127,7 @@ EXPORT_SYMBOL_GPL(crypto_il_tab);
 
 #define star_x(x) (((x) & 0x7f7f7f7f) << 1) ^ ((((x) & 0x80808080) >> 7) * 0x1b)
 
-#define imix_col(y,x)	do {		\
+#define imix_col(y, x)	do {		\
 	u	= star_x(x);		\
 	v	= star_x(u);		\
 	w	= star_x(v);		\
@@ -1448,7 +1448,6 @@ static struct crypto_alg aes_alg = {
 	.cra_ctxsize		=	sizeof(struct crypto_aes_ctx),
 	.cra_alignmask		=	3,
 	.cra_module		=	THIS_MODULE,
-	.cra_list		=	LIST_HEAD_INIT(aes_alg.cra_list),
 	.cra_u			=	{
 		.cipher = {
 			.cia_min_keysize	=	AES_MIN_KEY_SIZE,
@@ -1475,4 +1474,5 @@ module_exit(aes_fini);
 
 MODULE_DESCRIPTION("Rijndael (AES) Cipher Algorithm");
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_ALIAS("aes");
+MODULE_ALIAS_CRYPTO("aes");
+MODULE_ALIAS_CRYPTO("aes-generic");

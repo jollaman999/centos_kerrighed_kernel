@@ -1,16 +1,20 @@
 /*
  * Mini SCLP driver.
  *
- * Copyright IBM Corp. 2004,2009
+ * Copyright IBM Corp. 2004, 2009
  *
  *   Author(s):	Peter Oberparleiter <Peter.Oberparleiter@de.ibm.com>,
  *		Heiko Carstens <heiko.carstens@de.ibm.com>,
  *
  */
 
+#include <linux/linkage.h>
+
 LC_EXT_NEW_PSW		= 0x58			# addr of ext int handler
+LC_EXT_NEW_PSW_64	= 0x1b0			# addr of ext int handler 64 bit
 LC_EXT_INT_PARAM	= 0x80			# addr of ext int parameter
 LC_EXT_INT_CODE		= 0x86			# addr of ext int code
+LC_AR_MODE_ID		= 0xa3
 
 #
 # Subroutine which waits synchronously until either an external interruption
@@ -30,8 +34,22 @@ _sclp_wait_int:
 .LbaseS1:
 	ahi	%r15,-96			# create stack frame
 	la	%r8,LC_EXT_NEW_PSW		# register int handler
-	mvc	.LoldpswS1-.LbaseS1(8,%r13),0(%r8)
-	mvc	0(8,%r8),.LextpswS1-.LbaseS1(%r13)
+	la	%r9,.LextpswS1-.LbaseS1(%r13)
+#ifdef CONFIG_64BIT
+	tm	LC_AR_MODE_ID,1
+	jno	.Lesa1
+	la	%r8,LC_EXT_NEW_PSW_64		# register int handler 64 bit
+	la	%r9,.LextpswS1_64-.LbaseS1(%r13)
+.Lesa1:
+#endif
+	mvc	.LoldpswS1-.LbaseS1(16,%r13),0(%r8)
+	mvc	0(16,%r8),0(%r9)
+#ifdef CONFIG_64BIT
+	epsw	%r6,%r7				# set current addressing mode
+	nill	%r6,0x1				# in new psw (31 or 64 bit mode)
+	nilh	%r7,0x8000
+	stm	%r6,%r7,0(%r8)
+#endif
 	lhi	%r6,0x0200			# cr mask for ext int (cr0.54)
 	ltr	%r2,%r2
 	jz	.LsetctS1
@@ -64,15 +82,19 @@ _sclp_wait_int:
 .LtimeoutS1:
 	lctl	%c0,%c0,.LctlS1-.LbaseS1(%r13)	# restore interrupt setting
 	# restore old handler
-	mvc	0(8,%r8),.LoldpswS1-.LbaseS1(%r13)
+	mvc	0(16,%r8),.LoldpswS1-.LbaseS1(%r13)
 	lm	%r6,%r15,120(%r15)		# restore registers
 	br	%r14				# return to caller
 
 	.align	8
 .LoldpswS1:
-	.long	0, 0				# old ext int PSW
+	.long	0, 0, 0, 0			# old ext int PSW
 .LextpswS1:
 	.long	0x00080000, 0x80000000+.LwaitS1	# PSW to handle ext int
+#ifdef CONFIG_64BIT
+.LextpswS1_64:
+	.quad	0, .LwaitS1			# PSW to handle ext int, 64 bit
+#endif
 .LwaitpswS1:
 	.long	0x010a0000, 0x00000000+.LloopS1	# PSW to wait for ext int
 .LtimeS1:
@@ -203,7 +225,7 @@ _sclp_print:
 	ahi	%r2,1
 	ltr	%r0,%r0				# end of string?
 	jz	.LfinalizemtoS4
-	chi	%r0,0x15			# end of line (NL)?
+	chi	%r0,0x0a			# end of line (NL)?
 	jz	.LfinalizemtoS4
 	stc	%r0,0(%r6,%r7)			# copy to mto
 	la	%r11,0(%r6,%r7)
@@ -221,7 +243,7 @@ _sclp_print:
 	lh	%r9,0(%r8)			# update sccb length
 	ar	%r9,%r6
 	sth	%r9,0(%r8)
-	ar	%r7,%r6				# update current mto adress
+	ar	%r7,%r6				# update current mto address
 	ltr	%r0,%r0				# more characters?
 	jnz	.LinitmtoS4
 	l	%r2,.LwritedataS4-.LbaseS4(%r13)# write data
@@ -246,10 +268,16 @@ _sclp_print:
 #   R2	= 0 on success, 1 on failure
 #
 
-	.globl _sclp_print_early
-_sclp_print_early:
+ENTRY(_sclp_print_early)
 	stm	%r6,%r15,24(%r15)		# save registers
 	ahi	%r15,-96			# create stack frame
+#ifdef CONFIG_64BIT
+	tm	LC_AR_MODE_ID,1
+	jno	.Lesa2
+	ahi	%r15,-80
+	stmh	%r6,%r15,96(%r15)		# store upper register halves
+.Lesa2:
+#endif
 	lr	%r10,%r2			# save string pointer
 	lhi	%r2,0
 	bras	%r14,_sclp_setup		# enable console
@@ -262,6 +290,13 @@ _sclp_print_early:
 	lhi	%r2,1
 	bras	%r14,_sclp_setup		# disable console
 .LendS5:
+#ifdef CONFIG_64BIT
+	tm	LC_AR_MODE_ID,1
+	jno	.Lesa3
+	lmh	%r6,%r15,96(%r15)		# store upper register halves
+	ahi	%r15,80
+.Lesa3:
+#endif
 	lm	%r6,%r15,120(%r15)		# restore registers
 	br	%r14
 

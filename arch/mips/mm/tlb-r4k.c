@@ -3,7 +3,7 @@
  * License.  See the file "COPYING" in the main directory of this archive
  * for more details.
  *
- * Copyright (C) 1996 David S. Miller (dm@engr.sgi.com)
+ * Copyright (C) 1996 David S. Miller (davem@davemloft.net)
  * Copyright (C) 1997, 1998, 1999, 2000 Ralf Baechle ralf@gnu.org
  * Carsten Langgaard, carstenl@mips.com
  * Copyright (C) 2002 MIPS Technologies, Inc.  All rights reserved.
@@ -13,12 +13,13 @@
 #include <linux/smp.h>
 #include <linux/mm.h>
 #include <linux/hugetlb.h>
+#include <linux/module.h>
 
 #include <asm/cpu.h>
 #include <asm/bootinfo.h>
 #include <asm/mmu_context.h>
 #include <asm/pgtable.h>
-#include <asm/system.h>
+#include <asm/tlbmisc.h>
 
 extern void build_tlb_refill_handler(void);
 
@@ -94,6 +95,7 @@ void local_flush_tlb_all(void)
 	FLUSH_ITLB;
 	EXIT_CRITICAL(flags);
 }
+EXPORT_SYMBOL(local_flush_tlb_all);
 
 /* All entries common to a mm share an asid.  To effectively flush
    these entries, we just bump the asid. */
@@ -122,15 +124,13 @@ void local_flush_tlb_range(struct vm_area_struct *vma, unsigned long start,
 		unsigned long size, flags;
 
 		ENTER_CRITICAL(flags);
-		size = (end - start + (PAGE_SIZE - 1)) >> PAGE_SHIFT;
-		size = (size + 1) >> 1;
+		start = round_down(start, PAGE_SIZE << 1);
+		end = round_up(end, PAGE_SIZE << 1);
+		size = (end - start) >> (PAGE_SHIFT + 1);
 		if (size <= current_cpu_data.tlbsize/2) {
 			int oldpid = read_c0_entryhi();
 			int newpid = cpu_asid(cpu, mm);
 
-			start &= (PAGE_MASK << 1);
-			end += ((PAGE_SIZE << 1) - 1);
-			end &= (PAGE_MASK << 1);
 			while (start < end) {
 				int idx;
 
@@ -297,13 +297,13 @@ void __update_tlb(struct vm_area_struct * vma, unsigned long address, pte_t pte)
 	pudp = pud_offset(pgdp, address);
 	pmdp = pmd_offset(pudp, address);
 	idx = read_c0_index();
-#ifdef CONFIG_HUGETLB_PAGE
+#ifdef CONFIG_MIPS_HUGE_TLB_SUPPORT
 	/* this could be a huge page  */
 	if (pmd_huge(*pmdp)) {
 		unsigned long lo;
 		write_c0_pagemask(PM_HUGE_MASK);
 		ptep = (pte_t *)pmdp;
-		lo = pte_val(*ptep) >> 6;
+		lo = pte_to_entrylo(pte_val(*ptep));
 		write_c0_entrylo0(lo);
 		write_c0_entrylo1(lo + (HPAGE_SIZE >> 7));
 
@@ -312,6 +312,7 @@ void __update_tlb(struct vm_area_struct * vma, unsigned long address, pte_t pte)
 			tlb_write_random();
 		else
 			tlb_write_indexed();
+		tlbw_use_hazard();
 		write_c0_pagemask(PM_DEFAULT_MASK);
 	} else
 #endif
@@ -323,8 +324,8 @@ void __update_tlb(struct vm_area_struct * vma, unsigned long address, pte_t pte)
 		ptep++;
 		write_c0_entrylo1(ptep->pte_high);
 #else
-		write_c0_entrylo0(pte_val(*ptep++) >> 6);
-		write_c0_entrylo1(pte_val(*ptep) >> 6);
+		write_c0_entrylo0(pte_to_entrylo(pte_val(*ptep++)));
+		write_c0_entrylo1(pte_to_entrylo(pte_val(*ptep)));
 #endif
 		mtc0_tlbw_hazard();
 		if (idx < 0)
@@ -337,42 +338,8 @@ void __update_tlb(struct vm_area_struct * vma, unsigned long address, pte_t pte)
 	EXIT_CRITICAL(flags);
 }
 
-#if 0
-static void r4k_update_mmu_cache_hwbug(struct vm_area_struct * vma,
-				       unsigned long address, pte_t pte)
-{
-	unsigned long flags;
-	unsigned int asid;
-	pgd_t *pgdp;
-	pmd_t *pmdp;
-	pte_t *ptep;
-	int idx;
-
-	ENTER_CRITICAL(flags);
-	address &= (PAGE_MASK << 1);
-	asid = read_c0_entryhi() & ASID_MASK;
-	write_c0_entryhi(address | asid);
-	pgdp = pgd_offset(vma->vm_mm, address);
-	mtc0_tlbw_hazard();
-	tlb_probe();
-	tlb_probe_hazard();
-	pmdp = pmd_offset(pgdp, address);
-	idx = read_c0_index();
-	ptep = pte_offset_map(pmdp, address);
-	write_c0_entrylo0(pte_val(*ptep++) >> 6);
-	write_c0_entrylo1(pte_val(*ptep) >> 6);
-	mtc0_tlbw_hazard();
-	if (idx < 0)
-		tlb_write_random();
-	else
-		tlb_write_indexed();
-	tlbw_use_hazard();
-	EXIT_CRITICAL(flags);
-}
-#endif
-
-void __init add_wired_entry(unsigned long entrylo0, unsigned long entrylo1,
-	unsigned long entryhi, unsigned long pagemask)
+void add_wired_entry(unsigned long entrylo0, unsigned long entrylo1,
+		     unsigned long entryhi, unsigned long pagemask)
 {
 	unsigned long flags;
 	unsigned long wired;
@@ -402,78 +369,25 @@ void __init add_wired_entry(unsigned long entrylo0, unsigned long entrylo1,
 	EXIT_CRITICAL(flags);
 }
 
-/*
- * Used for loading TLB entries before trap_init() has started, when we
- * don't actually want to add a wired entry which remains throughout the
- * lifetime of the system
- */
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 
-static int temp_tlb_entry __cpuinitdata;
-
-__init int add_temporary_entry(unsigned long entrylo0, unsigned long entrylo1,
-			       unsigned long entryhi, unsigned long pagemask)
+int __init has_transparent_hugepage(void)
 {
-	int ret = 0;
+	unsigned int mask;
 	unsigned long flags;
-	unsigned long wired;
-	unsigned long old_pagemask;
-	unsigned long old_ctx;
 
 	ENTER_CRITICAL(flags);
-	/* Save old context and create impossible VPN2 value */
-	old_ctx = read_c0_entryhi();
-	old_pagemask = read_c0_pagemask();
-	wired = read_c0_wired();
-	if (--temp_tlb_entry < wired) {
-		printk(KERN_WARNING
-		       "No TLB space left for add_temporary_entry\n");
-		ret = -ENOSPC;
-		goto out;
-	}
+	write_c0_pagemask(PM_HUGE_MASK);
+	back_to_back_c0_hazard();
+	mask = read_c0_pagemask();
+	write_c0_pagemask(PM_DEFAULT_MASK);
 
-	write_c0_index(temp_tlb_entry);
-	write_c0_pagemask(pagemask);
-	write_c0_entryhi(entryhi);
-	write_c0_entrylo0(entrylo0);
-	write_c0_entrylo1(entrylo1);
-	mtc0_tlbw_hazard();
-	tlb_write_indexed();
-	tlbw_use_hazard();
-
-	write_c0_entryhi(old_ctx);
-	write_c0_pagemask(old_pagemask);
-out:
 	EXIT_CRITICAL(flags);
-	return ret;
+
+	return mask == PM_HUGE_MASK;
 }
 
-static void __cpuinit probe_tlb(unsigned long config)
-{
-	struct cpuinfo_mips *c = &current_cpu_data;
-	unsigned int reg;
-
-	/*
-	 * If this isn't a MIPS32 / MIPS64 compliant CPU.  Config 1 register
-	 * is not supported, we assume R4k style.  Cpu probing already figured
-	 * out the number of tlb entries.
-	 */
-	if ((c->processor_id & 0xff0000) == PRID_COMP_LEGACY)
-		return;
-#ifdef CONFIG_MIPS_MT_SMTC
-	/*
-	 * If TLB is shared in SMTC system, total size already
-	 * has been calculated and written into cpu_data tlbsize
-	 */
-	if((smtc_status & SMTC_TLB_SHARED) == SMTC_TLB_SHARED)
-		return;
-#endif /* CONFIG_MIPS_MT_SMTC */
-
-	reg = read_c0_config1();
-	if (!((config >> 7) & 3))
-		panic("No TLB present");
-
-	c->tlbsize = ((reg >> 25) & 0x3f) + 1;
-}
+#endif /* CONFIG_TRANSPARENT_HUGEPAGE  */
 
 static int __cpuinitdata ntlb;
 static int __init set_ntlb(char *str)
@@ -486,8 +400,6 @@ __setup("ntlb=", set_ntlb);
 
 void __cpuinit tlb_init(void)
 {
-	unsigned int config = read_c0_config();
-
 	/*
 	 * You should never change this register:
 	 *   - On R4600 1.7 the tlbp never hits for pages smaller than
@@ -495,16 +407,26 @@ void __cpuinit tlb_init(void)
 	 *   - The entire mm handling assumes the c0_pagemask register to
 	 *     be set to fixed-size pages.
 	 */
-	probe_tlb(config);
 	write_c0_pagemask(PM_DEFAULT_MASK);
 	write_c0_wired(0);
 	if (current_cpu_type() == CPU_R10000 ||
 	    current_cpu_type() == CPU_R12000 ||
 	    current_cpu_type() == CPU_R14000)
 		write_c0_framemask(0);
-	temp_tlb_entry = current_cpu_data.tlbsize - 1;
 
-        /* From this point on the ARC firmware is dead.  */
+	if (cpu_has_rixi) {
+		/*
+		 * Enable the no read, no exec bits, and enable large virtual
+		 * address.
+		 */
+		u32 pg = PG_RIE | PG_XIE;
+#ifdef CONFIG_64BIT
+		pg |= PG_ELPA;
+#endif
+		write_c0_pagegrain(pg);
+	}
+
+	/* From this point on the ARC firmware is dead.	 */
 	local_flush_tlb_all();
 
 	/* Did I tell you that ARC SUCKS?  */

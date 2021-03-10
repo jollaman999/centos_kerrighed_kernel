@@ -1,4 +1,5 @@
 #include <linux/kernel.h>
+#include <linux/gfp.h>
 #include <linux/ide.h>
 #include <linux/jiffies.h>
 #include <linux/blkdev.h>
@@ -45,13 +46,13 @@ static void issue_park_cmd(ide_drive_t *drive, unsigned long timeout)
 	 * timeout has expired, so power management will be reenabled.
 	 */
 	rq = blk_get_request(q, READ, GFP_NOWAIT);
-	if (unlikely(!rq))
+	if (IS_ERR(rq))
 		goto out;
 
 	rq->cmd[0] = REQ_UNPARK_HEADS;
 	rq->cmd_len = 1;
 	rq->cmd_type = REQ_TYPE_SPECIAL;
-	elv_add_request(q, rq, ELEVATOR_INSERT_FRONT, 1);
+	elv_add_request(q, rq, ELEVATOR_INSERT_FRONT);
 
 out:
 	return;

@@ -37,7 +37,7 @@ def trace_begin():
 def trace_end():
 	print_error_totals()
 
-def syscalls__sys_exit(event_name, context, common_cpu,
+def raw_syscalls__sys_exit(event_name, context, common_cpu,
 	common_secs, common_nsecs, common_pid, common_comm,
 	common_callchain, id, ret):
 	if (for_comm and common_comm != for_comm) or \

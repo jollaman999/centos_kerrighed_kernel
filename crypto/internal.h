@@ -6,7 +6,7 @@
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option) 
+ * Software Foundation; either version 2 of the License, or (at your option)
  * any later version.
  *
  */
@@ -85,6 +85,9 @@ void crypto_larval_kill(struct crypto_alg *alg);
 struct crypto_alg *crypto_larval_lookup(const char *name, u32 type, u32 mask);
 void crypto_alg_tested(const char *name, int err);
 
+void crypto_remove_spawns(struct crypto_alg *alg, struct list_head *list,
+			  struct crypto_alg *nalg);
+void crypto_remove_final(struct list_head *list);
 void crypto_shoot_alg(struct crypto_alg *alg);
 struct crypto_tfm *__crypto_alloc_tfm(struct crypto_alg *alg, u32 type,
 				      u32 mask);
@@ -99,6 +102,8 @@ void *crypto_alloc_tfm(const char *alg_name,
 int crypto_register_notifier(struct notifier_block *nb);
 int crypto_unregister_notifier(struct notifier_block *nb);
 int crypto_probing_notify(unsigned long val, void *v);
+
+unsigned int crypto_alg_extsize(struct crypto_alg *alg);
 
 static inline struct crypto_alg *crypto_alg_get(struct crypto_alg *alg)
 {

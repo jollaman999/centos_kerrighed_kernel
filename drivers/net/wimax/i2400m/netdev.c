@@ -73,7 +73,10 @@
  *                        alloc_netdev.
  */
 #include <linux/if_arp.h>
+#include <linux/slab.h>
 #include <linux/netdevice.h>
+#include <linux/ethtool.h>
+#include <linux/export.h>
 #include "i2400m.h"
 
 
@@ -82,14 +85,15 @@
 
 enum {
 /* netdev interface */
+	/* 20 secs? yep, this is the maximum timeout that the device
+	 * might take to get out of IDLE / negotiate it with the base
+	 * station. We add 1sec for good measure. */
+	I2400M_TX_TIMEOUT = 21 * HZ,
 	/*
-	 * Out of NWG spec (R1_v1.2.2), 3.3.3 ASN Bearer Plane MTU Size
-	 *
-	 * The MTU is 1400 or less
+	 * Experimentation has determined that, 20 to be a good value
+	 * for minimizing the jitter in the throughput.
 	 */
-	I2400M_MAX_MTU = 1400,
-	I2400M_TX_TIMEOUT = HZ,
-	I2400M_TX_QLEN = 5,
+	I2400M_TX_QLEN = 20,
 };
 
 
@@ -101,22 +105,19 @@ int i2400m_open(struct net_device *net_dev)
 	struct device *dev = i2400m_dev(i2400m);
 
 	d_fnstart(3, dev, "(net_dev %p [i2400m %p])\n", net_dev, i2400m);
-	if (i2400m->ready == 0) {
-		dev_err(dev, "Device is still initializing\n");
-		result = -EBUSY;
-	} else
+	/* Make sure we wait until init is complete... */
+	mutex_lock(&i2400m->init_mutex);
+	if (i2400m->updown)
 		result = 0;
+	else
+		result = -EBUSY;
+	mutex_unlock(&i2400m->init_mutex);
 	d_fnend(3, dev, "(net_dev %p [i2400m %p]) = %d\n",
 		net_dev, i2400m, result);
 	return result;
 }
 
 
-/*
- *
- * On kernel versions where cancel_work_sync() didn't return anything,
- * we rely on wake_tx_skb() being non-NULL.
- */
 static
 int i2400m_stop(struct net_device *net_dev)
 {
@@ -124,21 +125,7 @@ int i2400m_stop(struct net_device *net_dev)
 	struct device *dev = i2400m_dev(i2400m);
 
 	d_fnstart(3, dev, "(net_dev %p [i2400m %p])\n", net_dev, i2400m);
-	/* See i2400m_hard_start_xmit(), references are taken there
-	 * and here we release them if the work was still
-	 * pending. Note we can't differentiate work not pending vs
-	 * never scheduled, so the NULL check does that. */
-	if (cancel_work_sync(&i2400m->wake_tx_ws) == 0
-	    && i2400m->wake_tx_skb != NULL) {
-		unsigned long flags;
-		struct sk_buff *wake_tx_skb;
-		spin_lock_irqsave(&i2400m->tx_lock, flags);
-		wake_tx_skb = i2400m->wake_tx_skb;	/* compat help */
-		i2400m->wake_tx_skb = NULL;	/* compat help */
-		spin_unlock_irqrestore(&i2400m->tx_lock, flags);
-		i2400m_put(i2400m);
-		kfree_skb(wake_tx_skb);
-	}
+	i2400m_net_wake_stop(i2400m);
 	d_fnend(3, dev, "(net_dev %p [i2400m %p]) = 0\n", net_dev, i2400m);
 	return 0;
 }
@@ -167,8 +154,9 @@ void i2400m_wake_tx_work(struct work_struct *ws)
 {
 	int result;
 	struct i2400m *i2400m = container_of(ws, struct i2400m, wake_tx_ws);
+	struct net_device *net_dev = i2400m->wimax_dev.net_dev;
 	struct device *dev = i2400m_dev(i2400m);
-	struct sk_buff *skb = i2400m->wake_tx_skb;
+	struct sk_buff *skb;
 	unsigned long flags;
 
 	spin_lock_irqsave(&i2400m->tx_lock, flags);
@@ -179,30 +167,39 @@ void i2400m_wake_tx_work(struct work_struct *ws)
 	d_fnstart(3, dev, "(ws %p i2400m %p skb %p)\n", ws, i2400m, skb);
 	result = -EINVAL;
 	if (skb == NULL) {
-		dev_err(dev, "WAKE&TX: skb dissapeared!\n");
+		dev_err(dev, "WAKE&TX: skb disappeared!\n");
 		goto out_put;
 	}
+	/* If we have, somehow, lost the connection after this was
+	 * queued, don't do anything; this might be the device got
+	 * reset or just disconnected. */
+	if (unlikely(!netif_carrier_ok(net_dev)))
+		goto out_kfree;
 	result = i2400m_cmd_exit_idle(i2400m);
 	if (result == -EILSEQ)
 		result = 0;
 	if (result < 0) {
 		dev_err(dev, "WAKE&TX: device didn't get out of idle: "
-			"%d\n", result);
-			goto error;
+			"%d - resetting\n", result);
+		i2400m_reset(i2400m, I2400M_RT_BUS);
+		goto error;
 	}
 	result = wait_event_timeout(i2400m->state_wq,
-				    i2400m->state != I2400M_SS_IDLE, 5 * HZ);
+				    i2400m->state != I2400M_SS_IDLE,
+				    net_dev->watchdog_timeo - HZ/2);
 	if (result == 0)
 		result = -ETIMEDOUT;
 	if (result < 0) {
 		dev_err(dev, "WAKE&TX: error waiting for device to exit IDLE: "
-			"%d\n", result);
+			"%d - resetting\n", result);
+		i2400m_reset(i2400m, I2400M_RT_BUS);
 		goto error;
 	}
 	msleep(20);	/* device still needs some time or it drops it */
 	result = i2400m_tx(i2400m, skb->data, skb->len, I2400M_PT_DATA);
-	netif_wake_queue(i2400m->wimax_dev.net_dev);
 error:
+	netif_wake_queue(net_dev);
+out_kfree:
 	kfree_skb(skb);	/* refcount transferred by _hard_start_xmit() */
 out_put:
 	i2400m_put(i2400m);
@@ -226,6 +223,40 @@ void i2400m_tx_prep_header(struct sk_buff *skb)
 	skb_pull(skb, ETH_HLEN);
 	pl_hdr = (struct i2400m_pl_data_hdr *) skb_push(skb, sizeof(*pl_hdr));
 	pl_hdr->reserved = 0;
+}
+
+
+
+/*
+ * Cleanup resources acquired during i2400m_net_wake_tx()
+ *
+ * This is called by __i2400m_dev_stop and means we have to make sure
+ * the workqueue is flushed from any pending work.
+ */
+void i2400m_net_wake_stop(struct i2400m *i2400m)
+{
+	struct device *dev = i2400m_dev(i2400m);
+	struct sk_buff *wake_tx_skb;
+	unsigned long flags;
+
+	d_fnstart(3, dev, "(i2400m %p)\n", i2400m);
+	/*
+	 * See i2400m_hard_start_xmit(), references are taken there and
+	 * here we release them if the packet was still pending.
+	 */
+	cancel_work_sync(&i2400m->wake_tx_ws);
+
+	spin_lock_irqsave(&i2400m->tx_lock, flags);
+	wake_tx_skb = i2400m->wake_tx_skb;
+	i2400m->wake_tx_skb = NULL;
+	spin_unlock_irqrestore(&i2400m->tx_lock, flags);
+
+	if (wake_tx_skb) {
+		i2400m_put(i2400m);
+		kfree_skb(wake_tx_skb);
+	}
+
+	d_fnend(3, dev, "(i2400m %p) = void\n", i2400m);
 }
 
 
@@ -260,7 +291,7 @@ int i2400m_net_wake_tx(struct i2400m *i2400m, struct net_device *net_dev,
 	 * and if pending, release those resources. */
 	result = 0;
 	spin_lock_irqsave(&i2400m->tx_lock, flags);
-	if (!work_pending(&i2400m->wake_tx_ws)) {
+	if (!i2400m->wake_tx_skb) {
 		netif_stop_queue(net_dev);
 		i2400m_get(i2400m);
 		i2400m->wake_tx_skb = skb_get(skb);	/* transfer ref count */
@@ -303,7 +334,7 @@ int i2400m_net_tx(struct i2400m *i2400m, struct net_device *net_dev,
 	d_fnstart(3, dev, "(i2400m %p net_dev %p skb %p)\n",
 		  i2400m, net_dev, skb);
 	/* FIXME: check eth hdr, only IPv4 is routed by the device as of now */
-	net_dev->trans_start = jiffies;
+	netif_trans_update(net_dev);
 	i2400m_tx_prep_header(skb);
 	d_printf(3, dev, "NETTX: skb %p sending %d bytes to radio\n",
 		 skb, skb->len);
@@ -339,22 +370,27 @@ netdev_tx_t i2400m_hard_start_xmit(struct sk_buff *skb,
 {
 	struct i2400m *i2400m = net_dev_to_i2400m(net_dev);
 	struct device *dev = i2400m_dev(i2400m);
-	int result;
+	int result = -1;
 
 	d_fnstart(3, dev, "(skb %p net_dev %p)\n", skb, net_dev);
+
+	if (skb_header_cloned(skb) && 
+	    pskb_expand_head(skb, 0, 0, GFP_ATOMIC))
+		goto drop;
+
 	if (i2400m->state == I2400M_SS_IDLE)
 		result = i2400m_net_wake_tx(i2400m, net_dev, skb);
 	else
 		result = i2400m_net_tx(i2400m, net_dev, skb);
-	if (result <  0)
+	if (result <  0) {
+drop:
 		net_dev->stats.tx_dropped++;
-	else {
+	} else {
 		net_dev->stats.tx_packets++;
 		net_dev->stats.tx_bytes += skb->len;
 	}
-	kfree_skb(skb);
-
-	d_fnend(3, dev, "(skb %p net_dev %p)\n", skb, net_dev);
+	dev_kfree_skb(skb);
+	d_fnend(3, dev, "(skb %p net_dev %p) = %d\n", skb, net_dev, result);
 	return NETDEV_TX_OK;
 }
 
@@ -389,7 +425,6 @@ void i2400m_tx_timeout(struct net_device *net_dev)
 	 * this, there might be data pending to be sent or not...
 	 */
 	net_dev->stats.tx_errors++;
-	return;
 }
 
 
@@ -559,6 +594,23 @@ static const struct net_device_ops i2400m_netdev_ops = {
 	.ndo_change_mtu = i2400m_change_mtu,
 };
 
+static void i2400m_get_drvinfo(struct net_device *net_dev,
+			       struct ethtool_drvinfo *info)
+{
+	struct i2400m *i2400m = net_dev_to_i2400m(net_dev);
+
+	strlcpy(info->driver, KBUILD_MODNAME, sizeof(info->driver));
+	strlcpy(info->fw_version, i2400m->fw_name ? : "",
+		sizeof(info->fw_version));
+	if (net_dev->dev.parent)
+		strlcpy(info->bus_info, dev_name(net_dev->dev.parent),
+			sizeof(info->bus_info));
+}
+
+static const struct ethtool_ops i2400m_ethtool_ops = {
+	.get_drvinfo = i2400m_get_drvinfo,
+	.get_link = ethtool_op_get_link,
+};
 
 /**
  * i2400m_netdev_setup - Setup setup @net_dev's i2400m private data
@@ -580,6 +632,7 @@ void i2400m_netdev_setup(struct net_device *net_dev)
 		   & ~IFF_MULTICAST);
 	net_dev->watchdog_timeo = I2400M_TX_TIMEOUT;
 	net_dev->netdev_ops = &i2400m_netdev_ops;
+	net_dev->ethtool_ops = &i2400m_ethtool_ops;
 	d_fnend(3, NULL, "(net_dev %p) = void\n", net_dev);
 }
 EXPORT_SYMBOL_GPL(i2400m_netdev_setup);

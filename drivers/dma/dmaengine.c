@@ -45,6 +45,9 @@
  * See Documentation/dmaengine.txt for more details
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
+#include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/mm.h>
@@ -58,11 +61,16 @@
 #include <linux/jiffies.h>
 #include <linux/rculist.h>
 #include <linux/idr.h>
+#include <linux/slab.h>
+#include <linux/acpi.h>
+#include <linux/acpi_dma.h>
+#include <linux/of_dma.h>
+#include <linux/mempool.h>
 
 static DEFINE_MUTEX(dma_list_mutex);
+static DEFINE_IDR(dma_idr);
 static LIST_HEAD(dma_device_list);
 static long dmaengine_ref_count;
-static struct idr dma_idr;
 
 /* --- sysfs implementation --- */
 
@@ -169,7 +177,8 @@ static struct class dma_devclass = {
 #define dma_device_satisfies_mask(device, mask) \
 	__dma_device_satisfies_mask((device), &(mask))
 static int
-__dma_device_satisfies_mask(struct dma_device *device, dma_cap_mask_t *want)
+__dma_device_satisfies_mask(struct dma_device *device,
+			    const dma_cap_mask_t *want)
 {
 	dma_cap_mask_t has;
 
@@ -207,31 +216,35 @@ static void balance_ref_count(struct dma_chan *chan)
  */
 static int dma_chan_get(struct dma_chan *chan)
 {
-	int err = -ENODEV;
 	struct module *owner = dma_chan_to_owner(chan);
+	int ret;
 
+	/* The channel is already in use, update client count */
 	if (chan->client_count) {
 		__module_get(owner);
-		err = 0;
-	} else if (try_module_get(owner))
-		err = 0;
-
-	if (err == 0)
-		chan->client_count++;
-
-	/* allocate upon first client reference */
-	if (chan->client_count == 1 && err == 0) {
-		int desc_cnt = chan->device->device_alloc_chan_resources(chan);
-
-		if (desc_cnt < 0) {
-			err = desc_cnt;
-			chan->client_count = 0;
-			module_put(owner);
-		} else if (!dma_has_cap(DMA_PRIVATE, chan->device->cap_mask))
-			balance_ref_count(chan);
+		goto out;
 	}
 
-	return err;
+	if (!try_module_get(owner))
+		return -ENODEV;
+
+	/* allocate upon first client reference */
+	if (chan->device->device_alloc_chan_resources) {
+		ret = chan->device->device_alloc_chan_resources(chan);
+		if (ret < 0)
+			goto err_out;
+	}
+
+	if (!dma_has_cap(DMA_PRIVATE, chan->device->cap_mask))
+		balance_ref_count(chan);
+
+out:
+	chan->client_count++;
+	return 0;
+
+err_out:
+	module_put(owner);
+	return ret;
 }
 
 /**
@@ -242,11 +255,15 @@ static int dma_chan_get(struct dma_chan *chan)
  */
 static void dma_chan_put(struct dma_chan *chan)
 {
+	/* This channel is not in use, bail out */
 	if (!chan->client_count)
-		return; /* this channel failed alloc_chan_resources */
+		return;
+
 	chan->client_count--;
 	module_put(dma_chan_to_owner(chan));
-	if (chan->client_count == 0)
+
+	/* This channel is not in use anymore, free it */
+	if (!chan->client_count && chan->device->device_free_chan_resources)
 		chan->device->device_free_chan_resources(chan);
 }
 
@@ -259,10 +276,13 @@ enum dma_status dma_sync_wait(struct dma_chan *chan, dma_cookie_t cookie)
 	do {
 		status = dma_async_is_tx_complete(chan, cookie, NULL, NULL);
 		if (time_after_eq(jiffies, dma_sync_wait_timeout)) {
-			printk(KERN_ERR "dma_sync_wait_timeout!\n");
+			pr_err("%s: timeout!\n", __func__);
 			return DMA_ERROR;
 		}
-	} while (status == DMA_IN_PROGRESS);
+		if (status != DMA_IN_PROGRESS)
+			break;
+		cpu_relax();
+	} while (1);
 
 	return status;
 }
@@ -284,7 +304,7 @@ struct dma_chan_tbl_ent {
 /**
  * channel_table - percpu lookup table for memory-to-memory offload providers
  */
-static struct dma_chan_tbl_ent *channel_table[DMA_TX_TYPE_END];
+static struct dma_chan_tbl_ent __percpu *channel_table[DMA_TX_TYPE_END];
 
 static int __init dma_channel_table_init(void)
 {
@@ -310,7 +330,7 @@ static int __init dma_channel_table_init(void)
 	}
 
 	if (err) {
-		pr_err("dmaengine: initialization failure\n");
+		pr_err("initialization failure\n");
 		for_each_dma_cap_mask(cap, dma_cap_mask_all)
 			if (channel_table[cap])
 				free_percpu(channel_table[cap]);
@@ -326,16 +346,23 @@ arch_initcall(dma_channel_table_init);
  */
 struct dma_chan *dma_find_channel(enum dma_transaction_type tx_type)
 {
-	struct dma_chan *chan;
-	int cpu;
+	return this_cpu_read(channel_table[tx_type]->chan);
+}
+EXPORT_SYMBOL(dma_find_channel);
 
-	cpu = get_cpu();
-	chan = per_cpu_ptr(channel_table[tx_type], cpu)->chan;
-	put_cpu();
+/*
+ * net_dma_find_channel - find a channel for net_dma
+ * net_dma has alignment requirements
+ */
+struct dma_chan *net_dma_find_channel(void)
+{
+	struct dma_chan *chan = dma_find_channel(DMA_MEMCPY);
+	if (chan && !is_dma_copy_aligned(chan->device, 1, 1, 1))
+		return NULL;
 
 	return chan;
 }
-EXPORT_SYMBOL(dma_find_channel);
+EXPORT_SYMBOL(net_dma_find_channel);
 
 /**
  * dma_issue_pending_all - flush all pending operations across all channels
@@ -448,7 +475,8 @@ static void dma_channel_rebalance(void)
 		}
 }
 
-static struct dma_chan *private_candidate(dma_cap_mask_t *mask, struct dma_device *dev,
+static struct dma_chan *private_candidate(const dma_cap_mask_t *mask,
+					  struct dma_device *dev,
 					  dma_filter_fn fn, void *fn_param)
 {
 	struct dma_chan *chan;
@@ -490,7 +518,8 @@ static struct dma_chan *private_candidate(dma_cap_mask_t *mask, struct dma_devic
  * @fn: optional callback to disposition available channels
  * @fn_param: opaque parameter to pass to dma_filter_fn
  */
-struct dma_chan *__dma_request_channel(dma_cap_mask_t *mask, dma_filter_fn fn, void *fn_param)
+struct dma_chan *__dma_request_channel(const dma_cap_mask_t *mask,
+				       dma_filter_fn fn, void *fn_param)
 {
 	struct dma_device *device, *_d;
 	struct dma_chan *chan = NULL;
@@ -511,28 +540,48 @@ struct dma_chan *__dma_request_channel(dma_cap_mask_t *mask, dma_filter_fn fn, v
 			err = dma_chan_get(chan);
 
 			if (err == -ENODEV) {
-				pr_debug("%s: %s module removed\n", __func__,
-					 dma_chan_name(chan));
+				pr_debug("%s: %s module removed\n",
+					 __func__, dma_chan_name(chan));
 				list_del_rcu(&device->global_node);
 			} else if (err)
-				pr_err("dmaengine: failed to get %s: (%d)\n",
-				       dma_chan_name(chan), err);
+				pr_debug("%s: failed to get %s: (%d)\n",
+					 __func__, dma_chan_name(chan), err);
 			else
 				break;
 			if (--device->privatecnt == 0)
 				dma_cap_clear(DMA_PRIVATE, device->cap_mask);
-			chan->private = NULL;
 			chan = NULL;
 		}
 	}
 	mutex_unlock(&dma_list_mutex);
 
-	pr_debug("%s: %s (%s)\n", __func__, chan ? "success" : "fail",
+	pr_debug("%s: %s (%s)\n",
+		 __func__,
+		 chan ? "success" : "fail",
 		 chan ? dma_chan_name(chan) : NULL);
 
 	return chan;
 }
 EXPORT_SYMBOL_GPL(__dma_request_channel);
+
+/**
+ * dma_request_slave_channel - try to allocate an exclusive slave channel
+ * @dev:	pointer to client device structure
+ * @name:	slave channel name
+ */
+struct dma_chan *dma_request_slave_channel(struct device *dev, const char *name)
+{
+	/* If device-tree is present get slave info from here */
+	if (dev->of_node)
+		return of_dma_request_slave_channel(dev->of_node, name);
+
+	/* If device was enumerated by ACPI get slave info from here */
+	if (ACPI_HANDLE(dev))
+		return acpi_dma_request_slave_chan_by_name(dev, name);
+
+	return NULL;
+}
+EXPORT_SYMBOL_GPL(dma_request_slave_channel);
 
 void dma_release_channel(struct dma_chan *chan)
 {
@@ -543,7 +592,6 @@ void dma_release_channel(struct dma_chan *chan)
 	/* drop PRIVATE cap enabled by __dma_request_channel() */
 	if (--chan->device->privatecnt == 0)
 		dma_cap_clear(DMA_PRIVATE, chan->device->cap_mask);
-	chan->private = NULL;
 	mutex_unlock(&dma_list_mutex);
 }
 EXPORT_SYMBOL_GPL(dma_release_channel);
@@ -571,8 +619,8 @@ void dmaengine_get(void)
 				list_del_rcu(&device->global_node);
 				break;
 			} else if (err)
-				pr_err("dmaengine: failed to get %s: (%d)\n",
-				       dma_chan_name(chan), err);
+				pr_debug("%s: failed to get %s: (%d)\n",
+				       __func__, dma_chan_name(chan), err);
 		}
 	}
 
@@ -656,18 +704,14 @@ static int get_dma_id(struct dma_device *device)
 {
 	int rc;
 
- idr_retry:
-	if (!idr_pre_get(&dma_idr, GFP_KERNEL))
-		return -ENOMEM;
 	mutex_lock(&dma_list_mutex);
-	rc = idr_get_new(&dma_idr, NULL, &device->dev_id);
-	mutex_unlock(&dma_list_mutex);
-	if (rc == -EAGAIN)
-		goto idr_retry;
-	else if (rc != 0)
-		return rc;
 
-	return 0;
+	rc = idr_alloc(&dma_idr, NULL, 0, 0, GFP_KERNEL);
+	if (rc >= 0)
+		device->dev_id = rc;
+
+	mutex_unlock(&dma_list_mutex);
+	return rc < 0 ? rc : 0;
 }
 
 /**
@@ -698,19 +742,19 @@ int dma_async_device_register(struct dma_device *device)
 		!device->device_prep_dma_memset);
 	BUG_ON(dma_has_cap(DMA_INTERRUPT, device->cap_mask) &&
 		!device->device_prep_dma_interrupt);
-	BUG_ON(dma_has_cap(DMA_SLAVE, device->cap_mask) &&
-		!device->device_prep_slave_sg);
-	BUG_ON(dma_has_cap(DMA_SLAVE, device->cap_mask) &&
-		!device->device_terminate_all);
+	BUG_ON(dma_has_cap(DMA_SG, device->cap_mask) &&
+		!device->device_prep_dma_sg);
+	BUG_ON(dma_has_cap(DMA_CYCLIC, device->cap_mask) &&
+		!device->device_prep_dma_cyclic);
+	BUG_ON(dma_has_cap(DMA_INTERLEAVE, device->cap_mask) &&
+		!device->device_prep_interleaved_dma);
 
-	BUG_ON(!device->device_alloc_chan_resources);
-	BUG_ON(!device->device_free_chan_resources);
-	BUG_ON(!device->device_is_tx_complete);
+	BUG_ON(!device->device_tx_status);
 	BUG_ON(!device->device_issue_pending);
 	BUG_ON(!device->dev);
 
 	/* note: this only matters in the
-	 * CONFIG_ASYNC_TX_DISABLE_CHANNEL_SWITCH=y case
+	 * CONFIG_ASYNC_TX_ENABLE_CHANNEL_SWITCH=n case
 	 */
 	if (device_has_all_tx_types(device))
 		dma_cap_set(DMA_ASYNC_TX, device->cap_mask);
@@ -833,160 +877,142 @@ void dma_async_device_unregister(struct dma_device *device)
 		chan->dev->chan = NULL;
 		mutex_unlock(&dma_list_mutex);
 		device_unregister(&chan->dev->device);
+		free_percpu(chan->local);
 	}
 }
 EXPORT_SYMBOL(dma_async_device_unregister);
 
-/**
- * dma_async_memcpy_buf_to_buf - offloaded copy between virtual addresses
- * @chan: DMA channel to offload copy to
- * @dest: destination address (virtual)
- * @src: source address (virtual)
- * @len: length
- *
- * Both @dest and @src must be mappable to a bus address according to the
- * DMA mapping API rules for streaming mappings.
- * Both @dest and @src must stay memory resident (kernel memory or locked
- * user space pages).
- */
-dma_cookie_t
-dma_async_memcpy_buf_to_buf(struct dma_chan *chan, void *dest,
-			void *src, size_t len)
+struct dmaengine_unmap_pool {
+	struct kmem_cache *cache;
+	const char *name;
+	mempool_t *pool;
+	size_t size;
+};
+
+#define __UNMAP_POOL(x) { .size = x, .name = "dmaengine-unmap-" __stringify(x) }
+static struct dmaengine_unmap_pool unmap_pool[] = {
+	__UNMAP_POOL(2),
+	#if IS_ENABLED(CONFIG_ASYNC_TX_DMA)
+	__UNMAP_POOL(16),
+	__UNMAP_POOL(128),
+	__UNMAP_POOL(256),
+	#endif
+};
+
+static struct dmaengine_unmap_pool *__get_unmap_pool(int nr)
 {
-	struct dma_device *dev = chan->device;
-	struct dma_async_tx_descriptor *tx;
-	dma_addr_t dma_dest, dma_src;
-	dma_cookie_t cookie;
-	int cpu;
-	unsigned long flags;
+	int order = get_count_order(nr);
 
-	dma_src = dma_map_single(dev->dev, src, len, DMA_TO_DEVICE);
-	dma_dest = dma_map_single(dev->dev, dest, len, DMA_FROM_DEVICE);
-	flags = DMA_CTRL_ACK |
-		DMA_COMPL_SRC_UNMAP_SINGLE |
-		DMA_COMPL_DEST_UNMAP_SINGLE;
-	tx = dev->device_prep_dma_memcpy(chan, dma_dest, dma_src, len, flags);
+	switch (order) {
+	case 0 ... 1:
+		return &unmap_pool[0];
+	case 2 ... 4:
+		return &unmap_pool[1];
+	case 5 ... 7:
+		return &unmap_pool[2];
+	case 8:
+		return &unmap_pool[3];
+	default:
+		BUG();
+		return NULL;
+	}
+}
 
-	if (!tx) {
-		dma_unmap_single(dev->dev, dma_src, len, DMA_TO_DEVICE);
-		dma_unmap_single(dev->dev, dma_dest, len, DMA_FROM_DEVICE);
-		return -ENOMEM;
+static void dmaengine_unmap(struct kref *kref)
+{
+	struct dmaengine_unmap_data *unmap = container_of(kref, typeof(*unmap), kref);
+	struct device *dev = unmap->dev;
+	int cnt, i;
+
+	cnt = unmap->to_cnt;
+	for (i = 0; i < cnt; i++)
+		dma_unmap_page(dev, unmap->addr[i], unmap->len,
+			       DMA_TO_DEVICE);
+	cnt += unmap->from_cnt;
+	for (; i < cnt; i++)
+		dma_unmap_page(dev, unmap->addr[i], unmap->len,
+			       DMA_FROM_DEVICE);
+	cnt += unmap->bidi_cnt;
+	for (; i < cnt; i++)
+		dma_unmap_page(dev, unmap->addr[i], unmap->len,
+			       DMA_BIDIRECTIONAL);
+	mempool_free(unmap, __get_unmap_pool(cnt)->pool);
+}
+
+void dmaengine_unmap_put(struct dmaengine_unmap_data *unmap)
+{
+	if (unmap)
+		kref_put(&unmap->kref, dmaengine_unmap);
+}
+EXPORT_SYMBOL_GPL(dmaengine_unmap_put);
+
+static void dmaengine_destroy_unmap_pool(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(unmap_pool); i++) {
+		struct dmaengine_unmap_pool *p = &unmap_pool[i];
+
+		if (p->pool)
+			mempool_destroy(p->pool);
+		p->pool = NULL;
+		if (p->cache)
+			kmem_cache_destroy(p->cache);
+		p->cache = NULL;
+	}
+}
+
+static int __init dmaengine_init_unmap_pool(void)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(unmap_pool); i++) {
+		struct dmaengine_unmap_pool *p = &unmap_pool[i];
+		size_t size;
+
+		size = sizeof(struct dmaengine_unmap_data) +
+		       sizeof(dma_addr_t) * p->size;
+
+		p->cache = kmem_cache_create(p->name, size, 0,
+					     SLAB_HWCACHE_ALIGN, NULL);
+		if (!p->cache)
+			break;
+		p->pool = mempool_create_slab_pool(1, p->cache);
+		if (!p->pool)
+			break;
 	}
 
-	tx->callback = NULL;
-	cookie = tx->tx_submit(tx);
+	if (i == ARRAY_SIZE(unmap_pool))
+		return 0;
 
-	cpu = get_cpu();
-	per_cpu_ptr(chan->local, cpu)->bytes_transferred += len;
-	per_cpu_ptr(chan->local, cpu)->memcpy_count++;
-	put_cpu();
-
-	return cookie;
+	dmaengine_destroy_unmap_pool();
+	return -ENOMEM;
 }
-EXPORT_SYMBOL(dma_async_memcpy_buf_to_buf);
 
-/**
- * dma_async_memcpy_buf_to_pg - offloaded copy from address to page
- * @chan: DMA channel to offload copy to
- * @page: destination page
- * @offset: offset in page to copy to
- * @kdata: source address (virtual)
- * @len: length
- *
- * Both @page/@offset and @kdata must be mappable to a bus address according
- * to the DMA mapping API rules for streaming mappings.
- * Both @page/@offset and @kdata must stay memory resident (kernel memory or
- * locked user space pages)
- */
-dma_cookie_t
-dma_async_memcpy_buf_to_pg(struct dma_chan *chan, struct page *page,
-			unsigned int offset, void *kdata, size_t len)
+struct dmaengine_unmap_data *
+dmaengine_get_unmap_data(struct device *dev, int nr, gfp_t flags)
 {
-	struct dma_device *dev = chan->device;
-	struct dma_async_tx_descriptor *tx;
-	dma_addr_t dma_dest, dma_src;
-	dma_cookie_t cookie;
-	int cpu;
-	unsigned long flags;
+	struct dmaengine_unmap_data *unmap;
 
-	dma_src = dma_map_single(dev->dev, kdata, len, DMA_TO_DEVICE);
-	dma_dest = dma_map_page(dev->dev, page, offset, len, DMA_FROM_DEVICE);
-	flags = DMA_CTRL_ACK | DMA_COMPL_SRC_UNMAP_SINGLE;
-	tx = dev->device_prep_dma_memcpy(chan, dma_dest, dma_src, len, flags);
+	unmap = mempool_alloc(__get_unmap_pool(nr)->pool, flags);
+	if (!unmap)
+		return NULL;
 
-	if (!tx) {
-		dma_unmap_single(dev->dev, dma_src, len, DMA_TO_DEVICE);
-		dma_unmap_page(dev->dev, dma_dest, len, DMA_FROM_DEVICE);
-		return -ENOMEM;
-	}
+	memset(unmap, 0, sizeof(*unmap));
+	kref_init(&unmap->kref);
+	unmap->dev = dev;
 
-	tx->callback = NULL;
-	cookie = tx->tx_submit(tx);
-
-	cpu = get_cpu();
-	per_cpu_ptr(chan->local, cpu)->bytes_transferred += len;
-	per_cpu_ptr(chan->local, cpu)->memcpy_count++;
-	put_cpu();
-
-	return cookie;
+	return unmap;
 }
-EXPORT_SYMBOL(dma_async_memcpy_buf_to_pg);
-
-/**
- * dma_async_memcpy_pg_to_pg - offloaded copy from page to page
- * @chan: DMA channel to offload copy to
- * @dest_pg: destination page
- * @dest_off: offset in page to copy to
- * @src_pg: source page
- * @src_off: offset in page to copy from
- * @len: length
- *
- * Both @dest_page/@dest_off and @src_page/@src_off must be mappable to a bus
- * address according to the DMA mapping API rules for streaming mappings.
- * Both @dest_page/@dest_off and @src_page/@src_off must stay memory resident
- * (kernel memory or locked user space pages).
- */
-dma_cookie_t
-dma_async_memcpy_pg_to_pg(struct dma_chan *chan, struct page *dest_pg,
-	unsigned int dest_off, struct page *src_pg, unsigned int src_off,
-	size_t len)
-{
-	struct dma_device *dev = chan->device;
-	struct dma_async_tx_descriptor *tx;
-	dma_addr_t dma_dest, dma_src;
-	dma_cookie_t cookie;
-	int cpu;
-	unsigned long flags;
-
-	dma_src = dma_map_page(dev->dev, src_pg, src_off, len, DMA_TO_DEVICE);
-	dma_dest = dma_map_page(dev->dev, dest_pg, dest_off, len,
-				DMA_FROM_DEVICE);
-	flags = DMA_CTRL_ACK;
-	tx = dev->device_prep_dma_memcpy(chan, dma_dest, dma_src, len, flags);
-
-	if (!tx) {
-		dma_unmap_page(dev->dev, dma_src, len, DMA_TO_DEVICE);
-		dma_unmap_page(dev->dev, dma_dest, len, DMA_FROM_DEVICE);
-		return -ENOMEM;
-	}
-
-	tx->callback = NULL;
-	cookie = tx->tx_submit(tx);
-
-	cpu = get_cpu();
-	per_cpu_ptr(chan->local, cpu)->bytes_transferred += len;
-	per_cpu_ptr(chan->local, cpu)->memcpy_count++;
-	put_cpu();
-
-	return cookie;
-}
-EXPORT_SYMBOL(dma_async_memcpy_pg_to_pg);
+EXPORT_SYMBOL(dmaengine_get_unmap_data);
 
 void dma_async_tx_descriptor_init(struct dma_async_tx_descriptor *tx,
 	struct dma_chan *chan)
 {
 	tx->chan = chan;
+	#ifdef CONFIG_ASYNC_TX_ENABLE_CHANNEL_SWITCH
 	spin_lock_init(&tx->lock);
+	#endif
 }
 EXPORT_SYMBOL(dma_async_tx_descriptor_init);
 
@@ -999,12 +1025,12 @@ dma_wait_for_async_tx(struct dma_async_tx_descriptor *tx)
 	unsigned long dma_sync_wait_timeout = jiffies + msecs_to_jiffies(5000);
 
 	if (!tx)
-		return DMA_SUCCESS;
+		return DMA_COMPLETE;
 
 	while (tx->cookie == -EBUSY) {
 		if (time_after_eq(jiffies, dma_sync_wait_timeout)) {
 			pr_err("%s timeout waiting for descriptor submission\n",
-				__func__);
+			       __func__);
 			return DMA_ERROR;
 		}
 		cpu_relax();
@@ -1019,7 +1045,7 @@ EXPORT_SYMBOL_GPL(dma_wait_for_async_tx);
  */
 void dma_run_dependencies(struct dma_async_tx_descriptor *tx)
 {
-	struct dma_async_tx_descriptor *dep = tx->next;
+	struct dma_async_tx_descriptor *dep = txd_next(tx);
 	struct dma_async_tx_descriptor *dep_next;
 	struct dma_chan *chan;
 
@@ -1027,7 +1053,7 @@ void dma_run_dependencies(struct dma_async_tx_descriptor *tx)
 		return;
 
 	/* we'll submit tx->next now, so clear the link */
-	tx->next = NULL;
+	txd_clear_next(tx);
 	chan = dep->chan;
 
 	/* keep submitting up until a channel switch is detected
@@ -1035,14 +1061,14 @@ void dma_run_dependencies(struct dma_async_tx_descriptor *tx)
 	 * processing the interrupt from async_tx_channel_switch
 	 */
 	for (; dep; dep = dep_next) {
-		spin_lock_bh(&dep->lock);
-		dep->parent = NULL;
-		dep_next = dep->next;
+		txd_lock(dep);
+		txd_clear_parent(dep);
+		dep_next = txd_next(dep);
 		if (dep_next && dep_next->chan == chan)
-			dep->next = NULL; /* ->next will be submitted */
+			txd_clear_next(dep); /* ->next will be submitted */
 		else
 			dep_next = NULL; /* submit current dep and terminate */
-		spin_unlock_bh(&dep->lock);
+		txd_unlock(dep);
 
 		dep->tx_submit(dep);
 	}
@@ -1053,8 +1079,10 @@ EXPORT_SYMBOL_GPL(dma_run_dependencies);
 
 static int __init dma_bus_init(void)
 {
-	idr_init(&dma_idr);
-	mutex_init(&dma_list_mutex);
+	int err = dmaengine_init_unmap_pool();
+
+	if (err)
+		return err;
 	return class_register(&dma_devclass);
 }
 arch_initcall(dma_bus_init);

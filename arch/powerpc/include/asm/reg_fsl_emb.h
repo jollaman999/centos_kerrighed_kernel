@@ -17,8 +17,8 @@
 /* Freescale Book E Performance Monitor APU Registers */
 #define PMRN_PMC0	0x010	/* Performance Monitor Counter 0 */
 #define PMRN_PMC1	0x011	/* Performance Monitor Counter 1 */
-#define PMRN_PMC2	0x012	/* Performance Monitor Counter 1 */
-#define PMRN_PMC3	0x013	/* Performance Monitor Counter 1 */
+#define PMRN_PMC2	0x012	/* Performance Monitor Counter 2 */
+#define PMRN_PMC3	0x013	/* Performance Monitor Counter 3 */
 #define PMRN_PMLCA0	0x090	/* PM Local Control A0 */
 #define PMRN_PMLCA1	0x091	/* PM Local Control A1 */
 #define PMRN_PMLCA2	0x092	/* PM Local Control A2 */
@@ -31,7 +31,7 @@
 #define PMLCA_FCM0	0x08000000	/* Freeze when PMM==0 */
 #define PMLCA_CE	0x04000000	/* Condition Enable */
 
-#define PMLCA_EVENT_MASK 0x007f0000	/* Event field */
+#define PMLCA_EVENT_MASK 0x00ff0000	/* Event field */
 #define PMLCA_EVENT_SHIFT	16
 
 #define PMRN_PMLCB0	0x110	/* PM Local Control B0 */
@@ -39,7 +39,7 @@
 #define PMRN_PMLCB2	0x112	/* PM Local Control B2 */
 #define PMRN_PMLCB3	0x113	/* PM Local Control B3 */
 
-#define PMLCB_THRESHMUL_MASK	0x0700	/* Threshhold Multiple Field */
+#define PMLCB_THRESHMUL_MASK	0x0700	/* Threshold Multiple Field */
 #define PMLCB_THRESHMUL_SHIFT	8
 
 #define PMLCB_THRESHOLD_MASK	0x003f	/* Threshold Field */
@@ -55,8 +55,8 @@
 
 #define PMRN_UPMC0	0x000	/* User Performance Monitor Counter 0 */
 #define PMRN_UPMC1	0x001	/* User Performance Monitor Counter 1 */
-#define PMRN_UPMC2	0x002	/* User Performance Monitor Counter 1 */
-#define PMRN_UPMC3	0x003	/* User Performance Monitor Counter 1 */
+#define PMRN_UPMC2	0x002	/* User Performance Monitor Counter 2 */
+#define PMRN_UPMC3	0x003	/* User Performance Monitor Counter 3 */
 #define PMRN_UPMLCA0	0x080	/* User PM Local Control A0 */
 #define PMRN_UPMLCA1	0x081	/* User PM Local Control A1 */
 #define PMRN_UPMLCA2	0x082	/* User PM Local Control A2 */

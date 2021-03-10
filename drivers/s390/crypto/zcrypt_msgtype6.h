@@ -36,7 +36,6 @@
 
 #define MSGTYPE06_MAX_MSG_SIZE		(12*1024)
 
-#ifndef _ZCRYPT_PCICC_H_
 /**
  * The type 6 message family is associated with PCICC or PCIXCC cards.
  *
@@ -116,7 +115,19 @@ struct type86_fmt2_ext {
 	unsigned int	  count4;	/* 0x00000000			*/
 	unsigned int	  offset4;	/* 0x00000000			*/
 } __packed;
-#endif /* _ZCRYPT_PCICC_H_ */
+
+unsigned int get_cprb_fc(struct ica_xcRB *, struct ap_message *,
+			 unsigned int *, unsigned short **);
+unsigned int get_ep11cprb_fc(struct ep11_urb *, struct ap_message *,
+			     unsigned int *);
+unsigned int get_rng_fc(struct ap_message *, int *, unsigned int *);
+
+#define LOW	10
+#define MEDIUM	100
+#define HIGH	500
+
+int speed_idx_cca(int);
+int speed_idx_ep11(int);
 
 /**
  * Prepare a type6 CPRB message for random number generation
@@ -124,9 +135,9 @@ struct type86_fmt2_ext {
  * @ap_dev: AP device pointer
  * @ap_msg: pointer to AP message
  */
-static inline void rng_type6CPRB_msgX(struct ap_device *ap_dev,
-			       struct ap_message *ap_msg,
-			       unsigned random_number_length)
+static inline void rng_type6CPRB_msgX(struct ap_message *ap_msg,
+				      unsigned int random_number_length,
+				      unsigned int *domain)
 {
 	struct {
 		struct type6_hdr hdr;
@@ -142,32 +153,32 @@ static inline void rng_type6CPRB_msgX(struct ap_device *ap_dev,
 		.offset1	= 0x00000058,
 		.agent_id	= {'C', 'A'},
 		.function_code	= {'R', 'L'},
-		.ToCardLen1	= sizeof *msg - sizeof(msg->hdr),
-		.FromCardLen1	= sizeof *msg - sizeof(msg->hdr),
+		.ToCardLen1	= sizeof(*msg) - sizeof(msg->hdr),
+		.FromCardLen1	= sizeof(*msg) - sizeof(msg->hdr),
 	};
 	static struct CPRBX local_cprbx = {
 		.cprb_len	= 0x00dc,
 		.cprb_ver_id	= 0x02,
 		.func_id	= {0x54, 0x32},
-		.req_parml	= sizeof *msg - sizeof(msg->hdr) -
+		.req_parml	= sizeof(*msg) - sizeof(msg->hdr) -
 				  sizeof(msg->cprbx),
-		.rpl_msgbl	= sizeof *msg - sizeof(msg->hdr),
+		.rpl_msgbl	= sizeof(*msg) - sizeof(msg->hdr),
 	};
 
 	msg->hdr = static_type6_hdrX;
 	msg->hdr.FromCardLen2 = random_number_length,
 	msg->cprbx = local_cprbx;
 	msg->cprbx.rpl_datal = random_number_length,
-	msg->cprbx.domain = AP_QID_QUEUE(ap_dev->qid);
 	memcpy(msg->function_code, msg->hdr.function_code, 0x02);
 	msg->rule_length = 0x0a;
 	memcpy(msg->rule, "RANDOM  ", 8);
 	msg->verb_length = 0x02;
 	msg->key_length = 0x02;
-	ap_msg->length = sizeof *msg;
+	ap_msg->length = sizeof(*msg);
+	*domain = (unsigned short)msg->cprbx.domain;
 }
 
-int zcrypt_msgtype6_init(void);
+void zcrypt_msgtype6_init(void);
 void zcrypt_msgtype6_exit(void);
 
 #endif /* _ZCRYPT_MSGTYPE6_H_ */

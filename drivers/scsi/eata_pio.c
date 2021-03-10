@@ -50,7 +50,6 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 #include <linux/ioport.h>
-#include <linux/slab.h>
 #include <linux/in.h>
 #include <linux/pci.h>
 #include <linux/proc_fs.h>
@@ -93,58 +92,22 @@ static unsigned long queue_counter;
 
 static struct scsi_host_template driver_template;
 
-/*
- * eata_proc_info
- * inout : decides on the direction of the dataflow and the meaning of the 
- *         variables
- * buffer: If inout==FALSE data is being written to it else read from it
- * *start: If inout==FALSE start of the valid data in the buffer
- * offset: If inout==FALSE offset from the beginning of the imaginary file 
- *         from which we start writing into the buffer
- * length: If inout==FALSE max number of bytes to be written into the buffer 
- *         else number of bytes in the buffer
- */
-static int eata_pio_proc_info(struct Scsi_Host *shost, char *buffer, char **start, off_t offset,
-			      int length, int rw)
+static int eata_pio_show_info(struct seq_file *m, struct Scsi_Host *shost)
 {
-	int len = 0;
-	off_t begin = 0, pos = 0;
-
-	if (rw)
-		return -ENOSYS;
-
-	len += sprintf(buffer+len, "EATA (Extended Attachment) PIO driver version: "
+	seq_printf(m, "EATA (Extended Attachment) PIO driver version: "
 		   "%d.%d%s\n",VER_MAJOR, VER_MINOR, VER_SUB);
-	len += sprintf(buffer + len, "queued commands:     %10ld\n"
+	seq_printf(m, "queued commands:     %10ld\n"
 		   "processed interrupts:%10ld\n", queue_counter, int_counter);
-	len += sprintf(buffer + len, "\nscsi%-2d: HBA %.10s\n",
+	seq_printf(m, "\nscsi%-2d: HBA %.10s\n",
 		   shost->host_no, SD(shost)->name);
-	len += sprintf(buffer + len, "Firmware revision: v%s\n",
+	seq_printf(m, "Firmware revision: v%s\n",
 		   SD(shost)->revision);
-	len += sprintf(buffer + len, "IO: PIO\n");
-	len += sprintf(buffer + len, "Base IO : %#.4x\n", (u32) shost->base);
-	len += sprintf(buffer + len, "Host Bus: %s\n",
+	seq_printf(m, "IO: PIO\n");
+	seq_printf(m, "Base IO : %#.4x\n", (u32) shost->base);
+	seq_printf(m, "Host Bus: %s\n",
 		   (SD(shost)->bustype == 'P')?"PCI ":
 		   (SD(shost)->bustype == 'E')?"EISA":"ISA ");
-    
-	pos = begin + len;
-    
-	if (pos < offset) {
-		len = 0;
-		begin = pos;
-	}
-	if (pos > offset + length)
-		goto stop_output;
-    
-stop_output:
-	DBG(DBG_PROC, printk("2pos: %ld offset: %ld len: %d\n", pos, offset, len));
-	*start = buffer + (offset - begin);   /* Start of wanted data */
-	len -= (offset - begin);            /* Start slop */
-	if (len > length)
-		len = length;               /* Ending slop */
-	DBG(DBG_PROC, printk("3pos: %ld offset: %ld len: %d\n", pos, offset, len));
-    
-	return len;
+	return 0;
 }
 
 static int eata_pio_release(struct Scsi_Host *sh)
@@ -336,7 +299,7 @@ static inline unsigned int eata_pio_send_command(unsigned long base, unsigned ch
 	return 0;
 }
 
-static int eata_pio_queue(struct scsi_cmnd *cmd,
+static int eata_pio_queue_lck(struct scsi_cmnd *cmd,
 		void (*done)(struct scsi_cmnd *))
 {
 	unsigned int x, y;
@@ -373,8 +336,7 @@ static int eata_pio_queue(struct scsi_cmnd *cmd,
 	cp->status = USED;	/* claim free slot */
 
 	DBG(DBG_QUEUE, scmd_printk(KERN_DEBUG, cmd,
-		"eata_pio_queue pid %ld, y %d\n",
-		cmd->serial_number, y));
+		"eata_pio_queue 0x%p, y %d\n", cmd, y));
 
 	cmd->scsi_done = (void *) done;
 
@@ -418,8 +380,8 @@ static int eata_pio_queue(struct scsi_cmnd *cmd,
 	if (eata_pio_send_command(base, EATA_CMD_PIO_SEND_CP)) {
 		cmd->result = DID_BUS_BUSY << 16;
 		scmd_printk(KERN_NOTICE, cmd,
-			"eata_pio_queue pid %ld, HBA busy, "
-			"returning DID_BUS_BUSY, done.\n", cmd->serial_number);
+			"eata_pio_queue pid 0x%p, HBA busy, "
+			"returning DID_BUS_BUSY, done.\n", cmd);
 		done(cmd);
 		cp->status = FREE;
 		return 0;
@@ -433,19 +395,20 @@ static int eata_pio_queue(struct scsi_cmnd *cmd,
 		outw(0, base + HA_RDATA);
 
 	DBG(DBG_QUEUE, scmd_printk(KERN_DEBUG, cmd,
-		"Queued base %#.4lx pid: %ld "
-		"slot %d irq %d\n", sh->base, cmd->serial_number, y, sh->irq));
+		"Queued base %#.4lx cmd: 0x%p "
+		"slot %d irq %d\n", sh->base, cmd, y, sh->irq));
 
 	return 0;
 }
+
+static DEF_SCSI_QCMD(eata_pio_queue)
 
 static int eata_pio_abort(struct scsi_cmnd *cmd)
 {
 	unsigned int loop = 100;
 
 	DBG(DBG_ABNORM, scmd_printk(KERN_WARNING, cmd,
-		"eata_pio_abort called pid: %ld\n",
-		cmd->serial_number));
+		"eata_pio_abort called pid: 0x%p\n", cmd));
 
 	while (inb(cmd->device->host->base + HA_RAUXSTAT) & HA_ABUSY)
 		if (--loop == 0) {
@@ -480,8 +443,7 @@ static int eata_pio_host_reset(struct scsi_cmnd *cmd)
 	struct Scsi_Host *host = cmd->device->host;
 
 	DBG(DBG_ABNORM, scmd_printk(KERN_WARNING, cmd,
-		"eata_pio_reset called pid:%ld\n",
-		cmd->serial_number));
+		"eata_pio_reset called\n"));
 
 	spin_lock_irq(host->host_lock);
 
@@ -500,7 +462,7 @@ static int eata_pio_host_reset(struct scsi_cmnd *cmd)
 
 		sp = HD(cmd)->ccb[x].cmd;
 		HD(cmd)->ccb[x].status = RESET;
-		printk(KERN_WARNING "eata_pio_reset: slot %d in reset, pid %ld.\n", x, sp->serial_number);
+		printk(KERN_WARNING "eata_pio_reset: slot %d in reset.\n", x);
 
 		if (sp == NULL)
 			panic("eata_pio_reset: slot %d, sp==NULL.\n", x);
@@ -987,7 +949,7 @@ static int eata_pio_detect(struct scsi_host_template *tpnt)
 static struct scsi_host_template driver_template = {
 	.proc_name		= "eata_pio",
 	.name              	= "EATA (Extended Attachment) PIO driver",
-	.proc_info         	= eata_pio_proc_info,
+	.show_info         	= eata_pio_show_info,
 	.detect            	= eata_pio_detect,
 	.release           	= eata_pio_release,
 	.queuecommand      	= eata_pio_queue,

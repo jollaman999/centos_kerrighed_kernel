@@ -10,7 +10,7 @@
 #include <linux/init.h>
 #include <linux/percpu.h>
 #include <linux/nmi.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/kprobes.h>
 #include <linux/kernel_stat.h>
 #include <linux/reboot.h>
@@ -21,8 +21,9 @@
 
 #include <asm/perf_event.h>
 #include <asm/ptrace.h>
-#include <asm/local.h>
 #include <asm/pcr.h>
+
+#include "kstack.h"
 
 /* We don't have a real NMI on sparc64, but we can fake one
  * up using profiling counter overflow interrupts and interrupt
@@ -47,7 +48,7 @@ static DEFINE_PER_CPU(short, wd_enabled);
 static int endflag __initdata;
 
 static DEFINE_PER_CPU(unsigned int, last_irq_sum);
-static DEFINE_PER_CPU(local_t, alert_counter);
+static DEFINE_PER_CPU(long, alert_counter);
 static DEFINE_PER_CPU(int, nmi_touch);
 
 void touch_nmi_watchdog(void)
@@ -93,37 +94,42 @@ static void die_nmi(const char *str, struct pt_regs *regs, int do_panic)
 notrace __kprobes void perfctr_irq(int irq, struct pt_regs *regs)
 {
 	unsigned int sum, touched = 0;
-	int cpu = smp_processor_id();
+	void *orig_sp;
 
 	clear_softint(1 << irq);
-	pcr_ops->write(PCR_PIC_PRIV);
 
 	local_cpu_data().__nmi_count++;
 
 	nmi_enter();
 
+	orig_sp = set_hardirq_stack();
+
 	if (notify_die(DIE_NMI, "nmi", regs, 0,
 		       pt_regs_trap_type(regs), SIGINT) == NOTIFY_STOP)
 		touched = 1;
+	else
+		pcr_ops->write_pcr(0, pcr_ops->pcr_nmi_disable);
 
-	sum = kstat_irqs_cpu(0, cpu);
+	sum = local_cpu_data().irq0_irqs;
 	if (__get_cpu_var(nmi_touch)) {
 		__get_cpu_var(nmi_touch) = 0;
 		touched = 1;
 	}
 	if (!touched && __get_cpu_var(last_irq_sum) == sum) {
-		local_inc(&__get_cpu_var(alert_counter));
-		if (local_read(&__get_cpu_var(alert_counter)) == 30 * nmi_hz)
+		__this_cpu_inc(alert_counter);
+		if (__this_cpu_read(alert_counter) == 30 * nmi_hz)
 			die_nmi("BUG: NMI Watchdog detected LOCKUP",
 				regs, panic_on_timeout);
 	} else {
 		__get_cpu_var(last_irq_sum) = sum;
-		local_set(&__get_cpu_var(alert_counter), 0);
+		__this_cpu_write(alert_counter, 0);
 	}
 	if (__get_cpu_var(wd_enabled)) {
-		write_pic(picl_value(nmi_hz));
-		pcr_ops->write(pcr_enable);
+		pcr_ops->write_pic(0, pcr_ops->nmi_picl_value(nmi_hz));
+		pcr_ops->write_pcr(0, pcr_ops->pcr_nmi_enable);
 	}
+
+	restore_hardirq_stack(orig_sp);
 
 	nmi_exit();
 }
@@ -159,7 +165,7 @@ static void report_broken_nmi(int cpu, int *prev_nmi_count)
 
 void stop_nmi_watchdog(void *unused)
 {
-	pcr_ops->write(PCR_PIC_PRIV);
+	pcr_ops->write_pcr(0, pcr_ops->pcr_nmi_disable);
 	__get_cpu_var(wd_enabled) = 0;
 	atomic_dec(&nmi_active);
 }
@@ -216,10 +222,10 @@ void start_nmi_watchdog(void *unused)
 	__get_cpu_var(wd_enabled) = 1;
 	atomic_inc(&nmi_active);
 
-	pcr_ops->write(PCR_PIC_PRIV);
-	write_pic(picl_value(nmi_hz));
+	pcr_ops->write_pcr(0, pcr_ops->pcr_nmi_disable);
+	pcr_ops->write_pic(0, pcr_ops->nmi_picl_value(nmi_hz));
 
-	pcr_ops->write(pcr_enable);
+	pcr_ops->write_pcr(0, pcr_ops->pcr_nmi_enable);
 }
 
 static void nmi_adjust_hz_one(void *unused)
@@ -227,10 +233,10 @@ static void nmi_adjust_hz_one(void *unused)
 	if (!__get_cpu_var(wd_enabled))
 		return;
 
-	pcr_ops->write(PCR_PIC_PRIV);
-	write_pic(picl_value(nmi_hz));
+	pcr_ops->write_pcr(0, pcr_ops->pcr_nmi_disable);
+	pcr_ops->write_pic(0, pcr_ops->nmi_picl_value(nmi_hz));
 
-	pcr_ops->write(pcr_enable);
+	pcr_ops->write_pcr(0, pcr_ops->pcr_nmi_enable);
 }
 
 void nmi_adjust_hz(unsigned int new_hz)
@@ -264,8 +270,6 @@ int __init nmi_init(void)
 			atomic_set(&nmi_active, -1);
 		}
 	}
-	if (!err)
-		init_hw_perf_events();
 
 	return err;
 }

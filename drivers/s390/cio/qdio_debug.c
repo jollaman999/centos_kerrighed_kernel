@@ -1,12 +1,12 @@
 /*
- *  drivers/s390/cio/qdio_debug.c
- *
- *  Copyright IBM Corp. 2008,2009
+ *  Copyright IBM Corp. 2008, 2009
  *
  *  Author: Jan Glauber (jang@linux.vnet.ibm.com)
  */
 #include <linux/seq_file.h>
 #include <linux/debugfs.h>
+#include <linux/uaccess.h>
+#include <linux/export.h>
 #include <asm/debug.h>
 #include "qdio_debug.h"
 #include "qdio.h"
@@ -33,7 +33,6 @@ void qdio_allocate_dbf(struct qdio_initialize *init_data,
 	DBF_HEX(&init_data->input_handler, sizeof(void *));
 	DBF_HEX(&init_data->output_handler, sizeof(void *));
 	DBF_HEX(&init_data->int_parm, sizeof(long));
-	DBF_HEX(&init_data->flags, sizeof(long));
 	DBF_HEX(&init_data->input_sbal_addr_array, sizeof(void *));
 	DBF_HEX(&init_data->output_sbal_addr_array, sizeof(void *));
 	DBF_EVENT("irq:%8lx", (unsigned long)irq_ptr);
@@ -55,15 +54,17 @@ static int qstat_show(struct seq_file *m, void *v)
 	if (!q)
 		return 0;
 
-	seq_printf(m, "DSCI: %d   nr_used: %d\n",
-		   *(u32 *)q->irq_ptr->dsci, atomic_read(&q->nr_buf_used));
-	seq_printf(m, "ftc: %d  last_move: %d\n",
+	seq_printf(m, "Timestamp: %Lx  Last AI: %Lx\n",
+		   q->timestamp, last_ai_time);
+	seq_printf(m, "nr_used: %d  ftc: %d  last_move: %d\n",
+		   atomic_read(&q->nr_buf_used),
 		   q->first_to_check, q->last_move);
 	if (q->is_input_q) {
 		seq_printf(m, "polling: %d  ack start: %d  ack count: %d\n",
 			   q->u.in.polling, q->u.in.ack_start,
 			   q->u.in.ack_count);
-		seq_printf(m, "IRQs disabled: %u\n",
+		seq_printf(m, "DSCI: %d   IRQs disabled: %u\n",
+			   *(u32 *)q->irq_ptr->dsci,
 			   test_bit(QDIO_QUEUE_IRQS_DISABLED,
 			   &q->u.in.queue_irq_state));
 	}
@@ -127,7 +128,7 @@ static int qstat_show(struct seq_file *m, void *v)
 static int qstat_seq_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, qstat_show,
-			   filp->f_path.dentry->d_inode->i_private);
+			   file_inode(filp)->i_private);
 }
 
 static const struct file_operations debugfs_fops = {
@@ -155,6 +156,7 @@ static char *qperf_names[] = {
 	"Inbound queue full",
 	"Outbound calls",
 	"Outbound handler",
+	"Outbound queue full",
 	"Outbound fast_requeue",
 	"Outbound target_full",
 	"QEBSM eqbs",
@@ -191,19 +193,13 @@ static ssize_t qperf_seq_write(struct file *file, const char __user *ubuf,
 	struct qdio_irq *irq_ptr = seq->private;
 	struct qdio_q *q;
 	unsigned long val;
-	char buf[8];
 	int ret, i;
 
 	if (!irq_ptr)
 		return 0;
-	if (count >= sizeof(buf))
-		return -EINVAL;
-	if (copy_from_user(&buf, ubuf, count))
-		return -EFAULT;
-	buf[count] = 0;
 
-	ret = strict_strtoul(buf, 10, &val);
-	if (ret < 0)
+	ret = kstrtoul_from_user(ubuf, count, 10, &val);
+	if (ret)
 		return ret;
 
 	switch (val) {
@@ -225,10 +221,10 @@ static ssize_t qperf_seq_write(struct file *file, const char __user *ubuf,
 static int qperf_seq_open(struct inode *inode, struct file *filp)
 {
 	return single_open(filp, qperf_show,
-			   filp->f_path.dentry->d_inode->i_private);
+			   file_inode(filp)->i_private);
 }
 
-static struct file_operations debugfs_perf_fops = {
+static const struct file_operations debugfs_perf_fops = {
 	.owner	 = THIS_MODULE,
 	.open	 = qperf_seq_open,
 	.read	 = seq_read,
@@ -236,7 +232,8 @@ static struct file_operations debugfs_perf_fops = {
 	.llseek  = seq_lseek,
 	.release = single_release,
 };
-static void setup_debugfs_entry(struct qdio_q *q, struct ccw_device *cdev)
+
+static void setup_debugfs_entry(struct qdio_q *q)
 {
 	char name[QDIO_DEBUGFS_NAME_LEN];
 
@@ -267,12 +264,12 @@ void qdio_setup_debug_entries(struct qdio_irq *irq_ptr, struct ccw_device *cdev)
 		irq_ptr->debugfs_perf = NULL;
 
 	for_each_input_queue(irq_ptr, q, i)
-		setup_debugfs_entry(q, cdev);
+		setup_debugfs_entry(q);
 	for_each_output_queue(irq_ptr, q, i)
-		setup_debugfs_entry(q, cdev);
+		setup_debugfs_entry(q);
 }
 
-void qdio_shutdown_debug_entries(struct qdio_irq *irq_ptr, struct ccw_device *cdev)
+void qdio_shutdown_debug_entries(struct qdio_irq *irq_ptr)
 {
 	struct qdio_q *q;
 	int i;

@@ -28,6 +28,7 @@
 #include <linux/module.h>
 #include <linux/socket.h>
 #include <linux/if_arp.h>
+#include <linux/slab.h>
 #include <linux/if_ether.h>
 #include <linux/init.h>
 #include <linux/proc_fs.h>
@@ -37,7 +38,7 @@
 #include <linux/seq_file.h>
 #include <linux/rcupdate.h>
 #include <linux/jhash.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <net/net_namespace.h>
 #include <net/neighbour.h>
 #include <net/dst.h>
@@ -47,13 +48,12 @@
 #include <net/dn_neigh.h>
 #include <net/dn_route.h>
 
-static u32 dn_neigh_hash(const void *pkey, const struct net_device *dev);
 static int dn_neigh_construct(struct neighbour *);
 static void dn_long_error_report(struct neighbour *, struct sk_buff *);
 static void dn_short_error_report(struct neighbour *, struct sk_buff *);
-static int dn_long_output(struct sk_buff *);
-static int dn_short_output(struct sk_buff *);
-static int dn_phase3_output(struct sk_buff *);
+static int dn_long_output(struct neighbour *, struct sk_buff *);
+static int dn_short_output(struct neighbour *, struct sk_buff *);
+static int dn_phase3_output(struct neighbour *, struct sk_buff *);
 
 
 /*
@@ -64,8 +64,6 @@ static const struct neigh_ops dn_long_ops = {
 	.error_report =		dn_long_error_report,
 	.output =		dn_long_output,
 	.connected_output =	dn_long_output,
-	.hh_output =		dev_queue_xmit,
-	.queue_xmit =		dev_queue_xmit,
 };
 
 /*
@@ -76,8 +74,6 @@ static const struct neigh_ops dn_short_ops = {
 	.error_report =		dn_short_error_report,
 	.output =		dn_short_output,
 	.connected_output =	dn_short_output,
-	.hh_output =		dev_queue_xmit,
-	.queue_xmit =		dev_queue_xmit,
 };
 
 /*
@@ -88,43 +84,45 @@ static const struct neigh_ops dn_phase3_ops = {
 	.error_report =		dn_short_error_report, /* Can use short version here */
 	.output =		dn_phase3_output,
 	.connected_output =	dn_phase3_output,
-	.hh_output =		dev_queue_xmit,
-	.queue_xmit =		dev_queue_xmit
 };
+
+static u32 dn_neigh_hash(const void *pkey,
+			 const struct net_device *dev,
+			 __u32 *hash_rnd)
+{
+	return jhash_2words(*(__u16 *)pkey, 0, hash_rnd[0]);
+}
 
 struct neigh_table dn_neigh_table = {
 	.family =			PF_DECnet,
-	.entry_size =			sizeof(struct dn_neigh),
+	.entry_size =			NEIGH_ENTRY_SIZE(sizeof(struct dn_neigh)),
 	.key_len =			sizeof(__le16),
 	.hash =				dn_neigh_hash,
 	.constructor =			dn_neigh_construct,
 	.id =				"dn_neigh_cache",
 	.parms ={
 		.tbl =			&dn_neigh_table,
-		.base_reachable_time =	30 * HZ,
-		.retrans_time =	1 * HZ,
-		.gc_staletime =	60 * HZ,
-		.reachable_time =		30 * HZ,
-		.delay_probe_time =	5 * HZ,
-		.queue_len =		3,
-		.ucast_probes =	0,
-		.app_probes =		0,
-		.mcast_probes =	0,
-		.anycast_delay =	0,
-		.proxy_delay =		0,
-		.proxy_qlen =		0,
-		.locktime =		1 * HZ,
+		.reachable_time =	30 * HZ,
+		.data = {
+			[NEIGH_VAR_MCAST_PROBES] = 0,
+			[NEIGH_VAR_UCAST_PROBES] = 0,
+			[NEIGH_VAR_APP_PROBES] = 0,
+			[NEIGH_VAR_RETRANS_TIME] = 1 * HZ,
+			[NEIGH_VAR_BASE_REACHABLE_TIME] = 30 * HZ,
+			[NEIGH_VAR_DELAY_PROBE_TIME] = 5 * HZ,
+			[NEIGH_VAR_GC_STALETIME] = 60 * HZ,
+			[NEIGH_VAR_QUEUE_LEN_BYTES] = 64*1024,
+			[NEIGH_VAR_PROXY_QLEN] = 0,
+			[NEIGH_VAR_ANYCAST_DELAY] = 0,
+			[NEIGH_VAR_PROXY_DELAY] = 0,
+			[NEIGH_VAR_LOCKTIME] = 1 * HZ,
+		},
 	},
 	.gc_interval =			30 * HZ,
 	.gc_thresh1 =			128,
 	.gc_thresh2 =			512,
 	.gc_thresh3 =			1024,
 };
-
-static u32 dn_neigh_hash(const void *pkey, const struct net_device *dev)
-{
-	return jhash_2words(*(__u16 *)pkey, 0, dn_neigh_table.hash_rnd);
-}
 
 static int dn_neigh_construct(struct neighbour *neigh)
 {
@@ -166,8 +164,8 @@ static int dn_neigh_construct(struct neighbour *neigh)
 	else if ((dev->type == ARPHRD_ETHER) || (dev->type == ARPHRD_LOOPBACK))
 		dn_dn2eth(neigh->ha, dn->addr);
 	else {
-		if (net_ratelimit())
-			printk(KERN_DEBUG "Trying to create neigh for hw %d\n",  dev->type);
+		net_dbg_ratelimited("Trying to create neigh for hw %d\n",
+				    dev->type);
 		return -EINVAL;
 	}
 
@@ -206,26 +204,30 @@ static int dn_neigh_output_packet(struct sk_buff *skb)
 {
 	struct dst_entry *dst = skb_dst(skb);
 	struct dn_route *rt = (struct dn_route *)dst;
-	struct neighbour *neigh = dst->neighbour;
+	struct neighbour *neigh = rt->n;
 	struct net_device *dev = neigh->dev;
 	char mac_addr[ETH_ALEN];
+	unsigned int seq;
+	int err;
 
 	dn_dn2eth(mac_addr, rt->rt_local_src);
-	if (dev_hard_header(skb, dev, ntohs(skb->protocol), neigh->ha,
-			    mac_addr, skb->len) >= 0)
-		return neigh->ops->queue_xmit(skb);
+	do {
+		seq = read_seqbegin(&neigh->ha_lock);
+		err = dev_hard_header(skb, dev, ntohs(skb->protocol),
+				      neigh->ha, mac_addr, skb->len);
+	} while (read_seqretry(&neigh->ha_lock, seq));
 
-	if (net_ratelimit())
-		printk(KERN_DEBUG "dn_neigh_output_packet: oops, can't send packet\n");
-
-	kfree_skb(skb);
-	return -EINVAL;
+	if (err >= 0)
+		err = dev_queue_xmit(skb);
+	else {
+		kfree_skb(skb);
+		err = -EINVAL;
+	}
+	return err;
 }
 
-static int dn_long_output(struct sk_buff *skb)
+static int dn_long_output(struct neighbour *neigh, struct sk_buff *skb)
 {
-	struct dst_entry *dst = skb_dst(skb);
-	struct neighbour *neigh = dst->neighbour;
 	struct net_device *dev = neigh->dev;
 	int headroom = dev->hard_header_len + sizeof(struct dn_long_packet) + 3;
 	unsigned char *data;
@@ -236,15 +238,13 @@ static int dn_long_output(struct sk_buff *skb)
 	if (skb_headroom(skb) < headroom) {
 		struct sk_buff *skb2 = skb_realloc_headroom(skb, headroom);
 		if (skb2 == NULL) {
-			if (net_ratelimit())
-				printk(KERN_CRIT "dn_long_output: no memory\n");
+			net_crit_ratelimited("dn_long_output: no memory\n");
 			kfree_skb(skb);
 			return -ENOBUFS;
 		}
-		kfree_skb(skb);
+		consume_skb(skb);
 		skb = skb2;
-		if (net_ratelimit())
-			printk(KERN_INFO "dn_long_output: Increasing headroom\n");
+		net_info_ratelimited("dn_long_output: Increasing headroom\n");
 	}
 
 	data = skb_push(skb, sizeof(struct dn_long_packet) + 3);
@@ -265,13 +265,12 @@ static int dn_long_output(struct sk_buff *skb)
 
 	skb_reset_network_header(skb);
 
-	return NF_HOOK(PF_DECnet, NF_DN_POST_ROUTING, skb, NULL, neigh->dev, dn_neigh_output_packet);
+	return NF_HOOK(NFPROTO_DECNET, NF_DN_POST_ROUTING, skb, NULL,
+		       neigh->dev, dn_neigh_output_packet);
 }
 
-static int dn_short_output(struct sk_buff *skb)
+static int dn_short_output(struct neighbour *neigh, struct sk_buff *skb)
 {
-	struct dst_entry *dst = skb_dst(skb);
-	struct neighbour *neigh = dst->neighbour;
 	struct net_device *dev = neigh->dev;
 	int headroom = dev->hard_header_len + sizeof(struct dn_short_packet) + 2;
 	struct dn_short_packet *sp;
@@ -282,15 +281,13 @@ static int dn_short_output(struct sk_buff *skb)
 	if (skb_headroom(skb) < headroom) {
 		struct sk_buff *skb2 = skb_realloc_headroom(skb, headroom);
 		if (skb2 == NULL) {
-			if (net_ratelimit())
-				printk(KERN_CRIT "dn_short_output: no memory\n");
+			net_crit_ratelimited("dn_short_output: no memory\n");
 			kfree_skb(skb);
 			return -ENOBUFS;
 		}
-		kfree_skb(skb);
+		consume_skb(skb);
 		skb = skb2;
-		if (net_ratelimit())
-			printk(KERN_INFO "dn_short_output: Increasing headroom\n");
+		net_info_ratelimited("dn_short_output: Increasing headroom\n");
 	}
 
 	data = skb_push(skb, sizeof(struct dn_short_packet) + 2);
@@ -304,17 +301,16 @@ static int dn_short_output(struct sk_buff *skb)
 
 	skb_reset_network_header(skb);
 
-	return NF_HOOK(PF_DECnet, NF_DN_POST_ROUTING, skb, NULL, neigh->dev, dn_neigh_output_packet);
+	return NF_HOOK(NFPROTO_DECNET, NF_DN_POST_ROUTING, skb, NULL,
+		       neigh->dev, dn_neigh_output_packet);
 }
 
 /*
  * Phase 3 output is the same is short output, execpt that
  * it clears the area bits before transmission.
  */
-static int dn_phase3_output(struct sk_buff *skb)
+static int dn_phase3_output(struct neighbour *neigh, struct sk_buff *skb)
 {
-	struct dst_entry *dst = skb_dst(skb);
-	struct neighbour *neigh = dst->neighbour;
 	struct net_device *dev = neigh->dev;
 	int headroom = dev->hard_header_len + sizeof(struct dn_short_packet) + 2;
 	struct dn_short_packet *sp;
@@ -324,15 +320,13 @@ static int dn_phase3_output(struct sk_buff *skb)
 	if (skb_headroom(skb) < headroom) {
 		struct sk_buff *skb2 = skb_realloc_headroom(skb, headroom);
 		if (skb2 == NULL) {
-			if (net_ratelimit())
-				printk(KERN_CRIT "dn_phase3_output: no memory\n");
+			net_crit_ratelimited("dn_phase3_output: no memory\n");
 			kfree_skb(skb);
 			return -ENOBUFS;
 		}
-		kfree_skb(skb);
+		consume_skb(skb);
 		skb = skb2;
-		if (net_ratelimit())
-			printk(KERN_INFO "dn_phase3_output: Increasing headroom\n");
+		net_info_ratelimited("dn_phase3_output: Increasing headroom\n");
 	}
 
 	data = skb_push(skb, sizeof(struct dn_short_packet) + 2);
@@ -346,7 +340,8 @@ static int dn_phase3_output(struct sk_buff *skb)
 
 	skb_reset_network_header(skb);
 
-	return NF_HOOK(PF_DECnet, NF_DN_POST_ROUTING, skb, NULL, neigh->dev, dn_neigh_output_packet);
+	return NF_HOOK(NFPROTO_DECNET, NF_DN_POST_ROUTING, skb, NULL,
+		       neigh->dev, dn_neigh_output_packet);
 }
 
 /*
@@ -386,7 +381,7 @@ int dn_neigh_router_hello(struct sk_buff *skb)
 		write_lock(&neigh->lock);
 
 		neigh->used = jiffies;
-		dn_db = (struct dn_dev *)neigh->dev->dn_ptr;
+		dn_db = rcu_dereference(neigh->dev->dn_ptr);
 
 		if (!(neigh->nud_state & NUD_PERMANENT)) {
 			neigh->updated = jiffies;
@@ -399,13 +394,13 @@ int dn_neigh_router_hello(struct sk_buff *skb)
 
 			dn->flags &= ~DN_NDFLAG_P3;
 
-			switch(msg->iinfo & DN_RT_INFO_TYPE) {
-				case DN_RT_INFO_L1RT:
-					dn->flags &=~DN_NDFLAG_R2;
-					dn->flags |= DN_NDFLAG_R1;
-					break;
-				case DN_RT_INFO_L2RT:
-					dn->flags |= DN_NDFLAG_R2;
+			switch (msg->iinfo & DN_RT_INFO_TYPE) {
+			case DN_RT_INFO_L1RT:
+				dn->flags &=~DN_NDFLAG_R2;
+				dn->flags |= DN_NDFLAG_R1;
+				break;
+			case DN_RT_INFO_L2RT:
+				dn->flags |= DN_NDFLAG_R2;
 			}
 		}
 
@@ -596,12 +591,13 @@ static const struct file_operations dn_neigh_seq_fops = {
 
 void __init dn_neigh_init(void)
 {
-	neigh_table_init(&dn_neigh_table);
-	proc_net_fops_create(&init_net, "decnet_neigh", S_IRUGO, &dn_neigh_seq_fops);
+	neigh_table_init(NEIGH_DN_TABLE, &dn_neigh_table);
+	proc_create("decnet_neigh", S_IRUGO, init_net.proc_net,
+		    &dn_neigh_seq_fops);
 }
 
 void __exit dn_neigh_cleanup(void)
 {
-	proc_net_remove(&init_net, "decnet_neigh");
-	neigh_table_clear(&dn_neigh_table);
+	remove_proc_entry("decnet_neigh", init_net.proc_net);
+	neigh_table_clear(NEIGH_DN_TABLE, &dn_neigh_table);
 }

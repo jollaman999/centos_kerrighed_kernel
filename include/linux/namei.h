@@ -5,14 +5,9 @@
 #include <linux/errno.h>
 #include <linux/linkage.h>
 #include <linux/path.h>
+#include <linux/namei_lookup.h>
 
 struct vfsmount;
-
-struct open_intent {
-	int	flags;
-	int	create_mode;
-	struct file *file;
-};
 
 enum { MAX_NESTED_LINKS = 8 };
 
@@ -20,15 +15,13 @@ struct nameidata {
 	struct path	path;
 	struct qstr	last;
 	struct path	root;
+	struct inode	*inode; /* path.dentry.d_inode */
 	unsigned int	flags;
+	unsigned	seq;
 	int		last_type;
 	unsigned	depth;
 	char *saved_names[MAX_NESTED_LINKS + 1];
-
-	/* Intent data */
-	union {
-		struct open_intent open;
-	} intent;
+	RH_KABI_EXTEND(unsigned  m_seq)
 };
 
 /*
@@ -36,31 +29,9 @@ struct nameidata {
  */
 enum {LAST_NORM, LAST_ROOT, LAST_DOT, LAST_DOTDOT, LAST_BIND};
 
-/*
- * The bitmask for a lookup event:
- *  - follow links at the end
- *  - require a directory
- *  - ending slashes ok even for nonexistent files
- *  - internal "there are more path components" flag
- *  - locked when lookup done with dcache_lock held
- *  - dentry cache is untrusted; force a real lookup
- *  - suppress terminal automount
- */
-#define LOOKUP_FOLLOW		 1
-#define LOOKUP_DIRECTORY	 2
-#define LOOKUP_CONTINUE		 4
-#define LOOKUP_AUTOMOUNT	 8
-#define LOOKUP_PARENT		16
-#define LOOKUP_REVAL		64
-/*
- * Intent data
- */
-#define LOOKUP_OPEN		0x0100
-#define LOOKUP_CREATE		0x0200
-#define LOOKUP_EXCL		0x0400
-#define LOOKUP_RENAME_TARGET	0x0800
 
 extern int user_path_at(int, const char __user *, unsigned, struct path *);
+extern int user_path_at_empty(int, const char __user *, unsigned, struct path *, int *empty);
 
 #define user_path(name, path) user_path_at(AT_FDCWD, name, LOOKUP_FOLLOW, path)
 #define user_lpath(name, path) user_path_at(AT_FDCWD, name, 0, path)
@@ -69,24 +40,23 @@ extern int user_path_at(int, const char __user *, unsigned, struct path *);
 
 extern int kern_path(const char *, unsigned, struct path *);
 
-extern int path_lookup(const char *, unsigned, struct nameidata *);
-extern int vfs_path_lookup(struct dentry *, struct vfsmount *,
-			   const char *, unsigned int, struct nameidata *);
-
-extern struct file *lookup_instantiate_filp(struct nameidata *nd, struct dentry *dentry,
-		int (*open)(struct inode *, struct file *));
-
+extern struct dentry *kern_path_create(int, const char *, struct path *, unsigned int);
+extern struct dentry *user_path_create(int, const char __user *, struct path *, unsigned int);
+extern void done_path_create(struct path *, struct dentry *);
+extern struct dentry *kern_path_locked(const char *, struct path *);
 extern int kern_path_mountpoint(int, const char *, struct path *, unsigned int);
 
 extern struct dentry *lookup_one_len(const char *, struct dentry *, int);
-extern struct dentry *lookup_one_noperm(const char *, struct dentry *);
+extern struct dentry *lookup_one_len_unlocked(const char *, struct dentry *, int);
 
+extern int follow_down_one(struct path *);
 extern int follow_down(struct path *);
-extern int __follow_down(struct path *, bool);
 extern int follow_up(struct path *);
 
 extern struct dentry *lock_rename(struct dentry *, struct dentry *);
 extern void unlock_rename(struct dentry *, struct dentry *);
+
+extern void nd_jump_link(struct nameidata *nd, struct path *path);
 
 static inline void nd_set_link(struct nameidata *nd, char *path)
 {

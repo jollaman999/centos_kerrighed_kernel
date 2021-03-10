@@ -15,6 +15,7 @@
  * the Free Software Foundation.
  */
 
+#include <linux/slab.h>
 #include <linux/input.h>
 #include <linux/input/mt.h>
 #include <linux/serio.h>
@@ -22,13 +23,6 @@
 
 #include "psmouse.h"
 #include "alps.h"
-
-#undef DEBUG
-#ifdef DEBUG
-#define dbg(format, arg...) printk(KERN_INFO "alps.c: " format "\n", ## arg)
-#else
-#define dbg(format, arg...) do {} while (0)
-#endif
 
 /*
  * Definitions for ALPS version 3 and 4 command mode protocol
@@ -107,7 +101,6 @@ static const struct alps_nibble_commands alps_v6_nibble_commands[] = {
 					   6-byte ALPS packet */
 #define ALPS_IS_RUSHMORE	0x100	/* device is a rushmore */
 #define ALPS_BUTTONPAD		0x200	/* device is a clickpad */
-
 
 static const struct alps_model_info alps_model_data[] = {
 	{ { 0x32, 0x02, 0x14 },	0x00, ALPS_PROTO_V2, 0xf8, 0xf8, ALPS_PASS | ALPS_DUALPOINT },	/* Toshiba Salellite Pro M10 */
@@ -442,7 +435,7 @@ static void alps_report_mt_data(struct psmouse *psmouse, int n)
 	struct alps_fields *f = &priv->f;
 	int i, slot[MAX_TOUCHES];
 
-	input_mt_assign_slots(dev, slot, f->mt, n);
+	input_mt_assign_slots(dev, slot, f->mt, n, 0);
 	for (i = 0; i < n; i++)
 		alps_set_slot(dev, slot[i], f->mt[i].x, f->mt[i].y);
 
@@ -484,7 +477,7 @@ static void alps_process_trackstick_packet_v3(struct psmouse *psmouse)
 
 	/* Sanity check packet */
 	if (!(packet[0] & 0x40)) {
-		dbg("Bad trackstick packet, discarding\n");
+		psmouse_dbg(psmouse, "Bad trackstick packet, discarding\n");
 		return;
 	}
 
@@ -1147,10 +1140,9 @@ static psmouse_ret_t alps_handle_interleaved_ps2(struct psmouse *psmouse)
 		      psmouse->packet[4] |
 		      psmouse->packet[5]) & 0x80) ||
 		    (!alps_is_valid_first_byte(priv, psmouse->packet[6]))) {
-			dbg("refusing packet %x %x %x %x "
-			    "(suspected interleaved ps/2)\n",
-			    psmouse->packet[3], psmouse->packet[4],
-			    psmouse->packet[5], psmouse->packet[6]);
+			psmouse_dbg(psmouse,
+				    "refusing packet %4ph (suspected interleaved ps/2)\n",
+				    psmouse->packet + 3);
 			return PSMOUSE_BAD_DATA;
 		}
 
@@ -1169,13 +1161,13 @@ static psmouse_ret_t alps_handle_interleaved_ps2(struct psmouse *psmouse)
 		 * There is also possibility that we got 6-byte ALPS
 		 * packet followed  by 3-byte packet from trackpoint. We
 		 * can not distinguish between these 2 scenarios but
-		 * becase the latter is unlikely to happen in course of
+		 * because the latter is unlikely to happen in course of
 		 * normal operation (user would need to press all
 		 * buttons on the pad and start moving trackpoint
 		 * without touching the pad surface) we assume former.
 		 * Even if we are wrong the wost thing that would happen
 		 * the cursor would jump but we should not get protocol
-		 * desynchronization.
+		 * de-synchronization.
 		 */
 
 		alps_report_bare_ps2_packet(psmouse, &psmouse->packet[3],
@@ -1212,10 +1204,9 @@ static void alps_flush_packet(unsigned long data)
 		if ((psmouse->packet[3] |
 		     psmouse->packet[4] |
 		     psmouse->packet[5]) & 0x80) {
-			dbg("refusing packet %x %x %x "
-			    "(suspected interleaved ps/2)\n",
-			    psmouse->packet[3], psmouse->packet[4],
-			    psmouse->packet[5]);
+			psmouse_dbg(psmouse,
+				    "refusing packet %3ph (suspected interleaved ps/2)\n",
+				    psmouse->packet + 3);
 		} else {
 			priv->process_packet(psmouse);
 		}
@@ -1229,13 +1220,7 @@ static psmouse_ret_t alps_process_byte(struct psmouse *psmouse)
 {
 	struct alps_data *priv = psmouse->private;
 
-	/*
-	 * Check if we are dealing with a bare PS/2 packet, presumably from
-	 * a device connected to the external PS/2 port. Because bare PS/2
-	 * protocol does not have enough constant bits to self-synchronize
-	 * properly we only do this if the device is fully synchronized.
-	 */
-	if (!psmouse->out_of_sync_cnt && (psmouse->packet[0] & 0xc8) == 0x08) {
+	if ((psmouse->packet[0] & 0xc8) == 0x08) { /* PS/2 packet */
 		if (psmouse->pktcnt == 3) {
 			alps_report_bare_ps2_packet(psmouse, psmouse->packet,
 						    true);
@@ -1252,8 +1237,9 @@ static psmouse_ret_t alps_process_byte(struct psmouse *psmouse)
 	}
 
 	if (!alps_is_valid_first_byte(priv, psmouse->packet[0])) {
-		dbg("refusing packet[0] = %x (mask0 = %x, byte0 = %x)\n",
-		    psmouse->packet[0], priv->mask0, priv->byte0);
+		psmouse_dbg(psmouse,
+			    "refusing packet[0] = %x (mask0 = %x, byte0 = %x)\n",
+			    psmouse->packet[0], priv->mask0, priv->byte0);
 		return PSMOUSE_BAD_DATA;
 	}
 
@@ -1261,14 +1247,15 @@ static psmouse_ret_t alps_process_byte(struct psmouse *psmouse)
 	if ((priv->proto_version < ALPS_PROTO_V5) &&
 	    psmouse->pktcnt >= 2 && psmouse->pktcnt <= psmouse->pktsize &&
 	    (psmouse->packet[psmouse->pktcnt - 1] & 0x80)) {
-		dbg("refusing packet[%i] = %x\n",
-		    psmouse->pktcnt - 1, psmouse->packet[psmouse->pktcnt - 1]);
+		psmouse_dbg(psmouse, "refusing packet[%i] = %x\n",
+			    psmouse->pktcnt - 1,
+			    psmouse->packet[psmouse->pktcnt - 1]);
 		return PSMOUSE_BAD_DATA;
 	}
 
 	if (priv->proto_version == ALPS_PROTO_V7 &&
 	    !alps_is_valid_package_v7(psmouse)) {
-		dbg("refusing packet[%i] = %x\n",
+		psmouse_dbg(psmouse, "refusing packet[%i] = %x\n",
 			    psmouse->pktcnt - 1,
 			    psmouse->packet[psmouse->pktcnt - 1]);
 		return PSMOUSE_BAD_DATA;
@@ -1381,8 +1368,8 @@ static int alps_rpt_cmd(struct psmouse *psmouse, int init_command,
 	if (ps2_command(ps2dev, param, PSMOUSE_CMD_GETINFO))
 		return -EIO;
 
-	dbg("%2.2X report: %2.2x %2.2x %2.2x\n",
-	    repeated_command, param[0], param[1], param[2]);
+	psmouse_dbg(psmouse, "%2.2X report: %3ph\n",
+		    repeated_command, param);
 	return 0;
 }
 
@@ -1407,15 +1394,15 @@ static int alps_enter_command_mode(struct psmouse *psmouse)
 	unsigned char param[4];
 
 	if (alps_rpt_cmd(psmouse, 0, PSMOUSE_CMD_RESET_WRAP, param)) {
-		printk(KERN_ERR "failed to enter command mode\n");
+		psmouse_err(psmouse, "failed to enter command mode\n");
 		return -1;
 	}
 
 	if (!alps_check_valid_firmware_id(param)) {
-		dbg("unknown response while entering command mode\n");
+		psmouse_dbg(psmouse,
+			    "unknown response while entering command mode\n");
 		return -1;
 	}
-
 	return 0;
 }
 
@@ -1465,7 +1452,7 @@ static int alps_absolute_mode_v1_v2(struct psmouse *psmouse)
 	 * Switch mouse to poll (remote) mode so motion data will not
 	 * get in our way
 	 */
-	return ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_SETPOLL);
+	return ps2_command(ps2dev, NULL, PSMOUSE_CMD_SETPOLL);
 }
 
 static int alps_monitor_mode_send_word(struct psmouse *psmouse, u16 word)
@@ -1623,12 +1610,12 @@ static int alps_hw_init_v1_v2(struct psmouse *psmouse)
 	}
 
 	if (alps_tap_mode(psmouse, true)) {
-		printk(KERN_WARNING "alps.c: Failed to enable hardware tapping\n");
+		psmouse_warn(psmouse, "Failed to enable hardware tapping\n");
 		return -1;
 	}
 
 	if (alps_absolute_mode_v1_v2(psmouse)) {
-		printk(KERN_ERR "alps.c: Failed to enable absolute mode\n");
+		psmouse_err(psmouse, "Failed to enable absolute mode\n");
 		return -1;
 	}
 
@@ -1639,7 +1626,7 @@ static int alps_hw_init_v1_v2(struct psmouse *psmouse)
 
 	/* ALPS needs stream mode, otherwise it won't report any data */
 	if (ps2_command(&psmouse->ps2dev, NULL, PSMOUSE_CMD_SETSTREAM)) {
-		printk(KERN_ERR "alps.c: Failed to enable stream mode\n");
+		psmouse_err(psmouse, "Failed to enable stream mode\n");
 		return -1;
 	}
 
@@ -1665,7 +1652,7 @@ static int alps_hw_init_v6(struct psmouse *psmouse)
 		return -1;
 
 	if (alps_absolute_mode_v6(psmouse)) {
-		printk(KERN_ERR "alps.c: Failed to enable absolute mode\n");
+		psmouse_err(psmouse, "Failed to enable absolute mode\n");
 		return -1;
 	}
 
@@ -1754,11 +1741,10 @@ static int alps_setup_trackstick_v3(struct psmouse *psmouse, int reg_base)
 	 * all.
 	 */
 	if (alps_rpt_cmd(psmouse, 0, PSMOUSE_CMD_SETSCALE21, param)) {
-		printk(KERN_WARNING "trackstick E7 report failed\n");
+		psmouse_warn(psmouse, "trackstick E7 report failed\n");
 		ret = -ENODEV;
 	} else {
-		dbg("trackstick E7 report: %2.2x %2.2x %2.2x\n",
-		    param[0], param[1], param[2]);
+		psmouse_dbg(psmouse, "trackstick E7 report: %3ph\n", param);
 
 		/*
 		 * Not sure what this does, but it is absolutely
@@ -1771,7 +1757,8 @@ static int alps_setup_trackstick_v3(struct psmouse *psmouse, int reg_base)
 		    ps2_command(ps2dev, NULL, PSMOUSE_CMD_SETSCALE11) ||
 		    alps_command_mode_send_nibble(psmouse, 0x9) ||
 		    alps_command_mode_send_nibble(psmouse, 0x4)) {
-			printk(KERN_ERR "Error sending magic E6 sequence\n");
+			psmouse_err(psmouse,
+				    "Error sending magic E6 sequence\n");
 			ret = -EIO;
 			goto error;
 		}
@@ -1804,13 +1791,14 @@ static int alps_hw_init_v3(struct psmouse *psmouse)
 	reg_val = alps_probe_trackstick_v3(psmouse, ALPS_REG_BASE_PINNACLE);
 	if (reg_val == -EIO)
 		goto error;
+
 	if (reg_val == 0 &&
 	    alps_setup_trackstick_v3(psmouse, ALPS_REG_BASE_PINNACLE) == -EIO)
 		goto error;
 
 	if (alps_enter_command_mode(psmouse) ||
 	    alps_absolute_mode_v3(psmouse)) {
-		printk(KERN_ERR "Failed to enter absolute mode\n");
+		psmouse_err(psmouse, "Failed to enter absolute mode\n");
 		goto error;
 	}
 
@@ -1852,7 +1840,7 @@ static int alps_hw_init_v3(struct psmouse *psmouse)
 	param[0] = 0x64;
 	if (ps2_command(ps2dev, param, PSMOUSE_CMD_SETRATE) ||
 	    ps2_command(ps2dev, NULL, PSMOUSE_CMD_ENABLE)) {
-		printk(KERN_ERR "Failed to enable data reporting\n");
+		psmouse_err(psmouse, "Failed to enable data reporting\n");
 		return -1;
 	}
 
@@ -1899,7 +1887,8 @@ static int alps_get_v3_v7_resolution(struct psmouse *psmouse, int reg_pitch)
 	priv->x_res = priv->x_max * 10 / x_phys; /* units / mm */
 	priv->y_res = priv->y_max * 10 / y_phys; /* units / mm */
 
-	dbg("pitch %dx%d num-electrodes %dx%d physical size %dx%d mm res %dx%d\n",
+	psmouse_dbg(psmouse,
+		    "pitch %dx%d num-electrodes %dx%d physical size %dx%d mm res %dx%d\n",
 		    x_pitch, y_pitch, x_electrode, y_electrode,
 		    x_phys / 10, y_phys / 10, priv->x_res, priv->y_res);
 
@@ -1978,7 +1967,7 @@ static int alps_hw_init_v4(struct psmouse *psmouse)
 		goto error;
 
 	if (alps_absolute_mode_v4(psmouse)) {
-		printk(KERN_ERR "Failed to enter absolute mode\n");
+		psmouse_err(psmouse, "Failed to enter absolute mode\n");
 		goto error;
 	}
 
@@ -2026,7 +2015,7 @@ static int alps_hw_init_v4(struct psmouse *psmouse)
 	param[0] = 0x64;
 	if (ps2_command(ps2dev, param, PSMOUSE_CMD_SETRATE) ||
 	    ps2_command(ps2dev, NULL, PSMOUSE_CMD_ENABLE)) {
-		printk(KERN_ERR "Failed to enable data reporting\n");
+		psmouse_err(psmouse, "Failed to enable data reporting\n");
 		return -1;
 	}
 
@@ -2309,8 +2298,8 @@ static int alps_identify(struct psmouse *psmouse, struct alps_data *priv)
 		return 0;
 	}
 
-	dbg("Likely not an ALPS touchpad: E7=%2.2x %2.2x %2.2x, EC=%2.2x %2.2x %2.2x\n",
-	    e7[0], e7[1], e7[2], ec[0], ec[1], ec[2]);
+	psmouse_info(psmouse,
+		     "Unknown ALPS touchpad: E7=%3ph, EC=%3ph\n", e7, ec);
 
 	return -EINVAL;
 }
@@ -2448,6 +2437,10 @@ int alps_init(struct psmouse *psmouse)
 	dev2->keybit[BIT_WORD(BTN_LEFT)] =
 		BIT_MASK(BTN_LEFT) | BIT_MASK(BTN_MIDDLE) | BIT_MASK(BTN_RIGHT);
 
+	__set_bit(INPUT_PROP_POINTER, dev2->propbit);
+	if (priv->flags & ALPS_DUALPOINT)
+		__set_bit(INPUT_PROP_POINTING_STICK, dev2->propbit);
+
 	if (input_register_device(priv->dev2))
 		goto init_fail;
 
@@ -2459,9 +2452,6 @@ int alps_init(struct psmouse *psmouse)
 
 	/* We are having trouble resyncing ALPS touchpads so disable it for now */
 	psmouse->resync_time = 0;
-
-	/* Allow 2 invalid packets without resetting device */
-	psmouse->resetafter = psmouse->pktsize * 2;
 
 	return 0;
 

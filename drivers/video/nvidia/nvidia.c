@@ -21,7 +21,6 @@
 #include <linux/pci.h>
 #include <linux/console.h>
 #include <linux/backlight.h>
-#include <linux/nospec.h>
 #ifdef CONFIG_MTRR
 #include <asm/mtrr.h>
 #endif
@@ -71,34 +70,34 @@ static struct pci_device_id nvidiafb_pci_tbl[] = {
 MODULE_DEVICE_TABLE(pci, nvidiafb_pci_tbl);
 
 /* command line data, set in nvidiafb_setup() */
-static int flatpanel __devinitdata = -1;	/* Autodetect later */
-static int fpdither __devinitdata = -1;
-static int forceCRTC __devinitdata = -1;
-static int hwcur __devinitdata = 0;
-static int noaccel __devinitdata = 0;
-static int noscale __devinitdata = 0;
-static int paneltweak __devinitdata = 0;
-static int vram __devinitdata = 0;
-static int bpp __devinitdata = 8;
-static int reverse_i2c __devinitdata;
+static int flatpanel = -1;	/* Autodetect later */
+static int fpdither = -1;
+static int forceCRTC = -1;
+static int hwcur = 0;
+static int noaccel = 0;
+static int noscale = 0;
+static int paneltweak = 0;
+static int vram = 0;
+static int bpp = 8;
+static int reverse_i2c;
 #ifdef CONFIG_MTRR
-static int nomtrr __devinitdata = 0;
+static bool nomtrr = false;
 #endif
 #ifdef CONFIG_PMAC_BACKLIGHT
-static int backlight __devinitdata = 1;
+static int backlight = 1;
 #else
-static int backlight __devinitdata = 0;
+static int backlight = 0;
 #endif
 
-static char *mode_option __devinitdata = NULL;
+static char *mode_option = NULL;
 
-static struct fb_fix_screeninfo __devinitdata nvidiafb_fix = {
+static struct fb_fix_screeninfo nvidiafb_fix = {
 	.type = FB_TYPE_PACKED_PIXELS,
 	.xpanstep = 8,
 	.ypanstep = 1,
 };
 
-static struct fb_var_screeninfo __devinitdata nvidiafb_default_var = {
+static struct fb_var_screeninfo nvidiafb_default_var = {
 	.xres = 640,
 	.yres = 480,
 	.xres_virtual = 640,
@@ -721,7 +720,6 @@ static int nvidiafb_setcolreg(unsigned regno, unsigned red, unsigned green,
 	}
 
 	if (regno < 16 && info->fix.visual == FB_VISUAL_DIRECTCOLOR) {
-		regno = array_index_nospec(regno, 16);
 		((u32 *) info->pseudo_palette)[regno] =
 		    (regno << info->var.red.offset) |
 		    (regno << info->var.green.offset) |
@@ -889,7 +887,6 @@ static int nvidiafb_check_var(struct fb_var_screeninfo *var,
 		var->yres_virtual = vramlen / pitch;
 
 		if (var->yres_virtual < var->yres) {
-			gmb();
 			var->yres_virtual = var->yres;
 			var->xres_virtual = vramlen / var->yres_virtual;
 			var->xres_virtual /= var->bits_per_pixel / 8;
@@ -1060,7 +1057,7 @@ static int nvidiafb_suspend(struct pci_dev *dev, pm_message_t mesg)
 
 	if (mesg.event == PM_EVENT_PRETHAW)
 		mesg.event = PM_EVENT_FREEZE;
-	acquire_console_sem();
+	console_lock();
 	par->pm_state = mesg.event;
 
 	if (mesg.event & PM_EVENT_SLEEP) {
@@ -1073,7 +1070,7 @@ static int nvidiafb_suspend(struct pci_dev *dev, pm_message_t mesg)
 	}
 	dev->dev.power.power_state = mesg;
 
-	release_console_sem();
+	console_unlock();
 	return 0;
 }
 
@@ -1082,7 +1079,7 @@ static int nvidiafb_resume(struct pci_dev *dev)
 	struct fb_info *info = pci_get_drvdata(dev);
 	struct nvidia_par *par = info->par;
 
-	acquire_console_sem();
+	console_lock();
 	pci_set_power_state(dev, PCI_D0);
 
 	if (par->pm_state != PM_EVENT_FREEZE) {
@@ -1100,7 +1097,7 @@ static int nvidiafb_resume(struct pci_dev *dev)
 	nvidiafb_blank(FB_BLANK_UNBLANK, info);
 
 fail:
-	release_console_sem();
+	console_unlock();
 	return 0;
 }
 #else
@@ -1108,7 +1105,7 @@ fail:
 #define nvidiafb_resume NULL
 #endif
 
-static int __devinit nvidia_set_fbinfo(struct fb_info *info)
+static int nvidia_set_fbinfo(struct fb_info *info)
 {
 	struct fb_monspecs *specs = &info->monspecs;
 	struct fb_videomode modedb;
@@ -1204,7 +1201,7 @@ static int __devinit nvidia_set_fbinfo(struct fb_info *info)
 	return nvidiafb_check_var(&info->var, info);
 }
 
-static u32 __devinit nvidia_get_chipset(struct fb_info *info)
+static u32 nvidia_get_chipset(struct fb_info *info)
 {
 	struct nvidia_par *par = info->par;
 	u32 id = (par->pci_dev->vendor << 16) | par->pci_dev->device;
@@ -1227,7 +1224,7 @@ static u32 __devinit nvidia_get_chipset(struct fb_info *info)
 	return id;
 }
 
-static u32 __devinit nvidia_get_arch(struct fb_info *info)
+static u32 nvidia_get_arch(struct fb_info *info)
 {
 	struct nvidia_par *par = info->par;
 	u32 arch = 0;
@@ -1279,8 +1276,7 @@ static u32 __devinit nvidia_get_arch(struct fb_info *info)
 	return arch;
 }
 
-static int __devinit nvidiafb_probe(struct pci_dev *pd,
-				    const struct pci_device_id *ent)
+static int nvidiafb_probe(struct pci_dev *pd, const struct pci_device_id *ent)
 {
 	struct nvidia_par *par;
 	struct fb_info *info;
@@ -1441,7 +1437,7 @@ err_out:
 	return -ENODEV;
 }
 
-static void __devexit nvidiafb_remove(struct pci_dev *pd)
+static void nvidiafb_remove(struct pci_dev *pd)
 {
 	struct fb_info *info = pci_get_drvdata(pd);
 	struct nvidia_par *par = info->par;
@@ -1476,7 +1472,7 @@ static void __devexit nvidiafb_remove(struct pci_dev *pd)
  * ------------------------------------------------------------------------- */
 
 #ifndef MODULE
-static int __devinit nvidiafb_setup(char *options)
+static int nvidiafb_setup(char *options)
 {
 	char *this_opt;
 
@@ -1512,7 +1508,7 @@ static int __devinit nvidiafb_setup(char *options)
 			backlight = simple_strtoul(this_opt+10, NULL, 0);
 #ifdef CONFIG_MTRR
 		} else if (!strncmp(this_opt, "nomtrr", 6)) {
-			nomtrr = 1;
+			nomtrr = true;
 #endif
 		} else if (!strncmp(this_opt, "fpdither:", 9)) {
 			fpdither = simple_strtol(this_opt+9, NULL, 0);
@@ -1532,7 +1528,7 @@ static struct pci_driver nvidiafb_driver = {
 	.probe    = nvidiafb_probe,
 	.suspend  = nvidiafb_suspend,
 	.resume   = nvidiafb_resume,
-	.remove   = __devexit_p(nvidiafb_remove),
+	.remove   = nvidiafb_remove,
 };
 
 /* ------------------------------------------------------------------------- *
@@ -1541,7 +1537,7 @@ static struct pci_driver nvidiafb_driver = {
  *
  * ------------------------------------------------------------------------- */
 
-static int __devinit nvidiafb_init(void)
+static int nvidiafb_init(void)
 {
 #ifndef MODULE
 	char *option = NULL;
@@ -1602,7 +1598,7 @@ MODULE_PARM_DESC(bpp, "pixel width in bits"
 module_param(reverse_i2c, int, 0);
 MODULE_PARM_DESC(reverse_i2c, "reverse port assignment of the i2c bus");
 #ifdef CONFIG_MTRR
-module_param(nomtrr, bool, 0);
+module_param(nomtrr, bool, false);
 MODULE_PARM_DESC(nomtrr, "Disables MTRR support (0 or 1=disabled) "
 		 "(default=0)");
 #endif

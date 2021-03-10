@@ -106,8 +106,8 @@ static int clear_fast_ctr(struct percpu_rw_semaphore *brw)
 	int cpu;
 
 	for_each_possible_cpu(cpu) {
-		sum += *per_cpu_ptr(brw->fast_read_ctr, cpu);
-		*per_cpu_ptr(brw->fast_read_ctr, cpu) = 0;
+		sum += per_cpu(*brw->fast_read_ctr, cpu);
+		per_cpu(*brw->fast_read_ctr, cpu) = 0;
 	}
 
 	return sum;

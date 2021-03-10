@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0 */
 #ifndef OXYGEN_H_INCLUDED
 #define OXYGEN_H_INCLUDED
 
@@ -161,8 +162,8 @@ int oxygen_pci_probe(struct pci_dev *pci, int index, char *id,
 				     )
 		    );
 void oxygen_pci_remove(struct pci_dev *pci);
-#ifdef CONFIG_PM
-extern struct dev_pm_ops oxygen_pci_pm;
+#ifdef CONFIG_PM_SLEEP
+extern const struct dev_pm_ops oxygen_pci_pm;
 #endif
 void oxygen_pci_shutdown(struct pci_dev *pci);
 

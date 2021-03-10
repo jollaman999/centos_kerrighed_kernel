@@ -6,7 +6,6 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/scatterlist.h>
-#include <linux/gfp.h>
 
 #include "blk.h"
 
@@ -39,23 +38,17 @@ static void bio_batch_end_io(struct bio *bio, int err)
  *    Issue a discard request for the sectors in question.
  */
 int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
-		sector_t nr_sects, gfp_t gfp_mask, int flags)
+		sector_t nr_sects, gfp_t gfp_mask, unsigned long flags)
 {
 	DECLARE_COMPLETION_ONSTACK(wait);
 	struct request_queue *q = bdev_get_queue(bdev);
-	int type = (1 << BIO_RW) | (1 << BIO_RW_DISCARD);
-	sector_t max_discard_sectors;
-	sector_t granularity, alignment;
+	int type = REQ_WRITE | REQ_DISCARD;
+	unsigned int max_discard_sectors, granularity;
+	int alignment;
 	struct bio_batch bb;
 	struct bio *bio;
 	int ret = 0;
-
-	/*
-	 * DEPRECATED support for DISCARD_FL_BARRIER which will
-	 * fail with -EOPNOTSUPP (due to implicit BIO_RW_BARRIER)
-	 */
-	if (flags & DISCARD_FL_BARRIER)
-		type = DISCARD_BARRIER;
+	struct blk_plug plug;
 
 	if (!q)
 		return -ENXIO;
@@ -65,25 +58,30 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 
 	/* Zero-sector (unknown) and one-sector granularities are the same.  */
 	granularity = max(q->limits.discard_granularity >> 9, 1U);
-	alignment = bdev_discard_alignment(bdev) >> 9;
-	alignment = sector_div(alignment, granularity);
+	alignment = (bdev_discard_alignment(bdev) >> 9) % granularity;
 
 	/*
 	 * Ensure that max_discard_sectors is of the proper
 	 * granularity, so that requests stay aligned after a split.
 	 */
 	max_discard_sectors = min(q->limits.max_discard_sectors, UINT_MAX >> 9);
-	sector_div(max_discard_sectors, granularity);
-	max_discard_sectors *= granularity;
+	max_discard_sectors -= max_discard_sectors % granularity;
 	if (unlikely(!max_discard_sectors)) {
 		/* Avoid infinite loop below. Being cautious never hurts. */
 		return -EOPNOTSUPP;
+	}
+
+	if (flags & BLKDEV_DISCARD_SECURE) {
+		if (!blk_queue_secdiscard(q))
+			return -EOPNOTSUPP;
+		type |= REQ_SECURE;
 	}
 
 	atomic_set(&bb.done, 1);
 	bb.flags = 1 << BIO_UPTODATE;
 	bb.wait = &wait;
 
+	blk_start_plug(&plug);
 	while (nr_sects) {
 		unsigned int req_sects;
 		sector_t end_sect, tmp;
@@ -121,11 +119,20 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 
 		atomic_inc(&bb.done);
 		submit_bio(type, bio);
+
+		/*
+		 * We can loop for a long time in here, if someone does
+		 * full device discards (like mkfs). Be nice and allow
+		 * us to schedule out to avoid softlocking if preempt
+		 * is disabled.
+		 */
+		cond_resched();
 	}
+	blk_finish_plug(&plug);
 
 	/* Wait for bios in-flight */
 	if (!atomic_dec_and_test(&bb.done))
-		wait_for_completion(&wait);
+		wait_for_completion_io(&wait);
 
 	if (!test_bit(BIO_UPTODATE, &bb.flags))
 		ret = -EIO;
@@ -133,6 +140,80 @@ int blkdev_issue_discard(struct block_device *bdev, sector_t sector,
 	return ret;
 }
 EXPORT_SYMBOL(blkdev_issue_discard);
+
+/**
+ * blkdev_issue_write_same - queue a write same operation
+ * @bdev:	target blockdev
+ * @sector:	start sector
+ * @nr_sects:	number of sectors to write
+ * @gfp_mask:	memory allocation flags (for bio_alloc)
+ * @page:	page containing data to write
+ *
+ * Description:
+ *    Issue a write same request for the sectors in question.
+ */
+int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
+			    sector_t nr_sects, gfp_t gfp_mask,
+			    struct page *page)
+{
+	DECLARE_COMPLETION_ONSTACK(wait);
+	struct request_queue *q = bdev_get_queue(bdev);
+	unsigned int max_write_same_sectors;
+	struct bio_batch bb;
+	struct bio *bio;
+	int ret = 0;
+
+	if (!q)
+		return -ENXIO;
+
+	max_write_same_sectors = q->limits.max_write_same_sectors;
+
+	if (max_write_same_sectors == 0)
+		return -EOPNOTSUPP;
+
+	atomic_set(&bb.done, 1);
+	bb.flags = 1 << BIO_UPTODATE;
+	bb.wait = &wait;
+
+	while (nr_sects) {
+		bio = bio_alloc(gfp_mask, 1);
+		if (!bio) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		bio->bi_sector = sector;
+		bio->bi_end_io = bio_batch_end_io;
+		bio->bi_bdev = bdev;
+		bio->bi_private = &bb;
+		bio->bi_vcnt = 1;
+		bio->bi_io_vec->bv_page = page;
+		bio->bi_io_vec->bv_offset = 0;
+		bio->bi_io_vec->bv_len = bdev_logical_block_size(bdev);
+
+		if (nr_sects > max_write_same_sectors) {
+			bio->bi_size = max_write_same_sectors << 9;
+			nr_sects -= max_write_same_sectors;
+			sector += max_write_same_sectors;
+		} else {
+			bio->bi_size = nr_sects << 9;
+			nr_sects = 0;
+		}
+
+		atomic_inc(&bb.done);
+		submit_bio(REQ_WRITE | REQ_WRITE_SAME, bio);
+	}
+
+	/* Wait for bios in-flight */
+	if (!atomic_dec_and_test(&bb.done))
+		wait_for_completion_io(&wait);
+
+	if (!test_bit(BIO_UPTODATE, &bb.flags))
+		ret = -ENOTSUPP;
+
+	return ret;
+}
+EXPORT_SYMBOL(blkdev_issue_write_same);
 
 /**
  * blkdev_issue_zeroout - generate number of zero filed write bios
@@ -145,8 +226,8 @@ EXPORT_SYMBOL(blkdev_issue_discard);
  *  Generate and issue number of bios with zerofiled pages.
  */
 
-int blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
-			sector_t nr_sects, gfp_t gfp_mask)
+static int __blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
+				  sector_t nr_sects, gfp_t gfp_mask)
 {
 	int ret;
 	struct bio *bio;
@@ -187,12 +268,40 @@ int blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
 
 	/* Wait for bios in-flight */
 	if (!atomic_dec_and_test(&bb.done))
-		wait_for_completion(&wait);
+		wait_for_completion_io(&wait);
 
 	if (!test_bit(BIO_UPTODATE, &bb.flags))
 		/* One of bios in the batch was completed with error.*/
 		ret = -EIO;
 
 	return ret;
+}
+
+/**
+ * blkdev_issue_zeroout - zero-fill a block range
+ * @bdev:	blockdev to write
+ * @sector:	start sector
+ * @nr_sects:	number of sectors to write
+ * @gfp_mask:	memory allocation flags (for bio_alloc)
+ *
+ * Description:
+ *  Generate and issue number of bios with zerofiled pages.
+ */
+
+int blkdev_issue_zeroout(struct block_device *bdev, sector_t sector,
+			 sector_t nr_sects, gfp_t gfp_mask)
+{
+	if (bdev_write_same(bdev)) {
+		unsigned char bdn[BDEVNAME_SIZE];
+
+		if (!blkdev_issue_write_same(bdev, sector, nr_sects, gfp_mask,
+					     ZERO_PAGE(0)))
+			return 0;
+
+		bdevname(bdev, bdn);
+		pr_err("%s: WRITE SAME failed. Manually zeroing.\n", bdn);
+	}
+
+	return __blkdev_issue_zeroout(bdev, sector, nr_sects, gfp_mask);
 }
 EXPORT_SYMBOL(blkdev_issue_zeroout);

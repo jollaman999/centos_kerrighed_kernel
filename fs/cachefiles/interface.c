@@ -9,8 +9,8 @@
  * 2 of the Licence, or (at your option) any later version.
  */
 
+#include <linux/slab.h>
 #include <linux/mount.h>
-#include <linux/buffer_head.h>
 #include "internal.h"
 
 struct cachefiles_lookup_data {
@@ -193,7 +193,7 @@ struct fscache_object *cachefiles_grab_object(struct fscache_object *_object)
 }
 
 /*
- * update the auxilliary data for an object object on disk
+ * update the auxiliary data for an object object on disk
  */
 static void cachefiles_update_object(struct fscache_object *_object)
 {
@@ -281,9 +281,8 @@ static void cachefiles_drop_object(struct fscache_object *_object)
 		    _object != cache->cache.fsdef
 		    ) {
 			_debug("- retire object OBJ%x", object->fscache.debug_id);
-			inode = object->dentry->d_inode;
-			if (inode)
-				i_blocks = inode->i_blocks;
+			inode = d_backing_inode(object->dentry);
+			i_blocks = inode ? 0 : inode->i_blocks;
 
 			cachefiles_begin_secure(cache, &saved_cred);
 			cachefiles_delete_object(cache, object);
@@ -386,7 +385,7 @@ static void cachefiles_sync_cache(struct fscache_cache *_cache)
  * check if the backing cache is updated to FS-Cache
  * - called by FS-Cache when evaluates if need to invalidate the cache
  */
-static int cachefiles_check_consistency(struct fscache_operation *op)
+static bool cachefiles_check_consistency(struct fscache_operation *op)
 {
 	struct cachefiles_object *object;
 	struct cachefiles_cache *cache;
@@ -454,14 +453,14 @@ static int cachefiles_attr_changed(struct fscache_object *_object)
 		_debug("discard tail %llx", oi_size);
 		newattrs.ia_valid = ATTR_SIZE;
 		newattrs.ia_size = oi_size & PAGE_MASK;
-		ret = notify_change(object->backer, &newattrs);
+		ret = notify_change(object->backer, &newattrs, NULL);
 		if (ret < 0)
 			goto truncate_failed;
 	}
 
 	newattrs.ia_valid = ATTR_SIZE;
 	newattrs.ia_size = ni_size;
-	ret = notify_change(object->backer, &newattrs);
+	ret = notify_change(object->backer, &newattrs, NULL);
 
 truncate_failed:
 	mutex_unlock(&object->backer->d_inode->i_mutex);

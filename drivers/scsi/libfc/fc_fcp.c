@@ -27,6 +27,7 @@
 #include <linux/scatterlist.h>
 #include <linux/err.h>
 #include <linux/crc32.h>
+#include <linux/slab.h>
 
 #include <scsi/scsi_tcq.h>
 #include <scsi/scsi.h>
@@ -48,7 +49,7 @@ static struct kmem_cache *scsi_pkt_cachep;
 #define FC_SRB_CMD_SENT		(1 << 0)	/* cmd has been sent */
 #define FC_SRB_RCV_STATUS	(1 << 1)	/* response has arrived */
 #define FC_SRB_ABORT_PENDING	(1 << 2)	/* cmd abort sent to device */
-#define FC_SRB_ABORTED		(1 << 3)	/* abort acknowleged */
+#define FC_SRB_ABORTED		(1 << 3)	/* abort acknowledged */
 #define FC_SRB_DISCONTIG	(1 << 4)	/* non-sequential data recvd */
 #define FC_SRB_COMPL		(1 << 5)	/* fc_io_compl has been run */
 #define FC_SRB_FCP_PROCESSING_TMO (1 << 6)	/* timer function processing */
@@ -157,6 +158,9 @@ static struct fc_fcp_pkt *fc_fcp_pkt_alloc(struct fc_lport *lport, gfp_t gfp)
 		fsp->timer.data = (unsigned long)fsp;
 		INIT_LIST_HEAD(&fsp->list);
 		spin_lock_init(&fsp->scsi_pkt_lock);
+	} else {
+		per_cpu_ptr(lport->stats, get_cpu())->FcpPktAllocFails++;
+		put_cpu();
 	}
 	return fsp;
 }
@@ -262,6 +266,9 @@ static int fc_fcp_send_abort(struct fc_fcp_pkt *fsp)
 {
 	if (!fsp->seq_ptr)
 		return -EINVAL;
+
+	per_cpu_ptr(fsp->lp->stats, get_cpu())->FcpPktAborts++;
+	put_cpu();
 
 	fsp->state |= FC_SRB_ABORT_PENDING;
 	return fsp->lp->tt.seq_exch_abort(fsp->seq_ptr, 0);
@@ -419,6 +426,8 @@ static inline struct fc_frame *fc_fcp_frame_alloc(struct fc_lport *lport,
 	if (likely(fp))
 		return fp;
 
+	per_cpu_ptr(lport->stats, get_cpu())->FcpFrameAllocFails++;
+	put_cpu();
 	/* error case */
 	fc_fcp_can_queue_ramp_down(lport);
 	return NULL;
@@ -484,11 +493,11 @@ static void fc_fcp_recv_data(struct fc_fcp_pkt *fsp, struct fc_frame *fp)
 
 	if (!(fr_flags(fp) & FCPHF_CRC_UNCHECKED)) {
 		copy_len = fc_copy_buffer_to_sglist(buf, len, sg, &nents,
-						    &offset, KM_SOFTIRQ0, NULL);
+						    &offset, NULL);
 	} else {
 		crc = crc32(~0, (u8 *) fh, sizeof(*fh));
 		copy_len = fc_copy_buffer_to_sglist(buf, len, sg, &nents,
-						    &offset, KM_SOFTIRQ0, &crc);
+						    &offset, &crc);
 		buf = fc_frame_payload_get(fp, 0);
 		if (len % 4)
 			crc = crc32(crc, buf + len, 4 - (len % 4));
@@ -543,7 +552,7 @@ err:
  *
  * Called after receiving a Transfer Ready data descriptor.
  * If the LLD is capable of sequence offload then send down the
- * seq_blen ammount of data in single frame, otherwise send
+ * seq_blen amount of data in single frame, otherwise send
  * multiple frames of the maximum frame payload supported by
  * the target port.
  */
@@ -649,10 +658,10 @@ static int fc_fcp_send_data(struct fc_fcp_pkt *fsp, struct fc_seq *seq,
 			 * The scatterlist item may be bigger than PAGE_SIZE,
 			 * but we must not cross pages inside the kmap.
 			 */
-			page_addr = kmap_atomic(page, KM_SOFTIRQ0);
+			page_addr = kmap_atomic(page);
 			memcpy(data, (char *)page_addr + (off & ~PAGE_MASK),
 			       sg_bytes);
-			kunmap_atomic(page_addr, KM_SOFTIRQ0);
+			kunmap_atomic(page_addr);
 			data += sg_bytes;
 		}
 		offset += sg_bytes;
@@ -871,7 +880,7 @@ static void fc_fcp_resp(struct fc_fcp_pkt *fsp, struct fc_frame *fp)
 				fsp->scsi_resid = ntohl(rp_ex->fr_resid);
 				/*
 				 * The cmnd->underflow is the minimum number of
-				 * bytes that must be transfered for this
+				 * bytes that must be transferred for this
 				 * command.  Provided a sense condition is not
 				 * present, make sure the actual amount
 				 * transferred is at least the underflow value
@@ -1074,8 +1083,7 @@ static int fc_fcp_pkt_send(struct fc_lport *lport, struct fc_fcp_pkt *fsp)
 	fsp->cdb_cmd.fc_dl = htonl(fsp->data_len);
 	fsp->cdb_cmd.fc_flags = fsp->req_flags & ~FCP_CFL_LEN_MASK;
 
-	int_to_scsilun(fsp->cmd->device->lun,
-		       (struct scsi_lun *)fsp->cdb_cmd.fc_lun);
+	int_to_scsilun(fsp->cmd->device->lun, &fsp->cdb_cmd.fc_lun);
 	memcpy(fsp->cdb_cmd.fc_cdb, fsp->cmd->cmnd, fsp->cmd->cmd_len);
 
 	spin_lock_irqsave(&si->scsi_queue_lock, flags);
@@ -1245,7 +1253,7 @@ static void fc_lun_reset_send(unsigned long data)
 /**
  * fc_lun_reset() - Send a LUN RESET command to a device
  *		    and wait for the reply
- * @lport: The local port to sent the comand on
+ * @lport: The local port to sent the command on
  * @fsp:   The FCP packet that identifies the LUN to be reset
  * @id:	   The SCSI command ID
  * @lun:   The LUN ID to be reset
@@ -1257,7 +1265,7 @@ static int fc_lun_reset(struct fc_lport *lport, struct fc_fcp_pkt *fsp,
 
 	fsp->cdb_cmd.fc_dl = htonl(fsp->data_len);
 	fsp->cdb_cmd.fc_tm_flags = FCP_TMF_LUN_RESET;
-	int_to_scsilun(lun, (struct scsi_lun *)fsp->cdb_cmd.fc_lun);
+	int_to_scsilun(lun, &fsp->cdb_cmd.fc_lun);
 
 	fsp->wait_for_comp = 1;
 	init_completion(&fsp->tm_done);
@@ -1299,7 +1307,7 @@ static int fc_lun_reset(struct fc_lport *lport, struct fc_fcp_pkt *fsp,
 }
 
 /**
- * fc_tm_done() - Task Managment response handler
+ * fc_tm_done() - Task Management response handler
  * @seq: The sequence that the response is on
  * @fp:	 The response frame
  * @arg: The FCP packet the response is for
@@ -1481,14 +1489,13 @@ static void fc_fcp_rec_resp(struct fc_seq *seq, struct fc_frame *fp, void *arg)
 		case ELS_RJT_LOGIC:
 		case ELS_RJT_UNAB:
 			/*
-			 * If response got lost or is stuck in the
-			 * queue somewhere we have no idea if and when
-			 * the response will be received. So quarantine
-			 * the xid and retry the command.
+			 * If no data transfer, the command frame got dropped
+			 * so we just retry.  If data was transferred, we
+			 * lost the response but the target has no record,
+			 * so we abort and retry.
 			 */
-			if (rjt->er_explan == ELS_EXPL_OXID_RXID) {
-				struct fc_exch *ep = fc_seq_exch(fsp->seq_ptr);
-				ep->state |= FC_EX_QUARANTINE;
+			if (rjt->er_explan == ELS_EXPL_OXID_RXID &&
+			    fsp->xfer_len == 0) {
 				fc_fcp_retry_cmd(fsp);
 				break;
 			}
@@ -1775,14 +1782,14 @@ static inline int fc_fcp_lport_queue_ready(struct fc_lport *lport)
 
 /**
  * fc_queuecommand() - The queuecommand function of the SCSI template
+ * @shost: The Scsi_Host that the command was issued to
  * @cmd:   The scsi_cmnd to be executed
- * @done:  The callback function to be called when the scsi_cmnd is complete
  *
  * This is the i/o strategy routine, called by the SCSI layer.
  */
-int fc_queuecommand(struct scsi_cmnd *sc_cmd, void (*done)(struct scsi_cmnd *))
+int fc_queuecommand(struct Scsi_Host *shost, struct scsi_cmnd *sc_cmd)
 {
-	struct fc_lport *lport;
+	struct fc_lport *lport = shost_priv(shost);
 	struct fc_rport *rport = starget_to_rport(scsi_target(sc_cmd->device));
 	struct fc_fcp_pkt *fsp;
 	struct fc_rport_libfc_priv *rpriv;
@@ -1790,12 +1797,10 @@ int fc_queuecommand(struct scsi_cmnd *sc_cmd, void (*done)(struct scsi_cmnd *))
 	int rc = 0;
 	struct fc_stats *stats;
 
-	lport = shost_priv(sc_cmd->device->host);
-
 	rval = fc_remote_port_chkready(rport);
 	if (rval) {
 		sc_cmd->result = rval;
-		done(sc_cmd);
+		sc_cmd->scsi_done(sc_cmd);
 		return 0;
 	}
 
@@ -1805,7 +1810,7 @@ int fc_queuecommand(struct scsi_cmnd *sc_cmd, void (*done)(struct scsi_cmnd *))
 		 * online
 		 */
 		sc_cmd->result = DID_IMM_RETRY << 16;
-		done(sc_cmd);
+		sc_cmd->scsi_done(sc_cmd);
 		goto out;
 	}
 
@@ -1829,7 +1834,6 @@ int fc_queuecommand(struct scsi_cmnd *sc_cmd, void (*done)(struct scsi_cmnd *))
 	 */
 	fsp->cmd = sc_cmd;	/* save the cmd */
 	fsp->rport = rport;	/* set the remote port ptr */
-	sc_cmd->scsi_done = done;
 
 	/*
 	 * set up the transfer length

@@ -126,7 +126,6 @@ struct bfa_fcpim_s {
 	u32			path_tov;
 	u16			q_depth;
 	u8			reqq;		/*  Request queue to be used */
-	u8			rsvd;
 	struct list_head	itnim_q;	/*  queue of active itnim */
 	struct list_head	ioim_resfree_q; /*  IOs waiting for f/w */
 	struct list_head	ioim_comp_q;	/*  IO global comp Q	*/
@@ -183,6 +182,7 @@ struct bfa_ioim_s {
 	bfa_cb_cbfn_t		io_cbfn;	/*  IO completion handler */
 	struct bfa_ioim_sp_s	*iosp;		/*  slow-path IO handling */
 	u8			reqq;		/*  Request queue for I/O */
+	u8			mode;		/*  IO is passthrough or not */
 	u64			start_time;	/*  IO's Profile start val */
 };
 
@@ -412,9 +412,19 @@ void bfa_tskim_start(struct bfa_tskim_s *tskim,
 void bfa_cb_tskim_done(void *bfad, struct bfad_tskim_s *dtsk,
 			enum bfi_tskim_status tsk_status);
 
+void	bfa_fcpim_lunmask_rp_update(struct bfa_s *bfa, wwn_t lp_wwn,
+			wwn_t rp_wwn, u16 rp_tag, u8 lp_tag);
+bfa_status_t	bfa_fcpim_lunmask_update(struct bfa_s *bfa, u32 on_off);
+bfa_status_t	bfa_fcpim_lunmask_query(struct bfa_s *bfa, void *buf);
+bfa_status_t	bfa_fcpim_lunmask_delete(struct bfa_s *bfa, u16 vf_id,
+				wwn_t *pwwn, wwn_t rpwwn, struct scsi_lun lun);
+bfa_status_t	bfa_fcpim_lunmask_add(struct bfa_s *bfa, u16 vf_id,
+				wwn_t *pwwn, wwn_t rpwwn, struct scsi_lun lun);
+bfa_status_t	bfa_fcpim_lunmask_clear(struct bfa_s *bfa);
 u16		bfa_fcpim_read_throttle(struct bfa_s *bfa);
 bfa_status_t	bfa_fcpim_write_throttle(struct bfa_s *bfa, u16 value);
 bfa_status_t	bfa_fcpim_throttle_set(struct bfa_s *bfa, u16 value);
 bfa_status_t	bfa_fcpim_throttle_get(struct bfa_s *bfa, void *buf);
 u16     bfa_fcpim_get_throttle_cfg(struct bfa_s *bfa, u16 drv_cfg_param);
+
 #endif /* __BFA_FCPIM_H__ */

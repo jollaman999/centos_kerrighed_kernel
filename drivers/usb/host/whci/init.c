@@ -1,21 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Wireless Host Controller (WHC) initialization.
  *
  * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include <linux/kernel.h>
+#include <linux/gfp.h>
 #include <linux/dma-mapping.h>
 #include <linux/uwb/umc.h>
 
@@ -64,7 +54,7 @@ int whc_init(struct whc *whc)
 	init_waitqueue_head(&whc->cmd_wq);
 	init_waitqueue_head(&whc->async_list_wq);
 	init_waitqueue_head(&whc->periodic_list_wq);
-	whc->workqueue = create_singlethread_workqueue(dev_name(&whc->umc->dev));
+	whc->workqueue = alloc_ordered_workqueue(dev_name(&whc->umc->dev), 0);
 	if (whc->workqueue == NULL) {
 		ret = -ENOMEM;
 		goto error;
@@ -174,10 +164,9 @@ void whc_clean_up(struct whc *whc)
 	pzl_clean_up(whc);
 	asl_clean_up(whc);
 
-	if (whc->qset_pool)
-		dma_pool_destroy(whc->qset_pool);
+	dma_pool_destroy(whc->qset_pool);
 
-	len   = whc->umc->resource.end - whc->umc->resource.start + 1;
+	len   = resource_size(&whc->umc->resource);
 	if (whc->base)
 		iounmap(whc->base);
 	if (whc->base_phys)

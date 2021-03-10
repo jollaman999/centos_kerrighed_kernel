@@ -11,7 +11,6 @@
  */
 #include <linux/kernel.h>
 #include <linux/sched.h>
-#include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/errno.h>
 #include <linux/ptrace.h>
@@ -27,7 +26,6 @@
 #include <asm/processor.h>
 #include <asm/ptrace_offsets.h>
 #include <asm/rse.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <asm/unwind.h>
 #ifdef CONFIG_PERFMON
@@ -639,7 +637,7 @@ ptrace_attach_sync_user_rbs (struct task_struct *child)
 	 */
 
 	read_lock(&tasklist_lock);
-	if (child->signal) {
+	if (child->sighand) {
 		spin_lock_irq(&child->sighand->siglock);
 		if (child->state == TASK_STOPPED &&
 		    !test_and_set_tsk_thread_flag(child, TIF_RESTORE_RSE)) {
@@ -663,7 +661,7 @@ ptrace_attach_sync_user_rbs (struct task_struct *child)
 	 * job control stop, so that SIGCONT can be used to wake it up.
 	 */
 	read_lock(&tasklist_lock);
-	if (child->signal) {
+	if (child->sighand) {
 		spin_lock_irq(&child->sighand->siglock);
 		if (child->state == TASK_TRACED &&
 		    (child->signal->flags & SIGNAL_STOP_STOPPED)) {
@@ -672,33 +670,6 @@ ptrace_attach_sync_user_rbs (struct task_struct *child)
 		spin_unlock_irq(&child->sighand->siglock);
 	}
 	read_unlock(&tasklist_lock);
-}
-
-static inline int
-thread_matches (struct task_struct *thread, unsigned long addr)
-{
-	unsigned long thread_rbs_end;
-	struct pt_regs *thread_regs;
-
-	if (ptrace_check_attach(thread, 0) < 0)
-		/*
-		 * If the thread is not in an attachable state, we'll
-		 * ignore it.  The net effect is that if ADDR happens
-		 * to overlap with the portion of the thread's
-		 * register backing store that is currently residing
-		 * on the thread's kernel stack, then ptrace() may end
-		 * up accessing a stale value.  But if the thread
-		 * isn't stopped, that's a problem anyhow, so we're
-		 * doing as well as we can...
-		 */
-		return 0;
-
-	thread_regs = task_pt_regs(thread);
-	thread_rbs_end = ia64_get_user_rbs_end(thread, thread_regs, NULL);
-	if (!on_kernel_rbs(addr, thread_regs->ar_bspstore, thread_rbs_end))
-		return 0;
-
-	return 1;	/* looks like we've got a winner */
 }
 
 /*
@@ -1178,7 +1149,8 @@ ptrace_disable (struct task_struct *child)
 }
 
 long
-arch_ptrace (struct task_struct *child, long request, long addr, long data)
+arch_ptrace (struct task_struct *child, long request,
+	     unsigned long addr, unsigned long data)
 {
 	switch (request) {
 	case PTRACE_PEEKTEXT:
@@ -1246,20 +1218,8 @@ syscall_trace_enter (long arg0, long arg1, long arg2, long arg3,
 	if (test_thread_flag(TIF_RESTORE_RSE))
 		ia64_sync_krbs();
 
-	if (unlikely(current->audit_context)) {
-		long syscall;
-		int arch;
 
-		if (IS_IA32_PROCESS(&regs)) {
-			syscall = regs.r1;
-			arch = AUDIT_ARCH_I386;
-		} else {
-			syscall = regs.r15;
-			arch = AUDIT_ARCH_IA64;
-		}
-
-		audit_syscall_entry(arch, syscall, arg0, arg1, arg2, arg3);
-	}
+	audit_syscall_entry(AUDIT_ARCH_IA64, regs.r15, arg0, arg1, arg2, arg3);
 
 	return 0;
 }
@@ -1273,14 +1233,7 @@ syscall_trace_leave (long arg0, long arg1, long arg2, long arg3,
 {
 	int step;
 
-	if (unlikely(current->audit_context)) {
-		int success = AUDITSC_RESULT(regs.r10);
-		long result = regs.r8;
-
-		if (success != AUDITSC_SUCCESS)
-			result = -result;
-		audit_syscall_exit(success, result);
-	}
+	audit_syscall_exit(&regs);
 
 	step = test_thread_flag(TIF_SINGLESTEP);
 	if (step || test_thread_flag(TIF_SYSCALL_TRACE))
@@ -2172,11 +2125,6 @@ static const struct user_regset_view user_ia64_view = {
 
 const struct user_regset_view *task_user_regset_view(struct task_struct *tsk)
 {
-#ifdef CONFIG_IA32_SUPPORT
-	extern const struct user_regset_view user_ia32_view;
-	if (IS_IA32_PROCESS(task_pt_regs(tsk)))
-		return &user_ia32_view;
-#endif
 	return &user_ia64_view;
 }
 

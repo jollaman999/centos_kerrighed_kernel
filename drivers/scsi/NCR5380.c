@@ -695,33 +695,35 @@ static void NCR5380_print_status(struct Scsi_Host *instance)
  * Return the number of bytes read from or written
  */
 
-#undef SPRINTF
-#define SPRINTF(args...) do { if(pos < buffer + length-80) pos += sprintf(pos, ## args); } while(0)
-static
-char *lprint_Scsi_Cmnd(Scsi_Cmnd * cmd, char *pos, char *buffer, int length);
-static
-char *lprint_command(unsigned char *cmd, char *pos, char *buffer, int len);
-static
-char *lprint_opcode(int opcode, char *pos, char *buffer, int length);
-
-static int __maybe_unused NCR5380_proc_info(struct Scsi_Host *instance,
-	char *buffer, char **start, off_t offset, int length, int inout)
+static int __maybe_unused NCR5380_write_info(struct Scsi_Host *instance,
+	char *buffer, int length)
 {
-	char *pos = buffer;
+#ifdef DTC_PUBLIC_RELEASE
+	dtc_wmaxi = dtc_maxi = 0;
+#endif
+#ifdef PAS16_PUBLIC_RELEASE
+	pas_wmaxi = pas_maxi = 0;
+#endif
+	return (-ENOSYS);	/* Currently this is a no-op */
+}
+
+#undef SPRINTF
+#define SPRINTF(args...) seq_printf(m, ## args)
+static
+void lprint_Scsi_Cmnd(Scsi_Cmnd * cmd, struct seq_file *m);
+static
+void lprint_command(unsigned char *cmd, struct seq_file *m);
+static
+void lprint_opcode(int opcode, struct seq_file *m);
+
+static int __maybe_unused NCR5380_show_info(struct seq_file *m,
+	struct Scsi_Host *instance)
+{
 	struct NCR5380_hostdata *hostdata;
 	Scsi_Cmnd *ptr;
 
 	hostdata = (struct NCR5380_hostdata *) instance->hostdata;
 
-	if (inout) {		/* Has data been written to the file ? */
-#ifdef DTC_PUBLIC_RELEASE
-		dtc_wmaxi = dtc_maxi = 0;
-#endif
-#ifdef PAS16_PUBLIC_RELEASE
-		pas_wmaxi = pas_maxi = 0;
-#endif
-		return (-ENOSYS);	/* Currently this is a no-op */
-	}
 	SPRINTF("NCR5380 core release=%d.   ", NCR5380_PUBLIC_RELEASE);
 	if (((struct NCR5380_hostdata *) instance->hostdata)->flags & FLAG_NCR53C400)
 		SPRINTF("ncr53c400 release=%d.  ", NCR53C400_PUBLIC_RELEASE);
@@ -755,46 +757,37 @@ static int __maybe_unused NCR5380_proc_info(struct Scsi_Host *instance,
 	if (!hostdata->connected)
 		SPRINTF("scsi%d: no currently connected command\n", instance->host_no);
 	else
-		pos = lprint_Scsi_Cmnd((Scsi_Cmnd *) hostdata->connected, pos, buffer, length);
+		lprint_Scsi_Cmnd((Scsi_Cmnd *) hostdata->connected, m);
 	SPRINTF("scsi%d: issue_queue\n", instance->host_no);
 	for (ptr = (Scsi_Cmnd *) hostdata->issue_queue; ptr; ptr = (Scsi_Cmnd *) ptr->host_scribble)
-		pos = lprint_Scsi_Cmnd(ptr, pos, buffer, length);
+		lprint_Scsi_Cmnd(ptr, m);
 
 	SPRINTF("scsi%d: disconnected_queue\n", instance->host_no);
 	for (ptr = (Scsi_Cmnd *) hostdata->disconnected_queue; ptr; ptr = (Scsi_Cmnd *) ptr->host_scribble)
-		pos = lprint_Scsi_Cmnd(ptr, pos, buffer, length);
+		lprint_Scsi_Cmnd(ptr, m);
 	spin_unlock_irq(instance->host_lock);
-	
-	*start = buffer;
-	if (pos - buffer < offset)
-		return 0;
-	else if (pos - buffer - offset < length)
-		return pos - buffer - offset;
-	return length;
+	return 0;
 }
 
-static char *lprint_Scsi_Cmnd(Scsi_Cmnd * cmd, char *pos, char *buffer, int length)
+static void lprint_Scsi_Cmnd(Scsi_Cmnd * cmd, struct seq_file *m)
 {
 	SPRINTF("scsi%d : destination target %d, lun %d\n", cmd->device->host->host_no, cmd->device->id, cmd->device->lun);
 	SPRINTF("        command = ");
-	pos = lprint_command(cmd->cmnd, pos, buffer, length);
-	return (pos);
+	lprint_command(cmd->cmnd, m);
 }
 
-static char *lprint_command(unsigned char *command, char *pos, char *buffer, int length)
+static void lprint_command(unsigned char *command, struct seq_file *m)
 {
 	int i, s;
-	pos = lprint_opcode(command[0], pos, buffer, length);
+	lprint_opcode(command[0], m);
 	for (i = 1, s = COMMAND_SIZE(command[0]); i < s; ++i)
 		SPRINTF("%02x ", command[i]);
 	SPRINTF("\n");
-	return (pos);
 }
 
-static char *lprint_opcode(int opcode, char *pos, char *buffer, int length)
+static void lprint_opcode(int opcode, struct seq_file *m)
 {
 	SPRINTF("%2d (0x%02x)", opcode, opcode);
-	return (pos);
 }
 
 
@@ -814,7 +807,7 @@ static char *lprint_opcode(int opcode, char *pos, char *buffer, int length)
  *	Locks: interrupts must be enabled when we are called 
  */
 
-static int __devinit NCR5380_init(struct Scsi_Host *instance, int flags)
+static int NCR5380_init(struct Scsi_Host *instance, int flags)
 {
 	NCR5380_local_declare();
 	int i, pass;
@@ -936,8 +929,7 @@ static void NCR5380_exit(struct Scsi_Host *instance)
 {
 	struct NCR5380_hostdata *hostdata = (struct NCR5380_hostdata *) instance->hostdata;
 
-	cancel_delayed_work(&hostdata->coroutine);
-	flush_scheduled_work();
+	cancel_delayed_work_sync(&hostdata->coroutine);
 }
 
 /**
@@ -952,7 +944,7 @@ static void NCR5380_exit(struct Scsi_Host *instance)
  *	Locks: host lock taken by caller
  */
 
-static int NCR5380_queue_command(Scsi_Cmnd * cmd, void (*done) (Scsi_Cmnd *)) 
+static int NCR5380_queue_command_lck(Scsi_Cmnd * cmd, void (*done) (Scsi_Cmnd *))
 {
 	struct Scsi_Host *instance = cmd->device->host;
 	struct NCR5380_hostdata *hostdata = (struct NCR5380_hostdata *) instance->hostdata;
@@ -1021,6 +1013,7 @@ static int NCR5380_queue_command(Scsi_Cmnd * cmd, void (*done) (Scsi_Cmnd *))
 	return 0;
 }
 
+static DEF_SCSI_QCMD(NCR5380_queue_command)
 
 /**
  *	NCR5380_main	-	NCR state machines
@@ -1198,12 +1191,12 @@ static irqreturn_t NCR5380_intr(int dummy, void *dev_id)
 				 */
 
 				if ((NCR5380_read(MODE_REG) & MR_DMA) && ((basr & BASR_END_DMA_TRANSFER) || !(basr & BASR_PHASE_MATCH))) {
-					int transfered;
+					int transferred;
 
 					if (!hostdata->connected)
 						panic("scsi%d : received end of DMA interrupt with no connected cmd\n", instance->hostno);
 
-					transfered = (hostdata->dmalen - NCR5380_dma_residual(instance));
+					transferred = (hostdata->dmalen - NCR5380_dma_residual(instance));
 					hostdata->connected->SCp.this_residual -= transferred;
 					hostdata->connected->SCp.ptr += transferred;
 					hostdata->dmalen = 0;
@@ -1563,7 +1556,7 @@ failed:
  *      bytes to transfer, **data - pointer to data pointer.
  * 
  * Returns : -1 when different phase is entered without transferring
- *      maximum number of bytes, 0 if all bytes or transfered or exit
+ *      maximum number of bytes, 0 if all bytes or transferred or exit
  *      is in same phase.
  *
  *      Also, *phase, *count, *data are modified in place.
@@ -1800,7 +1793,7 @@ static int do_abort(struct Scsi_Host *host) {
  *      bytes to transfer, **data - pointer to data pointer.
  * 
  * Returns : -1 when different phase is entered without transferring
- *      maximum number of bytes, 0 if all bytes or transfered or exit
+ *      maximum number of bytes, 0 if all bytes or transferred or exit
  *      is in same phase.
  *
  *      Also, *phase, *count, *data are modified in place.
@@ -1857,7 +1850,9 @@ static int NCR5380_transfer_dma(struct Scsi_Host *instance, unsigned char *phase
 #endif
 	/* KLL May need eop and parity in 53c400 */
 	if (hostdata->flags & FLAG_NCR53C400)
-		NCR5380_write(MODE_REG, MR_BASE | MR_DMA_MODE | MR_ENABLE_PAR_CHECK | MR_ENABLE_PAR_INTR | MR_ENABLE_EOP_INTR | MR_DMA_MODE | MR_MONITOR_BSY);
+		NCR5380_write(MODE_REG, MR_BASE | MR_DMA_MODE |
+				MR_ENABLE_PAR_CHECK | MR_ENABLE_PAR_INTR |
+				MR_ENABLE_EOP_INTR | MR_MONITOR_BSY);
 	else
 		NCR5380_write(MODE_REG, MR_BASE | MR_DMA_MODE);
 #endif				/* def REAL_DMA */
@@ -2660,14 +2655,14 @@ static void NCR5380_dma_complete(NCR5380_instance * instance) {
  *
  * Purpose : abort a command
  *
- * Inputs : cmd - the Scsi_Cmnd to abort, code - code to set the 
- *      host byte of the result field to, if zero DID_ABORTED is 
+ * Inputs : cmd - the Scsi_Cmnd to abort, code - code to set the
+ *      host byte of the result field to, if zero DID_ABORTED is
  *      used.
  *
- * Returns : 0 - success, -1 on failure.
+ * Returns : SUCCESS - success, FAILED on failure.
  *
- *	XXX - there is no way to abort the command that is currently 
- *	connected, you have to wait for it to complete.  If this is 
+ *	XXX - there is no way to abort the command that is currently
+ *	connected, you have to wait for it to complete.  If this is
  *	a problem, we could implement longjmp() / setjmp(), setjmp()
  *	called where the loop started in NCR5380_main().
  *
@@ -2679,9 +2674,8 @@ static int NCR5380_abort(Scsi_Cmnd * cmd) {
 	struct Scsi_Host *instance = cmd->device->host;
 	struct NCR5380_hostdata *hostdata = (struct NCR5380_hostdata *) instance->hostdata;
 	Scsi_Cmnd *tmp, **prev;
-	
-	printk(KERN_WARNING "scsi%d : aborting command\n", instance->host_no);
-	scsi_print_command(cmd);
+
+	scmd_printk(KERN_WARNING, cmd, "aborting command\n");
 
 	NCR5380_print_status(instance);
 
@@ -2717,7 +2711,7 @@ static int NCR5380_abort(Scsi_Cmnd * cmd) {
  * aborted flag and get back into our main loop.
  */
 
-		return 0;
+		return SUCCESS;
 	}
 #endif
 

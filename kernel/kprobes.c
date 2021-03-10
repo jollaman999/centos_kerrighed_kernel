@@ -36,7 +36,7 @@
 #include <linux/init.h>
 #include <linux/slab.h>
 #include <linux/stddef.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/moduleloader.h>
 #include <linux/kallsyms.h>
 #include <linux/freezer.h>
@@ -45,17 +45,9 @@
 #include <linux/sysctl.h>
 #include <linux/kdebug.h>
 #include <linux/memory.h>
-#include <linux/cpu.h>
-
-/*
- * Need this inlcude for ftrace_text_reserved, but it breaks
- * KABI by defining struct ftrace_ret_stack, which is used
- * inside struct task_struct .
- */
-#ifndef __GENKSYMS__
 #include <linux/ftrace.h>
-#endif
-
+#include <linux/cpu.h>
+#include <linux/jump_label.h>
 
 #include <asm-generic/sections.h>
 #include <asm/cacheflush.h>
@@ -86,10 +78,10 @@ static bool kprobes_all_disarmed;
 static DEFINE_MUTEX(kprobe_mutex);
 static DEFINE_PER_CPU(struct kprobe *, kprobe_instance) = NULL;
 static struct {
-	spinlock_t lock ____cacheline_aligned_in_smp;
+	raw_spinlock_t lock ____cacheline_aligned_in_smp;
 } kretprobe_table_locks[KPROBE_TABLE_SIZE];
 
-static spinlock_t *kretprobe_table_lock_ptr(unsigned long hash)
+static raw_spinlock_t *kretprobe_table_lock_ptr(unsigned long hash)
 {
 	return &(kretprobe_table_locks[hash].lock);
 }
@@ -120,6 +112,7 @@ static struct kprobe_blackpoint kprobe_blacklist[] = {
 struct kprobe_insn_page {
 	struct list_head list;
 	kprobe_opcode_t *insns;		/* Page of instruction slots */
+	struct kprobe_insn_cache *cache;
 	int nused;
 	int ngarbage;
 	char slot_used[];
@@ -128,12 +121,6 @@ struct kprobe_insn_page {
 #define KPROBE_INSN_PAGE_SIZE(slots)			\
 	(offsetof(struct kprobe_insn_page, slot_used) +	\
 	 (sizeof(char) * (slots)))
-
-struct kprobe_insn_cache {
-	struct list_head pages;	/* list of kprobe_insn_page */
-	size_t insn_size;	/* size of instruction slot */
-	int nr_garbage;
-};
 
 static int slots_per_page(struct kprobe_insn_cache *c)
 {
@@ -146,8 +133,20 @@ enum kprobe_slot_state {
 	SLOT_USED = 2,
 };
 
-static DEFINE_MUTEX(kprobe_insn_mutex);	/* Protects kprobe_insn_slots */
-static struct kprobe_insn_cache kprobe_insn_slots = {
+static void *alloc_insn_page(void)
+{
+	return module_alloc(PAGE_SIZE);
+}
+
+static void free_insn_page(void *page)
+{
+	module_free(NULL, page);
+}
+
+struct kprobe_insn_cache kprobe_insn_slots = {
+	.mutex = __MUTEX_INITIALIZER(kprobe_insn_slots.mutex),
+	.alloc = alloc_insn_page,
+	.free = free_insn_page,
 	.pages = LIST_HEAD_INIT(kprobe_insn_slots.pages),
 	.insn_size = MAX_INSN_SIZE,
 	.nr_garbage = 0,
@@ -158,10 +157,12 @@ static int __kprobes collect_garbage_slots(struct kprobe_insn_cache *c);
  * __get_insn_slot() - Find a slot on an executable page for an instruction.
  * We allocate an executable page if there's no room on existing ones.
  */
-static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
+kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
 {
 	struct kprobe_insn_page *kip;
+	kprobe_opcode_t *slot = NULL;
 
+	mutex_lock(&c->mutex);
  retry:
 	list_for_each_entry(kip, &c->pages, list) {
 		if (kip->nused < slots_per_page(c)) {
@@ -170,7 +171,8 @@ static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
 				if (kip->slot_used[i] == SLOT_CLEAN) {
 					kip->slot_used[i] = SLOT_USED;
 					kip->nused++;
-					return kip->insns + (i * c->insn_size);
+					slot = kip->insns + (i * c->insn_size);
+					goto out;
 				}
 			}
 			/* kip->nused is broken. Fix it. */
@@ -186,37 +188,29 @@ static kprobe_opcode_t __kprobes *__get_insn_slot(struct kprobe_insn_cache *c)
 	/* All out of space.  Need to allocate a new page. */
 	kip = kmalloc(KPROBE_INSN_PAGE_SIZE(slots_per_page(c)), GFP_KERNEL);
 	if (!kip)
-		return NULL;
+		goto out;
 
 	/*
 	 * Use module_alloc so this page is within +/- 2GB of where the
 	 * kernel image and loaded module images reside. This is required
 	 * so x86_64 can correctly handle the %rip-relative fixups.
 	 */
-	kip->insns = module_alloc(PAGE_SIZE);
+	kip->insns = c->alloc();
 	if (!kip->insns) {
 		kfree(kip);
-		return NULL;
+		goto out;
 	}
 	INIT_LIST_HEAD(&kip->list);
 	memset(kip->slot_used, SLOT_CLEAN, slots_per_page(c));
 	kip->slot_used[0] = SLOT_USED;
 	kip->nused = 1;
 	kip->ngarbage = 0;
+	kip->cache = c;
 	list_add(&kip->list, &c->pages);
-	return kip->insns;
-}
-
-
-kprobe_opcode_t __kprobes *get_insn_slot(void)
-{
-	kprobe_opcode_t *ret = NULL;
-
-	mutex_lock(&kprobe_insn_mutex);
-	ret = __get_insn_slot(&kprobe_insn_slots);
-	mutex_unlock(&kprobe_insn_mutex);
-
-	return ret;
+	slot = kip->insns;
+out:
+	mutex_unlock(&c->mutex);
+	return slot;
 }
 
 /* Return 1 if all garbages are collected, otherwise 0. */
@@ -233,7 +227,7 @@ static int __kprobes collect_one_slot(struct kprobe_insn_page *kip, int idx)
 		 */
 		if (!list_is_singular(&kip->list)) {
 			list_del(&kip->list);
-			module_free(NULL, kip->insns);
+			kip->cache->free(kip->insns);
 			kfree(kip);
 		}
 		return 1;
@@ -263,11 +257,12 @@ static int __kprobes collect_garbage_slots(struct kprobe_insn_cache *c)
 	return 0;
 }
 
-static void __kprobes __free_insn_slot(struct kprobe_insn_cache *c,
-				       kprobe_opcode_t *slot, int dirty)
+void __kprobes __free_insn_slot(struct kprobe_insn_cache *c,
+				kprobe_opcode_t *slot, int dirty)
 {
 	struct kprobe_insn_page *kip;
 
+	mutex_lock(&c->mutex);
 	list_for_each_entry(kip, &c->pages, list) {
 		long idx = ((long)slot - (long)kip->insns) /
 				(c->insn_size * sizeof(kprobe_opcode_t));
@@ -280,57 +275,37 @@ static void __kprobes __free_insn_slot(struct kprobe_insn_cache *c,
 					collect_garbage_slots(c);
 			} else
 				collect_one_slot(kip, idx);
-			return;
+			goto out;
 		}
 	}
 	/* Could not free this slot. */
 	WARN_ON(1);
+out:
+	mutex_unlock(&c->mutex);
 }
 
-void __kprobes free_insn_slot(kprobe_opcode_t * slot, int dirty)
-{
-	mutex_lock(&kprobe_insn_mutex);
-	__free_insn_slot(&kprobe_insn_slots, slot, dirty);
-	mutex_unlock(&kprobe_insn_mutex);
-}
 #ifdef CONFIG_OPTPROBES
 /* For optimized_kprobe buffer */
-static DEFINE_MUTEX(kprobe_optinsn_mutex); /* Protects kprobe_optinsn_slots */
-static struct kprobe_insn_cache kprobe_optinsn_slots = {
+struct kprobe_insn_cache kprobe_optinsn_slots = {
+	.mutex = __MUTEX_INITIALIZER(kprobe_optinsn_slots.mutex),
+	.alloc = alloc_insn_page,
+	.free = free_insn_page,
 	.pages = LIST_HEAD_INIT(kprobe_optinsn_slots.pages),
 	/* .insn_size is initialized later */
 	.nr_garbage = 0,
 };
-/* Get a slot for optimized_kprobe buffer */
-kprobe_opcode_t __kprobes *get_optinsn_slot(void)
-{
-	kprobe_opcode_t *ret = NULL;
-
-	mutex_lock(&kprobe_optinsn_mutex);
-	ret = __get_insn_slot(&kprobe_optinsn_slots);
-	mutex_unlock(&kprobe_optinsn_mutex);
-
-	return ret;
-}
-
-void __kprobes free_optinsn_slot(kprobe_opcode_t * slot, int dirty)
-{
-	mutex_lock(&kprobe_optinsn_mutex);
-	__free_insn_slot(&kprobe_optinsn_slots, slot, dirty);
-	mutex_unlock(&kprobe_optinsn_mutex);
-}
 #endif
 #endif
 
 /* We have preemption disabled.. so it is safe to use __ versions */
 static inline void set_kprobe_instance(struct kprobe *kp)
 {
-	__get_cpu_var(kprobe_instance) = kp;
+	__this_cpu_write(kprobe_instance, kp);
 }
 
 static inline void reset_kprobe_instance(void)
 {
-	__get_cpu_var(kprobe_instance) = NULL;
+	__this_cpu_write(kprobe_instance, NULL);
 }
 
 /*
@@ -342,11 +317,10 @@ static inline void reset_kprobe_instance(void)
 struct kprobe __kprobes *get_kprobe(void *addr)
 {
 	struct hlist_head *head;
-	struct hlist_node *node;
 	struct kprobe *p;
 
 	head = &kprobe_table[hash_ptr(addr, KPROBE_HASH_BITS)];
-	hlist_for_each_entry_rcu(p, node, head, hlist) {
+	hlist_for_each_entry_rcu(p, head, hlist) {
 		if (p->addr == addr)
 			return p;
 	}
@@ -362,13 +336,20 @@ static inline int kprobe_aggrprobe(struct kprobe *p)
 	return p->pre_handler == aggr_pre_handler;
 }
 
+/* Return true(!0) if the kprobe is unused */
+static inline int kprobe_unused(struct kprobe *p)
+{
+	return kprobe_aggrprobe(p) && kprobe_disabled(p) &&
+	       list_empty(&p->list);
+}
+
 /*
  * Keep all fields in the kprobe consistent
  */
-static inline void copy_kprobe(struct kprobe *old_p, struct kprobe *p)
+static inline void copy_kprobe(struct kprobe *ap, struct kprobe *p)
 {
-	memcpy(&p->opcode, &old_p->opcode, sizeof(kprobe_opcode_t));
-	memcpy(&p->ainsn, &old_p->ainsn, sizeof(struct arch_specific_insn));
+	memcpy(&p->opcode, &ap->opcode, sizeof(kprobe_opcode_t));
+	memcpy(&p->ainsn, &ap->ainsn, sizeof(struct arch_specific_insn));
 }
 
 #ifdef CONFIG_OPTPROBES
@@ -392,6 +373,17 @@ void __kprobes opt_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	}
 }
 
+/* Free optimized instructions and optimized_kprobe */
+static __kprobes void free_aggr_kprobe(struct kprobe *p)
+{
+	struct optimized_kprobe *op;
+
+	op = container_of(p, struct optimized_kprobe, kp);
+	arch_remove_optimized_kprobe(op);
+	arch_remove_kprobe(p);
+	kfree(op);
+}
+
 /* Return true(!0) if the kprobe is ready for optimization. */
 static inline int kprobe_optready(struct kprobe *p)
 {
@@ -402,6 +394,33 @@ static inline int kprobe_optready(struct kprobe *p)
 		return arch_prepared_optinsn(&op->optinsn);
 	}
 
+	return 0;
+}
+
+/* Return true(!0) if the kprobe is disarmed. Note: p must be on hash list */
+static inline int kprobe_disarmed(struct kprobe *p)
+{
+	struct optimized_kprobe *op;
+
+	/* If kprobe is not aggr/opt probe, just return kprobe is disabled */
+	if (!kprobe_aggrprobe(p))
+		return kprobe_disabled(p);
+
+	op = container_of(p, struct optimized_kprobe, kp);
+
+	return kprobe_disabled(p) && list_empty(&op->list);
+}
+
+/* Return true(!0) if the probe is queued on (un)optimizing lists */
+static int __kprobes kprobe_queued(struct kprobe *p)
+{
+	struct optimized_kprobe *op;
+
+	if (kprobe_aggrprobe(p)) {
+		op = container_of(p, struct optimized_kprobe, kp);
+		if (!list_empty(&op->list))
+			return 1;
+	}
 	return 0;
 }
 
@@ -430,30 +449,23 @@ static struct kprobe *__kprobes get_optimized_kprobe(unsigned long addr)
 
 /* Optimization staging list, protected by kprobe_mutex */
 static LIST_HEAD(optimizing_list);
+static LIST_HEAD(unoptimizing_list);
+static LIST_HEAD(freeing_list);
 
 static void kprobe_optimizer(struct work_struct *work);
 static DECLARE_DELAYED_WORK(optimizing_work, kprobe_optimizer);
 #define OPTIMIZE_DELAY 5
 
-/* Kprobe jump optimizer */
-static __kprobes void kprobe_optimizer(struct work_struct *work)
+/*
+ * Optimize (replace a breakpoint with a jump) kprobes listed on
+ * optimizing_list.
+ */
+static __kprobes void do_optimize_kprobes(void)
 {
-	struct optimized_kprobe *op, *tmp;
-
-	/* Lock modules while optimizing kprobes */
-	mutex_lock(&module_mutex);
-	mutex_lock(&kprobe_mutex);
-	if (kprobes_all_disarmed || !kprobes_allow_optimization)
-		goto end;
-
-	/*
-	 * Wait for quiesence period to ensure all running interrupts
-	 * are done. Because optprobe may modify multiple instructions
-	 * there is a chance that Nth instruction is interrupted. In that
-	 * case, running interrupt can return to 2nd-Nth byte of jump
-	 * instruction. This wait is for avoiding it.
-	 */
-	synchronize_sched();
+	/* Optimization never be done when disarmed */
+	if (kprobes_all_disarmed || !kprobes_allow_optimization ||
+	    list_empty(&optimizing_list))
+		return;
 
 	/*
 	 * The optimization/unoptimization refers online_cpus via
@@ -467,17 +479,117 @@ static __kprobes void kprobe_optimizer(struct work_struct *work)
 	 */
 	get_online_cpus();
 	mutex_lock(&text_mutex);
-	list_for_each_entry_safe(op, tmp, &optimizing_list, list) {
-		WARN_ON(kprobe_disabled(&op->kp));
-		if (arch_optimize_kprobe(op) < 0)
-			op->kp.flags &= ~KPROBE_FLAG_OPTIMIZED;
-		list_del_init(&op->list);
+	arch_optimize_kprobes(&optimizing_list);
+	mutex_unlock(&text_mutex);
+	put_online_cpus();
+}
+
+/*
+ * Unoptimize (replace a jump with a breakpoint and remove the breakpoint
+ * if need) kprobes listed on unoptimizing_list.
+ */
+static __kprobes void do_unoptimize_kprobes(void)
+{
+	struct optimized_kprobe *op, *tmp;
+
+	/* Unoptimization must be done anytime */
+	if (list_empty(&unoptimizing_list))
+		return;
+
+	/* Ditto to do_optimize_kprobes */
+	get_online_cpus();
+	mutex_lock(&text_mutex);
+	arch_unoptimize_kprobes(&unoptimizing_list, &freeing_list);
+	/* Loop free_list for disarming */
+	list_for_each_entry_safe(op, tmp, &freeing_list, list) {
+		/* Disarm probes if marked disabled */
+		if (kprobe_disabled(&op->kp))
+			arch_disarm_kprobe(&op->kp);
+		if (kprobe_unused(&op->kp)) {
+			/*
+			 * Remove unused probes from hash list. After waiting
+			 * for synchronization, these probes are reclaimed.
+			 * (reclaiming is done by do_free_cleaned_kprobes.)
+			 */
+			hlist_del_rcu(&op->kp.hlist);
+		} else
+			list_del_init(&op->list);
 	}
 	mutex_unlock(&text_mutex);
 	put_online_cpus();
-end:
-	mutex_unlock(&kprobe_mutex);
+}
+
+/* Reclaim all kprobes on the free_list */
+static __kprobes void do_free_cleaned_kprobes(void)
+{
+	struct optimized_kprobe *op, *tmp;
+
+	list_for_each_entry_safe(op, tmp, &freeing_list, list) {
+		BUG_ON(!kprobe_unused(&op->kp));
+		list_del_init(&op->list);
+		free_aggr_kprobe(&op->kp);
+	}
+}
+
+/* Start optimizer after OPTIMIZE_DELAY passed */
+static __kprobes void kick_kprobe_optimizer(void)
+{
+	schedule_delayed_work(&optimizing_work, OPTIMIZE_DELAY);
+}
+
+/* Kprobe jump optimizer */
+static __kprobes void kprobe_optimizer(struct work_struct *work)
+{
+	mutex_lock(&kprobe_mutex);
+	/* Lock modules while optimizing kprobes */
+	mutex_lock(&module_mutex);
+
+	/*
+	 * Step 1: Unoptimize kprobes and collect cleaned (unused and disarmed)
+	 * kprobes before waiting for quiesence period.
+	 */
+	do_unoptimize_kprobes();
+
+	/*
+	 * Step 2: Wait for quiesence period to ensure all running interrupts
+	 * are done. Because optprobe may modify multiple instructions
+	 * there is a chance that Nth instruction is interrupted. In that
+	 * case, running interrupt can return to 2nd-Nth byte of jump
+	 * instruction. This wait is for avoiding it.
+	 */
+	synchronize_sched();
+
+	/* Step 3: Optimize kprobes after quiesence period */
+	do_optimize_kprobes();
+
+	/* Step 4: Free cleaned kprobes after quiesence period */
+	do_free_cleaned_kprobes();
+
 	mutex_unlock(&module_mutex);
+	mutex_unlock(&kprobe_mutex);
+
+	/* Step 5: Kick optimizer again if needed */
+	if (!list_empty(&optimizing_list) || !list_empty(&unoptimizing_list))
+		kick_kprobe_optimizer();
+}
+
+/* Wait for completing optimization and unoptimization */
+static __kprobes void wait_for_kprobe_optimizer(void)
+{
+	mutex_lock(&kprobe_mutex);
+
+	while (!list_empty(&optimizing_list) || !list_empty(&unoptimizing_list)) {
+		mutex_unlock(&kprobe_mutex);
+
+		/* this will also make optimizing_work execute immmediately */
+		flush_delayed_work(&optimizing_work);
+		/* @optimizing_work might not have been queued yet, relax */
+		cpu_relax();
+
+		mutex_lock(&kprobe_mutex);
+	}
+
+	mutex_unlock(&kprobe_mutex);
 }
 
 /* Optimize kprobe if p is ready to be optimized */
@@ -503,28 +615,83 @@ static __kprobes void optimize_kprobe(struct kprobe *p)
 	/* Check if it is already optimized. */
 	if (op->kp.flags & KPROBE_FLAG_OPTIMIZED)
 		return;
-
 	op->kp.flags |= KPROBE_FLAG_OPTIMIZED;
-	list_add(&op->list, &optimizing_list);
-	if (!delayed_work_pending(&optimizing_work))
-		schedule_delayed_work(&optimizing_work, OPTIMIZE_DELAY);
+
+	if (!list_empty(&op->list))
+		/* This is under unoptimizing. Just dequeue the probe */
+		list_del_init(&op->list);
+	else {
+		list_add(&op->list, &optimizing_list);
+		kick_kprobe_optimizer();
+	}
+}
+
+/* Short cut to direct unoptimizing */
+static __kprobes void force_unoptimize_kprobe(struct optimized_kprobe *op)
+{
+	get_online_cpus();
+	arch_unoptimize_kprobe(op);
+	put_online_cpus();
+	if (kprobe_disabled(&op->kp))
+		arch_disarm_kprobe(&op->kp);
 }
 
 /* Unoptimize a kprobe if p is optimized */
-static __kprobes void unoptimize_kprobe(struct kprobe *p)
+static __kprobes void unoptimize_kprobe(struct kprobe *p, bool force)
 {
 	struct optimized_kprobe *op;
 
-	if ((p->flags & KPROBE_FLAG_OPTIMIZED) && kprobe_aggrprobe(p)) {
-		op = container_of(p, struct optimized_kprobe, kp);
-		if (!list_empty(&op->list))
-			/* Dequeue from the optimization queue */
+	if (!kprobe_aggrprobe(p) || kprobe_disarmed(p))
+		return; /* This is not an optprobe nor optimized */
+
+	op = container_of(p, struct optimized_kprobe, kp);
+	if (!kprobe_optimized(p)) {
+		/* Unoptimized or unoptimizing case */
+		if (force && !list_empty(&op->list)) {
+			/*
+			 * Only if this is unoptimizing kprobe and forced,
+			 * forcibly unoptimize it. (No need to unoptimize
+			 * unoptimized kprobe again :)
+			 */
 			list_del_init(&op->list);
-		else
-			/* Replace jump with break */
-			arch_unoptimize_kprobe(op);
-		op->kp.flags &= ~KPROBE_FLAG_OPTIMIZED;
+			force_unoptimize_kprobe(op);
+		}
+		return;
 	}
+
+	op->kp.flags &= ~KPROBE_FLAG_OPTIMIZED;
+	if (!list_empty(&op->list)) {
+		/* Dequeue from the optimization queue */
+		list_del_init(&op->list);
+		return;
+	}
+	/* Optimized kprobe case */
+	if (force)
+		/* Forcibly update the code: this is a special case */
+		force_unoptimize_kprobe(op);
+	else {
+		list_add(&op->list, &unoptimizing_list);
+		kick_kprobe_optimizer();
+	}
+}
+
+/* Cancel unoptimizing for reusing */
+static void reuse_unused_kprobe(struct kprobe *ap)
+{
+	struct optimized_kprobe *op;
+
+	BUG_ON(!kprobe_unused(ap));
+	/*
+	 * Unused kprobe MUST be on the way of delayed unoptimizing (means
+	 * there is still a relative jump) and disabled.
+	 */
+	op = container_of(ap, struct optimized_kprobe, kp);
+	WARN_ON_ONCE(list_empty(&op->list));
+	/* Enable the probe again */
+	ap->flags &= ~KPROBE_FLAG_DISABLED;
+	/* Optimize it again (remove from op->list) */
+	BUG_ON(!kprobe_optready(ap));
+	optimize_kprobe(ap);
 }
 
 /* Remove optimized instructions */
@@ -533,12 +700,23 @@ static void __kprobes kill_optimized_kprobe(struct kprobe *p)
 	struct optimized_kprobe *op;
 
 	op = container_of(p, struct optimized_kprobe, kp);
-	if (!list_empty(&op->list)) {
-		/* Dequeue from the optimization queue */
+	if (!list_empty(&op->list))
+		/* Dequeue from the (un)optimization queue */
 		list_del_init(&op->list);
-		op->kp.flags &= ~KPROBE_FLAG_OPTIMIZED;
+	op->kp.flags &= ~KPROBE_FLAG_OPTIMIZED;
+
+	if (kprobe_unused(p)) {
+		/* Enqueue if it is unused */
+		list_add(&op->list, &freeing_list);
+		/*
+		 * Remove unused probes from the hash list. After waiting
+		 * for synchronization, this probe is reclaimed.
+		 * (reclaiming is done by do_free_cleaned_kprobes().)
+		 */
+		hlist_del_rcu(&op->kp.hlist);
 	}
-	/* Don't unoptimize, because the target code will be freed. */
+
+	/* Don't touch the code, because it is already freed. */
 	arch_remove_optimized_kprobe(op);
 }
 
@@ -549,16 +727,6 @@ static __kprobes void prepare_optimized_kprobe(struct kprobe *p)
 
 	op = container_of(p, struct optimized_kprobe, kp);
 	arch_prepare_optimized_kprobe(op);
-}
-
-/* Free optimized instructions and optimized_kprobe */
-static __kprobes void free_aggr_kprobe(struct kprobe *p)
-{
-	struct optimized_kprobe *op;
-
-	op = container_of(p, struct optimized_kprobe, kp);
-	arch_remove_optimized_kprobe(op);
-	kfree(op);
 }
 
 /* Allocate new optimized_kprobe and try to prepare optimized instructions */
@@ -588,74 +756,87 @@ static __kprobes void try_to_optimize_kprobe(struct kprobe *p)
 	struct kprobe *ap;
 	struct optimized_kprobe *op;
 
+	/* Impossible to optimize ftrace-based kprobe */
+	if (kprobe_ftrace(p))
+		return;
+
+	/* For preparing optimization, jump_label_text_reserved() is called */
+	jump_label_lock();
+	mutex_lock(&text_mutex);
+
 	ap = alloc_aggr_kprobe(p);
 	if (!ap)
-		return;
+		goto out;
 
 	op = container_of(ap, struct optimized_kprobe, kp);
 	if (!arch_prepared_optinsn(&op->optinsn)) {
 		/* If failed to setup optimizing, fallback to kprobe */
-		free_aggr_kprobe(ap);
-		return;
+		arch_remove_optimized_kprobe(op);
+		kfree(op);
+		goto out;
 	}
 
 	init_aggr_kprobe(ap, p);
-	optimize_kprobe(ap);
+	optimize_kprobe(ap);	/* This just kicks optimizer thread */
+
+out:
+	mutex_unlock(&text_mutex);
+	jump_label_unlock();
 }
 
 #ifdef CONFIG_SYSCTL
-/* This should be called with kprobe_mutex locked */
 static void __kprobes optimize_all_kprobes(void)
 {
 	struct hlist_head *head;
-	struct hlist_node *node;
 	struct kprobe *p;
 	unsigned int i;
 
+	mutex_lock(&kprobe_mutex);
 	/* If optimization is already allowed, just return */
 	if (kprobes_allow_optimization)
-		return;
+		goto out;
 
 	kprobes_allow_optimization = true;
 	for (i = 0; i < KPROBE_TABLE_SIZE; i++) {
 		head = &kprobe_table[i];
-		hlist_for_each_entry_rcu(p, node, head, hlist)
+		hlist_for_each_entry_rcu(p, head, hlist)
 			if (!kprobe_disabled(p))
 				optimize_kprobe(p);
 	}
 	printk(KERN_INFO "Kprobes globally optimized\n");
+out:
+	mutex_unlock(&kprobe_mutex);
 }
 
-/* This should be called with kprobe_mutex locked */
 static void __kprobes unoptimize_all_kprobes(void)
 {
 	struct hlist_head *head;
-	struct hlist_node *node;
 	struct kprobe *p;
 	unsigned int i;
 
+	mutex_lock(&kprobe_mutex);
 	/* If optimization is already prohibited, just return */
-	if (!kprobes_allow_optimization)
+	if (!kprobes_allow_optimization) {
+		mutex_unlock(&kprobe_mutex);
 		return;
-
-	kprobes_allow_optimization = false;
-	printk(KERN_INFO "Kprobes globally unoptimized\n");
-	get_online_cpus();	/* For avoiding text_mutex deadlock */
-	mutex_lock(&text_mutex);
-	for (i = 0; i < KPROBE_TABLE_SIZE; i++) {
-		head = &kprobe_table[i];
-		hlist_for_each_entry_rcu(p, node, head, hlist) {
-			if (!kprobe_disabled(p))
-				unoptimize_kprobe(p);
-		}
 	}
 
-	mutex_unlock(&text_mutex);
-	put_online_cpus();
-	/* Allow all currently running kprobes to complete */
-	synchronize_sched();
+	kprobes_allow_optimization = false;
+	for (i = 0; i < KPROBE_TABLE_SIZE; i++) {
+		head = &kprobe_table[i];
+		hlist_for_each_entry_rcu(p, head, hlist) {
+			if (!kprobe_disabled(p))
+				unoptimize_kprobe(p, false);
+		}
+	}
+	mutex_unlock(&kprobe_mutex);
+
+	/* Wait for unoptimizing completion */
+	wait_for_kprobe_optimizer();
+	printk(KERN_INFO "Kprobes globally unoptimized\n");
 }
 
+static DEFINE_MUTEX(kprobe_sysctl_mutex);
 int sysctl_kprobes_optimization;
 int proc_kprobes_optimization_handler(struct ctl_table *table, int write,
 				      void __user *buffer, size_t *length,
@@ -663,7 +844,7 @@ int proc_kprobes_optimization_handler(struct ctl_table *table, int write,
 {
 	int ret;
 
-	mutex_lock(&kprobe_mutex);
+	mutex_lock(&kprobe_sysctl_mutex);
 	sysctl_kprobes_optimization = kprobes_allow_optimization ? 1 : 0;
 	ret = proc_dointvec_minmax(table, write, buffer, length, ppos);
 
@@ -671,50 +852,67 @@ int proc_kprobes_optimization_handler(struct ctl_table *table, int write,
 		optimize_all_kprobes();
 	else
 		unoptimize_all_kprobes();
-	mutex_unlock(&kprobe_mutex);
+	mutex_unlock(&kprobe_sysctl_mutex);
 
 	return ret;
 }
 #endif /* CONFIG_SYSCTL */
 
+/* Put a breakpoint for a probe. Must be called with text_mutex locked */
 static void __kprobes __arm_kprobe(struct kprobe *p)
 {
-	struct kprobe *old_p;
+	struct kprobe *_p;
 
 	/* Check collision with other optimized kprobes */
-	old_p = get_optimized_kprobe((unsigned long)p->addr);
-	if (unlikely(old_p))
-		unoptimize_kprobe(old_p); /* Fallback to unoptimized kprobe */
+	_p = get_optimized_kprobe((unsigned long)p->addr);
+	if (unlikely(_p))
+		/* Fallback to unoptimized kprobe */
+		unoptimize_kprobe(_p, true);
 
 	arch_arm_kprobe(p);
 	optimize_kprobe(p);	/* Try to optimize (add kprobe to a list) */
 }
 
-static void __kprobes __disarm_kprobe(struct kprobe *p)
+/* Remove the breakpoint of a probe. Must be called with text_mutex locked */
+static void __kprobes __disarm_kprobe(struct kprobe *p, bool reopt)
 {
-	struct kprobe *old_p;
+	struct kprobe *_p;
 
-	unoptimize_kprobe(p);	/* Try to unoptimize */
-	arch_disarm_kprobe(p);
+	/* Try to unoptimize */
+	unoptimize_kprobe(p, kprobes_all_disarmed);
 
-	/* If another kprobe was blocked, optimize it. */
-	old_p = get_optimized_kprobe((unsigned long)p->addr);
-	if (unlikely(old_p))
-		optimize_kprobe(old_p);
+	if (!kprobe_queued(p)) {
+		arch_disarm_kprobe(p);
+		/* If another kprobe was blocked, optimize it. */
+		_p = get_optimized_kprobe((unsigned long)p->addr);
+		if (unlikely(_p) && reopt)
+			optimize_kprobe(_p);
+	}
+	/* TODO: reoptimize others after unoptimized this probe */
 }
 
 #else /* !CONFIG_OPTPROBES */
 
 #define optimize_kprobe(p)			do {} while (0)
-#define unoptimize_kprobe(p)			do {} while (0)
+#define unoptimize_kprobe(p, f)			do {} while (0)
 #define kill_optimized_kprobe(p)		do {} while (0)
 #define prepare_optimized_kprobe(p)		do {} while (0)
 #define try_to_optimize_kprobe(p)		do {} while (0)
 #define __arm_kprobe(p)				arch_arm_kprobe(p)
-#define __disarm_kprobe(p)			arch_disarm_kprobe(p)
+#define __disarm_kprobe(p, o)			arch_disarm_kprobe(p)
+#define kprobe_disarmed(p)			kprobe_disabled(p)
+#define wait_for_kprobe_optimizer()		do {} while (0)
+
+/* There should be no unused kprobes can be reused without optimization */
+static void reuse_unused_kprobe(struct kprobe *ap)
+{
+	printk(KERN_ERR "Error: There should be no unused kprobe here.\n");
+	BUG_ON(kprobe_unused(ap));
+}
 
 static __kprobes void free_aggr_kprobe(struct kprobe *p)
 {
+	arch_remove_kprobe(p);
 	kfree(p);
 }
 
@@ -724,9 +922,111 @@ static __kprobes struct kprobe *alloc_aggr_kprobe(struct kprobe *p)
 }
 #endif /* CONFIG_OPTPROBES */
 
-/* Arm a kprobe with text_mutex */
-static void __kprobes arm_kprobe(struct kprobe *kp)
+#ifdef CONFIG_KPROBES_ON_FTRACE
+static struct ftrace_ops kprobe_ftrace_ops __read_mostly = {
+	.func = kprobe_ftrace_handler,
+	.flags = FTRACE_OPS_FL_SAVE_REGS,
+};
+
+static struct ftrace_ops kprobe_ipmodify_ops __read_mostly = {
+	.func = kprobe_ftrace_handler,
+	.flags = FTRACE_OPS_FL_SAVE_REGS | FTRACE_OPS_FL_IPMODIFY,
+};
+
+static int kprobe_ipmodify_enabled;
+static int kprobe_ftrace_enabled;
+
+/* Must ensure p->addr is really on ftrace */
+static int __kprobes prepare_kprobe(struct kprobe *p)
 {
+	if (!kprobe_ftrace(p))
+		return arch_prepare_kprobe(p);
+
+	return arch_prepare_kprobe_ftrace(p);
+}
+
+/* Caller must lock kprobe_mutex */
+static int __kprobes __arm_kprobe_ftrace(struct kprobe *p,
+					struct ftrace_ops *ops, int *cnt)
+{
+	int ret = 0;
+
+	ret = ftrace_set_filter_ip(ops, (unsigned long)p->addr, 0, 0);
+	if (ret) {
+		pr_debug("Failed to arm kprobe-ftrace at %pS (%d)\n",
+			 p->addr, ret);
+		return ret;
+	}
+
+	if (*cnt == 0) {
+		ret = register_ftrace_function(ops);
+		if (ret) {
+			pr_debug("Failed to init kprobe-ftrace (%d)\n", ret);
+			goto err_ftrace;
+		}
+	}
+
+	(*cnt)++;
+	return ret;
+
+err_ftrace:
+	/*
+	 * At this point, sinec ops is not registered, we should be sefe from
+	 * registering empty filter.
+	 */
+	ftrace_set_filter_ip(ops, (unsigned long)p->addr, 1, 0);
+	return ret;
+}
+
+static int __kprobes arm_kprobe_ftrace(struct kprobe *p)
+{
+	bool ipmodify = (p->post_handler != NULL);
+
+	return __arm_kprobe_ftrace(p,
+		ipmodify ? &kprobe_ipmodify_ops : &kprobe_ftrace_ops,
+		ipmodify ? &kprobe_ipmodify_enabled : &kprobe_ftrace_enabled);
+}
+
+/* Caller must lock kprobe_mutex */
+static int __kprobes __disarm_kprobe_ftrace(struct kprobe *p,
+					   struct ftrace_ops *ops, int *cnt)
+{
+	int ret = 0;
+
+	if (*cnt == 1) {
+		ret = unregister_ftrace_function(ops);
+		if (WARN(ret < 0, "Failed to unregister kprobe-ftrace (%d)\n", ret))
+			return ret;
+	}
+
+	(*cnt)--;
+
+	ret = ftrace_set_filter_ip(ops, (unsigned long)p->addr, 1, 0);
+	WARN_ONCE(ret < 0, "Failed to disarm kprobe-ftrace at %pS (%d)\n",
+		  p->addr, ret);
+	return ret;
+}
+
+static int __kprobes disarm_kprobe_ftrace(struct kprobe *p)
+{
+	bool ipmodify = (p->post_handler != NULL);
+
+	return __disarm_kprobe_ftrace(p,
+		ipmodify ? &kprobe_ipmodify_ops : &kprobe_ftrace_ops,
+		ipmodify ? &kprobe_ipmodify_enabled : &kprobe_ftrace_enabled);
+}
+#else	/* !CONFIG_KPROBES_ON_FTRACE */
+#define prepare_kprobe(p)	arch_prepare_kprobe(p)
+#define arm_kprobe_ftrace(p)	(-ENODEV)
+#define disarm_kprobe_ftrace(p)	(-ENODEV)
+#endif
+
+/* Arm a kprobe with text_mutex */
+static int __kprobes arm_kprobe(struct kprobe *kp)
+{
+	if (unlikely(kprobe_ftrace(kp)))
+		return arm_kprobe_ftrace(kp);
+
 	/*
 	 * Here, since __arm_kprobe() doesn't use stop_machine(),
 	 * this doesn't cause deadlock on text_mutex. So, we don't
@@ -735,16 +1035,22 @@ static void __kprobes arm_kprobe(struct kprobe *kp)
 	mutex_lock(&text_mutex);
 	__arm_kprobe(kp);
 	mutex_unlock(&text_mutex);
+
+	return 0;
 }
 
 /* Disarm a kprobe with text_mutex */
-static void __kprobes disarm_kprobe(struct kprobe *kp)
+static int __kprobes disarm_kprobe(struct kprobe *kp, bool reopt)
 {
-	get_online_cpus();	/* For avoiding text_mutex deadlock */
+	if (unlikely(kprobe_ftrace(kp)))
+		return disarm_kprobe_ftrace(kp);
+
+	/* Ditto */
 	mutex_lock(&text_mutex);
-	__disarm_kprobe(kp);
+	__disarm_kprobe(kp, reopt);
 	mutex_unlock(&text_mutex);
-	put_online_cpus();
+
+	return 0;
 }
 
 /*
@@ -783,7 +1089,7 @@ static void __kprobes aggr_post_handler(struct kprobe *p, struct pt_regs *regs,
 static int __kprobes aggr_fault_handler(struct kprobe *p, struct pt_regs *regs,
 					int trapnr)
 {
-	struct kprobe *cur = __get_cpu_var(kprobe_instance);
+	struct kprobe *cur = __this_cpu_read(kprobe_instance);
 
 	/*
 	 * if we faulted "during" the execution of a user specified
@@ -798,7 +1104,7 @@ static int __kprobes aggr_fault_handler(struct kprobe *p, struct pt_regs *regs,
 
 static int __kprobes aggr_break_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct kprobe *cur = __get_cpu_var(kprobe_instance);
+	struct kprobe *cur = __this_cpu_read(kprobe_instance);
 	int ret = 0;
 
 	if (cur && cur->break_handler) {
@@ -831,9 +1137,9 @@ void __kprobes recycle_rp_inst(struct kretprobe_instance *ri,
 	hlist_del(&ri->hlist);
 	INIT_HLIST_NODE(&ri->hlist);
 	if (likely(rp)) {
-		spin_lock(&rp->lock);
+		raw_spin_lock(&rp->lock);
 		hlist_add_head(&ri->hlist, &rp->free_instances);
-		spin_unlock(&rp->lock);
+		raw_spin_unlock(&rp->lock);
 	} else
 		/* Unregistering */
 		hlist_add_head(&ri->hlist, head);
@@ -844,19 +1150,19 @@ void __kprobes kretprobe_hash_lock(struct task_struct *tsk,
 __acquires(hlist_lock)
 {
 	unsigned long hash = hash_ptr(tsk, KPROBE_HASH_BITS);
-	spinlock_t *hlist_lock;
+	raw_spinlock_t *hlist_lock;
 
 	*head = &kretprobe_inst_table[hash];
 	hlist_lock = kretprobe_table_lock_ptr(hash);
-	spin_lock_irqsave(hlist_lock, *flags);
+	raw_spin_lock_irqsave(hlist_lock, *flags);
 }
 
 static void __kprobes kretprobe_table_lock(unsigned long hash,
 	unsigned long *flags)
 __acquires(hlist_lock)
 {
-	spinlock_t *hlist_lock = kretprobe_table_lock_ptr(hash);
-	spin_lock_irqsave(hlist_lock, *flags);
+	raw_spinlock_t *hlist_lock = kretprobe_table_lock_ptr(hash);
+	raw_spin_lock_irqsave(hlist_lock, *flags);
 }
 
 void __kprobes kretprobe_hash_unlock(struct task_struct *tsk,
@@ -864,18 +1170,18 @@ void __kprobes kretprobe_hash_unlock(struct task_struct *tsk,
 __releases(hlist_lock)
 {
 	unsigned long hash = hash_ptr(tsk, KPROBE_HASH_BITS);
-	spinlock_t *hlist_lock;
+	raw_spinlock_t *hlist_lock;
 
 	hlist_lock = kretprobe_table_lock_ptr(hash);
-	spin_unlock_irqrestore(hlist_lock, *flags);
+	raw_spin_unlock_irqrestore(hlist_lock, *flags);
 }
 
 static void __kprobes kretprobe_table_unlock(unsigned long hash,
        unsigned long *flags)
 __releases(hlist_lock)
 {
-	spinlock_t *hlist_lock = kretprobe_table_lock_ptr(hash);
-	spin_unlock_irqrestore(hlist_lock, *flags);
+	raw_spinlock_t *hlist_lock = kretprobe_table_lock_ptr(hash);
+	raw_spin_unlock_irqrestore(hlist_lock, *flags);
 }
 
 /*
@@ -888,7 +1194,7 @@ void __kprobes kprobe_flush_task(struct task_struct *tk)
 {
 	struct kretprobe_instance *ri;
 	struct hlist_head *head, empty_rp;
-	struct hlist_node *node, *tmp;
+	struct hlist_node *tmp;
 	unsigned long hash, flags = 0;
 
 	if (unlikely(!kprobes_initialized))
@@ -899,12 +1205,12 @@ void __kprobes kprobe_flush_task(struct task_struct *tk)
 	hash = hash_ptr(tk, KPROBE_HASH_BITS);
 	head = &kretprobe_inst_table[hash];
 	kretprobe_table_lock(hash, &flags);
-	hlist_for_each_entry_safe(ri, node, tmp, head, hlist) {
+	hlist_for_each_entry_safe(ri, tmp, head, hlist) {
 		if (ri->task == tk)
 			recycle_rp_inst(ri, &empty_rp);
 	}
 	kretprobe_table_unlock(hash, &flags);
-	hlist_for_each_entry_safe(ri, node, tmp, &empty_rp, hlist) {
+	hlist_for_each_entry_safe(ri, tmp, &empty_rp, hlist) {
 		hlist_del(&ri->hlist);
 		kfree(ri);
 	}
@@ -913,9 +1219,9 @@ void __kprobes kprobe_flush_task(struct task_struct *tk)
 static inline void free_rp_inst(struct kretprobe *rp)
 {
 	struct kretprobe_instance *ri;
-	struct hlist_node *pos, *next;
+	struct hlist_node *next;
 
-	hlist_for_each_entry_safe(ri, pos, next, &rp->free_instances, hlist) {
+	hlist_for_each_entry_safe(ri, next, &rp->free_instances, hlist) {
 		hlist_del(&ri->hlist);
 		kfree(ri);
 	}
@@ -925,14 +1231,14 @@ static void __kprobes cleanup_rp_inst(struct kretprobe *rp)
 {
 	unsigned long flags, hash;
 	struct kretprobe_instance *ri;
-	struct hlist_node *pos, *next;
+	struct hlist_node *next;
 	struct hlist_head *head;
 
 	/* No race here */
 	for (hash = 0; hash < KPROBE_TABLE_SIZE; hash++) {
 		kretprobe_table_lock(hash, &flags);
 		head = &kretprobe_inst_table[hash];
-		hlist_for_each_entry_safe(ri, pos, next, head, hlist) {
+		hlist_for_each_entry_safe(ri, next, head, hlist) {
 			if (ri->rp == rp)
 				ri->rp = NULL;
 		}
@@ -950,7 +1256,7 @@ static int __kprobes add_new_kprobe(struct kprobe *ap, struct kprobe *p)
 	BUG_ON(kprobe_gone(ap) || kprobe_gone(p));
 
 	if (p->break_handler || p->post_handler)
-		unoptimize_kprobe(ap);	/* Fall back to normal kprobe */
+		unoptimize_kprobe(ap, true);	/* Fall back to normal kprobe */
 
 	if (p->break_handler) {
 		if (ap->break_handler)
@@ -962,12 +1268,6 @@ static int __kprobes add_new_kprobe(struct kprobe *ap, struct kprobe *p)
 	if (p->post_handler && !ap->post_handler)
 		ap->post_handler = aggr_post_handler;
 
-	if (kprobe_disabled(ap) && !kprobe_disabled(p)) {
-		ap->flags &= ~KPROBE_FLAG_DISABLED;
-		if (!kprobes_all_disarmed)
-			/* Arm the breakpoint again. */
-			__arm_kprobe(ap);
-	}
 	return 0;
 }
 
@@ -1001,19 +1301,32 @@ static void __kprobes init_aggr_kprobe(struct kprobe *ap, struct kprobe *p)
  * This is the second or subsequent kprobe at the address - handle
  * the intricacies
  */
-static int __kprobes register_aggr_kprobe(struct kprobe *old_p,
+static int __kprobes register_aggr_kprobe(struct kprobe *orig_p,
 					  struct kprobe *p)
 {
 	int ret = 0;
-	struct kprobe *ap = old_p;
+	struct kprobe *ap = orig_p;
 
-	if (!kprobe_aggrprobe(old_p)) {
-		/* If old_p is not an aggr_kprobe, create new aggr_kprobe. */
-		ap = alloc_aggr_kprobe(old_p);
-		if (!ap)
-			return -ENOMEM;
-		init_aggr_kprobe(ap, old_p);
-	}
+	/* For preparing optimization, jump_label_text_reserved() is called */
+	jump_label_lock();
+	/*
+	 * Get online CPUs to avoid text_mutex deadlock.with stop machine,
+	 * which is invoked by unoptimize_kprobe() in add_new_kprobe()
+	 */
+	get_online_cpus();
+	mutex_lock(&text_mutex);
+
+	if (!kprobe_aggrprobe(orig_p)) {
+		/* If orig_p is not an aggr_kprobe, create new aggr_kprobe. */
+		ap = alloc_aggr_kprobe(orig_p);
+		if (!ap) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		init_aggr_kprobe(ap, orig_p);
+	} else if (kprobe_unused(ap))
+		/* This probe is going to die. Rescue it */
+		reuse_unused_kprobe(ap);
 
 	if (kprobe_gone(ap)) {
 		/*
@@ -1029,7 +1342,7 @@ static int __kprobes register_aggr_kprobe(struct kprobe *old_p,
 			 * free aggr_probe. It will be used next time, or
 			 * freed by unregister_kprobe.
 			 */
-			return ret;
+			goto out;
 
 		/* Prepare optimized instructions if possible. */
 		prepare_optimized_kprobe(ap);
@@ -1044,24 +1357,26 @@ static int __kprobes register_aggr_kprobe(struct kprobe *old_p,
 
 	/* Copy ap's insn slot to p */
 	copy_kprobe(ap, p);
-	return add_new_kprobe(ap, p);
-}
+	ret = add_new_kprobe(ap, p);
 
-/* Try to disable aggr_kprobe, and return 1 if succeeded.*/
-static int __kprobes try_to_disable_aggr_kprobe(struct kprobe *p)
-{
-	struct kprobe *kp;
+out:
+	mutex_unlock(&text_mutex);
+	put_online_cpus();
+	jump_label_unlock();
 
-	list_for_each_entry_rcu(kp, &p->list, list) {
-		if (!kprobe_disabled(kp))
-			/*
-			 * There is an active probe on the list.
-			 * We can't disable aggr_kprobe.
-			 */
-			return 0;
+	if (ret == 0 && kprobe_disabled(ap) && !kprobe_disabled(p)) {
+		ap->flags &= ~KPROBE_FLAG_DISABLED;
+		if (!kprobes_all_disarmed) {
+			/* Arm the breakpoint again. */
+			ret = arm_kprobe(ap);
+			if (ret) {
+				ap->flags |= KPROBE_FLAG_DISABLED;
+				list_del_rcu(&p->list);
+				synchronize_sched();
+			}
+		}
 	}
-	p->flags |= KPROBE_FLAG_DISABLED;
-	return 1;
+	return ret;
 }
 
 static int __kprobes in_kprobes_functions(unsigned long addr)
@@ -1088,114 +1403,154 @@ static int __kprobes in_kprobes_functions(unsigned long addr)
 /*
  * If we have a symbol_name argument, look it up and add the offset field
  * to it. This way, we can specify a relative address to a symbol.
+ * This returns encoded errors if it fails to look up symbol or invalid
+ * combination of parameters.
  */
 static kprobe_opcode_t __kprobes *kprobe_addr(struct kprobe *p)
 {
 	kprobe_opcode_t *addr = p->addr;
+
+	if ((p->symbol_name && p->addr) ||
+	    (!p->symbol_name && !p->addr))
+		goto invalid;
+
 	if (p->symbol_name) {
-		if (addr)
-			return NULL;
 		kprobe_lookup_name(p->symbol_name, addr);
+		if (!addr)
+			return ERR_PTR(-ENOENT);
 	}
 
-	if (!addr)
-		return NULL;
-	return (kprobe_opcode_t *)(((char *)addr) + p->offset);
+	addr = (kprobe_opcode_t *)(((char *)addr) + p->offset);
+	if (addr)
+		return addr;
+
+invalid:
+	return ERR_PTR(-EINVAL);
 }
 
 /* Check passed kprobe is valid and return kprobe in kprobe_table. */
 static struct kprobe * __kprobes __get_valid_kprobe(struct kprobe *p)
 {
-	struct kprobe *old_p, *list_p;
+	struct kprobe *ap, *list_p;
 
-	old_p = get_kprobe(p->addr);
-	if (unlikely(!old_p))
+	ap = get_kprobe(p->addr);
+	if (unlikely(!ap))
 		return NULL;
 
-	if (p != old_p) {
-		list_for_each_entry_rcu(list_p, &old_p->list, list)
+	if (p != ap) {
+		list_for_each_entry_rcu(list_p, &ap->list, list)
 			if (list_p == p)
 			/* kprobe p is a valid probe */
 				goto valid;
 		return NULL;
 	}
 valid:
-	return old_p;
+	return ap;
 }
 
 /* Return error if the kprobe is being re-registered */
 static inline int check_kprobe_rereg(struct kprobe *p)
 {
 	int ret = 0;
-	struct kprobe *old_p;
 
 	mutex_lock(&kprobe_mutex);
-	old_p = __get_valid_kprobe(p);
-	if (old_p)
+	if (__get_valid_kprobe(p))
 		ret = -EINVAL;
 	mutex_unlock(&kprobe_mutex);
+
+	return ret;
+}
+
+static __kprobes int check_kprobe_address_safe(struct kprobe *p,
+					       struct module **probed_mod)
+{
+	int ret = 0;
+	unsigned long ftrace_addr;
+
+	/*
+	 * If the address is located on a ftrace nop, set the
+	 * breakpoint to the following instruction.
+	 */
+	ftrace_addr = ftrace_location((unsigned long)p->addr);
+	if (ftrace_addr) {
+#ifdef CONFIG_KPROBES_ON_FTRACE
+		/* Given address is not on the instruction boundary */
+		if ((unsigned long)p->addr != ftrace_addr)
+			return -EILSEQ;
+		p->flags |= KPROBE_FLAG_FTRACE;
+#else	/* !CONFIG_KPROBES_ON_FTRACE */
+		return -EINVAL;
+#endif
+	}
+
+	jump_label_lock();
+	preempt_disable();
+
+	/* Ensure it is not in reserved area nor out of text */
+	if (!kernel_text_address((unsigned long) p->addr) ||
+	    in_kprobes_functions((unsigned long) p->addr) ||
+	    jump_label_text_reserved(p->addr, p->addr)) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* Check if are we probing a module */
+	*probed_mod = __module_text_address((unsigned long) p->addr);
+	if (*probed_mod) {
+		/*
+		 * We must hold a refcount of the probed module while updating
+		 * its code to prohibit unexpected unloading.
+		 */
+		if (unlikely(!try_module_get(*probed_mod))) {
+			ret = -ENOENT;
+			goto out;
+		}
+
+		/*
+		 * If the module freed .init.text, we couldn't insert
+		 * kprobes in there.
+		 */
+		if (within_module_init((unsigned long)p->addr, *probed_mod) &&
+		    (*probed_mod)->state != MODULE_STATE_COMING) {
+			module_put(*probed_mod);
+			*probed_mod = NULL;
+			ret = -ENOENT;
+		}
+	}
+out:
+	preempt_enable();
+	jump_label_unlock();
+
 	return ret;
 }
 
 int __kprobes register_kprobe(struct kprobe *p)
 {
-	int ret = 0;
+	int ret;
 	struct kprobe *old_p;
 	struct module *probed_mod;
 	kprobe_opcode_t *addr;
 
+	/* Adjust probe address from symbol */
 	addr = kprobe_addr(p);
-	if (!addr)
-		return -EINVAL;
+	if (IS_ERR(addr))
+		return PTR_ERR(addr);
 	p->addr = addr;
 
 	ret = check_kprobe_rereg(p);
 	if (ret)
 		return ret;
 
-	preempt_disable();
-	if (!kernel_text_address((unsigned long) p->addr) ||
-	    in_kprobes_functions((unsigned long) p->addr) ||
-	    ftrace_text_reserved(p->addr, p->addr)) {
-		preempt_enable();
-		return -EINVAL;
-	}
-
 	/* User can pass only KPROBE_FLAG_DISABLED to register_kprobe */
 	p->flags &= KPROBE_FLAG_DISABLED;
-
-	/*
-	 * Check if are we probing a module.
-	 */
-	probed_mod = __module_text_address((unsigned long) p->addr);
-	if (probed_mod) {
-		/*
-		 * We must hold a refcount of the probed module while updating
-		 * its code to prohibit unexpected unloading.
-		 */
-		if (unlikely(!try_module_get(probed_mod))) {
-			preempt_enable();
-			return -EINVAL;
-		}
-		/*
-		 * If the module freed .init.text, we couldn't insert
-		 * kprobes in there.
-		 */
-		if (within_module_init((unsigned long)p->addr, probed_mod) &&
-		    probed_mod->state != MODULE_STATE_COMING) {
-			module_put(probed_mod);
-			preempt_enable();
-			return -EINVAL;
-		}
-	}
-	preempt_enable();
-
 	p->nmissed = 0;
 	INIT_LIST_HEAD(&p->list);
-	mutex_lock(&kprobe_mutex);
 
-	get_online_cpus();	/* For avoiding text_mutex deadlock. */
-	mutex_lock(&text_mutex);
+	ret = check_kprobe_address_safe(p, &probed_mod);
+	if (ret)
+		return ret;
+
+	mutex_lock(&kprobe_mutex);
 
 	old_p = get_kprobe(p->addr);
 	if (old_p) {
@@ -1204,7 +1559,9 @@ int __kprobes register_kprobe(struct kprobe *p)
 		goto out;
 	}
 
-	ret = arch_prepare_kprobe(p);
+	mutex_lock(&text_mutex);	/* Avoiding text modification */
+	ret = prepare_kprobe(p);
+	mutex_unlock(&text_mutex);
 	if (ret)
 		goto out;
 
@@ -1212,15 +1569,19 @@ int __kprobes register_kprobe(struct kprobe *p)
 	hlist_add_head_rcu(&p->hlist,
 		       &kprobe_table[hash_ptr(p->addr, KPROBE_HASH_BITS)]);
 
-	if (!kprobes_all_disarmed && !kprobe_disabled(p))
-		__arm_kprobe(p);
+	if (!kprobes_all_disarmed && !kprobe_disabled(p)) {
+		ret = arm_kprobe(p);
+		if (ret) {
+			hlist_del_rcu(&p->hlist);
+			synchronize_sched();
+			goto out;
+		}
+	}
 
 	/* Try to optimize kprobe */
 	try_to_optimize_kprobe(p);
 
 out:
-	mutex_unlock(&text_mutex);
-	put_online_cpus();
 	mutex_unlock(&kprobe_mutex);
 
 	if (probed_mod)
@@ -1230,67 +1591,133 @@ out:
 }
 EXPORT_SYMBOL_GPL(register_kprobe);
 
+/* Check if all probes on the aggrprobe are disabled */
+static int __kprobes aggr_kprobe_disabled(struct kprobe *ap)
+{
+	struct kprobe *kp;
+
+	list_for_each_entry_rcu(kp, &ap->list, list)
+		if (!kprobe_disabled(kp))
+			/*
+			 * There is an active probe on the list.
+			 * We can't disable this ap.
+			 */
+			return 0;
+
+	return 1;
+}
+
+/* Disable one kprobe: Make sure called under kprobe_mutex is locked */
+static struct kprobe *__kprobes __disable_kprobe(struct kprobe *p)
+{
+	struct kprobe *orig_p;
+	int ret;
+
+	/* Get an original kprobe for return */
+	orig_p = __get_valid_kprobe(p);
+	if (unlikely(orig_p == NULL))
+		return ERR_PTR(-EINVAL);
+
+	if (!kprobe_disabled(p)) {
+		/* Disable probe if it is a child probe */
+		if (p != orig_p)
+			p->flags |= KPROBE_FLAG_DISABLED;
+
+		/* Try to disarm and disable this/parent probe */
+		if (p == orig_p || aggr_kprobe_disabled(orig_p)) {
+			/*
+			 * If kprobes_all_disarmed is set, orig_p
+			 * should have already been disarmed, so
+			 * skip unneed disarming process.
+			 */
+			if (!kprobes_all_disarmed) {
+				ret = disarm_kprobe(orig_p, true);
+				if (ret) {
+					p->flags &= ~KPROBE_FLAG_DISABLED;
+					return ERR_PTR(ret);
+				}
+			}
+			orig_p->flags |= KPROBE_FLAG_DISABLED;
+		}
+	}
+
+	return orig_p;
+}
+
 /*
  * Unregister a kprobe without a scheduler synchronization.
  */
 static int __kprobes __unregister_kprobe_top(struct kprobe *p)
 {
-	struct kprobe *old_p, *list_p;
+	struct kprobe *ap, *list_p;
 
-	old_p = __get_valid_kprobe(p);
-	if (old_p == NULL)
-		return -EINVAL;
+	/* Disable kprobe. This will disarm it if needed. */
+	ap = __disable_kprobe(p);
+	if (IS_ERR(ap))
+		return PTR_ERR(ap);
 
-	if (old_p == p ||
-	    (kprobe_aggrprobe(old_p) &&
-	     list_is_singular(&old_p->list))) {
+	if (ap == p)
 		/*
-		 * Only probe on the hash list. Disarm only if kprobes are
-		 * enabled and not gone - otherwise, the breakpoint would
-		 * already have been removed. We save on flushing icache.
+		 * This probe is an independent(and non-optimized) kprobe
+		 * (not an aggrprobe). Remove from the hash list.
 		 */
-		if (!kprobes_all_disarmed && !kprobe_disabled(old_p))
-			disarm_kprobe(old_p);
-		hlist_del_rcu(&old_p->hlist);
-	} else {
+		goto disarmed;
+
+	/* Following process expects this probe is an aggrprobe */
+	WARN_ON(!kprobe_aggrprobe(ap));
+
+	if (list_is_singular(&ap->list) && kprobe_disarmed(ap))
+		/*
+		 * !disarmed could be happen if the probe is under delayed
+		 * unoptimizing.
+		 */
+		goto disarmed;
+	else {
+		/* If disabling probe has special handlers, update aggrprobe */
 		if (p->break_handler && !kprobe_gone(p))
-			old_p->break_handler = NULL;
+			ap->break_handler = NULL;
 		if (p->post_handler && !kprobe_gone(p)) {
-			list_for_each_entry_rcu(list_p, &old_p->list, list) {
+			list_for_each_entry_rcu(list_p, &ap->list, list) {
 				if ((list_p != p) && (list_p->post_handler))
 					goto noclean;
 			}
-			old_p->post_handler = NULL;
+			ap->post_handler = NULL;
 		}
 noclean:
+		/*
+		 * Remove from the aggrprobe: this path will do nothing in
+		 * __unregister_kprobe_bottom().
+		 */
 		list_del_rcu(&p->list);
-		if (!kprobe_disabled(old_p)) {
-			try_to_disable_aggr_kprobe(old_p);
-			if (!kprobes_all_disarmed) {
-				if (kprobe_disabled(old_p))
-					disarm_kprobe(old_p);
-				else
-					/* Try to optimize this probe again */
-					optimize_kprobe(old_p);
-			}
-		}
+		if (!kprobe_disabled(ap) && !kprobes_all_disarmed)
+			/*
+			 * Try to optimize this probe again, because post
+			 * handler may have been changed.
+			 */
+			optimize_kprobe(ap);
 	}
+	return 0;
+
+disarmed:
+	BUG_ON(!kprobe_disarmed(ap));
+	hlist_del_rcu(&ap->hlist);
 	return 0;
 }
 
 static void __kprobes __unregister_kprobe_bottom(struct kprobe *p)
 {
-	struct kprobe *old_p;
+	struct kprobe *ap;
 
 	if (list_empty(&p->list))
+		/* This is an independent kprobe */
 		arch_remove_kprobe(p);
 	else if (list_is_singular(&p->list)) {
-		/* "p" is the last child of an aggr_kprobe */
-		old_p = list_entry(p->list.next, struct kprobe, list);
+		/* This is the last child of an aggrprobe */
+		ap = list_entry(p->list.next, struct kprobe, list);
 		list_del(&p->list);
-		arch_remove_kprobe(old_p);
-		free_aggr_kprobe(old_p);
+		free_aggr_kprobe(ap);
 	}
+	/* Otherwise, do nothing. */
 }
 
 int __kprobes register_kprobes(struct kprobe **kps, int num)
@@ -1423,18 +1850,22 @@ static int __kprobes pre_handler_kretprobe(struct kprobe *p,
 
 	/*TODO: consider to only swap the RA after the last pre_handler fired */
 	hash = hash_ptr(current, KPROBE_HASH_BITS);
-	spin_lock_irqsave(&rp->lock, flags);
+	raw_spin_lock_irqsave(&rp->lock, flags);
 	if (!hlist_empty(&rp->free_instances)) {
 		ri = hlist_entry(rp->free_instances.first,
 				struct kretprobe_instance, hlist);
 		hlist_del(&ri->hlist);
-		spin_unlock_irqrestore(&rp->lock, flags);
+		raw_spin_unlock_irqrestore(&rp->lock, flags);
 
 		ri->rp = rp;
 		ri->task = current;
 
-		if (rp->entry_handler && rp->entry_handler(ri, regs))
+		if (rp->entry_handler && rp->entry_handler(ri, regs)) {
+			raw_spin_lock_irqsave(&rp->lock, flags);
+			hlist_add_head(&ri->hlist, &rp->free_instances);
+			raw_spin_unlock_irqrestore(&rp->lock, flags);
 			return 0;
+		}
 
 		arch_prepare_kretprobe(ri, regs);
 
@@ -1445,7 +1876,7 @@ static int __kprobes pre_handler_kretprobe(struct kprobe *p,
 		kretprobe_table_unlock(hash, &flags);
 	} else {
 		rp->nmissed++;
-		spin_unlock_irqrestore(&rp->lock, flags);
+		raw_spin_unlock_irqrestore(&rp->lock, flags);
 	}
 	return 0;
 }
@@ -1459,8 +1890,8 @@ int __kprobes register_kretprobe(struct kretprobe *rp)
 
 	if (kretprobe_blacklist_size) {
 		addr = kprobe_addr(&rp->kp);
-		if (!addr)
-			return -EINVAL;
+		if (IS_ERR(addr))
+			return PTR_ERR(addr);
 
 		for (i = 0; kretprobe_blacklist[i].name != NULL; i++) {
 			if (kretprobe_blacklist[i].addr == addr)
@@ -1481,7 +1912,7 @@ int __kprobes register_kretprobe(struct kretprobe *rp)
 		rp->maxactive = num_possible_cpus();
 #endif
 	}
-	spin_lock_init(&rp->lock);
+	raw_spin_lock_init(&rp->lock);
 	INIT_HLIST_HEAD(&rp->free_instances);
 	for (i = 0; i < rp->maxactive; i++) {
 		inst = kmalloc(sizeof(struct kretprobe_instance) +
@@ -1612,25 +2043,11 @@ int __kprobes disable_kprobe(struct kprobe *kp)
 
 	mutex_lock(&kprobe_mutex);
 
-	/* Check whether specified probe is valid. */
-	p = __get_valid_kprobe(kp);
-	if (unlikely(p == NULL)) {
-		ret = -EINVAL;
-		goto out;
-	}
+	/* Disable this kprobe */
+	p = __disable_kprobe(kp);
+	if (IS_ERR(p))
+		ret = PTR_ERR(p);
 
-	/* If the probe is already disabled (or gone), just return */
-	if (kprobe_disabled(kp))
-		goto out;
-
-	kp->flags |= KPROBE_FLAG_DISABLED;
-	if (p != kp)
-		/* When kp != p, p is always enabled. */
-		try_to_disable_aggr_kprobe(p);
-
-	if (!kprobes_all_disarmed && kprobe_disabled(p))
-		disarm_kprobe(p);
-out:
 	mutex_unlock(&kprobe_mutex);
 	return ret;
 }
@@ -1662,7 +2079,9 @@ int __kprobes enable_kprobe(struct kprobe *kp)
 
 	if (!kprobes_all_disarmed && kprobe_disabled(p)) {
 		p->flags &= ~KPROBE_FLAG_DISABLED;
-		arm_kprobe(p);
+		ret = arm_kprobe(p);
+		if (ret)
+			p->flags |= KPROBE_FLAG_DISABLED;
 	}
 out:
 	mutex_unlock(&kprobe_mutex);
@@ -1670,11 +2089,12 @@ out:
 }
 EXPORT_SYMBOL_GPL(enable_kprobe);
 
+/* Caller must NOT call this in usual path. This is only for critical case */
 void __kprobes dump_kprobe(struct kprobe *kp)
 {
-	printk(KERN_WARNING "Dumping kprobe:\n");
-	printk(KERN_WARNING "Name: %s\nAddress: %p\nOffset: %x\n",
-	       kp->symbol_name, kp->addr, kp->offset);
+	pr_err("Dumping kprobe:\n");
+	pr_err("Name: %s\nOffset: %x\nAddress: %pS\n",
+	       kp->symbol_name, kp->offset, kp->addr);
 }
 
 /* Module notifier call back, checking kprobes on the module */
@@ -1683,7 +2103,6 @@ static int __kprobes kprobes_module_callback(struct notifier_block *nb,
 {
 	struct module *mod = data;
 	struct hlist_head *head;
-	struct hlist_node *node;
 	struct kprobe *p;
 	unsigned int i;
 	int checkcore = (val == MODULE_STATE_GOING);
@@ -1700,7 +2119,7 @@ static int __kprobes kprobes_module_callback(struct notifier_block *nb,
 	mutex_lock(&kprobe_mutex);
 	for (i = 0; i < KPROBE_TABLE_SIZE; i++) {
 		head = &kprobe_table[i];
-		hlist_for_each_entry_rcu(p, node, head, hlist)
+		hlist_for_each_entry_rcu(p, head, hlist)
 			if (within_module_init((unsigned long)p->addr, mod) ||
 			    (checkcore &&
 			     within_module_core((unsigned long)p->addr, mod))) {
@@ -1735,7 +2154,7 @@ static int __init init_kprobes(void)
 	for (i = 0; i < KPROBE_TABLE_SIZE; i++) {
 		INIT_HLIST_HEAD(&kprobe_table[i]);
 		INIT_HLIST_HEAD(&kretprobe_inst_table[i]);
-		spin_lock_init(&(kretprobe_table_locks[i].lock));
+		raw_spin_lock_init(&(kretprobe_table_locks[i].lock));
 	}
 
 	/*
@@ -1819,10 +2238,11 @@ static void __kprobes report_probe(struct seq_file *pi, struct kprobe *p,
 
 	if (!pp)
 		pp = p;
-	seq_printf(pi, "%s%s%s\n",
+	seq_printf(pi, "%s%s%s%s\n",
 		(kprobe_gone(p) ? "[GONE]" : ""),
 		((kprobe_disabled(p) && !kprobe_gone(p)) ?  "[DISABLED]" : ""),
-		(kprobe_optimized(pp) ? "[OPTIMIZED]" : ""));
+		(kprobe_optimized(pp) ? "[OPTIMIZED]" : ""),
+		(kprobe_ftrace(pp) ? "[FTRACE]" : ""));
 }
 
 static void __kprobes *kprobe_seq_start(struct seq_file *f, loff_t *pos)
@@ -1846,7 +2266,6 @@ static void __kprobes kprobe_seq_stop(struct seq_file *f, void *v)
 static int __kprobes show_kprobe_addr(struct seq_file *pi, void *v)
 {
 	struct hlist_head *head;
-	struct hlist_node *node;
 	struct kprobe *p, *kp;
 	const char *sym = NULL;
 	unsigned int i = *(loff_t *) v;
@@ -1855,7 +2274,7 @@ static int __kprobes show_kprobe_addr(struct seq_file *pi, void *v)
 
 	head = &kprobe_table[i];
 	preempt_disable();
-	hlist_for_each_entry_rcu(p, node, head, hlist) {
+	hlist_for_each_entry_rcu(p, head, hlist) {
 		sym = kallsyms_lookup((unsigned long)p->addr, NULL,
 					&offset, &modname, namebuf);
 		if (kprobe_aggrprobe(p)) {
@@ -1887,12 +2306,12 @@ static const struct file_operations debugfs_kprobes_operations = {
 	.release        = seq_release,
 };
 
-static void __kprobes arm_all_kprobes(void)
+static int __kprobes arm_all_kprobes(void)
 {
 	struct hlist_head *head;
-	struct hlist_node *node;
 	struct kprobe *p;
-	unsigned int i;
+	unsigned int i, total = 0, errors = 0;
+	int err, ret = 0;
 
 	mutex_lock(&kprobe_mutex);
 
@@ -1900,64 +2319,83 @@ static void __kprobes arm_all_kprobes(void)
 	if (!kprobes_all_disarmed)
 		goto already_enabled;
 
+	/*
+	 * optimize_kprobe() called by arm_kprobe() checks
+	 * kprobes_all_disarmed, so set kprobes_all_disarmed before
+	 * arm_kprobe.
+	 */
+	kprobes_all_disarmed = false;
 	/* Arming kprobes doesn't optimize kprobe itself */
-	mutex_lock(&text_mutex);
 	for (i = 0; i < KPROBE_TABLE_SIZE; i++) {
 		head = &kprobe_table[i];
-		hlist_for_each_entry_rcu(p, node, head, hlist)
-			if (!kprobe_disabled(p))
-				__arm_kprobe(p);
+		/* Arm all kprobes on a best-effort basis */
+		hlist_for_each_entry_rcu(p, head, hlist) {
+			if (!kprobe_disabled(p)) {
+				err = arm_kprobe(p);
+				if (err)  {
+					errors++;
+					ret = err;
+				}
+				total++;
+			}
+		}
 	}
-	mutex_unlock(&text_mutex);
 
-	kprobes_all_disarmed = false;
-	printk(KERN_INFO "Kprobes globally enabled\n");
+	if (errors)
+		pr_warn("Kprobes globally enabled, but failed to arm %d out of %d probes\n",
+			errors, total);
+	else
+		pr_info("Kprobes globally enabled\n");
 
 already_enabled:
 	mutex_unlock(&kprobe_mutex);
-	return;
+	return ret;
 }
 
-static void __kprobes disarm_all_kprobes(void)
+static int __kprobes disarm_all_kprobes(void)
 {
 	struct hlist_head *head;
-	struct hlist_node *node;
 	struct kprobe *p;
-	unsigned int i;
+	unsigned int i, total = 0, errors = 0;
+	int err, ret = 0;
 
 	mutex_lock(&kprobe_mutex);
 
 	/* If kprobes are already disarmed, just return */
-	if (kprobes_all_disarmed)
-		goto already_disabled;
+	if (kprobes_all_disarmed) {
+		mutex_unlock(&kprobe_mutex);
+		return 0;
+	}
 
 	kprobes_all_disarmed = true;
-	printk(KERN_INFO "Kprobes globally disabled\n");
 
-	/*
-	 * Here we call get_online_cpus() for avoiding text_mutex deadlock,
-	 * because disarming may also unoptimize kprobes.
-	 */
-	get_online_cpus();
-	mutex_lock(&text_mutex);
 	for (i = 0; i < KPROBE_TABLE_SIZE; i++) {
 		head = &kprobe_table[i];
-		hlist_for_each_entry_rcu(p, node, head, hlist) {
-			if (!arch_trampoline_kprobe(p) && !kprobe_disabled(p))
-				__disarm_kprobe(p);
+		/* Disarm all kprobes on a best-effort basis */
+		hlist_for_each_entry_rcu(p, head, hlist) {
+			if (!arch_trampoline_kprobe(p) && !kprobe_disabled(p)) {
+				err = disarm_kprobe(p, false);
+				if (err) {
+					errors++;
+					ret = err;
+				}
+				total++;
+			}
 		}
 	}
 
-	mutex_unlock(&text_mutex);
-	put_online_cpus();
-	mutex_unlock(&kprobe_mutex);
-	/* Allow all currently running kprobes to complete */
-	synchronize_sched();
-	return;
+	if (errors)
+		pr_warn("Kprobes globally disabled, but failed to disarm %d out of %d probes\n",
+			errors, total);
+	else
+		pr_info("Kprobes globally disabled\n");
 
-already_disabled:
 	mutex_unlock(&kprobe_mutex);
-	return;
+
+	/* Wait for disarming all kprobes by optimizer */
+	wait_for_kprobe_optimizer();
+
+	return ret;
 }
 
 /*
@@ -1983,7 +2421,8 @@ static ssize_t write_enabled_file_bool(struct file *file,
 	       const char __user *user_buf, size_t count, loff_t *ppos)
 {
 	char buf[32];
-	int buf_size;
+	size_t buf_size;
+	int ret = 0;
 
 	buf_size = min(count, (sizeof(buf)-1));
 	if (copy_from_user(buf, user_buf, buf_size))
@@ -1993,14 +2432,17 @@ static ssize_t write_enabled_file_bool(struct file *file,
 	case 'y':
 	case 'Y':
 	case '1':
-		arm_all_kprobes();
+		ret = arm_all_kprobes();
 		break;
 	case 'n':
 	case 'N':
 	case '0':
-		disarm_all_kprobes();
+		ret = disarm_all_kprobes();
 		break;
 	}
+
+	if (ret)
+		return ret;
 
 	return count;
 }
@@ -2008,6 +2450,7 @@ static ssize_t write_enabled_file_bool(struct file *file,
 static const struct file_operations fops_kp = {
 	.read =         read_enabled_file_bool,
 	.write =        write_enabled_file_bool,
+	.llseek =	default_llseek,
 };
 
 static int __kprobes debugfs_kprobe_init(void)

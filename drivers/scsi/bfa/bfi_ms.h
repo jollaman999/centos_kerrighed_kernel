@@ -473,7 +473,7 @@ struct bfi_lps_cvl_event_s {
 struct bfi_lps_n2n_pid_req_s {
 	struct bfi_mhdr_s	mh;	/*  common msg header		*/
 	u8	fw_tag;
-	u32	lp_pid : 24;
+	u32	lp_pid:24;
 };
 
 union bfi_lps_h2i_msg_u {

@@ -5,8 +5,10 @@
 #include <linux/kernel.h>
 #include <linux/cdrom.h>
 #include <linux/delay.h>
+#include <linux/export.h>
 #include <linux/ide.h>
 #include <linux/scatterlist.h>
+#include <linux/gfp.h>
 
 #include <scsi/scsi.h>
 
@@ -232,8 +234,7 @@ int ide_queue_sense_rq(ide_drive_t *drive, void *special)
 
 	drive->hwif->rq = NULL;
 
-	elv_add_request(drive->queue, &drive->sense_rq,
-			ELEVATOR_INSERT_FRONT, 0);
+	elv_add_request(drive->queue, &drive->sense_rq, ELEVATOR_INSERT_FRONT);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(ide_queue_sense_rq);
@@ -263,8 +264,8 @@ void ide_retry_pc(ide_drive_t *drive)
 	 * of it.  The failed command will be retried after sense data
 	 * is acquired.
 	 */
-	blk_requeue_request(failed_rq->q, failed_rq);
 	drive->hwif->rq = NULL;
+	ide_requeue_and_plug(drive, failed_rq);
 	if (ide_queue_sense_rq(drive, pc)) {
 		blk_start_request(failed_rq);
 		ide_complete_rq(drive, -EIO, blk_rq_bytes(failed_rq));

@@ -1,6 +1,8 @@
-#include <linux/notifier.h>
-#include <linux/nospec.h>
+#define pr_fmt(fmt) "xen:" KBUILD_MODNAME ": " fmt
 
+#include <linux/notifier.h>
+
+#include <xen/xen.h>
 #include <xen/xenbus.h>
 
 #include <asm/xen/hypervisor.h>
@@ -25,12 +27,13 @@ static void disable_hotplug_cpu(int cpu)
 static int vcpu_online(unsigned int cpu)
 {
 	int err;
-	char dir[32], state[32];
+	char dir[16], state[16];
 
 	sprintf(dir, "cpu/%u", cpu);
-	err = xenbus_scanf(XBT_NIL, dir, "availability", "%s", state);
+	err = xenbus_scanf(XBT_NIL, dir, "availability", "%15s", state);
 	if (err != 1) {
-		printk(KERN_ERR "XENBUS: Unable to read cpu state\n");
+		if (!xen_initial_domain())
+			pr_err("Unable to read cpu state\n");
 		return err;
 	}
 
@@ -39,14 +42,13 @@ static int vcpu_online(unsigned int cpu)
 	else if (strcmp(state, "offline") == 0)
 		return 0;
 
-	printk(KERN_ERR "XENBUS: unknown state(%s) on CPU%d\n", state, cpu);
+	pr_err("unknown state(%s) on CPU%d\n", state, cpu);
 	return -EINVAL;
 }
 static void vcpu_hotplug(unsigned int cpu)
 {
 	if (!cpu_possible(cpu))
 		return;
-	cpu = array_index_nospec(cpu, num_possible_cpus());
 
 	switch (vcpu_online(cpu)) {
 	case 1:
@@ -88,7 +90,7 @@ static int setup_cpu_watcher(struct notifier_block *notifier,
 	for_each_possible_cpu(cpu) {
 		if (vcpu_online(cpu) == 0) {
 			(void)cpu_down(cpu);
-			cpu_clear(cpu, cpu_present_map);
+			set_cpu_present(cpu, false);
 		}
 	}
 

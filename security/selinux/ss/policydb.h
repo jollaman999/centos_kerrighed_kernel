@@ -29,6 +29,8 @@
 #include "symtab.h"
 #include "avtab.h"
 #include "sidtab.h"
+#include "ebitmap.h"
+#include "mls_types.h"
 #include "context.h"
 #include "constraint.h"
 
@@ -58,6 +60,20 @@ struct class_datum {
 	struct symtab permissions;	/* class-specific permission symbol table */
 	struct constraint_node *constraints;	/* constraints on class permissions */
 	struct constraint_node *validatetrans;	/* special transition rules */
+/* Options how a new object user, role, and type should be decided */
+#define DEFAULT_SOURCE         1
+#define DEFAULT_TARGET         2
+	char default_user;
+	char default_role;
+	char default_type;
+/* Options how a new object range should be decided */
+#define DEFAULT_SOURCE_LOW     1
+#define DEFAULT_SOURCE_HIGH    2
+#define DEFAULT_SOURCE_LOW_HIGH        3
+#define DEFAULT_TARGET_LOW     4
+#define DEFAULT_TARGET_HIGH    5
+#define DEFAULT_TARGET_LOW_HIGH        6
+	char default_range;
 };
 
 /* Role attributes */
@@ -70,9 +86,21 @@ struct role_datum {
 
 struct role_trans {
 	u32 role;		/* current role */
-	u32 type;		/* program executable type */
+	u32 type;		/* program executable type, or new object type */
+	u32 tclass;		/* process class, or new object class */
 	u32 new_role;		/* new role */
 	struct role_trans *next;
+};
+
+struct filename_trans {
+	u32 stype;		/* current process */
+	u32 ttype;		/* parent dir context */
+	u16 tclass;		/* class of new object */
+	const char *name;	/* last path component */
+};
+
+struct filename_trans_datum {
+	u32 otype;		/* expected of new object */
 };
 
 struct role_allow {
@@ -126,6 +154,17 @@ struct cond_bool_datum {
 struct cond_node;
 
 /*
+ * type set preserves data needed to determine constraint info from
+ * policy source. This is not used by the kernel policy but allows
+ * utilities such as audit2allow to determine constraint denials.
+ */
+struct type_set {
+	struct ebitmap types;
+	struct ebitmap negset;
+	u32 flags;
+};
+
+/*
  * The configuration data includes security contexts for
  * initial SIDs, unlabeled file systems, TCP and UDP port numbers,
  * network interfaces, and nodes.  This structure stores the
@@ -148,6 +187,15 @@ struct ocontext {
 			u32 addr[4];
 			u32 mask[4];
 		} node6;        /* IPv6 node information */
+		struct {
+			u64 subnet_prefix;
+			u16 low_pkey;
+			u16 high_pkey;
+		} ibpkey;
+		struct {
+			char *dev_name;
+			u8 port;
+		} ibendport;
 	} u;
 	union {
 		u32 sclass;  /* security class for genfs */
@@ -176,17 +224,21 @@ struct genfs {
 #define SYM_NUM     8
 
 /* object context array indices */
-#define OCON_ISID  0	/* initial SIDs */
-#define OCON_FS    1	/* unlabeled file systems */
-#define OCON_PORT  2	/* TCP and UDP port numbers */
-#define OCON_NETIF 3	/* network interfaces */
-#define OCON_NODE  4	/* nodes */
-#define OCON_FSUSE 5	/* fs_use */
-#define OCON_NODE6 6	/* IPv6 nodes */
-#define OCON_NUM   7
+#define OCON_ISID	0 /* initial SIDs */
+#define OCON_FS		1 /* unlabeled file systems */
+#define OCON_PORT	2 /* TCP and UDP port numbers */
+#define OCON_NETIF	3 /* network interfaces */
+#define OCON_NODE	4 /* nodes */
+#define OCON_FSUSE	5 /* fs_use */
+#define OCON_NODE6	6 /* IPv6 nodes */
+#define OCON_IBPKEY	7 /* Infiniband PKeys */
+#define OCON_IBENDPORT	8 /* Infiniband end ports */
+#define OCON_NUM	9
 
 /* The policy database */
 struct policydb {
+	int mls_enabled;
+
 	/* symbol tables */
 	struct symtab symtab[SYM_NUM];
 #define p_commons symtab[SYM_COMMONS]
@@ -199,27 +251,25 @@ struct policydb {
 #define p_cats symtab[SYM_CATS]
 
 	/* symbol names indexed by (value - 1) */
-	char **sym_val_to_name[SYM_NUM];
-#define p_common_val_to_name sym_val_to_name[SYM_COMMONS]
-#define p_class_val_to_name sym_val_to_name[SYM_CLASSES]
-#define p_role_val_to_name sym_val_to_name[SYM_ROLES]
-#define p_type_val_to_name sym_val_to_name[SYM_TYPES]
-#define p_user_val_to_name sym_val_to_name[SYM_USERS]
-#define p_bool_val_to_name sym_val_to_name[SYM_BOOLS]
-#define p_sens_val_to_name sym_val_to_name[SYM_LEVELS]
-#define p_cat_val_to_name sym_val_to_name[SYM_CATS]
+	struct flex_array *sym_val_to_name[SYM_NUM];
 
 	/* class, role, and user attributes indexed by (value - 1) */
 	struct class_datum **class_val_to_struct;
 	struct role_datum **role_val_to_struct;
 	struct user_datum **user_val_to_struct;
-	struct type_datum **type_val_to_struct;
+	struct flex_array *type_val_to_struct_array;
 
 	/* type enforcement access vectors and transitions */
 	struct avtab te_avtab;
 
 	/* role transitions */
 	struct role_trans *role_tr;
+
+	/* file transitions with the last path component */
+	/* quickly exclude lookups when parent ttype has no rules */
+	struct ebitmap filename_trans_ttypes;
+	/* actual set of filename_trans rules */
+	struct hashtab *filename_trans;
 
 	/* bools indexed by (value - 1) */
 	struct cond_bool_datum **bool_val_to_struct;
@@ -306,7 +356,7 @@ static inline int next_entry(void *buf, struct policy_file *fp, size_t bytes)
 	return 0;
 }
 
-static inline int put_entry(void *buf, size_t bytes, int num, struct policy_file *fp)
+static inline int put_entry(const void *buf, size_t bytes, int num, struct policy_file *fp)
 {
 	size_t len = bytes * num;
 
@@ -315,6 +365,13 @@ static inline int put_entry(void *buf, size_t bytes, int num, struct policy_file
 	fp->len -= len;
 
 	return 0;
+}
+
+static inline char *sym_name(struct policydb *p, unsigned int sym_num, unsigned int element_nr)
+{
+	struct flex_array *fa = p->sym_val_to_name[sym_num];
+
+	return flex_array_get_ptr(fa, element_nr);
 }
 
 extern u16 string_to_security_class(struct policydb *p, const char *name);

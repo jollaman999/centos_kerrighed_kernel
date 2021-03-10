@@ -14,11 +14,13 @@
 #include <asm/asm.h>
 
 #ifdef CONFIG_FUNCTION_TRACER
-/* mcount is defined in assembly */
+/* mcount and __fentry__ are defined in assembly */
+#ifdef CC_USING_FENTRY
+EXPORT_SYMBOL(__fentry__);
+#else
 EXPORT_SYMBOL(mcount);
 #endif
-
-EXPORT_SYMBOL(kernel_thread);
+#endif
 
 EXPORT_SYMBOL(__get_user_1);
 EXPORT_SYMBOL(__get_user_2);
@@ -29,33 +31,20 @@ EXPORT_SYMBOL(__put_user_2);
 EXPORT_SYMBOL(__put_user_4);
 EXPORT_SYMBOL(__put_user_8);
 
-__must_check unsigned long notrace
-copy_user_generic(void *to, const void *from, unsigned len)
-{
-	unsigned ret;
-
-	alternative_call(copy_user_generic_unrolled,
-			 copy_user_generic_string,
-			 X86_FEATURE_REP_GOOD,
-			 ASM_OUTPUT2("=a" (ret), "=D" (to), "=S" (from),
-				     "=d" (len)),
-			 "1" (to), "2" (from), "3" (len)
-			 : "memory", "rcx", "r8", "r9", "r10", "r11");
-	return ret;
-}
-EXPORT_SYMBOL(copy_user_generic);
 EXPORT_SYMBOL(copy_user_generic_string);
 EXPORT_SYMBOL(copy_user_generic_unrolled);
+EXPORT_SYMBOL(copy_user_enhanced_fast_string);
 EXPORT_SYMBOL(__copy_user_nocache);
-EXPORT_SYMBOL(copy_from_user);
-EXPORT_SYMBOL(copy_to_user);
+EXPORT_SYMBOL(_copy_from_user);
+EXPORT_SYMBOL(_copy_to_user);
 
-__must_check long __copy_from_user_inatomic(void *dst, const void __user *src,
-					    unsigned size)
-{
-	return copy_user_generic(dst, (__force const void *)src, size);
-}
-EXPORT_SYMBOL(__copy_from_user_inatomic);
+EXPORT_SYMBOL_GPL(__memcpy_mcsafe);
+
+#ifdef CONFIG_MCSAFE_TEST
+extern unsigned long mcsafe_test_src, mcsafe_test_dst;
+EXPORT_SYMBOL_GPL(mcsafe_test_src);
+EXPORT_SYMBOL_GPL(mcsafe_test_dst);
+#endif
 
 EXPORT_SYMBOL(copy_page);
 EXPORT_SYMBOL(clear_page);
@@ -79,15 +68,20 @@ EXPORT_SYMBOL(memcpy);
 EXPORT_SYMBOL(__memcpy);
 EXPORT_SYMBOL(memmove);
 
+#ifndef CONFIG_DEBUG_VIRTUAL
+EXPORT_SYMBOL(phys_base);
+#endif
 EXPORT_SYMBOL(empty_zero_page);
 EXPORT_SYMBOL(init_level4_pgt);
-EXPORT_SYMBOL(load_gs_index);
+#ifndef CONFIG_PARAVIRT
+EXPORT_SYMBOL(native_load_gs_index);
+#endif
 
-#ifdef CONFIG_RETPOLINE
 #define EXPORT_THUNK(reg)						\
 	extern void __x86_indirect_thunk_ ## reg(void);			\
 	EXPORT_SYMBOL(__x86_indirect_thunk_ ## reg)
 
+#ifdef CONFIG_RETPOLINE
 EXPORT_THUNK(rax);
 EXPORT_THUNK(rbx);
 EXPORT_THUNK(rcx);
@@ -103,4 +97,4 @@ EXPORT_THUNK(r12);
 EXPORT_THUNK(r13);
 EXPORT_THUNK(r14);
 EXPORT_THUNK(r15);
-#endif /* CONFIG_RETPOLINE */
+#endif

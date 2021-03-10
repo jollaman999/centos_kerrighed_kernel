@@ -13,9 +13,6 @@
 #include <linux/io.h>
 #include <linux/etherdevice.h>
 
-#if 1 /* in RHEL */
-#include <pcmcia/cs_types.h>
-#endif
 #include <pcmcia/cistpl.h>
 #include <pcmcia/ciscode.h>
 #include <pcmcia/ds.h>
@@ -150,8 +147,7 @@ error:
 	return err;
 }
 
-int ssb_pcmcia_switch_core(struct ssb_bus *bus,
-			   struct ssb_device *dev)
+static int ssb_pcmcia_switch_core(struct ssb_bus *bus, struct ssb_device *dev)
 {
 	int err;
 

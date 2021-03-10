@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /*
  * Keytable for MK-F12 IR remote provided together with Pixelview
@@ -34,7 +35,7 @@ static struct rc_map_table pixelview_mk12[] = {
 	{ 0x866b13, KEY_AGAIN },	/* loop */
 	{ 0x866b10, KEY_DIGITS },	/* +100 */
 
-	{ 0x866b00, KEY_MEDIA },	/* source */
+	{ 0x866b00, KEY_VIDEO },		/* source */
 	{ 0x866b18, KEY_MUTE },		/* mute */
 	{ 0x866b19, KEY_CAMERA },	/* snapshot */
 	{ 0x866b1a, KEY_SEARCH },	/* scan */

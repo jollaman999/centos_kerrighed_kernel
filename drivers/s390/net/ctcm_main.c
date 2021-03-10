@@ -1,6 +1,4 @@
 /*
- * drivers/s390/net/ctcm_main.c
- *
  * Copyright IBM Corp. 2001, 2009
  * Author(s):
  *	Original CTC driver(s):
@@ -267,7 +265,7 @@ static struct channel *channel_get(enum ctcm_channel_types type,
 		else {
 			ch->flags |= CHANNEL_FLAGS_INUSE;
 			ch->flags &= ~CHANNEL_FLAGS_RWMASK;
-			ch->flags |= (direction == WRITE)
+			ch->flags |= (direction == CTCM_WRITE)
 			    ? CHANNEL_FLAGS_WRITE : CHANNEL_FLAGS_READ;
 			fsm_newstate(ch->fsm, CTC_STATE_STOPPED);
 		}
@@ -388,7 +386,8 @@ int ctcm_ch_alloc_buffer(struct channel *ch)
 		CTCM_DBF_TEXT_(ERROR, CTC_DBF_ERROR,
 			"%s(%s): %s trans_skb allocation error",
 			CTCM_FUNTAIL, ch->id,
-			(CHANNEL_DIRECTION(ch->flags) == READ) ? "RX" : "TX");
+			(CHANNEL_DIRECTION(ch->flags) == CTCM_READ) ?
+				"RX" : "TX");
 		return -ENOMEM;
 	}
 
@@ -399,7 +398,8 @@ int ctcm_ch_alloc_buffer(struct channel *ch)
 		CTCM_DBF_TEXT_(ERROR, CTC_DBF_ERROR,
 			"%s(%s): %s set norm_cda failed",
 			CTCM_FUNTAIL, ch->id,
-			(CHANNEL_DIRECTION(ch->flags) == READ) ? "RX" : "TX");
+			(CHANNEL_DIRECTION(ch->flags) == CTCM_READ) ?
+				"RX" : "TX");
 		return -ENOMEM;
 	}
 
@@ -560,6 +560,9 @@ static int ctcm_transmit_skb(struct channel *ch, struct sk_buff *skb)
 		skb_queue_tail(&ch->io_queue, skb);
 		ccw_idx = 3;
 	}
+	if (do_debug_ccw)
+		ctcmpc_dumpit((char *)&ch->ccw[ccw_idx],
+					sizeof(struct ccw1) * 3);
 	ch->retry = 0;
 	fsm_newstate(ch->fsm, CTC_STATE_TX);
 	fsm_addtimer(&ch->timer, CTCM_TIME_5_SEC, CTC_EVENT_TIMER, ch);
@@ -603,14 +606,14 @@ static void ctcmpc_send_sweep_req(struct channel *rch)
 
 	priv = dev->ml_priv;
 	grp = priv->mpcg;
-	ch = priv->channel[WRITE];
+	ch = priv->channel[CTCM_WRITE];
 
 	/* sweep processing is not complete until response and request */
 	/* has completed for all read channels in group		       */
 	if (grp->in_sweep == 0) {
 		grp->in_sweep = 1;
-		grp->sweep_rsp_pend_num = grp->active_channels[READ];
-		grp->sweep_req_pend_num = grp->active_channels[READ];
+		grp->sweep_rsp_pend_num = grp->active_channels[CTCM_READ];
+		grp->sweep_req_pend_num = grp->active_channels[CTCM_READ];
 	}
 
 	sweep_skb = __dev_alloc_skb(MPC_BUFSIZE_DEFAULT, GFP_ATOMIC|GFP_DMA);
@@ -639,7 +642,7 @@ static void ctcmpc_send_sweep_req(struct channel *rch)
 
 	kfree(header);
 
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 	skb_queue_tail(&ch->sweep_queue, sweep_skb);
 
 	fsm_addtimer(&ch->sweep_timer, 100, CTC_EVENT_RSWEEP_TIMER, ch);
@@ -669,7 +672,6 @@ static int ctcmpc_transmit_skb(struct channel *ch, struct sk_buff *skb)
 	int ccw_idx;
 	unsigned long hi;
 	unsigned long saveflags = 0;	/* avoids compiler warning */
-	__u16 block_len;
 
 	CTCM_PR_DEBUG("Enter %s: %s, cp=%i ch=0x%p id=%s state=%s\n",
 			__func__, dev->name, smp_processor_id(), ch,
@@ -716,7 +718,6 @@ static int ctcmpc_transmit_skb(struct channel *ch, struct sk_buff *skb)
 	 */
 	atomic_inc(&skb->users);
 
-	block_len = skb->len + TH_HEADER_LENGTH + PDU_HEADER_LENGTH;
 	/*
 	 * IDAL support in CTCM is broken, so we have to
 	 * care about skb's above 2G ourselves.
@@ -910,8 +911,8 @@ static int ctcm_tx(struct sk_buff *skb, struct net_device *dev)
 	if (ctcm_test_and_set_busy(dev))
 		return NETDEV_TX_BUSY;
 
-	dev->trans_start = jiffies;
-	if (ctcm_transmit_skb(priv->channel[WRITE], skb) != 0)
+	netif_trans_update(dev);
+	if (ctcm_transmit_skb(priv->channel[CTCM_WRITE], skb) != 0)
 		return NETDEV_TX_BUSY;
 	return NETDEV_TX_OK;
 }
@@ -993,8 +994,8 @@ static int ctcmpc_tx(struct sk_buff *skb, struct net_device *dev)
 					goto done;
 	}
 
-	dev->trans_start = jiffies;
-	if (ctcmpc_transmit_skb(priv->channel[WRITE], skb) != 0) {
+	netif_trans_update(dev);
+	if (ctcmpc_transmit_skb(priv->channel[CTCM_WRITE], skb) != 0) {
 		CTCM_DBF_TEXT_(MPC_ERROR, CTC_DBF_ERROR,
 			"%s(%s): device error - dropped",
 					CTCM_FUNTAIL, dev->name);
@@ -1035,7 +1036,7 @@ static int ctcm_change_mtu(struct net_device *dev, int new_mtu)
 		return -EINVAL;
 
 	priv = dev->ml_priv;
-	max_bufsize = priv->channel[READ]->max_bufsize;
+	max_bufsize = priv->channel[CTCM_READ]->max_bufsize;
 
 	if (IS_MPC(priv)) {
 		if (new_mtu > max_bufsize - TH_HEADER_LENGTH)
@@ -1105,7 +1106,7 @@ static const struct net_device_ops ctcm_netdev_ops = {
 	.ndo_open		= ctcm_open,
 	.ndo_stop		= ctcm_close,
 	.ndo_get_stats		= ctcm_stats,
-	.ndo_change_mtu	   	= ctcm_change_mtu,
+	.ndo_change_mtu_rh74	= ctcm_change_mtu,
 	.ndo_start_xmit		= ctcm_tx,
 };
 
@@ -1113,7 +1114,7 @@ static const struct net_device_ops ctcm_mpc_netdev_ops = {
 	.ndo_open		= ctcm_open,
 	.ndo_stop		= ctcm_close,
 	.ndo_get_stats		= ctcm_stats,
-	.ndo_change_mtu	   	= ctcm_change_mtu,
+	.ndo_change_mtu_rh74	= ctcm_change_mtu,
 	.ndo_start_xmit		= ctcmpc_tx,
 };
 
@@ -1152,7 +1153,7 @@ static struct net_device *ctcm_init_netdevice(struct ctcm_priv *priv)
 				dev_fsm, dev_fsm_len, GFP_KERNEL);
 	if (priv->fsm == NULL) {
 		CTCMY_DBF_DEV(SETUP, dev, "init_fsm error");
-		kfree(dev);
+		free_netdev(dev);
 		return NULL;
 	}
 	fsm_newstate(priv->fsm, DEV_STATE_STOPPED);
@@ -1163,7 +1164,7 @@ static struct net_device *ctcm_init_netdevice(struct ctcm_priv *priv)
 		grp = ctcmpc_init_mpc_group(priv);
 		if (grp == NULL) {
 			MPC_DBF_DEV(SETUP, dev, "init_mpc_group error");
-			kfree(dev);
+			free_netdev(dev);
 			return NULL;
 		}
 		tasklet_init(&grp->mpc_tasklet2,
@@ -1226,10 +1227,10 @@ static void ctcm_irq_handler(struct ccw_device *cdev,
 	priv = dev_get_drvdata(&cgdev->dev);
 
 	/* Try to extract channel from driver data. */
-	if (priv->channel[READ]->cdev == cdev)
-		ch = priv->channel[READ];
-	else if (priv->channel[WRITE]->cdev == cdev)
-		ch = priv->channel[WRITE];
+	if (priv->channel[CTCM_READ]->cdev == cdev)
+		ch = priv->channel[CTCM_READ];
+	else if (priv->channel[CTCM_WRITE]->cdev == cdev)
+		ch = priv->channel[CTCM_WRITE];
 	else {
 		dev_err(&cdev->dev,
 			"%s: Internal error: Can't determine channel for "
@@ -1293,6 +1294,11 @@ static void ctcm_irq_handler(struct ccw_device *cdev,
 
 }
 
+static const struct device_type ctcm_devtype = {
+	.name = "ctcm",
+	.groups = ctcm_attr_groups,
+};
+
 /**
  * Add ctcm specific attributes.
  * Add ctcm private data.
@@ -1304,7 +1310,6 @@ static void ctcm_irq_handler(struct ccw_device *cdev,
 static int ctcm_probe_device(struct ccwgroup_device *cgdev)
 {
 	struct ctcm_priv *priv;
-	int rc;
 
 	CTCM_DBF_TEXT_(SETUP, CTC_DBF_INFO,
 			"%s %p",
@@ -1321,17 +1326,11 @@ static int ctcm_probe_device(struct ccwgroup_device *cgdev)
 		put_device(&cgdev->dev);
 		return -ENOMEM;
 	}
-
-	rc = ctcm_add_files(&cgdev->dev);
-	if (rc) {
-		kfree(priv);
-		put_device(&cgdev->dev);
-		return rc;
-	}
 	priv->buffer_size = CTCM_BUFSIZE_DEFAULT;
 	cgdev->cdev[0]->handler = ctcm_irq_handler;
 	cgdev->cdev[1]->handler = ctcm_irq_handler;
 	dev_set_drvdata(&cgdev->dev, priv);
+	cgdev->dev.type = &ctcm_devtype;
 
 	return 0;
 }
@@ -1364,8 +1363,7 @@ static int add_channel(struct ccw_device *cdev, enum ctcm_channel_types type,
 
 	ch->protocol = priv->protocol;
 	if (IS_MPC(priv)) {
-		ch->discontact_th = (struct th_header *)
-				kzalloc(TH_HEADER_LENGTH, gfp_type());
+		ch->discontact_th = kzalloc(TH_HEADER_LENGTH, gfp_type());
 		if (ch->discontact_th == NULL)
 					goto nomem_return;
 
@@ -1379,8 +1377,7 @@ static int add_channel(struct ccw_device *cdev, enum ctcm_channel_types type,
 	} else
 		ccw_num = 8;
 
-	ch->ccw = (struct ccw1 *)
-		kzalloc(ccw_num * sizeof(struct ccw1), GFP_KERNEL | GFP_DMA);
+	ch->ccw = kzalloc(ccw_num * sizeof(struct ccw1), GFP_KERNEL | GFP_DMA);
 	if (ch->ccw == NULL)
 					goto nomem_return;
 
@@ -1457,7 +1454,7 @@ static int add_channel(struct ccw_device *cdev, enum ctcm_channel_types type,
 				ch_fsm_len, GFP_KERNEL);
 	}
 	if (ch->fsm == NULL)
-				goto free_return;
+				goto nomem_return;
 
 	fsm_newstate(ch->fsm, CTC_STATE_IDLE);
 
@@ -1534,11 +1531,16 @@ static int ctcm_new_device(struct ccwgroup_device *cgdev)
 	struct net_device *dev;
 	struct ccw_device *cdev0;
 	struct ccw_device *cdev1;
+	struct channel *readc;
+	struct channel *writec;
 	int ret;
+	int result;
 
 	priv = dev_get_drvdata(&cgdev->dev);
-	if (!priv)
-		return -ENODEV;
+	if (!priv) {
+		result = -ENODEV;
+		goto out_err_result;
+	}
 
 	cdev0 = cgdev->cdev[0];
 	cdev1 = cgdev->cdev[1];
@@ -1549,39 +1551,48 @@ static int ctcm_new_device(struct ccwgroup_device *cgdev)
 	snprintf(write_id, CTCM_ID_SIZE, "ch-%s", dev_name(&cdev1->dev));
 
 	ret = add_channel(cdev0, type, priv);
-	if (ret)
-		return ret;
+	if (ret) {
+		result = ret;
+		goto out_err_result;
+	}
 	ret = add_channel(cdev1, type, priv);
-	if (ret)
-		return ret;
+	if (ret) {
+		result = ret;
+		goto out_remove_channel1;
+	}
 
 	ret = ccw_device_set_online(cdev0);
 	if (ret != 0) {
-		/* may be ok to fail now - can be done later */
 		CTCM_DBF_TEXT_(TRACE, CTC_DBF_NOTICE,
 			"%s(%s) set_online rc=%d",
 				CTCM_FUNTAIL, read_id, ret);
+		result = -EIO;
+		goto out_remove_channel2;
 	}
 
 	ret = ccw_device_set_online(cdev1);
 	if (ret != 0) {
-		/* may be ok to fail now - can be done later */
 		CTCM_DBF_TEXT_(TRACE, CTC_DBF_NOTICE,
 			"%s(%s) set_online rc=%d",
 				CTCM_FUNTAIL, write_id, ret);
+
+		result = -EIO;
+		goto out_ccw1;
 	}
 
 	dev = ctcm_init_netdevice(priv);
-	if (dev == NULL)
-			goto out;
+	if (dev == NULL) {
+		result = -ENODEV;
+		goto out_ccw2;
+	}
 
-	for (direction = READ; direction <= WRITE; direction++) {
+	for (direction = CTCM_READ; direction <= CTCM_WRITE; direction++) {
 		priv->channel[direction] =
-		    channel_get(type, direction == READ ? read_id : write_id,
-				direction);
+			channel_get(type, direction == CTCM_READ ?
+				read_id : write_id, direction);
 		if (priv->channel[direction] == NULL) {
-			if (direction == WRITE)
-				channel_free(priv->channel[READ]);
+			if (direction == CTCM_WRITE)
+				channel_free(priv->channel[CTCM_READ]);
 			goto out_dev;
 		}
 		priv->channel[direction]->netdev = dev;
@@ -1591,34 +1602,38 @@ static int ctcm_new_device(struct ccwgroup_device *cgdev)
 	/* sysfs magic */
 	SET_NETDEV_DEV(dev, &cgdev->dev);
 
-	if (register_netdev(dev))
-			goto out_dev;
-
-	if (ctcm_add_attributes(&cgdev->dev)) {
-		unregister_netdev(dev);
-			goto out_dev;
+	if (register_netdev(dev)) {
+		result = -ENODEV;
+		goto out_dev;
 	}
 
 	strlcpy(priv->fsm->name, dev->name, sizeof(priv->fsm->name));
 
 	dev_info(&dev->dev,
 		"setup OK : r/w = %s/%s, protocol : %d\n",
-			priv->channel[READ]->id,
-			priv->channel[WRITE]->id, priv->protocol);
+			priv->channel[CTCM_READ]->id,
+			priv->channel[CTCM_WRITE]->id, priv->protocol);
 
 	CTCM_DBF_TEXT_(SETUP, CTC_DBF_INFO,
 		"setup(%s) OK : r/w = %s/%s, protocol : %d", dev->name,
-			priv->channel[READ]->id,
-			priv->channel[WRITE]->id, priv->protocol);
+			priv->channel[CTCM_READ]->id,
+			priv->channel[CTCM_WRITE]->id, priv->protocol);
 
 	return 0;
 out_dev:
 	ctcm_free_netdevice(dev);
-out:
+out_ccw2:
 	ccw_device_set_offline(cgdev->cdev[1]);
+out_ccw1:
 	ccw_device_set_offline(cgdev->cdev[0]);
-
-	return -ENODEV;
+out_remove_channel2:
+	readc = channel_get(type, read_id, CTCM_READ);
+	channel_remove(readc);
+out_remove_channel1:
+	writec = channel_get(type, write_id, CTCM_WRITE);
+	channel_remove(writec);
+out_err_result:
+	return result;
 }
 
 /**
@@ -1637,19 +1652,18 @@ static int ctcm_shutdown_device(struct ccwgroup_device *cgdev)
 	if (!priv)
 		return -ENODEV;
 
-	if (priv->channel[READ]) {
-		dev = priv->channel[READ]->netdev;
+	if (priv->channel[CTCM_READ]) {
+		dev = priv->channel[CTCM_READ]->netdev;
 		CTCM_DBF_DEV(SETUP, dev, "");
 		/* Close the device */
 		ctcm_close(dev);
 		dev->flags &= ~IFF_RUNNING;
-		ctcm_remove_attributes(&cgdev->dev);
-		channel_free(priv->channel[READ]);
+		channel_free(priv->channel[CTCM_READ]);
 	} else
 		dev = NULL;
 
-	if (priv->channel[WRITE])
-		channel_free(priv->channel[WRITE]);
+	if (priv->channel[CTCM_WRITE])
+		channel_free(priv->channel[CTCM_WRITE]);
 
 	if (dev) {
 		unregister_netdev(dev);
@@ -1662,11 +1676,11 @@ static int ctcm_shutdown_device(struct ccwgroup_device *cgdev)
 	ccw_device_set_offline(cgdev->cdev[1]);
 	ccw_device_set_offline(cgdev->cdev[0]);
 
-	if (priv->channel[READ])
-		channel_remove(priv->channel[READ]);
-	if (priv->channel[WRITE])
-		channel_remove(priv->channel[WRITE]);
-	priv->channel[READ] = priv->channel[WRITE] = NULL;
+	if (priv->channel[CTCM_READ])
+		channel_remove(priv->channel[CTCM_READ]);
+	if (priv->channel[CTCM_WRITE])
+		channel_remove(priv->channel[CTCM_WRITE]);
+	priv->channel[CTCM_READ] = priv->channel[CTCM_WRITE] = NULL;
 
 	return 0;
 
@@ -1677,15 +1691,12 @@ static void ctcm_remove_device(struct ccwgroup_device *cgdev)
 {
 	struct ctcm_priv *priv = dev_get_drvdata(&cgdev->dev);
 
-	BUG_ON(priv == NULL);
-
 	CTCM_DBF_TEXT_(SETUP, CTC_DBF_INFO,
 			"removing device %p, proto : %d",
 			cgdev, priv->protocol);
 
 	if (cgdev->state == CCWGROUP_ONLINE)
 		ctcm_shutdown_device(cgdev);
-	ctcm_remove_files(&cgdev->dev);
 	dev_set_drvdata(&cgdev->dev, NULL);
 	kfree(priv);
 	put_device(&cgdev->dev);
@@ -1697,11 +1708,11 @@ static int ctcm_pm_suspend(struct ccwgroup_device *gdev)
 
 	if (gdev->state == CCWGROUP_OFFLINE)
 		return 0;
-	netif_device_detach(priv->channel[READ]->netdev);
-	ctcm_close(priv->channel[READ]->netdev);
+	netif_device_detach(priv->channel[CTCM_READ]->netdev);
+	ctcm_close(priv->channel[CTCM_READ]->netdev);
 	if (!wait_event_timeout(priv->fsm->wait_q,
 	    fsm_getstate(priv->fsm) == DEV_STATE_STOPPED, CTCM_TIME_5_SEC)) {
-		netif_device_attach(priv->channel[READ]->netdev);
+		netif_device_attach(priv->channel[CTCM_READ]->netdev);
 		return -EBUSY;
 	}
 	ccw_device_set_offline(gdev->cdev[1]);
@@ -1722,9 +1733,9 @@ static int ctcm_pm_resume(struct ccwgroup_device *gdev)
 	rc = ccw_device_set_online(gdev->cdev[0]);
 	if (rc)
 		goto err_out;
-	ctcm_open(priv->channel[READ]->netdev);
+	ctcm_open(priv->channel[CTCM_READ]->netdev);
 err_out:
-	netif_device_attach(priv->channel[READ]->netdev);
+	netif_device_attach(priv->channel[CTCM_READ]->netdev);
 	return rc;
 }
 
@@ -1737,19 +1748,22 @@ static struct ccw_device_id ctcm_ids[] = {
 MODULE_DEVICE_TABLE(ccw, ctcm_ids);
 
 static struct ccw_driver ctcm_ccw_driver = {
-	.owner	= THIS_MODULE,
-	.name	= "ctcm",
+	.driver = {
+		.owner	= THIS_MODULE,
+		.name	= "ctcm",
+	},
 	.ids	= ctcm_ids,
 	.probe	= ccwgroup_probe_ccwdev,
 	.remove	= ccwgroup_remove_ccwdev,
+	.int_class = IRQIO_CTC,
 };
 
 static struct ccwgroup_driver ctcm_group_driver = {
-	.owner       = THIS_MODULE,
-	.name        = CTC_DRIVER_NAME,
-	.max_slaves  = 2,
-	.driver_id   = 0xC3E3C3D4,	/* CTCM */
-	.probe       = ctcm_probe_device,
+	.driver = {
+		.owner	= THIS_MODULE,
+		.name	= CTC_DRIVER_NAME,
+	},
+	.setup	     = ctcm_probe_device,
 	.remove      = ctcm_remove_device,
 	.set_online  = ctcm_new_device,
 	.set_offline = ctcm_shutdown_device,
@@ -1758,31 +1772,25 @@ static struct ccwgroup_driver ctcm_group_driver = {
 	.restore     = ctcm_pm_resume,
 };
 
-static ssize_t
-ctcm_driver_group_store(struct device_driver *ddrv, const char *buf,
-			size_t count)
+static ssize_t ctcm_driver_group_store(struct device_driver *ddrv,
+				       const char *buf,	size_t count)
 {
 	int err;
 
-	err = ccwgroup_create_from_string(ctcm_root_dev,
-					  ctcm_group_driver.driver_id,
-					  &ctcm_ccw_driver, 2, buf);
+	err = ccwgroup_create_dev(ctcm_root_dev, &ctcm_group_driver, 2, buf);
 	return err ? err : count;
 }
-
 static DRIVER_ATTR(group, 0200, NULL, ctcm_driver_group_store);
 
-static struct attribute *ctcm_group_attrs[] = {
+static struct attribute *ctcm_drv_attrs[] = {
 	&driver_attr_group.attr,
 	NULL,
 };
-
-static struct attribute_group ctcm_group_attr_group = {
-	.attrs = ctcm_group_attrs,
+static struct attribute_group ctcm_drv_attr_group = {
+	.attrs = ctcm_drv_attrs,
 };
-
-static const struct attribute_group *ctcm_group_attr_groups[] = {
-	&ctcm_group_attr_group,
+static const struct attribute_group *ctcm_drv_attr_groups[] = {
+	&ctcm_drv_attr_group,
 	NULL,
 };
 
@@ -1798,7 +1806,6 @@ static const struct attribute_group *ctcm_group_attr_groups[] = {
  */
 static void __exit ctcm_exit(void)
 {
-	driver_remove_file(&ctcm_group_driver.driver, &driver_attr_group);
 	ccwgroup_driver_unregister(&ctcm_group_driver);
 	ccw_driver_unregister(&ctcm_ccw_driver);
 	root_device_unregister(ctcm_root_dev);
@@ -1836,7 +1843,7 @@ static int __init ctcm_init(void)
 	ret = ccw_driver_register(&ctcm_ccw_driver);
 	if (ret)
 		goto ccw_err;
-	ctcm_group_driver.driver.groups = ctcm_group_attr_groups;
+	ctcm_group_driver.driver.groups = ctcm_drv_attr_groups;
 	ret = ccwgroup_driver_register(&ctcm_group_driver);
 	if (ret)
 		goto ccwgroup_err;

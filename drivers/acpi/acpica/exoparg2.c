@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -119,38 +119,11 @@ acpi_status acpi_ex_opcode_2A_0T_0R(struct acpi_walk_state *walk_state)
 			status = AE_AML_OPERAND_TYPE;
 			break;
 		}
-#ifdef ACPI_GPE_NOTIFY_CHECK
-		/*
-		 * GPE method wake/notify check.  Here, we want to ensure that we
-		 * don't receive any "DeviceWake" Notifies from a GPE _Lxx or _Exx
-		 * GPE method during system runtime.  If we do, the GPE is marked
-		 * as "wake-only" and disabled.
-		 *
-		 * 1) Is the Notify() value == device_wake?
-		 * 2) Is this a GPE deferred method?  (An _Lxx or _Exx method)
-		 * 3) Did the original GPE happen at system runtime?
-		 *    (versus during wake)
-		 *
-		 * If all three cases are true, this is a wake-only GPE that should
-		 * be disabled at runtime.
-		 */
-		if (value == 2) {	/* device_wake */
-			status =
-			    acpi_ev_check_for_wake_only_gpe(walk_state->
-							    gpe_event_info);
-			if (ACPI_FAILURE(status)) {
-
-				/* AE_WAKE_ONLY_GPE only error, means ignore this notify */
-
-				return_ACPI_STATUS(AE_OK)
-			}
-		}
-#endif
 
 		/*
 		 * Dispatch the notify to the appropriate handler
 		 * NOTE: the request is queued for execution after this method
-		 * completes.  The notify handlers are NOT invoked synchronously
+		 * completes. The notify handlers are NOT invoked synchronously
 		 * from this thread -- because handlers may in turn run other
 		 * control methods.
 		 */
@@ -282,9 +255,9 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 {
 	union acpi_operand_object **operand = &walk_state->operands[0];
 	union acpi_operand_object *return_desc = NULL;
-	acpi_integer index;
+	u64 index;
 	acpi_status status = AE_OK;
-	acpi_size length;
+	acpi_size length = 0;
 
 	ACPI_FUNCTION_TRACE_STR(ex_opcode_2A_1T_1R,
 				acpi_ps_get_opcode_name(walk_state->opcode));
@@ -331,7 +304,6 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 		break;
 
 	case AML_TO_STRING_OP:	/* to_string (Buffer, Length, Result) (ACPI 2.0) */
-
 		/*
 		 * Input object is guaranteed to be a buffer at this point (it may have
 		 * been converted.)  Copy the raw buffer data to a new object of
@@ -347,7 +319,6 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 		 * NOTE: A length of zero is ok, and will create a zero-length, null
 		 *       terminated string.
 		 */
-		length = 0;
 		while ((length < operand[0]->buffer.length) &&
 		       (length < operand[1]->integer.value) &&
 		       (operand[0]->buffer.pointer[length])) {
@@ -366,8 +337,8 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 		 * Copy the raw buffer data with no transform.
 		 * (NULL terminated already)
 		 */
-		ACPI_MEMCPY(return_desc->string.pointer,
-			    operand[0]->buffer.pointer, length);
+		memcpy(return_desc->string.pointer,
+		       operand[0]->buffer.pointer, length);
 		break;
 
 	case AML_CONCAT_RES_OP:
@@ -403,6 +374,7 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 		case ACPI_TYPE_STRING:
 
 			if (index >= operand[0]->string.length) {
+				length = operand[0]->string.length;
 				status = AE_AML_STRING_LIMIT;
 			}
 
@@ -413,6 +385,7 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 		case ACPI_TYPE_BUFFER:
 
 			if (index >= operand[0]->buffer.length) {
+				length = operand[0]->buffer.length;
 				status = AE_AML_BUFFER_LIMIT;
 			}
 
@@ -423,6 +396,7 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 		case ACPI_TYPE_PACKAGE:
 
 			if (index >= operand[0]->package.count) {
+				length = operand[0]->package.count;
 				status = AE_AML_PACKAGE_LIMIT;
 			}
 
@@ -441,8 +415,9 @@ acpi_status acpi_ex_opcode_2A_1T_1R(struct acpi_walk_state *walk_state)
 
 		if (ACPI_FAILURE(status)) {
 			ACPI_EXCEPTION((AE_INFO, status,
-					"Index (0x%8.8X%8.8X) is beyond end of object",
-					ACPI_FORMAT_UINT64(index)));
+					"Index (0x%X%8.8X) is beyond end of object (length 0x%X)",
+					ACPI_FORMAT_UINT64(index),
+					(u32)length));
 			goto cleanup;
 		}
 
@@ -584,7 +559,7 @@ acpi_status acpi_ex_opcode_2A_0T_1R(struct acpi_walk_state *walk_state)
 	 * Default is FALSE (zero)
 	 */
 	if (logical_result) {
-		return_desc->integer.value = ACPI_INTEGER_MAX;
+		return_desc->integer.value = ACPI_UINT64_MAX;
 	}
 
       cleanup:

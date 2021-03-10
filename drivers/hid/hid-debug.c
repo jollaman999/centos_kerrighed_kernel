@@ -26,9 +26,14 @@
  * Vojtech Pavlik, Simunkova 1594, Prague 8, 182 00 Czech Republic
  */
 
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+
 #include <linux/debugfs.h>
 #include <linux/seq_file.h>
+#include <linux/kfifo.h>
 #include <linux/sched.h>
+#include <linux/export.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/poll.h>
 
@@ -110,6 +115,14 @@ static const struct hid_usage_entry hid_usage_table[] = {
       {0, 0xbd, "FlareRelease"},
       {0, 0xbe, "LandingGear"},
       {0, 0xbf, "ToeBrake"},
+  {  6, 0, "GenericDeviceControls" },
+      {0, 0x20, "BatteryStrength" },
+      {0, 0x21, "WirelessChannel" },
+      {0, 0x22, "WirelessID" },
+      {0, 0x23, "DiscoverWirelessControl" },
+      {0, 0x24, "SecurityCodeCharacterEntered" },
+      {0, 0x25, "SecurityCodeCharactedErased" },
+      {0, 0x26, "SecurityCodeCleared" },
   {  7, 0, "Keyboard" },
   {  8, 0, "LED" },
       {0, 0x01, "NumLock"},
@@ -153,6 +166,9 @@ static const struct hid_usage_entry hid_usage_table[] = {
     {0, 0x53, "DeviceIndex"},
     {0, 0x54, "ContactCount"},
     {0, 0x55, "ContactMaximumNumber"},
+    {0, 0x59, "ButtonType"},
+    {0, 0x5A, "SecondaryBarrelSwitch"},
+    {0, 0x5B, "TransducerSerialNumber"},
   { 15, 0, "PhysicalInterfaceDevice" },
     {0, 0x00, "Undefined"},
     {0, 0x01, "Physical_Interface_Device"},
@@ -338,7 +354,7 @@ static const struct hid_usage_entry hid_usage_table[] = {
     { 0x85, 0x83, "DesignCapacity" },
     { 0x85, 0x85, "ManufacturerDate" },
     { 0x85, 0x89, "iDeviceChemistry" },
-    { 0x85, 0x8b, "Rechargable" },
+    { 0x85, 0x8b, "Rechargeable" },
     { 0x85, 0x8f, "iOEMInformation" },
     { 0x85, 0x8d, "CapacityGranularity1" },
     { 0x85, 0xd0, "ACPresent" },
@@ -392,7 +408,7 @@ char *hid_resolv_usage(unsigned usage, struct seq_file *f) {
 
 	buf = resolv_usage_page(usage >> 16, f);
 	if (IS_ERR(buf)) {
-		printk(KERN_ERR "error allocating HID debug buffer\n");
+		pr_err("error allocating HID debug buffer\n");
 		return NULL;
 	}
 
@@ -446,6 +462,11 @@ void hid_dump_field(struct hid_field *field, int n, struct seq_file *f) {
 		tab(n, f);
 		seq_printf(f, "Logical(");
 		hid_resolv_usage(field->logical, f); seq_printf(f, ")\n");
+	}
+	if (field->application) {
+		tab(n, f);
+		seq_printf(f, "Application(");
+		hid_resolv_usage(field->application, f); seq_printf(f, ")\n");
 	}
 	tab(n, f); seq_printf(f, "Usage(%d)\n", field->maxusage);
 	for (j = 0; j < field->maxusage; j++) {
@@ -560,17 +581,47 @@ EXPORT_SYMBOL_GPL(hid_dump_device);
 /* enqueue string to 'events' ring buffer */
 void hid_debug_event(struct hid_device *hdev, char *buf)
 {
-	int i;
 	struct hid_debug_list *list;
+	unsigned long flags;
 
-	list_for_each_entry(list, &hdev->debug_list, node) {
-		for (i = 0; i <= strlen(buf); i++)
-			list->hid_debug_buf[(list->tail + i) % (HID_DEBUG_BUFSIZE - 1)] =
-				buf[i];
-		list->tail = (list->tail + i) % (HID_DEBUG_BUFSIZE - 1);
-        }
+	spin_lock_irqsave(&hdev->debug_list_lock, flags);
+	list_for_each_entry(list, &hdev->debug_list, node)
+		kfifo_in(&list->hid_debug_fifo, buf, strlen(buf));
+	spin_unlock_irqrestore(&hdev->debug_list_lock, flags);
+
+	wake_up_interruptible(&hdev->debug_wait);
 }
 EXPORT_SYMBOL_GPL(hid_debug_event);
+
+void hid_dump_report(struct hid_device *hid, int type, u8 *data,
+		int size)
+{
+	struct hid_report_enum *report_enum;
+	char *buf;
+	unsigned int i;
+
+	buf = kmalloc(sizeof(char) * HID_DEBUG_BUFSIZE, GFP_ATOMIC);
+
+	if (!buf)
+		return;
+
+	report_enum = hid->report_enum + type;
+
+	/* dump the report */
+	snprintf(buf, HID_DEBUG_BUFSIZE - 1,
+			"\nreport (size %u) (%snumbered) = ", size,
+			report_enum->numbered ? "" : "un");
+	hid_debug_event(hid, buf);
+
+	for (i = 0; i < size; i++) {
+		snprintf(buf, HID_DEBUG_BUFSIZE - 1,
+				" %02x", data[i]);
+		hid_debug_event(hid, buf);
+	}
+	hid_debug_event(hid, "\n");
+	kfree(buf);
+}
+EXPORT_SYMBOL_GPL(hid_dump_report);
 
 void hid_dump_input(struct hid_device *hdev, struct hid_usage *usage, __s32 value)
 {
@@ -586,8 +637,7 @@ void hid_dump_input(struct hid_device *hdev, struct hid_usage *usage, __s32 valu
 	hid_debug_event(hdev, buf);
 
 	kfree(buf);
-        wake_up_interruptible(&hdev->debug_wait);
-
+	wake_up_interruptible(&hdev->debug_wait);
 }
 EXPORT_SYMBOL_GPL(hid_dump_input);
 
@@ -810,7 +860,7 @@ static const char *relatives[REL_MAX + 1] = {
 	[REL_WHEEL] = "Wheel",		[REL_MISC] = "Misc",
 };
 
-static const char *absolutes[ABS_MAX + 1] = {
+static const char *absolutes[ABS_CNT] = {
 	[ABS_X] = "X",			[ABS_Y] = "Y",
 	[ABS_Z] = "Z",			[ABS_RX] = "Rx",
 	[ABS_RY] = "Ry",		[ABS_RZ] = "Rz",
@@ -864,13 +914,13 @@ static const char **names[EV_MAX + 1] = {
 	[EV_SND] = sounds,			[EV_REP] = repeats,
 };
 
-void hid_resolv_event(__u8 type, __u16 code, struct seq_file *f) {
-
+static void hid_resolv_event(__u8 type, __u16 code, struct seq_file *f)
+{
 	seq_printf(f, "%s.%s", events[type] ? events[type] : "?",
 		names[type] ? (names[type][code] ? names[type][code] : "?") : "?");
 }
 
-void hid_dump_input_mapping(struct hid_device *hid, struct seq_file *f)
+static void hid_dump_input_mapping(struct hid_device *hid, struct seq_file *f)
 {
 	int i, j, k;
 	struct hid_report *report;
@@ -892,15 +942,21 @@ void hid_dump_input_mapping(struct hid_device *hid, struct seq_file *f)
 
 }
 
-
 static int hid_debug_rdesc_show(struct seq_file *f, void *p)
 {
 	struct hid_device *hdev = f->private;
+	const __u8 *rdesc = hdev->rdesc;
+	unsigned rsize = hdev->rsize;
 	int i;
 
+	if (!rdesc) {
+		rdesc = hdev->dev_rdesc;
+		rsize = hdev->dev_rsize;
+	}
+
 	/* dump HID report descriptor */
-	for (i = 0; i < hdev->rsize; i++)
-		seq_printf(f, "%02x ", hdev->rdesc[i]);
+	for (i = 0; i < rsize; i++)
+		seq_printf(f, "%02x ", rdesc[i]);
 	seq_printf(f, "\n\n");
 
 	/* dump parsed data and input mappings */
@@ -920,14 +976,15 @@ static int hid_debug_events_open(struct inode *inode, struct file *file)
 {
 	int err = 0;
 	struct hid_debug_list *list;
+	unsigned long flags;
 
 	if (!(list = kzalloc(sizeof(struct hid_debug_list), GFP_KERNEL))) {
 		err = -ENOMEM;
 		goto out;
 	}
 
-	if (!(list->hid_debug_buf = kzalloc(sizeof(char) * HID_DEBUG_BUFSIZE, GFP_KERNEL))) {
-		err = -ENOMEM;
+	err = kfifo_alloc(&list->hid_debug_fifo, HID_DEBUG_FIFOSIZE, GFP_KERNEL);
+	if (err) {
 		kfree(list);
 		goto out;
 	}
@@ -935,7 +992,9 @@ static int hid_debug_events_open(struct inode *inode, struct file *file)
 	file->private_data = list;
 	mutex_init(&list->read_mutex);
 
+	spin_lock_irqsave(&list->hdev->debug_list_lock, flags);
 	list_add_tail(&list->node, &list->hdev->debug_list);
+	spin_unlock_irqrestore(&list->hdev->debug_list_lock, flags);
 
 out:
 	return err;
@@ -945,70 +1004,56 @@ static ssize_t hid_debug_events_read(struct file *file, char __user *buffer,
 		size_t count, loff_t *ppos)
 {
 	struct hid_debug_list *list = file->private_data;
-	int ret = 0, len;
+	int ret = 0, copied;
 	DECLARE_WAITQUEUE(wait, current);
 
-	while (ret == 0) {
-		mutex_lock(&list->read_mutex);
-		if (list->head == list->tail) {
-			add_wait_queue(&list->hdev->debug_wait, &wait);
-			set_current_state(TASK_INTERRUPTIBLE);
+	mutex_lock(&list->read_mutex);
+	if (kfifo_is_empty(&list->hid_debug_fifo)) {
+		add_wait_queue(&list->hdev->debug_wait, &wait);
+		set_current_state(TASK_INTERRUPTIBLE);
 
-			while (list->head == list->tail) {
-				if (file->f_flags & O_NONBLOCK) {
-					ret = -EAGAIN;
-					break;
-				}
-				if (signal_pending(current)) {
-					ret = -ERESTARTSYS;
-					break;
-				}
-
-				if (!list->hdev || !list->hdev->debug) {
-					ret = -EIO;
-					break;
-				}
-
-				/* allow O_NONBLOCK from other threads */
-				mutex_unlock(&list->read_mutex);
-				schedule();
-				mutex_lock(&list->read_mutex);
-				set_current_state(TASK_INTERRUPTIBLE);
+		while (kfifo_is_empty(&list->hid_debug_fifo)) {
+			if (file->f_flags & O_NONBLOCK) {
+				ret = -EAGAIN;
+				break;
+			}
+			if (signal_pending(current)) {
+				ret = -ERESTARTSYS;
+				break;
 			}
 
-			set_current_state(TASK_RUNNING);
-			remove_wait_queue(&list->hdev->debug_wait, &wait);
+			/* if list->hdev is NULL we cannot remove_wait_queue().
+			 * if list->hdev->debug is 0 then hid_debug_unregister()
+			 * was already called and list->hdev is being destroyed.
+			 * if we add remove_wait_queue() here we can hit a race.
+			 */
+			if (!list->hdev || !list->hdev->debug) {
+				ret = -EIO;
+				set_current_state(TASK_RUNNING);
+				goto out;
+			}
+
+			/* allow O_NONBLOCK from other threads */
+			mutex_unlock(&list->read_mutex);
+			schedule();
+			mutex_lock(&list->read_mutex);
+			set_current_state(TASK_INTERRUPTIBLE);
 		}
+
+		__set_current_state(TASK_RUNNING);
+		remove_wait_queue(&list->hdev->debug_wait, &wait);
 
 		if (ret)
 			goto out;
-
-		/* pass the ringbuffer contents to userspace */
-copy_rest:
-		if (list->tail == list->head)
-			goto out;
-		if (list->tail > list->head) {
-			len = list->tail - list->head;
-
-			if (copy_to_user(buffer + ret, &list->hid_debug_buf[list->head], len)) {
-				ret = -EFAULT;
-				goto out;
-			}
-			ret += len;
-			list->head += len;
-		} else {
-			len = HID_DEBUG_BUFSIZE - list->head;
-
-			if (copy_to_user(buffer, &list->hid_debug_buf[list->head], len)) {
-				ret = -EFAULT;
-				goto out;
-			}
-			list->head = 0;
-			ret += len;
-			goto copy_rest;
-		}
-
 	}
+
+	/* pass the fifo content to userspace, locking is not needed with only
+	 * one concurrent reader and one concurrent writer
+	 */
+	ret = kfifo_to_user(&list->hid_debug_fifo, buffer, count, &copied);
+	if (ret)
+		goto out;
+	ret = copied;
 out:
 	mutex_unlock(&list->read_mutex);
 	return ret;
@@ -1019,7 +1064,7 @@ static unsigned int hid_debug_events_poll(struct file *file, poll_table *wait)
 	struct hid_debug_list *list = file->private_data;
 
 	poll_wait(file, &list->hdev->debug_wait, wait);
-	if (list->head != list->tail)
+	if (!kfifo_is_empty(&list->hid_debug_fifo))
 		return POLLIN | POLLRDNORM;
 	if (!list->hdev->debug)
 		return POLLERR | POLLHUP;
@@ -1029,9 +1074,12 @@ static unsigned int hid_debug_events_poll(struct file *file, poll_table *wait)
 static int hid_debug_events_release(struct inode *inode, struct file *file)
 {
 	struct hid_debug_list *list = file->private_data;
+	unsigned long flags;
 
+	spin_lock_irqsave(&list->hdev->debug_list_lock, flags);
 	list_del(&list->node);
-	kfree(list->hid_debug_buf);
+	spin_unlock_irqrestore(&list->hdev->debug_list_lock, flags);
+	kfifo_free(&list->hid_debug_fifo);
 	kfree(list);
 
 	return 0;
@@ -1050,6 +1098,7 @@ static const struct file_operations hid_debug_events_fops = {
 	.read           = hid_debug_events_read,
 	.poll		= hid_debug_events_poll,
 	.release        = hid_debug_events_release,
+	.llseek		= noop_llseek,
 };
 
 
@@ -1081,4 +1130,3 @@ void hid_debug_exit(void)
 {
 	debugfs_remove_recursive(hid_debug_root);
 }
-

@@ -97,9 +97,9 @@ enum isci_status {
 struct isci_port {
 	struct isci_host *isci_host;
 	struct list_head remote_dev_list;
-	enum sci_status hard_reset_status;
 	#define IPORT_RESET_PENDING 0
 	unsigned long state;
+	enum sci_status hard_reset_status;
 	struct sci_base_state_machine sm;
 	bool ready_exit;
 	u8 logical_port_index;

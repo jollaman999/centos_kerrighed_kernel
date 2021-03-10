@@ -15,9 +15,29 @@
 #include <asm/page.h>
 #include <linux/types.h>
 #include <linux/mm.h>          /* Get struct page {...} */
+#include <asm-generic/iomap.h>
 
+#ifndef CONFIG_PCI
+#define _IO_BASE	0
+#define _ISA_MEM_BASE	0
+#define PCI_DRAM_OFFSET	0
+#else
+#define _IO_BASE	isa_io_base
+#define _ISA_MEM_BASE	isa_mem_base
+#define PCI_DRAM_OFFSET	pci_dram_offset
+#endif
+
+extern unsigned long isa_io_base;
+extern unsigned long pci_io_base;
+extern unsigned long pci_dram_offset;
+
+extern resource_size_t isa_mem_base;
 
 #define IO_SPACE_LIMIT (0xFFFFFFFF)
+
+/* the following is needed to support PCI with some drivers */
+
+#define mmiowb()
 
 static inline unsigned char __raw_readb(const volatile void __iomem *addr)
 {
@@ -54,7 +74,7 @@ static inline void __raw_writeq(unsigned long v, volatile void __iomem *addr)
 
 /*
  * read (readb, readw, readl, readq) and write (writeb, writew,
- * writel, writeq) accessors are for PCI and thus littel endian.
+ * writel, writeq) accessors are for PCI and thus little endian.
  * Linux 2.4 for Microblaze had this wrong.
  */
 static inline unsigned char readb(const volatile void __iomem *addr)
@@ -92,17 +112,22 @@ static inline void writel(unsigned int v, volatile void __iomem *addr)
 #define iowrite16(v, addr)	__raw_writew((u16)(v), (u16 *)(addr))
 #define iowrite32(v, addr)	__raw_writel((u32)(v), (u32 *)(addr))
 
+#define ioread16be(addr)	__raw_readw((u16 *)(addr))
+#define ioread32be(addr)	__raw_readl((u32 *)(addr))
+#define iowrite16be(v, addr)	__raw_writew((u16)(v), (u16 *)(addr))
+#define iowrite32be(v, addr)	__raw_writel((u32)(v), (u32 *)(addr))
+
 /* These are the definitions for the x86 IO instructions
  * inb/inw/inl/outb/outw/outl, the "string" versions
  * insb/insw/insl/outsb/outsw/outsl, and the "pausing" versions
  * inb_p/inw_p/...
  * The macros don't do byte-swapping.
  */
-#define inb(port)		readb((u8 *)((port)))
+#define inb(port)		readb((u8 *)((unsigned long)(port)))
 #define outb(val, port)		writeb((val), (u8 *)((unsigned long)(port)))
-#define inw(port)		readw((u16 *)((port)))
+#define inw(port)		readw((u16 *)((unsigned long)(port)))
 #define outw(val, port)		writew((val), (u16 *)((unsigned long)(port)))
-#define inl(port)		readl((u32 *)((port)))
+#define inl(port)		readl((u32 *)((unsigned long)(port)))
 #define outl(val, port)		writel((val), (u32 *)((unsigned long)(port)))
 
 #define inb_p(port)		inb((port))
@@ -118,19 +143,14 @@ static inline void writel(unsigned int v, volatile void __iomem *addr)
 
 #ifdef CONFIG_MMU
 
-#define mm_ptov(addr)		((void *)__phys_to_virt(addr))
-#define mm_vtop(addr)		((unsigned long)__virt_to_phys(addr))
 #define phys_to_virt(addr)	((void *)__phys_to_virt(addr))
 #define virt_to_phys(addr)	((unsigned long)__virt_to_phys(addr))
 #define virt_to_bus(addr)	((unsigned long)__virt_to_phys(addr))
 
-#define __page_address(page) \
-		(PAGE_OFFSET + (((page) - mem_map) << PAGE_SHIFT))
-#define page_to_phys(page)	virt_to_phys((void *)__page_address(page))
 #define page_to_bus(page)	(page_to_phys(page))
 #define bus_to_virt(addr)	(phys_to_virt(addr))
 
-extern void iounmap(void *addr);
+extern void iounmap(void __iomem *addr);
 /*extern void *__ioremap(phys_addr_t address, unsigned long size,
 		unsigned long flags);*/
 extern void __iomem *ioremap(phys_addr_t address, unsigned long size);
@@ -217,7 +237,7 @@ static inline void __iomem *__ioremap(phys_addr_t address, unsigned long size,
  * Little endian
  */
 
-#define out_le32(a, v) __raw_writel(__cpu_to_le32(v), (a));
+#define out_le32(a, v) __raw_writel(__cpu_to_le32(v), (a))
 #define out_le16(a, v) __raw_writew(__cpu_to_le16(v), (a))
 
 #define in_le32(a) __le32_to_cpu(__raw_readl(a))
@@ -227,15 +247,99 @@ static inline void __iomem *__ioremap(phys_addr_t address, unsigned long size,
 #define out_8(a, v) __raw_writeb((v), (a))
 #define in_8(a) __raw_readb(a)
 
-/* FIXME */
-static inline void __iomem *ioport_map(unsigned long port, unsigned int len)
-{
-	return (void __iomem *) (port);
-}
+#define mmiowb()
 
-static inline void ioport_unmap(void __iomem *addr)
+#define ioport_map(port, nr)	((void __iomem *)(port))
+#define ioport_unmap(addr)
+
+/* from asm-generic/io.h */
+#ifndef insb
+static inline void insb(unsigned long addr, void *buffer, int count)
 {
-	/* Nothing to do */
+	if (count) {
+		u8 *buf = buffer;
+		do {
+			u8 x = inb(addr);
+			*buf++ = x;
+		} while (--count);
+	}
 }
+#endif
+
+#ifndef insw
+static inline void insw(unsigned long addr, void *buffer, int count)
+{
+	if (count) {
+		u16 *buf = buffer;
+		do {
+			u16 x = inw(addr);
+			*buf++ = x;
+		} while (--count);
+	}
+}
+#endif
+
+#ifndef insl
+static inline void insl(unsigned long addr, void *buffer, int count)
+{
+	if (count) {
+		u32 *buf = buffer;
+		do {
+			u32 x = inl(addr);
+			*buf++ = x;
+		} while (--count);
+	}
+}
+#endif
+
+#ifndef outsb
+static inline void outsb(unsigned long addr, const void *buffer, int count)
+{
+	if (count) {
+		const u8 *buf = buffer;
+		do {
+			outb(*buf++, addr);
+		} while (--count);
+	}
+}
+#endif
+
+#ifndef outsw
+static inline void outsw(unsigned long addr, const void *buffer, int count)
+{
+	if (count) {
+		const u16 *buf = buffer;
+		do {
+			outw(*buf++, addr);
+		} while (--count);
+	}
+}
+#endif
+
+#ifndef outsl
+static inline void outsl(unsigned long addr, const void *buffer, int count)
+{
+	if (count) {
+		const u32 *buf = buffer;
+		do {
+			outl(*buf++, addr);
+		} while (--count);
+	}
+}
+#endif
+
+#define ioread8_rep(p, dst, count) \
+	insb((unsigned long) (p), (dst), (count))
+#define ioread16_rep(p, dst, count) \
+	insw((unsigned long) (p), (dst), (count))
+#define ioread32_rep(p, dst, count) \
+	insl((unsigned long) (p), (dst), (count))
+
+#define iowrite8_rep(p, src, count) \
+	outsb((unsigned long) (p), (src), (count))
+#define iowrite16_rep(p, src, count) \
+	outsw((unsigned long) (p), (src), (count))
+#define iowrite32_rep(p, src, count) \
+	outsl((unsigned long) (p), (src), (count))
 
 #endif /* _ASM_MICROBLAZE_IO_H */

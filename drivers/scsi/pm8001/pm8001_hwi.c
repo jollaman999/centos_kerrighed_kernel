@@ -3461,7 +3461,7 @@ hw_event_sata_phy_up(struct pm8001_hba_info *pm8001_ha, void *piomb)
 		sizeof(struct dev_to_host_fis));
 	phy->frame_rcvd_size = sizeof(struct dev_to_host_fis);
 	phy->identify.target_port_protocols = SAS_PROTOCOL_SATA;
-	phy->identify.device_type = SATA_DEV;
+	phy->identify.device_type = SAS_SATA_DEV;
 	pm8001_get_attached_sas_addr(phy, phy->sas_phy.attached_sas_addr);
 	spin_unlock_irqrestore(&phy->sas_phy.frame_rcvd_lock, flags);
 	pm8001_bytes_dmaed(pm8001_ha, phy_id);
@@ -3754,7 +3754,7 @@ int pm8001_mpi_task_abort_resp(struct pm8001_hba_info *pm8001_ha, void *piomb)
 	pm8001_ccb_task_free(pm8001_ha, t, ccb, tag);
 	mb();
 
-	if ((pm8001_dev->id & NCQ_ABORT_ALL_FLAG) && t)	{
+	if (pm8001_dev->id & NCQ_ABORT_ALL_FLAG) {
 		pm8001_tag_free(pm8001_ha, tag);
 		sas_free_task(t);
 		/* clear the flag */
@@ -4366,7 +4366,7 @@ static int pm8001_chip_sata_req(struct pm8001_hba_info *pm8001_ha,
 			PM8001_IO_DBG(pm8001_ha, pm8001_printk("PIO\n"));
 		}
 		if (task->ata_task.use_ncq &&
-			dev->sata_dev.command_set != ATAPI_COMMAND_SET) {
+			dev->sata_dev.class != ATA_DEV_ATAPI) {
 			ATAP = 0x07; /* FPDMA */
 			PM8001_IO_DBG(pm8001_ha, pm8001_printk("FPDMA\n"));
 		}
@@ -4533,7 +4533,7 @@ static int pm8001_chip_reg_dev_req(struct pm8001_hba_info *pm8001_ha,
 	if (flag == 1)
 		stp_sspsmp_sata = 0x02; /*direct attached sata */
 	else {
-		if (pm8001_dev->dev_type == SATA_DEV)
+		if (pm8001_dev->dev_type == SAS_SATA_DEV)
 			stp_sspsmp_sata = 0x00; /* stp*/
 		else if (pm8001_dev->dev_type == SAS_END_DEVICE ||
 			pm8001_dev->dev_type == SAS_EDGE_EXPANDER_DEVICE ||
@@ -4670,7 +4670,7 @@ int pm8001_chip_abort_task(struct pm8001_hba_info *pm8001_ha,
 			cmd_tag, task_tag));
 	if (pm8001_dev->dev_type == SAS_END_DEVICE)
 		opc = OPC_INB_SSP_ABORT;
-	else if (pm8001_dev->dev_type == SATA_DEV)
+	else if (pm8001_dev->dev_type == SAS_SATA_DEV)
 		opc = OPC_INB_SATA_ABORT;
 	else
 		opc = OPC_INB_SMP_ABORT;/* SMP */

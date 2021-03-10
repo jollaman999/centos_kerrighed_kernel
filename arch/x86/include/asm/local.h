@@ -3,8 +3,7 @@
 
 #include <linux/percpu.h>
 
-#include <asm/system.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
 #include <asm/asm.h>
 
 typedef struct {
@@ -125,27 +124,11 @@ static inline int local_add_negative(long i, local_t *l)
  */
 static inline long local_add_return(long i, local_t *l)
 {
-	long __i;
-#ifdef CONFIG_M386
-	unsigned long flags;
-	if (unlikely(boot_cpu_data.x86 <= 3))
-		goto no_xadd;
-#endif
-	/* Modern 486+ processor */
-	__i = i;
+	long __i = i;
 	asm volatile(_ASM_XADD "%0, %1;"
 		     : "+r" (i), "+m" (l->a.counter)
 		     : : "memory");
 	return i + __i;
-
-#ifdef CONFIG_M386
-no_xadd: /* Legacy 386 processor */
-	local_irq_save(flags);
-	__i = local_read(l);
-	local_set(l, i + __i);
-	local_irq_restore(flags);
-	return i + __i;
-#endif
 }
 
 static inline long local_sub_return(long i, local_t *l)
@@ -194,42 +177,5 @@ static inline long local_sub_return(long i, local_t *l)
 #define __local_dec(l)		local_dec(l)
 #define __local_add(i, l)	local_add((i), (l))
 #define __local_sub(i, l)	local_sub((i), (l))
-
-/* Use these for per-cpu local_t variables: on some archs they are
- * much more efficient than these naive implementations.  Note they take
- * a variable, not an address.
- *
- * X86_64: This could be done better if we moved the per cpu data directly
- * after GS.
- */
-
-/* Need to disable preemption for the cpu local counters otherwise we could
-   still access a variable of a previous CPU in a non atomic way. */
-#define cpu_local_wrap_v(l)		\
-({					\
-	local_t res__;			\
-	preempt_disable(); 		\
-	res__ = (l);			\
-	preempt_enable();		\
-	res__;				\
-})
-#define cpu_local_wrap(l)		\
-({					\
-	preempt_disable();		\
-	(l);				\
-	preempt_enable();		\
-})					\
-
-#define cpu_local_read(l)    cpu_local_wrap_v(local_read(&__get_cpu_var((l))))
-#define cpu_local_set(l, i)  cpu_local_wrap(local_set(&__get_cpu_var((l)), (i)))
-#define cpu_local_inc(l)     cpu_local_wrap(local_inc(&__get_cpu_var((l))))
-#define cpu_local_dec(l)     cpu_local_wrap(local_dec(&__get_cpu_var((l))))
-#define cpu_local_add(i, l)  cpu_local_wrap(local_add((i), &__get_cpu_var((l))))
-#define cpu_local_sub(i, l)  cpu_local_wrap(local_sub((i), &__get_cpu_var((l))))
-
-#define __cpu_local_inc(l)	cpu_local_inc((l))
-#define __cpu_local_dec(l)	cpu_local_dec((l))
-#define __cpu_local_add(i, l)	cpu_local_add((i), (l))
-#define __cpu_local_sub(i, l)	cpu_local_sub((i), (l))
 
 #endif /* _ASM_X86_LOCAL_H */

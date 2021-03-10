@@ -40,6 +40,7 @@ extern void gru_wait_abort_proc(void *cb);
 			*((volatile unsigned long *)(p)) = v; /* force st.rel */	\
 		} while (0)
 #elif defined(CONFIG_X86_64)
+#include <asm/cacheflush.h>
 #define __flush_cache(p)		clflush(p)
 #define gru_ordered_store_ulong(p, v)					\
 		do {							\
@@ -130,7 +131,7 @@ struct gru_instruction_bits {
 struct gru_instruction {
     /* DW 0 */
     union {
-	unsigned long		op64;    /* icmd,xtype,iaa0,ima,opc,tri0 */
+    	unsigned long		op64;    /* icmd,xtype,iaa0,ima,opc,tri0 */
 	struct {
 		unsigned int	op32;
 		unsigned int	tri0;

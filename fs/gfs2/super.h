@@ -46,15 +46,14 @@ extern void update_statfs(struct gfs2_sbd *sdp, struct buffer_head *m_bh,
 			  struct buffer_head *l_bh);
 extern int gfs2_statfs_sync(struct super_block *sb, int type);
 
-extern int gfs2_freeze_fs(struct gfs2_sbd *sdp);
-extern void gfs2_unfreeze_fs(struct gfs2_sbd *sdp, int force);
+extern void free_sbd(struct gfs2_sbd *sdp);
 
 extern struct file_system_type gfs2_fs_type;
 extern struct file_system_type gfs2meta_fs_type;
 extern const struct export_operations gfs2_export_ops;
 extern const struct super_operations gfs2_super_ops;
 extern const struct dentry_operations gfs2_dops;
-extern struct xattr_handler *gfs2_xattr_handlers[];
+extern const struct xattr_handler *gfs2_xattr_handlers[];
 
 #endif /* __SUPER_DOT_H__ */
 

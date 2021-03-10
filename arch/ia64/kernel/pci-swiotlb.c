@@ -1,6 +1,7 @@
 /* Glue code to lib/swiotlb.c */
 
 #include <linux/pci.h>
+#include <linux/gfp.h>
 #include <linux/cache.h>
 #include <linux/module.h>
 #include <linux/dma-mapping.h>
@@ -14,24 +15,30 @@ int swiotlb __read_mostly;
 EXPORT_SYMBOL(swiotlb);
 
 static void *ia64_swiotlb_alloc_coherent(struct device *dev, size_t size,
-					 dma_addr_t *dma_handle, gfp_t gfp)
+					 dma_addr_t *dma_handle, gfp_t gfp,
+					 struct dma_attrs *attrs)
 {
 	if (dev->coherent_dma_mask != DMA_BIT_MASK(64))
 		gfp |= GFP_DMA;
 	return swiotlb_alloc_coherent(dev, size, dma_handle, gfp);
 }
 
+static void ia64_swiotlb_free_coherent(struct device *dev, size_t size,
+				       void *vaddr, dma_addr_t dma_addr,
+				       struct dma_attrs *attrs)
+{
+	swiotlb_free_coherent(dev, size, vaddr, dma_addr);
+}
+
 struct dma_map_ops swiotlb_dma_ops = {
-	.alloc_coherent = ia64_swiotlb_alloc_coherent,
-	.free_coherent = swiotlb_free_coherent,
+	.alloc = ia64_swiotlb_alloc_coherent,
+	.free = ia64_swiotlb_free_coherent,
 	.map_page = swiotlb_map_page,
 	.unmap_page = swiotlb_unmap_page,
 	.map_sg = swiotlb_map_sg_attrs,
 	.unmap_sg = swiotlb_unmap_sg_attrs,
 	.sync_single_for_cpu = swiotlb_sync_single_for_cpu,
 	.sync_single_for_device = swiotlb_sync_single_for_device,
-	.sync_single_range_for_cpu = swiotlb_sync_single_range_for_cpu,
-	.sync_single_range_for_device = swiotlb_sync_single_range_for_device,
 	.sync_sg_for_cpu = swiotlb_sync_sg_for_cpu,
 	.sync_sg_for_device = swiotlb_sync_sg_for_device,
 	.dma_supported = swiotlb_dma_supported,

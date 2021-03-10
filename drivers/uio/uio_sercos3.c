@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /* sercos3: UIO driver for the Automata Sercos III PCI card
 
    Copyright (C) 2008 Linutronix GmbH
@@ -28,6 +29,7 @@
 #include <linux/pci.h>
 #include <linux/uio_driver.h>
 #include <linux/io.h>
+#include <linux/slab.h>
 
 /* ID's for SERCOS III PCI card (PLX 9030) */
 #define SERCOS_SUB_VENDOR_ID  0x1971
@@ -115,7 +117,7 @@ static int sercos3_setup_iomem(struct pci_dev *dev, struct uio_info *info,
 	return 0;
 }
 
-static int __devinit sercos3_pci_probe(struct pci_dev *dev,
+static int sercos3_pci_probe(struct pci_dev *dev,
 				       const struct pci_device_id *id)
 {
 	struct uio_info *info;
@@ -153,7 +155,7 @@ static int __devinit sercos3_pci_probe(struct pci_dev *dev,
 	info->name = "Sercos_III_PCI";
 	info->version = "0.0.1";
 	info->irq = dev->irq;
-	info->irq_flags = IRQF_DISABLED | IRQF_SHARED;
+	info->irq_flags = IRQF_SHARED;
 	info->handler = sercos3_handler;
 	info->irqcontrol = sercos3_irqcontrol;
 
@@ -196,7 +198,7 @@ static void sercos3_pci_remove(struct pci_dev *dev)
 	kfree(info);
 }
 
-static struct pci_device_id sercos3_pci_ids[] __devinitdata = {
+static struct pci_device_id sercos3_pci_ids[] = {
 	{
 		.vendor =       PCI_VENDOR_ID_PLX,
 		.device =       PCI_DEVICE_ID_PLX_9030,

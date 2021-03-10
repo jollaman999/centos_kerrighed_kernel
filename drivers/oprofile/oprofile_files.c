@@ -45,7 +45,7 @@ static ssize_t timeout_write(struct file *file, char const __user *buf,
 		return -EINVAL;
 
 	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval)
+	if (retval <= 0)
 		return retval;
 
 	retval = oprofile_set_timeout(val);
@@ -59,6 +59,7 @@ static ssize_t timeout_write(struct file *file, char const __user *buf,
 static const struct file_operations timeout_fops = {
 	.read		= timeout_read,
 	.write		= timeout_write,
+	.llseek		= default_llseek,
 };
 
 #endif
@@ -83,7 +84,7 @@ static ssize_t depth_write(struct file *file, char const __user *buf, size_t cou
 		return -EINVAL;
 
 	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval)
+	if (retval <= 0)
 		return retval;
 
 	retval = oprofile_set_ulong(&oprofile_backtrace_depth, val);
@@ -96,7 +97,8 @@ static ssize_t depth_write(struct file *file, char const __user *buf, size_t cou
 
 static const struct file_operations depth_fops = {
 	.read		= depth_read,
-	.write		= depth_write
+	.write		= depth_write,
+	.llseek		= default_llseek,
 };
 
 
@@ -108,6 +110,7 @@ static ssize_t pointer_size_read(struct file *file, char __user *buf, size_t cou
 
 static const struct file_operations pointer_size_fops = {
 	.read		= pointer_size_read,
+	.llseek		= default_llseek,
 };
 
 
@@ -119,6 +122,7 @@ static ssize_t cpu_type_read(struct file *file, char __user *buf, size_t count, 
 
 static const struct file_operations cpu_type_fops = {
 	.read		= cpu_type_read,
+	.llseek		= default_llseek,
 };
 
 
@@ -137,9 +141,10 @@ static ssize_t enable_write(struct file *file, char const __user *buf, size_t co
 		return -EINVAL;
 
 	retval = oprofilefs_ulong_from_user(&val, buf, count);
-	if (retval)
+	if (retval <= 0)
 		return retval;
 
+	retval = 0;
 	if (val)
 		retval = oprofile_start();
 	else
@@ -154,6 +159,7 @@ static ssize_t enable_write(struct file *file, char const __user *buf, size_t co
 static const struct file_operations enable_fops = {
 	.read		= enable_read,
 	.write		= enable_write,
+	.llseek		= default_llseek,
 };
 
 
@@ -166,6 +172,7 @@ static ssize_t dump_write(struct file *file, char const __user *buf, size_t coun
 
 static const struct file_operations dump_fops = {
 	.write		= dump_write,
+	.llseek		= noop_llseek,
 };
 
 void oprofile_create_files(struct super_block *sb, struct dentry *root)

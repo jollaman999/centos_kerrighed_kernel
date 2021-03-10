@@ -40,10 +40,13 @@
 #include <linux/hdreg.h>
 #include <linux/cdrom.h>
 #include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/mutex.h>
 #include <linux/scatterlist.h>
 #include <linux/bitmap.h>
 #include <linux/list.h>
 
+#include <xen/xen.h>
 #include <xen/xenbus.h>
 #include <xen/grant_table.h>
 #include <xen/events.h>
@@ -55,11 +58,6 @@
 #include <xen/interface/io/protocols.h>
 
 #include <asm/xen/hypervisor.h>
-
-static int sda_is_xvda;
-module_param(sda_is_xvda, bool, 0);
-MODULE_PARM_DESC(sda_is_xvda,
-		 "sdX in guest config translates to xvdX, not xvd(X+4)");
 
 enum blkif_state {
 	BLKIF_STATE_DISCONNECTED,
@@ -87,6 +85,7 @@ struct split_bio {
 	int err;
 };
 
+static DEFINE_MUTEX(blkfront_mutex);
 static const struct block_device_operations xlvbd_block_fops;
 
 /*
@@ -127,7 +126,8 @@ struct blkfront_info
 	unsigned int persistent_gnts_c;
 	unsigned long shadow_free;
 	unsigned int feature_flush;
-	unsigned int feature_discard;
+	unsigned int feature_discard:1;
+	unsigned int feature_secdiscard:1;
 	unsigned int discard_granularity;
 	unsigned int discard_alignment;
 	unsigned int feature_persistent:1;
@@ -155,12 +155,10 @@ static DEFINE_SPINLOCK(minor_lock);
 #define BLKIF_MINOR_EXT(dev) ((dev)&(~EXTENDED))
 #define EMULATED_HD_DISK_MINOR_OFFSET (0)
 #define EMULATED_HD_DISK_NAME_OFFSET (EMULATED_HD_DISK_MINOR_OFFSET / 256)
+#define EMULATED_SD_DISK_MINOR_OFFSET (0)
+#define EMULATED_SD_DISK_NAME_OFFSET (EMULATED_SD_DISK_MINOR_OFFSET / 256)
 
 #define DEV_NAME	"xvd"	/* name in /dev */
-
-/* module settings dependent on the "sda_is_xvda" module parameter */
-static int emulated_sd_disk_minor_offset = EMULATED_HD_DISK_MINOR_OFFSET + (4 * 16);
-static int emulated_sd_disk_name_offset = EMULATED_HD_DISK_NAME_OFFSET + 4;
 
 #define SEGS_PER_INDIRECT_FRAME \
 	(PAGE_SIZE/sizeof(struct blkif_request_segment))
@@ -287,7 +285,7 @@ static int xlbd_reserve_minors(unsigned int minor, unsigned int nr)
 	if (end > nr_minors) {
 		unsigned long *bitmap, *old;
 
-		bitmap = kzalloc(BITS_TO_LONGS(end) * sizeof(*bitmap),
+		bitmap = kcalloc(BITS_TO_LONGS(end), sizeof(*bitmap),
 				 GFP_KERNEL);
 		if (bitmap == NULL)
 			return -ENOMEM;
@@ -439,12 +437,15 @@ static int blkif_queue_request(struct request *req)
 	id = get_id_from_freelist(info);
 	info->shadow[id].request = req;
 
-	if (unlikely(req->cmd_flags & REQ_DISCARD)) {
+	if (unlikely(req->cmd_flags & (REQ_DISCARD | REQ_SECURE))) {
 		ring_req->operation = BLKIF_OP_DISCARD;
-		ring_req->u.discard.nr_segments = 0;
 		ring_req->u.discard.nr_sectors = blk_rq_sectors(req);
 		ring_req->u.discard.id = id;
 		ring_req->u.discard.sector_number = (blkif_sector_t)blk_rq_pos(req);
+		if ((req->cmd_flags & REQ_SECURE) && info->feature_secdiscard)
+			ring_req->u.discard.flag = BLKIF_DISCARD_SECURE;
+		else
+			ring_req->u.discard.flag = 0;
 	} else {
 		BUG_ON(info->max_indirect_segments == 0 &&
 		       req->nr_phys_segments > BLKIF_MAX_SEGMENTS_PER_REQUEST);
@@ -457,7 +458,7 @@ static int blkif_queue_request(struct request *req)
 			 * The indirect operation can only be a BLKIF_OP_READ or
 			 * BLKIF_OP_WRITE
 			 */
-			BUG_ON(req->cmd_flags & (REQ_FLUSH | REQ_HARDBARRIER | REQ_FUA));
+			BUG_ON(req->cmd_flags & (REQ_FLUSH | REQ_FUA));
 			ring_req->operation = BLKIF_OP_INDIRECT;
 			ring_req->u.indirect.indirect_op = rq_data_dir(req) ?
 				BLKIF_OP_WRITE : BLKIF_OP_READ;
@@ -469,7 +470,7 @@ static int blkif_queue_request(struct request *req)
 			ring_req->u.rw.handle = info->handle;
 			ring_req->operation = rq_data_dir(req) ?
 				BLKIF_OP_WRITE : BLKIF_OP_READ;
-			if (req->cmd_flags & (REQ_FLUSH | REQ_HARDBARRIER | REQ_FUA)) {
+			if (req->cmd_flags & (REQ_FLUSH | REQ_FUA)) {
 				/*
 				 * Ideally we can do an unordered flush-to-disk. In case the
 				 * backend onlysupports barriers, use that. A barrier request
@@ -502,7 +503,7 @@ static int blkif_queue_request(struct request *req)
 				unsigned long uninitialized_var(pfn);
 
 				if (segments)
-					kunmap_atomic(segments, KM_IRQ0);
+					kunmap_atomic(segments);
 
 				n = i / SEGS_PER_INDIRECT_FRAME;
 				if (!info->feature_persistent) {
@@ -517,7 +518,7 @@ static int blkif_queue_request(struct request *req)
 				}
 				gnt_list_entry = get_grant(&gref_head, pfn, info);
 				info->shadow[id].indirect_grants[n] = gnt_list_entry;
-				segments = kmap_atomic(pfn_to_page(gnt_list_entry->pfn), KM_IRQ0);
+				segments = kmap_atomic(pfn_to_page(gnt_list_entry->pfn));
 				ring_req->u.indirect.indirect_grefs[n] = gnt_list_entry->gref;
 			}
 
@@ -532,10 +533,8 @@ static int blkif_queue_request(struct request *req)
 
 				BUG_ON(sg->offset + sg->length > PAGE_SIZE);
 
-				shared_data = kmap_atomic(
-					pfn_to_page(gnt_list_entry->pfn),
-					KM_IRQ0);
-				bvec_data = kmap_atomic(sg_page(sg), KM_IRQ0);
+				shared_data = kmap_atomic(pfn_to_page(gnt_list_entry->pfn));
+				bvec_data = kmap_atomic(sg_page(sg));
 
 				/*
 				 * this does not wipe data stored outside the
@@ -550,8 +549,8 @@ static int blkif_queue_request(struct request *req)
 				       bvec_data   + sg->offset,
 				       sg->length);
 
-				kunmap_atomic(bvec_data, KM_IRQ0);
-				kunmap_atomic(shared_data, KM_IRQ0);
+				kunmap_atomic(bvec_data);
+				kunmap_atomic(shared_data);
 			}
 			if (ring_req->operation != BLKIF_OP_INDIRECT) {
 				ring_req->u.rw.seg[i] =
@@ -569,7 +568,7 @@ static int blkif_queue_request(struct request *req)
 			}
 		}
 		if (segments)
-			kunmap_atomic(segments, KM_IRQ0);
+			kunmap_atomic(segments);
 	}
 
 	info->ring.req_prod_pvt++;
@@ -670,6 +669,8 @@ static int xlvbd_init_blk_queue(struct gendisk *gd, u16 sector_size,
 		blk_queue_max_discard_sectors(rq, get_capacity(gd));
 		rq->limits.discard_granularity = info->discard_granularity;
 		rq->limits.discard_alignment = info->discard_alignment;
+		if (info->feature_secdiscard)
+			queue_flag_set_unlocked(QUEUE_FLAG_SECDISCARD, rq);
 	}
 
 	/* Hard sector size and max sectors impersonate the equiv. hardware. */
@@ -734,8 +735,8 @@ static int xen_translate_vdev(int vdevice, int *minor, unsigned int *offset)
 				EMULATED_HD_DISK_MINOR_OFFSET;
 			break;
 		case XEN_SCSI_DISK0_MAJOR:
-			*offset = (*minor / PARTS_PER_DISK) + emulated_sd_disk_name_offset;
-			*minor = *minor + emulated_sd_disk_minor_offset;
+			*offset = (*minor / PARTS_PER_DISK) + EMULATED_SD_DISK_NAME_OFFSET;
+			*minor = *minor + EMULATED_SD_DISK_MINOR_OFFSET;
 			break;
 		case XEN_SCSI_DISK1_MAJOR:
 		case XEN_SCSI_DISK2_MAJOR:
@@ -746,10 +747,10 @@ static int xen_translate_vdev(int vdevice, int *minor, unsigned int *offset)
 		case XEN_SCSI_DISK7_MAJOR:
 			*offset = (*minor / PARTS_PER_DISK) + 
 				((major - XEN_SCSI_DISK1_MAJOR + 1) * 16) +
-				emulated_sd_disk_name_offset;
+				EMULATED_SD_DISK_NAME_OFFSET;
 			*minor = *minor +
 				((major - XEN_SCSI_DISK1_MAJOR + 1) * 16 * PARTS_PER_DISK) +
-				emulated_sd_disk_minor_offset;
+				EMULATED_SD_DISK_MINOR_OFFSET;
 			break;
 		case XEN_SCSI_DISK8_MAJOR:
 		case XEN_SCSI_DISK9_MAJOR:
@@ -761,10 +762,10 @@ static int xen_translate_vdev(int vdevice, int *minor, unsigned int *offset)
 		case XEN_SCSI_DISK15_MAJOR:
 			*offset = (*minor / PARTS_PER_DISK) + 
 				((major - XEN_SCSI_DISK8_MAJOR + 8) * 16) +
-				emulated_sd_disk_name_offset;
+				EMULATED_SD_DISK_NAME_OFFSET;
 			*minor = *minor +
 				((major - XEN_SCSI_DISK8_MAJOR + 8) * 16 * PARTS_PER_DISK) +
-				emulated_sd_disk_minor_offset;
+				EMULATED_SD_DISK_MINOR_OFFSET;
 			break;
 		case XENVBD_MAJOR:
 			*offset = *minor / PARTS_PER_DISK;
@@ -775,6 +776,14 @@ static int xen_translate_vdev(int vdevice, int *minor, unsigned int *offset)
 			return -ENODEV;
 	}
 	return 0;
+}
+
+static char *encode_disk_name(char *ptr, unsigned int n)
+{
+	if (n >= 26)
+		ptr = encode_disk_name(ptr, n / 26 - 1);
+	*ptr = 'a' + n % 26;
+	return ptr + 1;
 }
 
 static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
@@ -788,6 +797,7 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 	unsigned int offset;
 	int minor;
 	int nr_parts;
+	char *ptr;
 
 	BUG_ON(info->gd != NULL);
 	BUG_ON(info->rq != NULL);
@@ -812,7 +822,11 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 					"emulated IDE disks,\n\t choose an xvd device name"
 					"from xvde on\n", info->vdevice);
 	}
-	err = -ENODEV;
+	if (minor >> MINORBITS) {
+		pr_warn("blkfront: %#x's minor (%#x) out of range; ignoring\n",
+			info->vdevice, minor);
+		return -ENODEV;
+	}
 
 	if ((minor % nr_parts) == 0)
 		nr_minors = nr_parts;
@@ -826,23 +840,14 @@ static int xlvbd_alloc_gendisk(blkif_sector_t capacity,
 	if (gd == NULL)
 		goto release;
 
-	if (nr_minors > 1) {
-		if (offset < 26)
-			sprintf(gd->disk_name, "%s%c", DEV_NAME, 'a' + offset);
-		else
-			sprintf(gd->disk_name, "%s%c%c", DEV_NAME,
-				'a' + ((offset / 26)-1), 'a' + (offset % 26));
-	} else {
-		if (offset < 26)
-			sprintf(gd->disk_name, "%s%c%d", DEV_NAME,
-				'a' + offset,
-				minor & (nr_parts - 1));
-		else
-			sprintf(gd->disk_name, "%s%c%c%d", DEV_NAME,
-				'a' + ((offset / 26) - 1),
-				'a' + (offset % 26),
-				minor & (nr_parts - 1));
-	}
+	strcpy(gd->disk_name, DEV_NAME);
+	ptr = encode_disk_name(gd->disk_name + sizeof(DEV_NAME) - 1, offset);
+	BUG_ON(ptr >= gd->disk_name + DISK_NAME_LEN);
+	if (nr_minors > 1)
+		*ptr = 0;
+	else
+		snprintf(ptr, gd->disk_name + DISK_NAME_LEN - ptr,
+			 "%d", minor & (nr_parts - 1));
 
 	gd->major = XENVBD_MAJOR;
 	gd->first_minor = minor;
@@ -898,7 +903,7 @@ static void xlvbd_release_gendisk(struct blkfront_info *info)
 	spin_unlock_irqrestore(&info->io_lock, flags);
 
 	/* Flush gnttab callback work. Must be done with no locks held. */
-	flush_scheduled_work();
+	flush_work(&info->work);
 
 	del_gendisk(info->gd);
 
@@ -1025,7 +1030,7 @@ free_shadow:
 	spin_unlock_irq(&info->io_lock);
 
 	/* Flush gnttab callback work. Must be done with no locks held. */
-	flush_scheduled_work();
+	flush_work(&info->work);
 
 	/* Free resources associated with old device channel. */
 	if (info->ring_ref != GRANT_INVALID_REF) {
@@ -1062,13 +1067,13 @@ static void blkif_completion(struct blk_shadow *s, struct blkfront_info *info,
 		for_each_sg(s->sg, sg, nseg, i) {
 			BUG_ON(sg->offset + sg->length > PAGE_SIZE);
 			shared_data = kmap_atomic(
-				pfn_to_page(s->grants_used[i]->pfn), KM_IRQ0);
-			bvec_data = kmap_atomic(sg_page(sg), KM_IRQ0);
+				pfn_to_page(s->grants_used[i]->pfn));
+			bvec_data = kmap_atomic(sg_page(sg));
 			memcpy(bvec_data   + sg->offset,
 			       shared_data + sg->offset,
 			       sg->length);
-			kunmap_atomic(bvec_data, KM_IRQ0);
-			kunmap_atomic(shared_data, KM_IRQ0);
+			kunmap_atomic(bvec_data);
+			kunmap_atomic(shared_data);
 		}
 	}
 	/* Add the persistent grant into the list of free grants */
@@ -1161,7 +1166,8 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 		}
 		req  = info->shadow[id].request;
 
-		blkif_completion(&info->shadow[id], info, bret);
+		if (bret->operation != BLKIF_OP_DISCARD)
+			blkif_completion(&info->shadow[id], info, bret);
 
 		if (add_id_to_freelist(info, id)) {
 			WARN(1, "%s: response to %s (id %ld) couldn't be recycled!\n",
@@ -1178,7 +1184,9 @@ static irqreturn_t blkif_interrupt(int irq, void *dev_id)
 					   info->gd->disk_name, op_name(bret->operation));
 				error = -EOPNOTSUPP;
 				info->feature_discard = 0;
+				info->feature_secdiscard = 0;
 				queue_flag_clear(QUEUE_FLAG_DISCARD, rq);
+				queue_flag_clear(QUEUE_FLAG_SECDISCARD, rq);
 			}
 			__blk_end_request_all(req, error);
 			break;
@@ -1261,9 +1269,8 @@ static int setup_blkring(struct xenbus_device *dev,
 	if (err)
 		goto fail;
 
-	err = bind_evtchn_to_irqhandler(info->evtchn,
-					blkif_interrupt,
-					IRQF_SAMPLE_RANDOM, "blkif", info);
+	err = bind_evtchn_to_irqhandler(info->evtchn, blkif_interrupt, 0,
+					"blkif", info);
 	if (err <= 0) {
 		xenbus_dev_fatal(dev, err,
 				 "bind_evtchn_to_irqhandler failed");
@@ -1340,6 +1347,10 @@ again:
 		xenbus_dev_fatal(dev, err, "%s", message);
  destroy_blkring:
 	blkif_free(info, 0);
+
+	kfree(info);
+	dev_set_drvdata(&dev->dev, NULL);
+
  out:
 	return err;
 }
@@ -1369,62 +1380,25 @@ static int blkfront_probe(struct xenbus_device *dev,
 		}
 	}
 
-	/* 	
-	 * Prevent hooking up IDE if ide-unplug not supported;
-	 * Never hook up SCSI devices on pv-on-hvm guest
-	 */
 	if (xen_hvm_domain()) {
-		extern int xen_ide_unplug_unsupported;
-		int major;
-		int cfg = 1;
-		char* type;
+		char *type;
 		int len;
+		/* no unplug has been done: do not hook devices != xen vbds */
+		if (xen_has_pv_and_legacy_disk_devices()) {
+			int major;
 
-		if (!VDEV_IS_EXTENDED(vdevice))
-			major = BLKIF_MAJOR(vdevice);
-		else
-			major = XENVBD_MAJOR;
+			if (!VDEV_IS_EXTENDED(vdevice))
+				major = BLKIF_MAJOR(vdevice);
+			else
+				major = XENVBD_MAJOR;
 
-		switch(major) {
-		case IDE0_MAJOR:
-		case IDE1_MAJOR:
-		case IDE2_MAJOR:
-		case IDE3_MAJOR:
-		case IDE4_MAJOR:
-		case IDE5_MAJOR:
-		case IDE6_MAJOR:
-		case IDE7_MAJOR:
-		case IDE8_MAJOR:
-		case IDE9_MAJOR:
-			if (xen_ide_unplug_unsupported)
-				cfg = 0;
-			break;
-		case SCSI_DISK0_MAJOR:
-		case SCSI_DISK1_MAJOR:
-		case SCSI_DISK2_MAJOR:
-		case SCSI_DISK3_MAJOR:
-		case SCSI_DISK4_MAJOR:
-		case SCSI_DISK5_MAJOR:
-		case SCSI_DISK6_MAJOR:
-		case SCSI_DISK7_MAJOR:
-		case SCSI_DISK8_MAJOR:
-		case SCSI_DISK9_MAJOR:
-		case SCSI_DISK10_MAJOR:
-		case SCSI_DISK11_MAJOR:
-		case SCSI_DISK12_MAJOR:
-		case SCSI_DISK13_MAJOR:
-		case SCSI_DISK14_MAJOR:
-		case SCSI_DISK15_MAJOR:
-			cfg = 0;
-			break;
+			if (major != XENVBD_MAJOR) {
+				printk(KERN_INFO
+						"%s: HVM does not support vbd %d as xen block device\n",
+						__FUNCTION__, vdevice);
+				return -ENODEV;
+			}
 		}
-		if (cfg == 0) {
-			printk(KERN_INFO
-				"%s: HVM does not support vbd %d as xen block device\n",
-			__FUNCTION__, vdevice);
-			return -ENODEV;
-		}
-
 		/* do not create a PV cdrom device if we are an HVM guest */
 		type = xenbus_read(XBT_NIL, dev->nodename, "device-type", &len);
 		if (IS_ERR(type))
@@ -1435,8 +1409,6 @@ static int blkfront_probe(struct xenbus_device *dev,
 		}
 		kfree(type);
 	}
-
-
 	info = kzalloc(sizeof(*info), GFP_KERNEL);
 	if (!info) {
 		xenbus_dev_fatal(dev, -ENOMEM, "allocating info structure");
@@ -1461,65 +1433,7 @@ static int blkfront_probe(struct xenbus_device *dev,
 	info->handle = simple_strtoul(strrchr(dev->nodename, '/')+1, NULL, 0);
 	dev_set_drvdata(&dev->dev, info);
 
-	err = talk_to_blkback(dev, info);
-	if (err) {
-		kfree(info);
-		dev_set_drvdata(&dev->dev, NULL);
-		return err;
-	}
-
 	return 0;
-}
-
-/*
- * This is a clone of md_trim_bio, used to split a bio into smaller ones
- */
-static void trim_bio(struct bio *bio, int offset, int size)
-{
-	/* 'bio' is a cloned bio which we need to trim to match
-	 * the given offset and size.
-	 * This requires adjusting bi_sector, bi_size, and bi_io_vec
-	 */
-	int i;
-	struct bio_vec *bvec;
-	int sofar = 0;
-
-	size <<= 9;
-	if (offset == 0 && size == bio->bi_size)
-		return;
-
-	bio->bi_sector += offset;
-	bio->bi_size = size;
-	offset <<= 9;
-	clear_bit(BIO_SEG_VALID, &bio->bi_flags);
-
-	while (bio->bi_idx < bio->bi_vcnt &&
-	       bio->bi_io_vec[bio->bi_idx].bv_len <= offset) {
-		/* remove this whole bio_vec */
-		offset -= bio->bi_io_vec[bio->bi_idx].bv_len;
-		bio->bi_idx++;
-	}
-	if (bio->bi_idx < bio->bi_vcnt) {
-		bio->bi_io_vec[bio->bi_idx].bv_offset += offset;
-		bio->bi_io_vec[bio->bi_idx].bv_len -= offset;
-	}
-	/* avoid any complications with bi_idx being non-zero*/
-	if (bio->bi_idx) {
-		memmove(bio->bi_io_vec, bio->bi_io_vec+bio->bi_idx,
-			(bio->bi_vcnt - bio->bi_idx) * sizeof(struct bio_vec));
-		bio->bi_vcnt -= bio->bi_idx;
-		bio->bi_idx = 0;
-	}
-	/* Make sure vcnt and last bv are not too big */
-	bio_for_each_segment(bvec, bio, i) {
-		if (sofar + bvec->bv_len > size)
-			bvec->bv_len = size - sofar;
-		if (bvec->bv_len == 0) {
-			bio->bi_vcnt = i;
-			break;
-		}
-		sofar += bvec->bv_len;
-	}
 }
 
 static void split_bio_end(struct bio *bio, int error)
@@ -1551,11 +1465,10 @@ static int blkif_recover(struct blkfront_info *info)
 	struct list_head requests;
 
 	/* Stage 1: Make a safe copy of the shadow state. */
-	copy = kmalloc(sizeof(info->shadow),
+	copy = kmemdup(info->shadow, sizeof(info->shadow),
 		       GFP_NOIO | __GFP_REPEAT | __GFP_HIGH);
 	if (!copy)
 		return -ENOMEM;
-	memcpy(copy, info->shadow, sizeof(info->shadow));
 
 	/* Stage 2: Set up free list. */
 	memset(&info->shadow, 0, sizeof(info->shadow));
@@ -1583,7 +1496,7 @@ static int blkif_recover(struct blkfront_info *info)
 		 * Get the bios in the request so we can re-queue them.
 		 */
 		if (copy[i].request->cmd_flags &
-		    (REQ_FLUSH | REQ_FUA | REQ_DISCARD)) {
+		    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
 			/*
 			 * Flush operations don't contain bios, so
 			 * we need to requeue the whole request
@@ -1608,7 +1521,7 @@ static int blkif_recover(struct blkfront_info *info)
 	spin_lock_irq(&info->io_lock);
 	while ((req = blk_fetch_request(info->rq)) != NULL) {
 		if (req->cmd_flags &
-		    (REQ_FLUSH | REQ_FUA | REQ_DISCARD)) {
+		    (REQ_FLUSH | REQ_FUA | REQ_DISCARD | REQ_SECURE)) {
 			list_add(&req->queuelist, &requests);
 			continue;
 		}
@@ -1658,7 +1571,7 @@ static int blkif_recover(struct blkfront_info *info)
 					   (unsigned int)(bio->bi_size >> 9) - offset);
 				cloned_bio = bio_clone(bio, GFP_NOIO);
 				BUG_ON(cloned_bio == NULL);
-				trim_bio(cloned_bio, offset, size);
+				bio_trim(cloned_bio, offset, size);
 				cloned_bio->bi_private = split_bio;
 				cloned_bio->bi_end_io = split_bio_end;
 				submit_bio(cloned_bio->bi_rw, cloned_bio);
@@ -1730,6 +1643,7 @@ blkfront_closing(struct blkfront_info *info)
 	if (bdev->bd_openers) {
 		xenbus_dev_error(xbdev, -EBUSY,
 				 "Device in use; refusing to close");
+		xenbus_switch_state(xbdev, XenbusStateClosing);
 	} else {
 		xlvbd_release_gendisk(info);
 		xenbus_frontend_closed(xbdev);
@@ -1744,6 +1658,7 @@ static void blkfront_setup_discard(struct blkfront_info *info)
 	int err;
 	unsigned int discard_granularity;
 	unsigned int discard_alignment;
+	unsigned int discard_secure;
 
 	info->feature_discard = 1;
 	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
@@ -1754,6 +1669,11 @@ static void blkfront_setup_discard(struct blkfront_info *info)
 		info->discard_granularity = discard_granularity;
 		info->discard_alignment = discard_alignment;
 	}
+	err = xenbus_gather(XBT_NIL, info->xbdev->otherend,
+		    "discard-secure", "%d", &discard_secure,
+		    NULL);
+	if (!err)
+		info->feature_secdiscard = !!discard_secure;
 }
 
 static int blkfront_setup_indirect(struct blkfront_info *info)
@@ -1846,7 +1766,6 @@ static void blkfront_connect(struct blkfront_info *info)
 	unsigned int binfo;
 	int err;
 	int barrier, flush, discard, persistent;
-	dev_t devt;
 
 	switch (info->connected) {
 	case BLKIF_STATE_CONNECTED:
@@ -1858,12 +1777,8 @@ static void blkfront_connect(struct blkfront_info *info)
 				   "sectors", "%Lu", &sectors);
 		if (XENBUS_EXIST_ERR(err))
 			return;
-
-		devt = disk_devt(info->gd);
-		printk(KERN_INFO "Changing capacity of (%u, %u) to %Lu "
-		       "sectors\n", (unsigned)MAJOR(devt),
-		       (unsigned)MINOR(devt), sectors);
-
+		printk(KERN_INFO "Setting capacity to %Lu\n",
+		       sectors);
 		set_capacity(info->gd, sectors);
 		revalidate_disk(info->gd);
 
@@ -1877,9 +1792,9 @@ static void blkfront_connect(struct blkfront_info *info)
 		 */
 		blkif_recover(info);
 		return;
+
 	default:
-		/* keep gcc quiet; ISO C99 6.8.4.2p5, 6.8.3p6 */
-		;
+		break;
 	}
 
 	dev_dbg(&info->xbdev->dev, "%s:%s.\n",
@@ -1987,13 +1902,36 @@ static void blkback_changed(struct xenbus_device *dev,
 	dev_dbg(&dev->dev, "blkfront:blkback_changed to state %d.\n", backend_state);
 
 	switch (backend_state) {
-	case XenbusStateInitialising:
 	case XenbusStateInitWait:
+		if (dev->state != XenbusStateInitialising)
+			break;
+		if (talk_to_blkback(dev, info))
+			break;
+	case XenbusStateInitialising:
 	case XenbusStateInitialised:
+	case XenbusStateReconfiguring:
+	case XenbusStateReconfigured:
 	case XenbusStateUnknown:
 		break;
 
 	case XenbusStateConnected:
+		/*
+		 * talk_to_blkback sets state to XenbusStateInitialised
+		 * and blkfront_connect sets it to XenbusStateConnected
+		 * (if connection went OK).
+		 *
+		 * If the backend (or toolstack) decides to poke at backend
+		 * state (and re-trigger the watch by setting the state repeatedly
+		 * to XenbusStateConnected (4)) we need to deal with this.
+		 * This is allowed as this is used to communicate to the guest
+		 * that the size of disk has changed!
+		 */
+		if ((dev->state != XenbusStateInitialised) &&
+		    (dev->state != XenbusStateConnected)) {
+			if (talk_to_blkback(dev, info))
+				break;
+		}
+
 		blkfront_connect(info);
 		break;
 
@@ -2040,6 +1978,10 @@ static int blkfront_remove(struct xenbus_device *xbdev)
 	mutex_lock(&bdev->bd_mutex);
 	info = disk->private_data;
 
+	dev_warn(disk_to_dev(disk),
+		 "%s was hot-unplugged, %d stale handles\n",
+		 xbdev->nodename, bdev->bd_openers);
+
 	if (info && !bdev->bd_openers) {
 		xlvbd_release_gendisk(info);
 		disk->private_data = NULL;
@@ -2065,6 +2007,8 @@ static int blkif_open(struct block_device *bdev, fmode_t mode)
 	struct blkfront_info *info;
 	int err = 0;
 
+	mutex_lock(&blkfront_mutex);
+
 	info = disk->private_data;
 	if (!info) {
 		/* xbdev gone */
@@ -2081,17 +2025,24 @@ static int blkif_open(struct block_device *bdev, fmode_t mode)
 	mutex_unlock(&info->mutex);
 
 out:
+	mutex_unlock(&blkfront_mutex);
 	return err;
 }
 
-static int blkif_release(struct gendisk *disk, fmode_t mode)
+static void blkif_release(struct gendisk *disk, fmode_t mode)
 {
 	struct blkfront_info *info = disk->private_data;
 	struct block_device *bdev;
 	struct xenbus_device *xbdev;
 
+	mutex_lock(&blkfront_mutex);
+
 	bdev = bdget_disk(disk, 0);
 
+	if (!bdev) {
+		WARN(1, "Block device %s yanked out from us!\n", disk->disk_name);
+		goto out_mutex;
+	}
 	if (bdev->bd_openers)
 		goto out;
 
@@ -2105,6 +2056,7 @@ static int blkif_release(struct gendisk *disk, fmode_t mode)
 
 	if (xbdev && xbdev->state == XenbusStateClosing) {
 		/* pending switch to state closed */
+		dev_info(disk_to_dev(bdev->bd_disk), "releasing disk\n");
 		xlvbd_release_gendisk(info);
 		xenbus_frontend_closed(info->xbdev);
  	}
@@ -2113,6 +2065,7 @@ static int blkif_release(struct gendisk *disk, fmode_t mode)
 
 	if (!xbdev) {
 		/* sudden device removal */
+		dev_info(disk_to_dev(bdev->bd_disk), "releasing disk\n");
 		xlvbd_release_gendisk(info);
 		disk->private_data = NULL;
 		kfree(info);
@@ -2120,7 +2073,8 @@ static int blkif_release(struct gendisk *disk, fmode_t mode)
 
 out:
 	bdput(bdev);
-	return 0;
+out_mutex:
+	mutex_unlock(&blkfront_mutex);
 }
 
 static const struct block_device_operations xlvbd_block_fops =
@@ -2129,25 +2083,22 @@ static const struct block_device_operations xlvbd_block_fops =
 	.open = blkif_open,
 	.release = blkif_release,
 	.getgeo = blkif_getgeo,
-	.locked_ioctl = blkif_ioctl,
+	.ioctl = blkif_ioctl,
 };
 
 
-static struct xenbus_device_id blkfront_ids[] = {
+static const struct xenbus_device_id blkfront_ids[] = {
 	{ "vbd" },
 	{ "" }
 };
 
-static struct xenbus_driver blkfront = {
-	.name = "vbd",
-	.owner = THIS_MODULE,
-	.ids = blkfront_ids,
+static DEFINE_XENBUS_DRIVER(blkfront, ,
 	.probe = blkfront_probe,
 	.remove = blkfront_remove,
 	.resume = blkfront_resume,
 	.otherend_changed = blkback_changed,
 	.is_ready = blkfront_is_ready,
-};
+);
 
 static int __init xlblk_init(void)
 {
@@ -2156,22 +2107,16 @@ static int __init xlblk_init(void)
 	if (!xen_domain())
 		return -ENODEV;
 
-	if (xen_hvm_domain() && !xen_platform_pci_unplug)
+	if (!xen_has_pv_disk_devices())
 		return -ENODEV;
 
-	printk("%s: register_blkdev major: %d \n", __FUNCTION__, XENVBD_MAJOR);
 	if (register_blkdev(XENVBD_MAJOR, DEV_NAME)) {
 		printk(KERN_WARNING "xen_blk: can't get major %d with name %s\n",
 		       XENVBD_MAJOR, DEV_NAME);
 		return -ENODEV;
 	}
 
-	if (sda_is_xvda) {
-		emulated_sd_disk_minor_offset = 0;
-		emulated_sd_disk_name_offset = emulated_sd_disk_minor_offset / 256;
-	}
-
-	ret = xenbus_register_frontend(&blkfront);
+	ret = xenbus_register_frontend(&blkfront_driver);
 	if (ret) {
 		unregister_blkdev(XENVBD_MAJOR, DEV_NAME);
 		return ret;
@@ -2184,7 +2129,7 @@ module_init(xlblk_init);
 
 static void __exit xlblk_exit(void)
 {
-	xenbus_unregister_driver(&blkfront);
+	xenbus_unregister_driver(&blkfront_driver);
 	unregister_blkdev(XENVBD_MAJOR, DEV_NAME);
 	kfree(minors);
 }

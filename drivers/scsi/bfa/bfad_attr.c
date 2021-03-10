@@ -532,7 +532,7 @@ bfad_im_vport_delete(struct fc_vport *fc_vport)
 	wait_for_completion(vport->comp_del);
 
 	bfad_scsi_host_free(bfad, im_port);
-
+	list_del(&vport->list_entry);
 	kfree(vport);
 
 	return 0;

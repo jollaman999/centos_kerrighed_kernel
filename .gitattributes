@@ -1,5 +1,2 @@
-redhat		export-ignore
-redhat/		export-ignore
+/redhat		export-ignore
 makefile	export-ignore
-.gitattributes	export-ignore
-.gitignore	export-ignore

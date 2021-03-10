@@ -13,7 +13,6 @@
 #include <linux/kernel_stat.h>
 #include <asm/runtime_instr.h>
 #include <asm/cpu_mf.h>
-#include <asm/s390_ext.h>
 #include <asm/irq.h>
 
 /* empty control block to disable RI by loading it */
@@ -21,14 +20,7 @@ struct runtime_instr_cb runtime_instr_empty_cb;
 
 static int runtime_instr_avail(void)
 {
-	unsigned long long facility_bits[2];
-
-	if (stfle(facility_bits, 2) <= 0)
-		return 0;
-	if (facility_bits[1] & (1ULL << 63))
-		return 1;
-	else
-		return 0;
+	return test_facility(64);
 }
 
 static void disable_runtime_instr(void)
@@ -48,8 +40,6 @@ static void disable_runtime_instr(void)
 static void init_runtime_instr_cb(struct runtime_instr_cb *cb)
 {
 	cb->buf_limit = 0xfff;
-	if (user_mode == HOME_SPACE_MODE)
-		cb->home_space = 1;
 	cb->int_requested = 1;
 	cb->pstate = 1;
 	cb->pstate_set_buf = 1;
@@ -71,12 +61,15 @@ void exit_thread_runtime_instr(void)
 	task->thread.ri_cb = NULL;
 }
 
-static void runtime_instr_int_handler(__u16 ext_code)
+static void runtime_instr_int_handler(struct ext_code ext_code,
+				unsigned int param32, unsigned long param64)
 {
 	struct siginfo info;
 
-	if (!(S390_lowcore.ext_params & CPU_MF_INT_RI_MASK))
+	if (!(param32 & CPU_MF_INT_RI_MASK))
 		return;
+
+	inc_irq_stat(IRQEXT_CMR);
 
 	if (!current->thread.ri_cb)
 		return;
@@ -89,13 +82,12 @@ static void runtime_instr_int_handler(__u16 ext_code)
 	memset(&info, 0, sizeof(info));
 	info.si_signo = current->thread.ri_signum;
 	info.si_code = SI_QUEUE;
-	if (S390_lowcore.ext_params & CPU_MF_INT_RI_BUF_FULL)
+	if (param32 & CPU_MF_INT_RI_BUF_FULL)
 		info.si_int = ENOBUFS;
-	else if (S390_lowcore.ext_params & CPU_MF_INT_RI_HALTED)
+	else if (param32 & CPU_MF_INT_RI_HALTED)
 		info.si_int = ECANCELED;
 	else
-		/* unknown reason */
-		return;
+		return; /* unknown reason */
 
 	send_sig_info(current->thread.ri_signum, &info, current);
 }
@@ -145,10 +137,11 @@ static int __init runtime_instr_init(void)
 	if (!runtime_instr_avail())
 		return 0;
 
-	measurement_alert_subclass_register();
-	rc = register_external_interrupt(0x1407, runtime_instr_int_handler);
+	irq_subclass_register(IRQ_SUBCLASS_MEASUREMENT_ALERT);
+	rc = register_external_irq(EXT_IRQ_MEASURE_ALERT,
+				   runtime_instr_int_handler);
 	if (rc)
-		measurement_alert_subclass_unregister();
+		irq_subclass_unregister(IRQ_SUBCLASS_MEASUREMENT_ALERT);
 	else
 		pr_info("Runtime instrumentation facility initialized\n");
 	return rc;

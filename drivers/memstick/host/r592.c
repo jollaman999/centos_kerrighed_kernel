@@ -23,7 +23,7 @@
 #include <linux/swab.h>
 #include "r592.h"
 
-static int r592_enable_dma = 1;
+static bool r592_enable_dma = 1;
 static int debug;
 
 static const char *tpc_names[] = {
@@ -455,7 +455,7 @@ static int r592_transfer_fifo_pio(struct r592_device *dev)
 /* Executes one TPC (data is read/written from small or large fifo) */
 static void r592_execute_tpc(struct r592_device *dev)
 {
-	bool is_write = dev->req->tpc >= MS_TPC_SET_RW_REG_ADRS;
+	bool is_write;
 	int len, error;
 	u32 status, reg;
 
@@ -464,6 +464,7 @@ static void r592_execute_tpc(struct r592_device *dev)
 		return;
 	}
 
+	is_write = dev->req->tpc >= MS_TPC_SET_RW_REG_ADRS;
 	len = dev->req->long_data ?
 		dev->req->sg.length : dev->req->data_len;
 
@@ -797,7 +798,7 @@ static int r592_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (memstick_add_host(host))
 		goto error7;
 
-	message("driver succesfully loaded");
+	message("driver successfully loaded");
 	return 0;
 error7:
 	free_irq(dev->irq, dev);
@@ -847,7 +848,7 @@ static void r592_remove(struct pci_dev *pdev)
 			dev->dummy_dma_page_physical_address);
 }
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 static int r592_suspend(struct device *core_dev)
 {
 	struct pci_dev *pdev = to_pci_dev(core_dev);
@@ -870,9 +871,9 @@ static int r592_resume(struct device *core_dev)
 	r592_update_card_detect(dev);
 	return 0;
 }
-
-SIMPLE_DEV_PM_OPS(r592_pm_ops, r592_suspend, r592_resume);
 #endif
+
+static SIMPLE_DEV_PM_OPS(r592_pm_ops, r592_suspend, r592_resume);
 
 MODULE_DEVICE_TABLE(pci, r592_pci_id_tbl);
 
@@ -881,9 +882,7 @@ static struct pci_driver r852_pci_driver = {
 	.id_table	= r592_pci_id_tbl,
 	.probe		= r592_probe,
 	.remove		= r592_remove,
-#ifdef CONFIG_PM
 	.driver.pm	= &r592_pm_ops,
-#endif
 };
 
 static __init int r592_module_init(void)

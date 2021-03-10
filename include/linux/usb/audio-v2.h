@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (c) 2010 Daniel Mack <daniel@caiaq.de>
  *
@@ -18,15 +19,51 @@
 /* v1.0 and v2.0 of this standard have many things in common. For the rest
  * of the definitions, please refer to audio.h */
 
-static inline bool uac2_control_is_readable(u32 bmControls, u8 control)
+/*
+ * bmControl field decoders
+ *
+ * From the USB Audio spec v2.0:
+ *
+ *   bmaControls() is a (ch+1)-element array of 4-byte bitmaps,
+ *   each containing a set of bit pairs. If a Control is present,
+ *   it must be Host readable. If a certain Control is not
+ *   present then the bit pair must be set to 0b00.
+ *   If a Control is present but read-only, the bit pair must be
+ *   set to 0b01. If a Control is also Host programmable, the bit
+ *   pair must be set to 0b11. The value 0b10 is not allowed.
+ *
+ */
+
+static inline bool uac_v2v3_control_is_readable(u32 bmControls, u8 control)
 {
-	return (bmControls >> (control * 2)) & 0x1;
+	return (bmControls >> ((control - 1) * 2)) & 0x1;
 }
 
-static inline bool uac2_control_is_writeable(u32 bmControls, u8 control)
+static inline bool uac_v2v3_control_is_writeable(u32 bmControls, u8 control)
 {
-	return (bmControls >> (control * 2)) & 0x2;
+	return (bmControls >> ((control - 1) * 2)) & 0x2;
 }
+
+/* 4.7.2 Class-Specific AC Interface Descriptor */
+struct uac2_ac_header_descriptor {
+	__u8  bLength;			/* 9 */
+	__u8  bDescriptorType;		/* USB_DT_CS_INTERFACE */
+	__u8  bDescriptorSubtype;	/* UAC_MS_HEADER */
+	__le16 bcdADC;			/* 0x0200 */
+	__u8  bCategory;
+	__le16 wTotalLength;		/* includes Unit and Terminal desc. */
+	__u8  bmControls;
+} __packed;
+
+/* 2.3.1.6 Type I Format Type Descriptor (Frmts20 final.pdf)*/
+struct uac2_format_type_i_descriptor {
+	__u8  bLength;			/* in bytes: 6 */
+	__u8  bDescriptorType;		/* USB_DT_CS_INTERFACE */
+	__u8  bDescriptorSubtype;	/* FORMAT_TYPE */
+	__u8  bFormatType;		/* FORMAT_TYPE_1 */
+	__u8  bSubslotSize;		/* {1,2,3,4} */
+	__u8  bBitResolution;
+} __packed;
 
 /* 4.7.2.1 Clock Source Descriptor */
 
@@ -57,7 +94,7 @@ struct uac_clock_selector_descriptor {
 	__u8 bClockID;
 	__u8 bNrInPins;
 	__u8 baCSourceID[];
-	/* bmControls, bAssocTerminal and iClockSource omitted */
+	/* bmControls and iClockSource omitted */
 } __attribute__((packed));
 
 /* 4.7.2.3 Clock Multiplier Descriptor */
@@ -79,13 +116,13 @@ struct uac2_input_terminal_descriptor {
 	__u8 bDescriptorType;
 	__u8 bDescriptorSubtype;
 	__u8 bTerminalID;
-	__u16 wTerminalType;
+	__le16 wTerminalType;
 	__u8 bAssocTerminal;
 	__u8 bCSourceID;
 	__u8 bNrChannels;
-	__u32 bmChannelConfig;
+	__le32 bmChannelConfig;
 	__u8 iChannelNames;
-	__u16 bmControls;
+	__le16 bmControls;
 	__u8 iTerminal;
 } __attribute__((packed));
 
@@ -96,11 +133,11 @@ struct uac2_output_terminal_descriptor {
 	__u8 bDescriptorType;
 	__u8 bDescriptorSubtype;
 	__u8 bTerminalID;
-	__u16 wTerminalType;
+	__le16 wTerminalType;
 	__u8 bAssocTerminal;
 	__u8 bSourceID;
 	__u8 bCSourceID;
-	__u16 bmControls;
+	__le16 bmControls;
 	__u8 iTerminal;
 } __attribute__((packed));
 
@@ -128,9 +165,9 @@ struct uac2_as_header_descriptor {
 	__u8 bTerminalLink;
 	__u8 bmControls;
 	__u8 bFormatType;
-	__u32 bmFormats;
+	__le32 bmFormats;
 	__u8 bNrChannels;
-	__u32 bmChannelConfig;
+	__le32 bmChannelConfig;
 	__u8 iChannelNames;
 } __attribute__((packed));
 
@@ -151,6 +188,13 @@ struct uac2_iso_endpoint_descriptor {
 #define UAC2_CONTROL_PITCH		(3 << 0)
 #define UAC2_CONTROL_DATA_OVERRUN	(3 << 2)
 #define UAC2_CONTROL_DATA_UNDERRUN	(3 << 4)
+
+/* 5.2.5.4.2 Connector Control Parameter Block */
+struct uac2_connectors_ctl_blk {
+	__u8 bNrChannels;
+	__le32 bmChannelConfig;
+	__u8 iChannelNames;
+} __attribute__((packed));
 
 /* 6.1 Interrupt Data Message */
 

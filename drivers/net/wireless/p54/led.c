@@ -16,6 +16,7 @@
  * published by the Free Software Foundation.
  */
 
+#include <linux/init.h>
 #include <linux/firmware.h>
 #include <linux/etherdevice.h>
 
@@ -83,7 +84,7 @@ static void p54_led_brightness_set(struct led_classdev *led_dev,
 
 static int p54_register_led(struct p54_common *priv,
 			    unsigned int led_index,
-			    char *name, const char *trigger)
+			    char *name, char *trigger)
 {
 	struct p54_led_dev *led = &priv->leds[led_index];
 	int err;

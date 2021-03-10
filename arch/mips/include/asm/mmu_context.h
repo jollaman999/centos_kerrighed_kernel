@@ -24,6 +24,26 @@
 #endif /* SMTC */
 #include <asm-generic/mm_hooks.h>
 
+#ifdef CONFIG_MIPS_PGD_C0_CONTEXT
+
+#define TLBMISS_HANDLER_SETUP_PGD(pgd)					\
+do {									\
+	void (*tlbmiss_handler_setup_pgd)(unsigned long);		\
+	extern u32 tlbmiss_handler_setup_pgd_array[16];			\
+									\
+	tlbmiss_handler_setup_pgd =					\
+		(__typeof__(tlbmiss_handler_setup_pgd)) tlbmiss_handler_setup_pgd_array; \
+	tlbmiss_handler_setup_pgd((unsigned long)(pgd));		\
+} while (0)
+
+#define TLBMISS_HANDLER_SETUP()						\
+	do {								\
+		TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir);		\
+		write_c0_xcontext((unsigned long) smp_processor_id() << 51); \
+	} while (0)
+
+#else /* CONFIG_MIPS_PGD_C0_CONTEXT: using  pgd_current*/
+
 /*
  * For the fast tlb miss handlers, we keep a per cpu array of pointers
  * to the current pgd for each processor. Also, the proc. id is stuffed
@@ -46,7 +66,7 @@ extern unsigned long pgd_current[];
 	back_to_back_c0_hazard();					\
 	TLBMISS_HANDLER_SETUP_PGD(swapper_pg_dir)
 #endif
-
+#endif /* CONFIG_MIPS_PGD_C0_CONTEXT*/
 #if defined(CONFIG_CPU_R3000) || defined(CONFIG_CPU_TX39XX)
 
 #define ASID_INC	0x40
@@ -57,18 +77,12 @@ extern unsigned long pgd_current[];
 #define ASID_INC	0x10
 #define ASID_MASK	0xff0
 
-#elif defined(CONFIG_CPU_RM9000)
-
-#define ASID_INC	0x1
-#define ASID_MASK	0xfff
-
-/* SMTC/34K debug hack - but maybe we'll keep it */
 #elif defined(CONFIG_MIPS_MT_SMTC)
 
 #define ASID_INC	0x1
 extern unsigned long smtc_asid_mask;
 #define ASID_MASK	(smtc_asid_mask)
-#define	HW_ASID_MASK	0xff
+#define HW_ASID_MASK	0xff
 /* End SMTC/34K debug hack */
 #else /* FIXME: not correct for R6000 */
 
@@ -77,7 +91,7 @@ extern unsigned long smtc_asid_mask;
 
 #endif
 
-#define cpu_context(cpu, mm)	((mm)->context[cpu])
+#define cpu_context(cpu, mm)	((mm)->context.asid[cpu])
 #define cpu_asid(cpu, mm)	(cpu_context((cpu), (mm)) & ASID_MASK)
 #define asid_cache(cpu)		(cpu_data[cpu].asid_cache)
 
@@ -97,15 +111,21 @@ static inline void enter_lazy_tlb(struct mm_struct *mm, struct task_struct *tsk)
 static inline void
 get_new_mmu_context(struct mm_struct *mm, unsigned long cpu)
 {
+	extern void kvm_local_flush_tlb_all(void);
 	unsigned long asid = asid_cache(cpu);
 
 	if (! ((asid += ASID_INC) & ASID_MASK) ) {
 		if (cpu_has_vtag_icache)
 			flush_icache_all();
+#ifdef CONFIG_KVM
+		kvm_local_flush_tlb_all();      /* start new asid cycle */
+#else
 		local_flush_tlb_all();	/* start new asid cycle */
+#endif
 		if (!asid)		/* fix version if needed */
 			asid = ASID_FIRST_VERSION;
 	}
+
 	cpu_context(cpu, mm) = asid_cache(cpu) = asid;
 }
 
@@ -124,14 +144,14 @@ init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 {
 	int i;
 
-	for_each_online_cpu(i)
+	for_each_possible_cpu(i)
 		cpu_context(i, mm) = 0;
 
 	return 0;
 }
 
 static inline void switch_mm(struct mm_struct *prev, struct mm_struct *next,
-                             struct task_struct *tsk)
+			     struct task_struct *tsk)
 {
 	unsigned int cpu = smp_processor_id();
 	unsigned long flags;
@@ -229,7 +249,7 @@ activate_mm(struct mm_struct *prev, struct mm_struct *next)
 	}
 	/* See comments for similar code above */
 	write_c0_entryhi((read_c0_entryhi() & ~HW_ASID_MASK) |
-	                 cpu_asid(cpu, next));
+			 cpu_asid(cpu, next));
 	ehb(); /* Make sure it propagates to TCStatus */
 	evpe(mtflags);
 #else

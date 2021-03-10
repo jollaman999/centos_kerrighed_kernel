@@ -83,11 +83,11 @@ struct internal_state;
 
 typedef struct z_stream_s {
     const Byte *next_in;   /* next input byte */
-    uInt     avail_in;  /* number of bytes available at next_in */
+	uLong avail_in;  /* number of bytes available at next_in */
     uLong    total_in;  /* total nb of input bytes read so far */
 
     Byte    *next_out;  /* next output byte should be put there */
-    uInt     avail_out; /* remaining free space at next_out */
+	uLong avail_out; /* remaining free space at next_out */
     uLong    total_out; /* total nb of bytes output so far */
 
     char     *msg;      /* last error message, NULL if no error */
@@ -179,11 +179,16 @@ typedef z_stream *z_streamp;
 
                         /* basic functions */
 
-extern int zlib_deflate_workspacesize (void);
+extern int zlib_deflate_workspacesize (int windowBits, int memLevel);
 /*
    Returns the number of bytes that needs to be allocated for a per-
-   stream workspace.  A pointer to this number of bytes should be
-   returned in stream->workspace before calling zlib_deflateInit().
+   stream workspace with the specified parameters.  A pointer to this
+   number of bytes should be returned in stream->workspace before
+   you call zlib_deflateInit() or zlib_deflateInit2().  If you call
+   zlib_deflateInit(), specify windowBits = MAX_WBITS and memLevel =
+   MAX_MEM_LEVEL here.  If you call zlib_deflateInit2(), the windowBits
+   and memLevel parameters passed to zlib_deflateInit2() must not
+   exceed those passed here.
 */
 
 /* 

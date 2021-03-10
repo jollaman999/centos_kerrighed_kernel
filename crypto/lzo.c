@@ -21,6 +21,7 @@
 #include <linux/crypto.h>
 #include <linux/vmalloc.h>
 #include <linux/lzo.h>
+#include <linux/mm.h>
 
 struct lzo_ctx {
 	void *lzo_comp_mem;
@@ -30,7 +31,7 @@ static int lzo_init(struct crypto_tfm *tfm)
 {
 	struct lzo_ctx *ctx = crypto_tfm_ctx(tfm);
 
-	ctx->lzo_comp_mem = vmalloc(LZO1X_MEM_COMPRESS);
+	ctx->lzo_comp_mem = kvmalloc(LZO1X_MEM_COMPRESS, GFP_KERNEL);
 	if (!ctx->lzo_comp_mem)
 		return -ENOMEM;
 
@@ -41,7 +42,7 @@ static void lzo_exit(struct crypto_tfm *tfm)
 {
 	struct lzo_ctx *ctx = crypto_tfm_ctx(tfm);
 
-	vfree(ctx->lzo_comp_mem);
+	kvfree(ctx->lzo_comp_mem);
 }
 
 static int lzo_compress(struct crypto_tfm *tfm, const u8 *src,
@@ -81,7 +82,6 @@ static struct crypto_alg alg = {
 	.cra_flags		= CRYPTO_ALG_TYPE_COMPRESS,
 	.cra_ctxsize		= sizeof(struct lzo_ctx),
 	.cra_module		= THIS_MODULE,
-	.cra_list		= LIST_HEAD_INIT(alg.cra_list),
 	.cra_init		= lzo_init,
 	.cra_exit		= lzo_exit,
 	.cra_u			= { .compress = {
@@ -104,3 +104,4 @@ module_exit(lzo_mod_fini);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("LZO Compression Algorithm");
+MODULE_ALIAS_CRYPTO("lzo");

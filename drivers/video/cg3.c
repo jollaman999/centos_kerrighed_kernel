@@ -12,7 +12,6 @@
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/string.h>
-#include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/fb.h>
@@ -244,8 +243,8 @@ static int cg3_ioctl(struct fb_info *info, unsigned int cmd, unsigned long arg)
  *  Initialisation
  */
 
-static void __devinit cg3_init_fix(struct fb_info *info, int linebytes,
-				   struct device_node *dp)
+static void cg3_init_fix(struct fb_info *info, int linebytes,
+			 struct device_node *dp)
 {
 	strlcpy(info->fix.id, dp->name, sizeof(info->fix.id));
 
@@ -257,8 +256,8 @@ static void __devinit cg3_init_fix(struct fb_info *info, int linebytes,
 	info->fix.accel = FB_ACCEL_SUN_CGTHREE;
 }
 
-static void __devinit cg3_rdi_maybe_fixup_var(struct fb_var_screeninfo *var,
-					      struct device_node *dp)
+static void cg3_rdi_maybe_fixup_var(struct fb_var_screeninfo *var,
+				    struct device_node *dp)
 {
 	const char *params;
 	char *p;
@@ -280,36 +279,36 @@ static void __devinit cg3_rdi_maybe_fixup_var(struct fb_var_screeninfo *var,
 	}
 }
 
-static u8 cg3regvals_66hz[] __devinitdata = {	/* 1152 x 900, 66 Hz */
+static u8 cg3regvals_66hz[] = {	/* 1152 x 900, 66 Hz */
 	0x14, 0xbb,	0x15, 0x2b,	0x16, 0x04,	0x17, 0x14,
 	0x18, 0xae,	0x19, 0x03,	0x1a, 0xa8,	0x1b, 0x24,
 	0x1c, 0x01,	0x1d, 0x05,	0x1e, 0xff,	0x1f, 0x01,
 	0x10, 0x20,	0
 };
 
-static u8 cg3regvals_76hz[] __devinitdata = {	/* 1152 x 900, 76 Hz */
+static u8 cg3regvals_76hz[] = {	/* 1152 x 900, 76 Hz */
 	0x14, 0xb7,	0x15, 0x27,	0x16, 0x03,	0x17, 0x0f,
 	0x18, 0xae,	0x19, 0x03,	0x1a, 0xae,	0x1b, 0x2a,
 	0x1c, 0x01,	0x1d, 0x09,	0x1e, 0xff,	0x1f, 0x01,
 	0x10, 0x24,	0
 };
 
-static u8 cg3regvals_rdi[] __devinitdata = {	/* 640 x 480, cgRDI */
+static u8 cg3regvals_rdi[] = {	/* 640 x 480, cgRDI */
 	0x14, 0x70,	0x15, 0x20,	0x16, 0x08,	0x17, 0x10,
 	0x18, 0x06,	0x19, 0x02,	0x1a, 0x31,	0x1b, 0x51,
 	0x1c, 0x06,	0x1d, 0x0c,	0x1e, 0xff,	0x1f, 0x01,
 	0x10, 0x22,	0
 };
 
-static u8 *cg3_regvals[] __devinitdata = {
+static u8 *cg3_regvals[] = {
 	cg3regvals_66hz, cg3regvals_76hz, cg3regvals_rdi
 };
 
-static u_char cg3_dacvals[] __devinitdata = {
+static u_char cg3_dacvals[] = {
 	4, 0xff,	5, 0x00,	6, 0x70,	7, 0x00,	0
 };
 
-static int __devinit cg3_do_default_mode(struct cg3_par *par)
+static int cg3_do_default_mode(struct cg3_par *par)
 {
 	enum cg3_type type;
 	u8 *p;
@@ -347,10 +346,9 @@ static int __devinit cg3_do_default_mode(struct cg3_par *par)
 	return 0;
 }
 
-static int __devinit cg3_probe(struct of_device *op,
-			       const struct of_device_id *match)
+static int cg3_probe(struct platform_device *op)
 {
-	struct device_node *dp = op->node;
+	struct device_node *dp = op->dev.of_node;
 	struct fb_info *info;
 	struct cg3_par *par;
 	int linebytes, err;
@@ -400,7 +398,8 @@ static int __devinit cg3_probe(struct of_device *op,
 			goto out_unmap_screen;
 	}
 
-	if (fb_alloc_cmap(&info->cmap, 256, 0))
+	err = fb_alloc_cmap(&info->cmap, 256, 0);
+	if (err)
 		goto out_unmap_screen;
 
 	fb_set_cmap(&info->cmap, info);
@@ -434,7 +433,7 @@ out_err:
 	return err;
 }
 
-static int __devexit cg3_remove(struct of_device *op)
+static int cg3_remove(struct platform_device *op)
 {
 	struct fb_info *info = dev_get_drvdata(&op->dev);
 	struct cg3_par *par = info->par;
@@ -463,11 +462,14 @@ static const struct of_device_id cg3_match[] = {
 };
 MODULE_DEVICE_TABLE(of, cg3_match);
 
-static struct of_platform_driver cg3_driver = {
-	.name		= "cg3",
-	.match_table	= cg3_match,
+static struct platform_driver cg3_driver = {
+	.driver = {
+		.name = "cg3",
+		.owner = THIS_MODULE,
+		.of_match_table = cg3_match,
+	},
 	.probe		= cg3_probe,
-	.remove		= __devexit_p(cg3_remove),
+	.remove		= cg3_remove,
 };
 
 static int __init cg3_init(void)
@@ -475,12 +477,12 @@ static int __init cg3_init(void)
 	if (fb_get_options("cg3fb", NULL))
 		return -ENODEV;
 
-	return of_register_driver(&cg3_driver, &of_bus_type);
+	return platform_driver_register(&cg3_driver);
 }
 
 static void __exit cg3_exit(void)
 {
-	of_unregister_driver(&cg3_driver);
+	platform_driver_unregister(&cg3_driver);
 }
 
 module_init(cg3_init);

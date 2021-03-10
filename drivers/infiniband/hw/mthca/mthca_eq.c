@@ -34,6 +34,7 @@
 #include <linux/errno.h>
 #include <linux/interrupt.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 
 #include "mthca_dev.h"
 #include "mthca_cmd.h"
@@ -478,15 +479,15 @@ static int mthca_create_eq(struct mthca_dev *dev,
 	eq->nent = roundup_pow_of_two(max(nent, 2));
 	npages = ALIGN(eq->nent * MTHCA_EQ_ENTRY_SIZE, PAGE_SIZE) / PAGE_SIZE;
 
-	eq->page_list = kmalloc(npages * sizeof *eq->page_list,
-				GFP_KERNEL);
+	eq->page_list = kmalloc_array(npages, sizeof(*eq->page_list),
+				      GFP_KERNEL);
 	if (!eq->page_list)
 		goto err_out;
 
 	for (i = 0; i < npages; ++i)
 		eq->page_list[i].buf = NULL;
 
-	dma_list = kmalloc(npages * sizeof *dma_list, GFP_KERNEL);
+	dma_list = kmalloc_array(npages, sizeof(*dma_list), GFP_KERNEL);
 	if (!dma_list)
 		goto err_out_free;
 
@@ -502,7 +503,7 @@ static int mthca_create_eq(struct mthca_dev *dev,
 			goto err_out_free_pages;
 
 		dma_list[i] = t;
-		pci_unmap_addr_set(&eq->page_list[i], mapping, t);
+		dma_unmap_addr_set(&eq->page_list[i], mapping, t);
 
 		clear_page(eq->page_list[i].buf);
 	}
@@ -571,7 +572,7 @@ static int mthca_create_eq(struct mthca_dev *dev,
 		if (eq->page_list[i].buf)
 			dma_free_coherent(&dev->pdev->dev, PAGE_SIZE,
 					  eq->page_list[i].buf,
-					  pci_unmap_addr(&eq->page_list[i],
+					  dma_unmap_addr(&eq->page_list[i],
 							 mapping));
 
 	mthca_free_mailbox(dev, mailbox);
@@ -618,7 +619,7 @@ static void mthca_free_eq(struct mthca_dev *dev,
 	for (i = 0; i < npages; ++i)
 		pci_free_consistent(dev->pdev, PAGE_SIZE,
 				    eq->page_list[i].buf,
-				    pci_unmap_addr(&eq->page_list[i], mapping));
+				    dma_unmap_addr(&eq->page_list[i], mapping));
 
 	kfree(eq->page_list);
 	mthca_free_mailbox(dev, mailbox);

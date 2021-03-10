@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Wireless USB Standard Definitions
  * Event Size Tables
@@ -74,7 +75,7 @@ enum {
  * WUSB defines that CHIDs, CDIDs and CKs are a 16 byte string of
  * data. In order to avoid confusion and enforce types, we wrap it.
  *
- * Make it packed, as we use it in some hw defintions.
+ * Make it packed, as we use it in some hw definitions.
  */
 struct wusb_ckhdid {
 	u8 data[16];
@@ -126,7 +127,7 @@ enum {
 /**
  * WUSB IE: Channel Stop (WUSB1.0[7.5.8])
  *
- * Tells devices the host is going to stop sending MMCs and will dissapear.
+ * Tells devices the host is going to stop sending MMCs and will disappear.
  */
 struct wuie_channel_stop {
 	struct wuie_hdr hdr;
@@ -271,6 +272,8 @@ static inline u8 wusb_key_index(int index, int type, int originator)
 #define WUSB_KEY_INDEX_TYPE_GTK			2
 #define WUSB_KEY_INDEX_ORIGINATOR_HOST		0
 #define WUSB_KEY_INDEX_ORIGINATOR_DEVICE	1
+/* bits 0-3 used for the key index. */
+#define WUSB_KEY_INDEX_MAX			15
 
 /* A CCM Nonce, defined in WUSB1.0[6.4.1] */
 struct aes_ccm_nonce {

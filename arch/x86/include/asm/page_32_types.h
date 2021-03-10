@@ -13,14 +13,13 @@
  * If you want more physical memory than this then see the CONFIG_HIGHMEM4G
  * and CONFIG_HIGHMEM64G options in the kernel configuration.
  */
-#define __PAGE_OFFSET		_AC(CONFIG_PAGE_OFFSET, UL)
+#define __PAGE_OFFSET_BASE	_AC(CONFIG_PAGE_OFFSET, UL)
+#define __PAGE_OFFSET		__PAGE_OFFSET_BASE
 
-#ifdef CONFIG_4KSTACKS
-#define THREAD_ORDER	0
-#else
-#define THREAD_ORDER	1
-#endif
-#define THREAD_SIZE 	(PAGE_SIZE << THREAD_ORDER)
+#define __START_KERNEL_map	__PAGE_OFFSET
+
+#define THREAD_SIZE_ORDER	1
+#define THREAD_SIZE		(PAGE_SIZE << THREAD_SIZE_ORDER)
 
 #define DOUBLEFAULT_STACK 1
 #define NMI_STACK 0
@@ -35,7 +34,7 @@
  * entries have all the host bits set in a guest.
  * The real limit is still 44 bits.
  */
-#define __PHYSICAL_MASK_SHIFT	46
+#define __PHYSICAL_MASK_SHIFT	52
 #define __VIRTUAL_MASK_SHIFT	32
 
 #else  /* !CONFIG_X86_PAE */

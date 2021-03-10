@@ -23,6 +23,7 @@
 #include <linux/hash.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
+#include <linux/slab.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
 #include <scsi/scsi_device.h>
@@ -92,7 +93,7 @@ struct scsi_cmnd *scsi_host_get_command(struct Scsi_Host *shost,
 
 	/*
 	 * The blk helpers are used to the READ/WRITE requests
-	 * transfering data from a initiator point of view. Since
+	 * transferring data from a initiator point of view. Since
 	 * we are in target mode we want the opposite.
 	 */
 	rq = blk_get_request(shost->uspace_req_q, !write, gfp_mask);
@@ -110,7 +111,7 @@ struct scsi_cmnd *scsi_host_get_command(struct Scsi_Host *shost,
 	cmd->cmnd = rq->cmd;
 
 	rq->special = cmd;
-	rq->cmd_type = REQ_TYPE_SPECIAL;
+	rq->cmd_type = REQ_TYPE_DRV_PRIV;
 	rq->cmd_flags |= REQ_TYPE_BLOCK_PC;
 	rq->end_io_data = tcmd;
 
@@ -154,7 +155,8 @@ void scsi_host_put_command(struct Scsi_Host *shost, struct scsi_cmnd *cmd)
 	__blk_put_request(q, rq);
 	spin_unlock_irqrestore(q->queue_lock, flags);
 
-	__scsi_put_command(shost, cmd, &shost->shost_gendev);
+	__scsi_put_command(shost, cmd);
+	put_device(&shost->shost_gendev);
 }
 EXPORT_SYMBOL_GPL(scsi_host_put_command);
 
@@ -184,6 +186,7 @@ static void scsi_tgt_cmd_destroy(struct work_struct *work)
 	dprintk("cmd %p %d %u\n", cmd, cmd->sc_data_direction,
 		rq_data_dir(cmd->request));
 	scsi_unmap_user_pages(tcmd);
+	tcmd->rq->bio = NULL;
 	scsi_host_put_command(scsi_tgt_cmd_to_host(cmd), cmd);
 }
 
@@ -625,7 +628,7 @@ static int __init scsi_tgt_init(void)
 	if (!scsi_tgt_cmd_cache)
 		return -ENOMEM;
 
-	scsi_tgtd = create_workqueue("scsi_tgtd");
+	scsi_tgtd = alloc_workqueue("scsi_tgtd", 0, 1);
 	if (!scsi_tgtd) {
 		err = -ENOMEM;
 		goto free_kmemcache;

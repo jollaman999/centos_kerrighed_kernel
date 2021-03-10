@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /* Norwood Micro (non-Pro) TV Tuner
    By Peter Naulls <peter@chocky.org>
@@ -29,7 +30,7 @@ static struct rc_map_table norwood[] = {
 	{ 0x28, KEY_8 },
 	{ 0x29, KEY_9 },
 
-	{ 0x78, KEY_TUNER },		/* Video Source        */
+	{ 0x78, KEY_VIDEO },		/* Video Source        */
 	{ 0x2c, KEY_EXIT },		/* Open/Close software */
 	{ 0x2a, KEY_SELECT },		/* 2 Digit Select      */
 	{ 0x69, KEY_AGAIN },		/* Recall              */
@@ -49,7 +50,7 @@ static struct rc_map_table norwood[] = {
 	{ 0x37, KEY_PLAY },		/* Play                */
 	{ 0x36, KEY_PAUSE },		/* Pause               */
 	{ 0x2b, KEY_STOP },		/* Stop                */
-	{ 0x67, KEY_FASTFORWARD },	/* Foward              */
+	{ 0x67, KEY_FASTFORWARD },	/* Forward              */
 	{ 0x66, KEY_REWIND },		/* Rewind              */
 	{ 0x3e, KEY_SEARCH },		/* Auto Scan           */
 	{ 0x2e, KEY_CAMERA },		/* Capture Video       */

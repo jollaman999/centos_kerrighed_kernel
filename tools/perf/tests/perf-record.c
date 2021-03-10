@@ -1,3 +1,8 @@
+#include <errno.h>
+#include <inttypes.h>
+/* For the CLR_() macros */
+#include <pthread.h>
+
 #include <sched.h>
 #include "evlist.h"
 #include "evsel.h"
@@ -32,7 +37,7 @@ realloc:
 	return cpu;
 }
 
-int test__PERF_RECORD(void)
+int test__PERF_RECORD(struct test *test __maybe_unused, int subtest __maybe_unused)
 {
 	struct record_opts opts = {
 		.target = {
@@ -40,12 +45,11 @@ int test__PERF_RECORD(void)
 			.uses_mmap = true,
 		},
 		.no_buffering = true,
-		.freq	      = 10,
 		.mmap_pages   = 256,
 	};
 	cpu_set_t cpu_mask;
 	size_t cpu_mask_size = sizeof(cpu_mask);
-	struct perf_evlist *evlist = perf_evlist__new_default();
+	struct perf_evlist *evlist = perf_evlist__new_dummy();
 	struct perf_evsel *evsel;
 	struct perf_sample sample;
 	const char *cmd = "sleep";
@@ -61,7 +65,10 @@ int test__PERF_RECORD(void)
 	int total_events = 0, nr_events[PERF_RECORD_MAX] = { 0, };
 	char sbuf[STRERR_BUFSIZE];
 
-	if (evlist == NULL || argv == NULL) {
+	if (evlist == NULL) /* Fallback for kernels lacking PERF_COUNT_SW_DUMMY */
+		evlist = perf_evlist__new_default();
+
+	if (evlist == NULL) {
 		pr_debug("Not enough memory to create evlist\n");
 		goto out;
 	}
@@ -97,12 +104,12 @@ int test__PERF_RECORD(void)
 	perf_evsel__set_sample_bit(evsel, CPU);
 	perf_evsel__set_sample_bit(evsel, TID);
 	perf_evsel__set_sample_bit(evsel, TIME);
-	perf_evlist__config(evlist, &opts);
+	perf_evlist__config(evlist, &opts, NULL);
 
 	err = sched__get_first_possible_cpu(evlist->workload.pid, &cpu_mask);
 	if (err < 0) {
 		pr_debug("sched__get_first_possible_cpu: %s\n",
-			 strerror_r(errno, sbuf, sizeof(sbuf)));
+			 str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out_delete_evlist;
 	}
 
@@ -113,7 +120,7 @@ int test__PERF_RECORD(void)
 	 */
 	if (sched_setaffinity(evlist->workload.pid, cpu_mask_size, &cpu_mask) < 0) {
 		pr_debug("sched_setaffinity: %s\n",
-			 strerror_r(errno, sbuf, sizeof(sbuf)));
+			 str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out_delete_evlist;
 	}
 
@@ -124,7 +131,7 @@ int test__PERF_RECORD(void)
 	err = perf_evlist__open(evlist);
 	if (err < 0) {
 		pr_debug("perf_evlist__open: %s\n",
-			 strerror_r(errno, sbuf, sizeof(sbuf)));
+			 str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out_delete_evlist;
 	}
 
@@ -133,10 +140,10 @@ int test__PERF_RECORD(void)
 	 * fds in the same CPU to be injected in the same mmap ring buffer
 	 * (using ioctl(PERF_EVENT_IOC_SET_OUTPUT)).
 	 */
-	err = perf_evlist__mmap(evlist, opts.mmap_pages, false);
+	err = perf_evlist__mmap(evlist, opts.mmap_pages);
 	if (err < 0) {
 		pr_debug("perf_evlist__mmap: %s\n",
-			 strerror_r(errno, sbuf, sizeof(sbuf)));
+			 str_error_r(errno, sbuf, sizeof(sbuf)));
 		goto out_delete_evlist;
 	}
 
@@ -156,8 +163,13 @@ int test__PERF_RECORD(void)
 
 		for (i = 0; i < evlist->nr_mmaps; i++) {
 			union perf_event *event;
+			struct perf_mmap *md;
 
-			while ((event = perf_evlist__mmap_read(evlist, i)) != NULL) {
+			md = &evlist->mmap[i];
+			if (perf_mmap__read_init(md) < 0)
+				continue;
+
+			while ((event = perf_mmap__read_event(md)) != NULL) {
 				const u32 type = event->header.type;
 				const char *name = perf_event__name(type);
 
@@ -167,13 +179,13 @@ int test__PERF_RECORD(void)
 
 				err = perf_evlist__parse_sample(evlist, event, &sample);
 				if (err < 0) {
-					if (verbose)
+					if (verbose > 0)
 						perf_event__fprintf(event, stderr);
 					pr_debug("Couldn't parse sample\n");
 					goto out_delete_evlist;
 				}
 
-				if (verbose) {
+				if (verbose > 0) {
 					pr_info("%" PRIu64" %d ", sample.time, sample.cpu);
 					perf_event__fprintf(event, stderr);
 				}
@@ -258,8 +270,9 @@ int test__PERF_RECORD(void)
 					++errs;
 				}
 
-				perf_evlist__mmap_consume(evlist, i);
+				perf_mmap__consume(md);
 			}
+			perf_mmap__read_done(md);
 		}
 
 		/*

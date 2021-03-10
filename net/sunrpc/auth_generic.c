@@ -5,6 +5,7 @@
  */
 
 #include <linux/err.h>
+#include <linux/slab.h>
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/sched.h>
@@ -13,12 +14,12 @@
 #include <linux/sunrpc/debug.h>
 #include <linux/sunrpc/sched.h>
 
-#ifdef RPC_DEBUG
+#if IS_ENABLED(CONFIG_SUNRPC_DEBUG)
 # define RPCDBG_FACILITY	RPCDBG_AUTH
 #endif
 
-#define RPC_MACHINE_CRED_USERID		((uid_t)0)
-#define RPC_MACHINE_CRED_GROUPID	((gid_t)0)
+#define RPC_MACHINE_CRED_USERID		GLOBAL_ROOT_UID
+#define RPC_MACHINE_CRED_GROUPID	GLOBAL_ROOT_GID
 
 struct generic_cred {
 	struct rpc_cred gc_base;
@@ -36,6 +37,19 @@ struct rpc_cred *rpc_lookup_cred(void)
 	return rpcauth_lookupcred(&generic_auth, 0);
 }
 EXPORT_SYMBOL_GPL(rpc_lookup_cred);
+
+struct rpc_cred *
+rpc_lookup_generic_cred(struct auth_cred *acred, int flags, gfp_t gfp)
+{
+	return rpcauth_lookup_credcache(&generic_auth, acred, flags, gfp);
+}
+EXPORT_SYMBOL_GPL(rpc_lookup_generic_cred);
+
+struct rpc_cred *rpc_lookup_cred_nonblock(void)
+{
+	return rpcauth_lookupcred(&generic_auth, RPCAUTH_LOOKUP_RCU);
+}
+EXPORT_SYMBOL_GPL(rpc_lookup_cred_nonblock);
 
 /*
  * Public call interface for looking up machine creds.
@@ -64,21 +78,29 @@ static struct rpc_cred *generic_bind_cred(struct rpc_task *task,
 	return auth->au_ops->lookup_cred(auth, acred, lookupflags);
 }
 
+static int
+generic_hash_cred(struct auth_cred *acred, unsigned int hashbits)
+{
+	return hash_64(from_kgid(&init_user_ns, acred->gid) |
+		((u64)from_kuid(&init_user_ns, acred->uid) <<
+			(sizeof(gid_t) * 8)), hashbits);
+}
+
 /*
  * Lookup generic creds for current process
  */
 static struct rpc_cred *
 generic_lookup_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
 {
-	return rpcauth_lookup_credcache(&generic_auth, acred, flags);
+	return rpcauth_lookup_credcache(&generic_auth, acred, flags, GFP_KERNEL);
 }
 
 static struct rpc_cred *
-generic_create_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
+generic_create_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags, gfp_t gfp)
 {
 	struct generic_cred *gcred;
 
-	gcred = kmalloc(sizeof(*gcred), GFP_KERNEL);
+	gcred = kmalloc(sizeof(*gcred), gfp);
 	if (gcred == NULL)
 		return ERR_PTR(-ENOMEM);
 
@@ -96,7 +118,9 @@ generic_create_cred(struct rpc_auth *auth, struct auth_cred *acred, int flags)
 
 	dprintk("RPC:       allocated %s cred %p for uid %d gid %d\n",
 			gcred->acred.machine_cred ? "machine" : "generic",
-			gcred, acred->uid, acred->gid);
+			gcred,
+			from_kuid(&init_user_ns, acred->uid),
+			from_kgid(&init_user_ns, acred->gid));
 	return &gcred->gc_base;
 }
 
@@ -129,8 +153,8 @@ machine_cred_match(struct auth_cred *acred, struct generic_cred *gcred, int flag
 {
 	if (!gcred->acred.machine_cred ||
 	    gcred->acred.principal != acred->principal ||
-	    gcred->acred.uid != acred->uid ||
-	    gcred->acred.gid != acred->gid)
+	    !uid_eq(gcred->acred.uid, acred->uid) ||
+	    !gid_eq(gcred->acred.gid, acred->gid))
 		return 0;
 	return 1;
 }
@@ -147,8 +171,8 @@ generic_match(struct auth_cred *acred, struct rpc_cred *cred, int flags)
 	if (acred->machine_cred)
 		return machine_cred_match(acred, gcred, flags);
 
-	if (gcred->acred.uid != acred->uid ||
-	    gcred->acred.gid != acred->gid ||
+	if (!uid_eq(gcred->acred.uid, acred->uid) ||
+	    !gid_eq(gcred->acred.gid, acred->gid) ||
 	    gcred->acred.machine_cred != 0)
 		goto out_nomatch;
 
@@ -160,8 +184,8 @@ generic_match(struct auth_cred *acred, struct rpc_cred *cred, int flags)
 	if (gcred->acred.group_info->ngroups != acred->group_info->ngroups)
 		goto out_nomatch;
 	for (i = 0; i < gcred->acred.group_info->ngroups; i++) {
-		if (GROUP_AT(gcred->acred.group_info, i) !=
-				GROUP_AT(acred->group_info, i))
+		if (!gid_eq(GROUP_AT(gcred->acred.group_info, i),
+				GROUP_AT(acred->group_info, i)))
 			goto out_nomatch;
 	}
 out_match:
@@ -230,7 +254,7 @@ generic_key_timeout(struct rpc_auth *auth, struct rpc_cred *cred)
 		if (test_and_clear_bit(RPC_CRED_KEY_EXPIRE_SOON,
 					&acred->ac_flags))
 			dprintk("RPC:        UID %d Credential key reset\n",
-				tcred->cr_uid);
+				from_kuid(&init_user_ns, tcred->cr_uid));
 		/* set up fasttrack for the normal case */
 		set_bit(RPC_CRED_NOTIFY_TIMEOUT, &acred->ac_flags);
 	}
@@ -242,6 +266,7 @@ generic_key_timeout(struct rpc_auth *auth, struct rpc_cred *cred)
 static const struct rpc_authops generic_auth_ops = {
 	.owner = THIS_MODULE,
 	.au_name = "Generic",
+	.hash_cred = generic_hash_cred,
 	.lookup_cred = generic_lookup_cred,
 	.crcreate = generic_create_cred,
 	.key_timeout = generic_key_timeout,

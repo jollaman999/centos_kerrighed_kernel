@@ -29,7 +29,6 @@
 #ifndef __POWER_H__
 #define __POWER_H__
 
-
 /*---------------------  Export Definitions -------------------------*/
 #define     C_PWBT                   1000      // micro sec. power up before TBTT
 #define     PS_FAST_INTERVAL         1         // Fast power saving listen interval
@@ -39,46 +38,44 @@
 
 /*---------------------  Export Variables  --------------------------*/
 
-
 /*---------------------  Export Types  ------------------------------*/
-
 
 /*---------------------  Export Functions  --------------------------*/
 
-// IN PSDevice pDevice
-// IN PSDevice hDeviceContext
+// PSDevice pDevice
+// PSDevice hDeviceContext
 
-BOOL
+bool
 PSbConsiderPowerDown(
-    IN HANDLE hDeviceContext,
-    IN BOOL bCheckRxDMA,
-    IN BOOL bCheckCountToWakeUp
-    );
+	void *hDeviceContext,
+	bool bCheckRxDMA,
+	bool bCheckCountToWakeUp
+);
 
-VOID
+void
 PSvDisablePowerSaving(
-    IN HANDLE hDeviceContext
-    );
+	void *hDeviceContext
+);
 
-VOID
+void
 PSvEnablePowerSaving(
-    IN HANDLE hDeviceContext,
-    IN WORD wListenInterval
-    );
+	void *hDeviceContext,
+	unsigned short wListenInterval
+);
 
-VOID
+void
 PSvSendPSPOLL(
-    IN HANDLE hDeviceContext
-    );
+	void *hDeviceContext
+);
 
-BOOL
+bool
 PSbSendNullPacket(
-    IN HANDLE hDeviceContext
-    );
+	void *hDeviceContext
+);
 
-BOOL
+bool
 PSbIsNextTBTTWakeUp(
-    IN HANDLE hDeviceContext
-    );
+	void *hDeviceContext
+);
 
 #endif //__POWER_H__

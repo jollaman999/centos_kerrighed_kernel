@@ -12,15 +12,16 @@
 #include <linux/irq.h>
 #include <linux/kernel.h>
 #include <linux/time.h>
+#include <linux/cpu.h>
 
 #include <asm/sysreg.h>
 
 #include <mach/pm.h>
 
 
-static cycle_t read_cycle_count(struct clocksource *cs)
+static u64 read_cycle_count(struct clocksource *cs)
 {
-	return (cycle_t)sysreg_read(COUNT);
+	return (u64)sysreg_read(COUNT);
 }
 
 /*
@@ -35,7 +36,6 @@ static struct clocksource counter = {
 	.rating		= 50,
 	.read		= read_cycle_count,
 	.mask		= CLOCKSOURCE_MASK(32),
-	.shift		= 16,
 	.flags		= CLOCK_SOURCE_IS_CONTINUOUS,
 };
 
@@ -88,13 +88,24 @@ static void comparator_mode(enum clock_event_mode mode,
 		pr_debug("%s: start\n", evdev->name);
 		/* FALLTHROUGH */
 	case CLOCK_EVT_MODE_RESUME:
-		cpu_disable_idle_sleep();
+		/*
+		 * If we're using the COUNT and COMPARE registers we
+		 * need to force idle poll.
+		 */
+		cpu_idle_poll_ctrl(true);
 		break;
 	case CLOCK_EVT_MODE_UNUSED:
 	case CLOCK_EVT_MODE_SHUTDOWN:
 		sysreg_write(COMPARE, 0);
 		pr_debug("%s: stop\n", evdev->name);
-		cpu_enable_idle_sleep();
+		if (evdev->mode == CLOCK_EVT_MODE_ONESHOT ||
+		    evdev->mode == CLOCK_EVT_MODE_RESUME) {
+			/*
+			 * Only disable idle poll if we have forced that
+			 * in a previous call.
+			 */
+			cpu_idle_poll_ctrl(false);
+		}
 		break;
 	default:
 		BUG();
@@ -110,22 +121,20 @@ static struct clock_event_device comparator = {
 	.set_mode	= comparator_mode,
 };
 
+void read_persistent_clock(struct timespec *ts)
+{
+	ts->tv_sec = mktime(2007, 1, 1, 0, 0, 0);
+	ts->tv_nsec = 0;
+}
+
 void __init time_init(void)
 {
 	unsigned long counter_hz;
 	int ret;
 
-	xtime.tv_sec = mktime(2007, 1, 1, 0, 0, 0);
-	xtime.tv_nsec = 0;
-
-	set_normalized_timespec(&wall_to_monotonic,
-				-xtime.tv_sec, -xtime.tv_nsec);
-
 	/* figure rate for counter */
 	counter_hz = clk_get_rate(boot_cpu_data.clk);
-	counter.mult = clocksource_hz2mult(counter_hz, counter.shift);
-
-	ret = clocksource_register(&counter);
+	ret = clocksource_register_hz(&counter, counter_hz);
 	if (ret)
 		pr_debug("timer: could not register clocksource: %d\n", ret);
 

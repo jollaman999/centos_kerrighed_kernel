@@ -11,6 +11,7 @@
 #include <linux/inetdevice.h>
 #include <linux/inet.h>
 #include <linux/interrupt.h>
+#include <linux/export.h>
 #include <linux/netpoll.h>
 #include <linux/sched.h>
 #include <linux/delay.h>
@@ -19,6 +20,7 @@
 #include <linux/workqueue.h>
 #include <linux/netlink.h>
 #include <linux/net_dropmon.h>
+#include <linux/slab.h>
 
 #include <asm/unaligned.h>
 #include <asm/bitops.h>
@@ -29,6 +31,14 @@
 #include <trace/events/napi.h>
 #include <trace/events/sock.h>
 #include <trace/events/udp.h>
+#include <trace/events/qdisc.h>
+#if IS_ENABLED(CONFIG_BRIDGE)
+#include <trace/events/bridge.h>
+EXPORT_TRACEPOINT_SYMBOL_GPL(br_fdb_add);
+EXPORT_TRACEPOINT_SYMBOL_GPL(br_fdb_external_learn_add);
+EXPORT_TRACEPOINT_SYMBOL_GPL(fdb_delete);
+EXPORT_TRACEPOINT_SYMBOL_GPL(br_fdb_update);
+#endif
 
 EXPORT_TRACEPOINT_SYMBOL_GPL(kfree_skb);
 

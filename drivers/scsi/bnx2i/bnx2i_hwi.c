@@ -181,7 +181,7 @@ int bnx2i_arm_cq_event_coalescing(struct bnx2i_endpoint *ep, u8 action)
 
 /**
  * bnx2i_get_rq_buf - copy RQ buffer contents to driver buffer
- * @conn:		iscsi connection on which RQ event occured
+ * @conn:		iscsi connection on which RQ event occurred
  * @ptr:		driver buffer to which RQ buffer contents is to
  *			be copied
  * @len:		length of valid data inside RQ buf
@@ -243,8 +243,10 @@ void bnx2i_put_rq_buf(struct bnx2i_conn *bnx2i_conn, int count)
 		ep->qp.rq_prod_idx %= bnx2i_conn->hba->max_rqes;
 		if (!hi_bit)
 			ep->qp.rq_prod_idx |= 0x8000;
-	} else
+	} else {
+		gmb();
 		ep->qp.rq_prod_idx |= hi_bit;
+	}
 
 	if (test_bit(BNX2I_NX2_DEV_57710, &ep->hba->cnic_dev_type)) {
 		rq_db = (struct bnx2i_5771x_sq_rq_db *) ep->qp.rq_pgtbl_virt;
@@ -333,13 +335,11 @@ static void bnx2i_ring_dbell_update_sq_params(struct bnx2i_conn *bnx2i_conn,
 int bnx2i_send_iscsi_login(struct bnx2i_conn *bnx2i_conn,
 			   struct iscsi_task *task)
 {
-	struct bnx2i_cmd *bnx2i_cmd;
 	struct bnx2i_login_request *login_wqe;
-	struct iscsi_login *login_hdr;
+	struct iscsi_login_req *login_hdr;
 	u32 dword;
 
-	bnx2i_cmd = (struct bnx2i_cmd *)task->dd_data;
-	login_hdr = (struct iscsi_login *)task->hdr;
+	login_hdr = (struct iscsi_login_req *)task->hdr;
 	login_wqe = (struct bnx2i_login_request *)
 						bnx2i_conn->ep->qp.sq_prod_qe;
 
@@ -392,12 +392,10 @@ int bnx2i_send_iscsi_tmf(struct bnx2i_conn *bnx2i_conn,
 	struct iscsi_tm *tmfabort_hdr;
 	struct scsi_cmnd *ref_sc;
 	struct iscsi_task *ctask;
-	struct bnx2i_cmd *bnx2i_cmd;
 	struct bnx2i_tmf_request *tmfabort_wqe;
 	u32 dword;
 	u32 scsi_lun[2];
 
-	bnx2i_cmd = (struct bnx2i_cmd *)mtask->dd_data;
 	tmfabort_hdr = (struct iscsi_tm *)mtask->hdr;
 	tmfabort_wqe = (struct bnx2i_tmf_request *)
 						bnx2i_conn->ep->qp.sq_prod_qe;
@@ -464,12 +462,10 @@ int bnx2i_send_iscsi_tmf(struct bnx2i_conn *bnx2i_conn,
 int bnx2i_send_iscsi_text(struct bnx2i_conn *bnx2i_conn,
 			  struct iscsi_task *mtask)
 {
-	struct bnx2i_cmd *bnx2i_cmd;
 	struct bnx2i_text_request *text_wqe;
 	struct iscsi_text *text_hdr;
 	u32 dword;
 
-	bnx2i_cmd = (struct bnx2i_cmd *)mtask->dd_data;
 	text_hdr = (struct iscsi_text *)mtask->hdr;
 	text_wqe = (struct bnx2i_text_request *) bnx2i_conn->ep->qp.sq_prod_qe;
 
@@ -542,11 +538,9 @@ int bnx2i_send_iscsi_nopout(struct bnx2i_conn *bnx2i_conn,
 			    char *datap, int data_len, int unsol)
 {
 	struct bnx2i_endpoint *ep = bnx2i_conn->ep;
-	struct bnx2i_cmd *bnx2i_cmd;
 	struct bnx2i_nop_out_request *nopout_wqe;
 	struct iscsi_nopout *nopout_hdr;
 
-	bnx2i_cmd = (struct bnx2i_cmd *)task->dd_data;
 	nopout_hdr = (struct iscsi_nopout *)task->hdr;
 	nopout_wqe = (struct bnx2i_nop_out_request *)ep->qp.sq_prod_qe;
 
@@ -556,12 +550,9 @@ int bnx2i_send_iscsi_nopout(struct bnx2i_conn *bnx2i_conn,
 	nopout_wqe->op_attr = ISCSI_FLAG_CMD_FINAL;
 	memcpy(nopout_wqe->lun, &nopout_hdr->lun, 8);
 
-	if (test_bit(BNX2I_NX2_DEV_57710, &ep->hba->cnic_dev_type)) {
-		u32 tmp = nopout_wqe->lun[0];
-		/* 57710 requires LUN field to be swapped */
-		nopout_wqe->lun[0] = nopout_wqe->lun[1];
-		nopout_wqe->lun[1] = tmp;
-	}
+	/* 57710 requires LUN field to be swapped */
+	if (test_bit(BNX2I_NX2_DEV_57710, &ep->hba->cnic_dev_type))
+		swap(nopout_wqe->lun[0], nopout_wqe->lun[1]);
 
 	nopout_wqe->itt = ((u16)task->itt |
 			   (ISCSI_TASK_TYPE_MPATH <<
@@ -603,11 +594,9 @@ int bnx2i_send_iscsi_nopout(struct bnx2i_conn *bnx2i_conn,
 int bnx2i_send_iscsi_logout(struct bnx2i_conn *bnx2i_conn,
 			    struct iscsi_task *task)
 {
-	struct bnx2i_cmd *bnx2i_cmd;
 	struct bnx2i_logout_request *logout_wqe;
 	struct iscsi_logout *logout_hdr;
 
-	bnx2i_cmd = (struct bnx2i_cmd *)task->dd_data;
 	logout_hdr = (struct iscsi_logout *)task->hdr;
 
 	logout_wqe = (struct bnx2i_logout_request *)
@@ -1084,15 +1073,14 @@ int bnx2i_alloc_qp_resc(struct bnx2i_hba *hba, struct bnx2i_endpoint *ep)
 
 	/* Allocate memory area for actual SQ element */
 	ep->qp.sq_virt =
-		dma_alloc_coherent(&hba->pcidev->dev, ep->qp.sq_mem_size,
-				   &ep->qp.sq_phys, GFP_KERNEL);
+		dma_zalloc_coherent(&hba->pcidev->dev, ep->qp.sq_mem_size,
+					&ep->qp.sq_phys, GFP_KERNEL);
 	if (!ep->qp.sq_virt) {
 		printk(KERN_ALERT "bnx2i: unable to alloc SQ BD memory %d\n",
 				  ep->qp.sq_mem_size);
 		goto mem_alloc_err;
 	}
 
-	memset(ep->qp.sq_virt, 0x00, ep->qp.sq_mem_size);
 	ep->qp.sq_first_qe = ep->qp.sq_virt;
 	ep->qp.sq_prod_qe = ep->qp.sq_first_qe;
 	ep->qp.sq_cons_qe = ep->qp.sq_first_qe;
@@ -1121,14 +1109,13 @@ int bnx2i_alloc_qp_resc(struct bnx2i_hba *hba, struct bnx2i_endpoint *ep)
 
 	/* Allocate memory area for actual CQ element */
 	ep->qp.cq_virt =
-		dma_alloc_coherent(&hba->pcidev->dev, ep->qp.cq_mem_size,
-				   &ep->qp.cq_phys, GFP_KERNEL);
+		dma_zalloc_coherent(&hba->pcidev->dev, ep->qp.cq_mem_size,
+					&ep->qp.cq_phys, GFP_KERNEL);
 	if (!ep->qp.cq_virt) {
 		printk(KERN_ALERT "bnx2i: unable to alloc CQ BD memory %d\n",
 				  ep->qp.cq_mem_size);
 		goto mem_alloc_err;
 	}
-	memset(ep->qp.cq_virt, 0x00, ep->qp.cq_mem_size);
 
 	ep->qp.cq_first_qe = ep->qp.cq_virt;
 	ep->qp.cq_prod_qe = ep->qp.cq_first_qe;
@@ -1360,7 +1347,7 @@ int bnx2i_process_scsi_cmd_resp(struct iscsi_session *session,
 	struct bnx2i_cmd_response *resp_cqe;
 	struct bnx2i_cmd *bnx2i_cmd;
 	struct iscsi_task *task;
-	struct iscsi_cmd_rsp *hdr;
+	struct iscsi_scsi_rsp *hdr;
 	u32 datalen = 0;
 
 	resp_cqe = (struct bnx2i_cmd_response *)cqe;
@@ -1397,7 +1384,7 @@ int bnx2i_process_scsi_cmd_resp(struct iscsi_session *session,
 	}
 	bnx2i_iscsi_unmap_sg_list(bnx2i_cmd);
 
-	hdr = (struct iscsi_cmd_rsp *)task->hdr;
+	hdr = (struct iscsi_scsi_rsp *)task->hdr;
 	resp_cqe = (struct bnx2i_cmd_response *)cqe;
 	hdr->opcode = resp_cqe->op_code;
 	hdr->max_cmdsn = cpu_to_be32(resp_cqe->max_cmd_sn);
@@ -2418,7 +2405,7 @@ static void bnx2i_process_conn_destroy_cmpl(struct bnx2i_hba *hba,
 	ep = bnx2i_find_ep_in_destroy_list(hba, conn_destroy->iscsi_conn_id);
 	if (!ep) {
 		printk(KERN_ALERT "bnx2i_conn_destroy_cmpl: no pending "
-				  "offload request, unexpected complection\n");
+				  "offload request, unexpected completion\n");
 		return;
 	}
 
@@ -2449,7 +2436,6 @@ static void bnx2i_process_ofld_cmpl(struct bnx2i_hba *hba,
 {
 	u32 cid_addr;
 	struct bnx2i_endpoint *ep;
-	u32 cid_num;
 
 	ep = bnx2i_find_ep_in_ofld_list(hba, ofld_kcqe->iscsi_conn_id);
 	if (!ep) {
@@ -2484,7 +2470,6 @@ static void bnx2i_process_ofld_cmpl(struct bnx2i_hba *hba,
 	} else {
 		ep->state = EP_STATE_OFLD_COMPL;
 		cid_addr = ofld_kcqe->iscsi_conn_context_id;
-		cid_num = bnx2i_get_cid_num(ep);
 		ep->ep_cid = cid_addr;
 		ep->qp.ctx_base = NULL;
 	}
@@ -2743,6 +2728,8 @@ int bnx2i_map_ep_dbell_regs(struct bnx2i_endpoint *ep)
 					      BNX2X_DOORBELL_PCI_BAR);
 		reg_off = (1 << BNX2X_DB_SHIFT) * (cid_num & 0x1FFFF);
 		ep->qp.ctx_base = ioremap_nocache(reg_base + reg_off, 4);
+		if (!ep->qp.ctx_base)
+			return -ENOMEM;
 		goto arm_cq;
 	}
 

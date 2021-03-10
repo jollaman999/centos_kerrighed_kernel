@@ -1,7 +1,7 @@
 /*
- * Line6 Linux USB driver - 0.8.0
+ * Line6 Linux USB driver - 0.9.1beta
  *
- * Copyright (C) 2004-2009 Markus Grabner (grabner@icg.tugraz.at)
+ * Copyright (C) 2004-2010 Markus Grabner (grabner@icg.tugraz.at)
  *
  *	This program is free software; you can redistribute it and/or
  *	modify it under the terms of the GNU General Public License as
@@ -12,12 +12,8 @@
 #ifndef DRIVER_H
 #define DRIVER_H
 
-
-#include "config.h"
-
 #include <linux/spinlock.h>
 #include <linux/usb.h>
-#include <linux/wait.h>
 #include <sound/core.h>
 
 #include "midi.h"
@@ -25,10 +21,8 @@
 #define DRIVER_NAME "line6usb"
 
 #define LINE6_TIMEOUT 1
-#define LINE6_MAX_DEVICES 8
 #define LINE6_BUFSIZE_LISTEN 32
 #define LINE6_MESSAGE_MAXLEN 256
-
 
 /*
 	Line6 MIDI control commands
@@ -50,15 +44,13 @@
 */
 #define LINE6_CHANNEL_DEVICE 0x02
 
-#define LINE6_CHANNEL_UNKNOWN 5  /* don't know yet what this is good for */
+#define LINE6_CHANNEL_UNKNOWN 5	/* don't know yet what this is good for */
 
 #define LINE6_CHANNEL_MASK 0x0f
 
-
 #define MISSING_CASE	\
-	printk(KERN_ERR "line6usb driver bug: missing case in %s:%d\n", \
+	pr_err("line6usb driver bug: missing case in %s:%d\n", \
 		__FILE__, __LINE__)
-
 
 #define CHECK_RETURN(x)		\
 do {				\
@@ -67,21 +59,43 @@ do {				\
 		return err;	\
 } while (0)
 
+#define CHECK_STARTUP_PROGRESS(x, n)	\
+do {					\
+	if ((x) >= (n))			\
+		return;			\
+	x = (n);			\
+} while (0)
 
 extern const unsigned char line6_midi_id[3];
-extern struct usb_line6 *line6_devices[LINE6_MAX_DEVICES];
-extern struct workqueue_struct *line6_workqueue;
 
 static const int SYSEX_DATA_OFS = sizeof(line6_midi_id) + 3;
 static const int SYSEX_EXTRA_SIZE = sizeof(line6_midi_id) + 4;
-
 
 /**
 	 Common properties of Line6 devices.
 */
 struct line6_properties {
-	const char *name;
+	/**
+		 Bit identifying this device in the line6usb driver.
+	*/
 	int device_bit;
+
+	/**
+		 Card id string (maximum 16 characters).
+		 This can be used to address the device in ALSA programs as
+		 "default:CARD=<id>"
+	*/
+	const char *id;
+
+	/**
+		 Card short name (maximum 32 characters).
+	*/
+	const char *name;
+
+	/**
+		 Bit vector defining this device's capabilities in the
+		 line6usb driver.
+	*/
 	int capabilities;
 };
 
@@ -172,7 +186,6 @@ struct usb_line6 {
 	int message_length;
 };
 
-
 extern char *line6_alloc_sysex_buffer(struct usb_line6 *line6, int code1,
 				      int code2, int size);
 extern ssize_t line6_nop_read(struct device *dev,
@@ -184,7 +197,7 @@ extern int line6_read_data(struct usb_line6 *line6, int address, void *data,
 			   size_t datalen);
 extern int line6_read_serial_number(struct usb_line6 *line6,
 				    int *serial_number);
-extern int line6_send_program(struct usb_line6 *line6, int value);
+extern int line6_send_program(struct usb_line6 *line6, u8 value);
 extern int line6_send_raw_message(struct usb_line6 *line6, const char *buffer,
 				  int size);
 extern int line6_send_raw_message_async(struct usb_line6 *line6,
@@ -193,12 +206,13 @@ extern int line6_send_sysex_message(struct usb_line6 *line6,
 				    const char *buffer, int size);
 extern ssize_t line6_set_raw(struct device *dev, struct device_attribute *attr,
 			     const char *buf, size_t count);
+extern void line6_start_timer(struct timer_list *timer, unsigned int msecs,
+			      void (*function) (unsigned long),
+			      unsigned long data);
 extern int line6_transmit_parameter(struct usb_line6 *line6, int param,
-				    int value);
+				    u8 value);
+extern int line6_version_request_async(struct usb_line6 *line6);
 extern int line6_write_data(struct usb_line6 *line6, int address, void *data,
 			    size_t datalen);
-extern void line6_write_hexdump(struct usb_line6 *line6, char dir,
-				const unsigned char *buffer, int size);
-
 
 #endif

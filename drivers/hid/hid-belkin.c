@@ -5,7 +5,6 @@
  *  Copyright (c) 2000-2005 Vojtech Pavlik <vojtech@suse.cz>
  *  Copyright (c) 2005 Michael Haboustak <mike-@cinci.rr.com> for Concept2, Inc
  *  Copyright (c) 2006-2007 Jiri Kosina
- *  Copyright (c) 2007 Paul Walmsley
  *  Copyright (c) 2008 Jiri Slaby
  */
 
@@ -56,14 +55,14 @@ static int belkin_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	ret = hid_parse(hdev);
 	if (ret) {
-		dev_err(&hdev->dev, "parse failed\n");
+		hid_err(hdev, "parse failed\n");
 		goto err_free;
 	}
 
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT |
 		((quirks & BELKIN_HIDDEV) ? HID_CONNECT_HIDDEV_FORCE : 0));
 	if (ret) {
-		dev_err(&hdev->dev, "hw start failed\n");
+		hid_err(hdev, "hw start failed\n");
 		goto err_free;
 	}
 
@@ -87,17 +86,6 @@ static struct hid_driver belkin_driver = {
 	.input_mapping = belkin_input_mapping,
 	.probe = belkin_probe,
 };
+module_hid_driver(belkin_driver);
 
-static int __init belkin_init(void)
-{
-	return hid_register_driver(&belkin_driver);
-}
-
-static void __exit belkin_exit(void)
-{
-	hid_unregister_driver(&belkin_driver);
-}
-
-module_init(belkin_init);
-module_exit(belkin_exit);
 MODULE_LICENSE("GPL");

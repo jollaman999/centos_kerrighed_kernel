@@ -1,8 +1,8 @@
 /*
  * Generic pidhash and scalable, time-bounded PID allocator
  *
- * (C) 2002-2003 William Irwin, IBM
- * (C) 2004 William Irwin, Oracle
+ * (C) 2002-2003 Nadia Yvette Chambers, IBM
+ * (C) 2004 Nadia Yvette Chambers, Oracle
  * (C) 2002-2004 Ingo Molnar, Red Hat
  *
  * pid-structures are backing objects for tasks sharing a given ID to chain
@@ -27,7 +27,7 @@
  */
 
 #include <linux/mm.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/rculist.h>
@@ -36,6 +36,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/init_task.h>
 #include <linux/syscalls.h>
+#include <linux/proc_ns.h>
 #include <linux/proc_fs.h>
 
 #define pid_hashfn(nr, ns)	\
@@ -50,9 +51,6 @@ int pid_max = PID_MAX_DEFAULT;
 
 int pid_max_min = RESERVED_PIDS + 1;
 int pid_max_max = PID_MAX_LIMIT;
-
-#define BITS_PER_PAGE		(PAGE_SIZE*8)
-#define BITS_PER_PAGE_MASK	(BITS_PER_PAGE-1)
 
 static inline int mk_pid(struct pid_namespace *pid_ns,
 		struct pidmap *map, int off)
@@ -79,24 +77,10 @@ struct pid_namespace init_pid_ns = {
 	.last_pid = 0,
 	.level = 0,
 	.child_reaper = &init_task,
+	.user_ns = &init_user_ns,
 	.proc_inum = PROC_PID_INIT_INO,
 };
 EXPORT_SYMBOL_GPL(init_pid_ns);
-
-int is_container_init(struct task_struct *tsk)
-{
-	int ret = 0;
-	struct pid *pid;
-
-	rcu_read_lock();
-	pid = task_pid(tsk);
-	if (pid != NULL && pid->numbers[pid->level].nr == 1)
-		ret = 1;
-	rcu_read_unlock();
-
-	return ret;
-}
-EXPORT_SYMBOL(is_container_init);
 
 /*
  * Note: disable interrupts while the pidmap_lock is held as an
@@ -139,7 +123,9 @@ static int pid_before(int base, int a, int b)
 }
 
 /*
- * We might be racing with someone else trying to set pid_ns->last_pid.
+ * We might be racing with someone else trying to set pid_ns->last_pid
+ * at the pid allocation time (there's also a sysctl for this, but racing
+ * with this one is OK, see comment in kernel/pid_namespace.c about it).
  * We want the winner to have the "later" value, because if the
  * "earlier" value prevails, then a pid may get reused immediately.
  *
@@ -171,7 +157,12 @@ static int alloc_pidmap(struct pid_namespace *pid_ns)
 		pid = RESERVED_PIDS;
 	offset = pid & BITS_PER_PAGE_MASK;
 	map = &pid_ns->pidmap[pid/BITS_PER_PAGE];
-	max_scan = (pid_max + BITS_PER_PAGE - 1)/BITS_PER_PAGE - !offset;
+	/*
+	 * If last_pid points into the middle of the map->page we
+	 * want to scan this bitmap block twice, the second time
+	 * we start with offset == 0 (or RESERVED_PIDS).
+	 */
+	max_scan = DIV_ROUND_UP(pid_max, BITS_PER_PAGE) - !offset;
 	for (i = 0; i <= max_scan; ++i) {
 		if (unlikely(!map->page)) {
 			void *page = kzalloc(PAGE_SIZE, GFP_KERNEL);
@@ -180,32 +171,29 @@ static int alloc_pidmap(struct pid_namespace *pid_ns)
 			 * installing it:
 			 */
 			spin_lock_irq(&pidmap_lock);
-			if (map->page)
-				kfree(page);
-			else
+			if (!map->page) {
 				map->page = page;
+				page = NULL;
+			}
 			spin_unlock_irq(&pidmap_lock);
+			kfree(page);
 			if (unlikely(!map->page))
 				break;
 		}
 		if (likely(atomic_read(&map->nr_free))) {
-			do {
+			for ( ; ; ) {
 				if (!test_and_set_bit(offset, map->page)) {
 					atomic_dec(&map->nr_free);
 					set_last_pid(pid_ns, last, pid);
 					return pid;
 				}
 				offset = find_next_offset(map, offset);
+				if (offset >= BITS_PER_PAGE)
+					break;
 				pid = mk_pid(pid_ns, map, offset);
-			/*
-			 * find_next_offset() found a bit, the pid from it
-			 * is in-bounds, and if we fell back to the last
-			 * bitmap block and the final block was the same
-			 * as the starting point, pid is before last_pid.
-			 */
-			} while (offset < BITS_PER_PAGE && pid < pid_max &&
-					(i != max_scan || pid < last ||
-					    !((last+1) & BITS_PER_PAGE_MASK)));
+				if (pid >= pid_max)
+					break;
+			}
 		}
 		if (map < &pid_ns->pidmap[(pid_max-1)/BITS_PER_PAGE]) {
 			++map;
@@ -284,11 +272,6 @@ void free_pid(struct pid *pid)
 			 */
 			wake_up_process(ns->child_reaper);
 			break;
-		case PIDNS_HASH_ADDING:
-			/* Handle a fork failure of the first process */
-			WARN_ON(ns->child_reaper);
-			ns->nr_hashed = 0;
-			/* fall through */
 		case 0:
 			schedule_work(&ns->proc_work);
 			break;
@@ -372,10 +355,9 @@ void disable_pid_allocation(struct pid_namespace *ns)
 
 struct pid *find_pid_ns(int nr, struct pid_namespace *ns)
 {
-	struct hlist_node *elem;
 	struct upid *pnr;
 
-	hlist_for_each_entry_rcu(pnr, elem,
+	hlist_for_each_entry_rcu(pnr,
 			&pid_hash[pid_hashfn(nr, ns)], pid_chain)
 		if (pnr->nr == nr && pnr->ns == ns)
 			return container_of(pnr, struct pid,
@@ -394,14 +376,10 @@ EXPORT_SYMBOL_GPL(find_vpid);
 /*
  * attach_pid() must be called with the tasklist_lock write-held.
  */
-void attach_pid(struct task_struct *task, enum pid_type type,
-		struct pid *pid)
+void attach_pid(struct task_struct *task, enum pid_type type)
 {
-	struct pid_link *link;
-
-	link = &task->pids[type];
-	link->pid = pid;
-	hlist_add_head_rcu(&link->node, &pid->tasks[type]);
+	struct pid_link *link = &task->pids[type];
+	hlist_add_head_rcu(&link->node, &link->pid->tasks[type]);
 }
 
 static void __change_pid(struct task_struct *task, enum pid_type type,
@@ -433,7 +411,7 @@ void change_pid(struct task_struct *task, enum pid_type type,
 		struct pid *pid)
 {
 	__change_pid(task, type, pid);
-	attach_pid(task, type, pid);
+	attach_pid(task, type);
 }
 
 /* transfer_pid is an optimization of attach_pid(new), detach_pid(old) */
@@ -449,7 +427,8 @@ struct task_struct *pid_task(struct pid *pid, enum pid_type type)
 	struct task_struct *result = NULL;
 	if (pid) {
 		struct hlist_node *first;
-		first = rcu_dereference(pid->tasks[type].first);
+		first = rcu_dereference_check(hlist_first_rcu(&pid->tasks[type]),
+					      lockdep_tasklist_lock_is_held());
 		if (first)
 			result = hlist_entry(first, struct task_struct, pids[(type)].node);
 	}
@@ -458,10 +437,13 @@ struct task_struct *pid_task(struct pid *pid, enum pid_type type)
 EXPORT_SYMBOL(pid_task);
 
 /*
- * Must be called under rcu_read_lock() or with tasklist_lock read-held.
+ * Must be called under rcu_read_lock().
  */
 struct task_struct *find_task_by_pid_ns(pid_t nr, struct pid_namespace *ns)
 {
+	rcu_lockdep_assert(rcu_read_lock_held(),
+			   "find_task_by_pid_ns() needs rcu_read_lock()"
+			   " protection");
 	return pid_task(find_pid_ns(nr, ns), PIDTYPE_PID);
 }
 
@@ -518,6 +500,7 @@ pid_t pid_nr_ns(struct pid *pid, struct pid_namespace *ns)
 	}
 	return nr;
 }
+EXPORT_SYMBOL_GPL(pid_nr_ns);
 
 pid_t pid_vnr(struct pid *pid)
 {
@@ -586,7 +569,8 @@ void __init pidhash_init(void)
 
 	pid_hash = alloc_large_system_hash("PID", sizeof(*pid_hash), 0, 18,
 					   HASH_EARLY | HASH_SMALL,
-					   &pidhash_shift, NULL, 4096);
+					   &pidhash_shift, NULL,
+					   0, 4096);
 	pidhash_size = 1U << pidhash_shift;
 
 	for (i = 0; i < pidhash_size; i++)
@@ -612,5 +596,5 @@ void __init pidmap_init(void)
 	init_pid_ns.nr_hashed = PIDNS_HASH_ADDING;
 
 	init_pid_ns.pid_cachep = KMEM_CACHE(pid,
-			SLAB_HWCACHE_ALIGN | SLAB_PANIC);
+			SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT);
 }

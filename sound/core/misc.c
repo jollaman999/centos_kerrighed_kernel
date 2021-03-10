@@ -20,7 +20,10 @@
  */
 
 #include <linux/init.h>
+#include <linux/export.h>
+#include <linux/moduleparam.h>
 #include <linux/time.h>
+#include <linux/slab.h>
 #include <linux/ioport.h>
 #include <sound/core.h>
 
@@ -45,7 +48,6 @@ void release_and_free_resource(struct resource *res)
 		kfree(res);
 	}
 }
-
 EXPORT_SYMBOL(release_and_free_resource);
 
 #ifdef CONFIG_SND_VERBOSE_PRINTK
@@ -57,26 +59,6 @@ static const char *sanity_file_name(const char *path)
 	else
 		return path;
 }
-
-/* print file and line with a certain printk prefix */
-static int print_snd_pfx(unsigned int level, const char *path, int line,
-			 const char *format)
-{
-	const char *file = sanity_file_name(path);
-	char tmp[] = "<0>";
-	const char *pfx = level ? KERN_DEBUG : KERN_DEFAULT;
-	int ret = 0;
-
-	if (format[0] == '<' && format[2] == '>') {
-		tmp[1] = format[1];
-		pfx = tmp;
-		ret = 1;
-	}
-	printk("%sALSA %s:%d: ", pfx, file, line);
-	return ret;
-}
-#else
-#define print_snd_pfx(level, path, line, format)	0
 #endif
 
 #if defined(CONFIG_SND_DEBUG) || defined(CONFIG_SND_VERBOSE_PRINTK)
@@ -84,15 +66,42 @@ void __snd_printk(unsigned int level, const char *path, int line,
 		  const char *format, ...)
 {
 	va_list args;
-	
-#ifdef CONFIG_SND_DEBUG	
+#ifdef CONFIG_SND_VERBOSE_PRINTK
+	int kern_level;
+	struct va_format vaf;
+	char verbose_fmt[] = KERN_DEFAULT "ALSA %s:%d %pV";
+	bool level_found = false;
+#endif
+
+#ifdef CONFIG_SND_DEBUG
 	if (debug < level)
 		return;
 #endif
+
 	va_start(args, format);
-	if (print_snd_pfx(level, path, line, format))
-		format += 3; /* skip the printk level-prefix */
+#ifdef CONFIG_SND_VERBOSE_PRINTK
+	vaf.fmt = format;
+	vaf.va = &args;
+
+	while ((kern_level = printk_get_level(vaf.fmt)) != 0) {
+		const char *end_of_header = printk_skip_level(vaf.fmt);
+
+		/* Ignore KERN_CONT. We print filename:line for each piece. */
+		if (kern_level >= '0' && kern_level <= '7') {
+			memcpy(verbose_fmt, vaf.fmt, end_of_header - vaf.fmt);
+			level_found = true;
+		}
+
+		vaf.fmt = end_of_header;
+	}
+
+	if (!level_found && level)
+		memcpy(verbose_fmt, KERN_DEBUG, sizeof(KERN_DEBUG) - 1);
+
+	printk(verbose_fmt, sanity_file_name(path), line, &vaf);
+#else
 	vprintk(format, args);
+#endif
 	va_end(args);
 }
 EXPORT_SYMBOL_GPL(__snd_printk);

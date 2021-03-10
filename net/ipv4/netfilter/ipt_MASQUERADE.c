@@ -8,7 +8,7 @@
  * it under the terms of the GNU General Public License version 2 as
  * published by the Free Software Foundation.
  */
-
+#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 #include <linux/types.h>
 #include <linux/inetdevice.h>
 #include <linux/ip.h>
@@ -19,127 +19,51 @@
 #include <net/ip.h>
 #include <net/checksum.h>
 #include <net/route.h>
-#include <net/netfilter/nf_nat_rule.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/netfilter/x_tables.h>
+#include <net/netfilter/nf_nat.h>
+#include <net/netfilter/ipv4/nf_nat_masquerade.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Netfilter Core Team <coreteam@netfilter.org>");
 MODULE_DESCRIPTION("Xtables: automatic-address SNAT");
 
 /* FIXME: Multiple targets. --RR */
-static bool masquerade_tg_check(const struct xt_tgchk_param *par)
+static int masquerade_tg_check(const struct xt_tgchk_param *par)
 {
-	const struct nf_nat_multi_range_compat *mr = par->targinfo;
+	const struct nf_nat_ipv4_multi_range_compat *mr = par->targinfo;
 
-	if (mr->range[0].flags & IP_NAT_RANGE_MAP_IPS) {
-		pr_debug("masquerade_check: bad MAP_IPS.\n");
-		return false;
+	if (mr->range[0].flags & NF_NAT_RANGE_MAP_IPS) {
+		pr_debug("bad MAP_IPS.\n");
+		return -EINVAL;
 	}
 	if (mr->rangesize != 1) {
-		pr_debug("masquerade_check: bad rangesize %u\n", mr->rangesize);
-		return false;
+		pr_debug("bad rangesize %u\n", mr->rangesize);
+		return -EINVAL;
 	}
-	return true;
+	return 0;
 }
 
 static unsigned int
-masquerade_tg(struct sk_buff *skb, const struct xt_target_param *par)
+masquerade_tg(struct sk_buff *skb, const struct xt_action_param *par)
 {
-	struct nf_conn *ct;
-	struct nf_conn_nat *nat;
-	enum ip_conntrack_info ctinfo;
-	struct nf_nat_range newrange;
-	const struct nf_nat_multi_range_compat *mr;
-	const struct rtable *rt;
-	__be32 newsrc;
-
-	NF_CT_ASSERT(par->hooknum == NF_INET_POST_ROUTING);
-
-	ct = nf_ct_get(skb, &ctinfo);
-	nat = nfct_nat(ct);
-
-	NF_CT_ASSERT(ct && (ctinfo == IP_CT_NEW || ctinfo == IP_CT_RELATED
-			    || ctinfo == IP_CT_RELATED + IP_CT_IS_REPLY));
-
-	/* Source address is 0.0.0.0 - locally generated packet that is
-	 * probably not supposed to be masqueraded.
-	 */
-	if (ct->tuplehash[IP_CT_DIR_ORIGINAL].tuple.src.u3.ip == 0)
-		return NF_ACCEPT;
+	struct nf_nat_range range;
+	const struct nf_nat_ipv4_multi_range_compat *mr;
 
 	mr = par->targinfo;
-	rt = skb_rtable(skb);
-	newsrc = inet_select_addr(par->out, rt->rt_gateway, RT_SCOPE_UNIVERSE);
-	if (!newsrc) {
-		printk("MASQUERADE: %s ate my IP address\n", par->out->name);
-		return NF_DROP;
-	}
+	range.flags = mr->range[0].flags;
+	range.min_proto = mr->range[0].min;
+	range.max_proto = mr->range[0].max;
 
-	nat->masq_index = par->out->ifindex;
-
-	/* Transfer from original range. */
-	newrange = ((struct nf_nat_range)
-		{ mr->range[0].flags | IP_NAT_RANGE_MAP_IPS,
-		  newsrc, newsrc,
-		  mr->range[0].min, mr->range[0].max });
-
-	/* Hand modified range to generic setup. */
-	return nf_nat_setup_info(ct, &newrange, IP_NAT_MANIP_SRC);
+	return nf_nat_masquerade_ipv4(skb, xt_hooknum(par), &range,
+				      xt_out(par));
 }
-
-static int
-device_cmp(struct nf_conn *i, void *ifindex)
-{
-	const struct nf_conn_nat *nat = nfct_nat(i);
-
-	if (!nat)
-		return 0;
-
-	return nat->masq_index == (int)(long)ifindex;
-}
-
-static int masq_device_event(struct notifier_block *this,
-			     unsigned long event,
-			     void *ptr)
-{
-	const struct net_device *dev = ptr;
-	struct net *net = dev_net(dev);
-
-	if (event == NETDEV_DOWN) {
-		/* Device was downed.  Search entire table for
-		   conntracks which were associated with that device,
-		   and forget them. */
-		NF_CT_ASSERT(dev->ifindex != 0);
-
-		nf_ct_iterate_cleanup(net, device_cmp,
-				      (void *)(long)dev->ifindex);
-	}
-
-	return NOTIFY_DONE;
-}
-
-static int masq_inet_event(struct notifier_block *this,
-			   unsigned long event,
-			   void *ptr)
-{
-	struct net_device *dev = ((struct in_ifaddr *)ptr)->ifa_dev->dev;
-	return masq_device_event(this, event, dev);
-}
-
-static struct notifier_block masq_dev_notifier = {
-	.notifier_call	= masq_device_event,
-};
-
-static struct notifier_block masq_inet_notifier = {
-	.notifier_call	= masq_inet_event,
-};
 
 static struct xt_target masquerade_tg_reg __read_mostly = {
 	.name		= "MASQUERADE",
 	.family		= NFPROTO_IPV4,
 	.target		= masquerade_tg,
-	.targetsize	= sizeof(struct nf_nat_multi_range_compat),
+	.targetsize	= sizeof(struct nf_nat_ipv4_multi_range_compat),
 	.table		= "nat",
 	.hooks		= 1 << NF_INET_POST_ROUTING,
 	.checkentry	= masquerade_tg_check,
@@ -151,13 +75,12 @@ static int __init masquerade_tg_init(void)
 	int ret;
 
 	ret = xt_register_target(&masquerade_tg_reg);
+	if (ret)
+		return ret;
 
-	if (ret == 0) {
-		/* Register for device down reports */
-		register_netdevice_notifier(&masq_dev_notifier);
-		/* Register IP address change reports */
-		register_inetaddr_notifier(&masq_inet_notifier);
-	}
+	ret = nf_nat_masquerade_ipv4_register_notifier();
+	if (ret)
+		xt_unregister_target(&masquerade_tg_reg);
 
 	return ret;
 }
@@ -165,8 +88,7 @@ static int __init masquerade_tg_init(void)
 static void __exit masquerade_tg_exit(void)
 {
 	xt_unregister_target(&masquerade_tg_reg);
-	unregister_netdevice_notifier(&masq_dev_notifier);
-	unregister_inetaddr_notifier(&masq_inet_notifier);
+	nf_nat_masquerade_ipv4_unregister_notifier();
 }
 
 module_init(masquerade_tg_init);

@@ -1,52 +1,54 @@
 // SPDX-License-Identifier: GPL-2.0
 #include <linux/module.h>
 #include <linux/device.h>
-#include <linux/uaccess.h>
+#include <linux/cpu.h>
+#include <asm/facility.h>
 #include <asm/nospec-branch.h>
-
-int nobp_flag = IS_ENABLED(CONFIG_KERNEL_NOBP);
-int gmb_flag = 1;
 
 static int __init nobp_setup_early(char *str)
 {
 	bool enabled;
 	int rc;
 
-	rc = strtobool(str, &enabled);
-	if (!rc) {
-		nobp_flag = !!enabled;
-		if (nobp_flag && IS_ENABLED(CONFIG_EXPOLINE))
-			/*
-			 * The user explicitely requested nobp=1, enable it
-			 * and disable the expoline support.
-			 */
+	rc = kstrtobool(str, &enabled);
+	if (rc)
+		return rc;
+	if (enabled && test_facility(82)) {
+		/*
+		 * The user explicitely requested nobp=1, enable it and
+		 * disable the expoline support.
+		 */
+		__set_facility(82, S390_lowcore.alt_stfle_fac_list);
+		if (IS_ENABLED(CONFIG_EXPOLINE))
 			nospec_disable = 1;
+	} else {
+		__clear_facility(82, S390_lowcore.alt_stfle_fac_list);
 	}
-	return rc;
+	return 0;
 }
 early_param("nobp", nobp_setup_early);
 
 static int __init nospec_setup_early(char *str)
 {
-	nobp_flag = 0;
+	__clear_facility(82, S390_lowcore.alt_stfle_fac_list);
 	return 0;
 }
 early_param("nospec", nospec_setup_early);
 
 static int __init nogmb_setup_early(char *str)
 {
-	gmb_flag = 0;
+	__clear_facility(81, S390_lowcore.alt_stfle_fac_list);
 	return 0;
 }
 early_param("nogmb", nogmb_setup_early);
 
 static int __init nospec_report(void)
 {
-	if (MACHINE_HAS_ETOKEN)
+	if (test_facility(156))
 		pr_info("Spectre V2 mitigation: etokens\n");
 	if (IS_ENABLED(CC_USING_EXPOLINE) && !nospec_disable)
 		pr_info("Spectre V2 mitigation: execute trampolines.\n");
-	if (nobp_flag)
+	if (__test_facility(82, S390_lowcore.alt_stfle_fac_list))
 		pr_info("Spectre V2 mitigation: limited branch prediction.\n");
 	return 0;
 }
@@ -65,21 +67,21 @@ early_param("nospectre_v2", nospectre_v2_setup_early);
 
 void __init nospec_auto_detect(void)
 {
-	if (MACHINE_HAS_ETOKEN) {
+	if (test_facility(156) || cpu_mitigations_off()) {
 		/*
 		 * The machine supports etokens.
 		 * Disable expolines and disable nobp.
 		 */
 		if (IS_ENABLED(CC_USING_EXPOLINE))
 			nospec_disable = 1;
-		nobp_flag = 0;
+		__clear_facility(82, S390_lowcore.alt_stfle_fac_list);
 	} else if (IS_ENABLED(CC_USING_EXPOLINE)) {
 		/*
 		 * The kernel has been compiled with expolines.
 		 * Keep expolines enabled and disable nobp.
 		 */
 		nospec_disable = 0;
-		nobp_flag = 0;
+		__clear_facility(82, S390_lowcore.alt_stfle_fac_list);
 	}
 	/*
 	 * If the kernel has not been compiled with expolines the
@@ -92,7 +94,7 @@ static int __init spectre_v2_setup_early(char *str)
 {
 	if (str && !strncmp(str, "on", 2)) {
 		nospec_disable = 0;
-		nobp_flag = 0;
+		__clear_facility(82, S390_lowcore.alt_stfle_fac_list);
 	}
 	if (str && !strncmp(str, "off", 3))
 		nospec_disable = 1;

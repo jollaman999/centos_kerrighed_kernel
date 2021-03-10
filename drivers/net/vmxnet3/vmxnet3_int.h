@@ -20,13 +20,14 @@
  * The full GNU General Public License is included in this distribution in
  * the file called "COPYING".
  *
- * Maintained by: pv-drivers@vmware.com
+ * Maintained by: Shreyas Bhatewara pv-drivers@vmware.com
  *
  */
 
 #ifndef _VMXNET3_INT_H
 #define _VMXNET3_INT_H
 
+#include <linux/bitops.h>
 #include <linux/ethtool.h>
 #include <linux/delay.h>
 #include <linux/netdevice.h>
@@ -36,7 +37,6 @@
 #include <linux/spinlock.h>
 #include <linux/ioport.h>
 #include <linux/highmem.h>
-#include <linux/init.h>
 #include <linux/timer.h>
 #include <linux/skbuff.h>
 #include <linux/interrupt.h>
@@ -69,19 +69,21 @@
 /*
  * Version numbers
  */
-#define VMXNET3_DRIVER_VERSION_STRING   "1.4.a.0-k"
+#define VMXNET3_DRIVER_VERSION_STRING   "1.4.17.0-k"
 
-/* a 32-bit int, each byte encode a verion number in VMXNET3_DRIVER_VERSION */
-#define VMXNET3_DRIVER_VERSION_NUM      0x01040a00
+/* Each byte of this 32-bit integer encodes a version number in
+ * VMXNET3_DRIVER_VERSION_STRING.
+ */
+#define VMXNET3_DRIVER_VERSION_NUM      0x01041100
 
 #if defined(CONFIG_PCI_MSI)
 	/* RSS only makes sense if MSI-X is supported. */
 	#define VMXNET3_RSS
 #endif
 
-#define VMXNET3_REV_3		2	/* Vmxnet3 Rev. 3 */
-#define VMXNET3_REV_2		1	/* Vmxnet3 Rev. 2 */
-#define VMXNET3_REV_1		0	/* Vmxnet3 Rev. 1 */
+#define VMXNET3_REV_3          2       /* Vmxnet3 Rev. 3 */
+#define VMXNET3_REV_2          1       /* Vmxnet3 Rev. 2 */
+#define VMXNET3_REV_1          0       /* Vmxnet3 Rev. 1 */
 
 /*
  * Capabilities
@@ -119,9 +121,8 @@ enum {
 };
 
 /*
- * PCI vendor and device IDs.
+ * Maximum devices supported.
  */
-#define PCI_DEVICE_ID_VMWARE_VMXNET3    0x07B0
 #define MAX_ETHERNET_CARDS		10
 #define MAX_PCI_PASSTHRU_DEVICE		6
 
@@ -312,7 +313,7 @@ struct vmxnet3_intr {
 	u8  num_intrs;			/* # of intr vectors */
 	u8  event_intr_idx;		/* idx of the intr vector for event */
 	u8  mod_levels[VMXNET3_LINUX_MAX_MSIX_VECT]; /* moderation level */
-	char	event_msi_vector_name[IFNAMSIZ+11];
+	char	event_msi_vector_name[IFNAMSIZ+17];
 #ifdef CONFIG_PCI_MSI
 	struct msix_entry msix_entries[VMXNET3_LINUX_MAX_MSIX_VECT];
 #endif
@@ -329,7 +330,7 @@ struct vmxnet3_intr {
 struct vmxnet3_adapter {
 	struct vmxnet3_tx_queue		tx_queue[VMXNET3_DEVICE_MAX_TX_QUEUES];
 	struct vmxnet3_rx_queue		rx_queue[VMXNET3_DEVICE_MAX_RX_QUEUES];
-	struct vlan_group		*vlan_grp;
+	unsigned long			active_vlans[BITS_TO_LONGS(VLAN_N_VID)];
 	struct vmxnet3_intr		intr;
 	spinlock_t			cmd_lock;
 	struct Vmxnet3_DriverShared	*shared;
@@ -343,10 +344,8 @@ struct vmxnet3_adapter {
 	u8			__iomem *hw_addr1; /* for BAR 1 */
 	u8                              version;
 
-	/* feature control */
 	bool				rxcsum;
-	bool				lro;
-	bool				jumbo_frame;
+
 #ifdef VMXNET3_RSS
 	struct UPT1_RSSConf		*rss_conf;
 	bool				rss;
@@ -359,7 +358,6 @@ struct vmxnet3_adapter {
 	int		rx_buf_per_pkt;  /* only apply to the 1st ring */
 	dma_addr_t			shared_pa;
 	dma_addr_t queue_desc_pa;
-	dma_addr_t coal_conf_pa;
 
 	/* Wake-on-LAN */
 	u32     wol;
@@ -385,9 +383,6 @@ struct vmxnet3_adapter {
 	unsigned long  state;    /* VMXNET3_STATE_BIT_xxx */
 
 	int share_intr;
-
-	struct Vmxnet3_CoalesceScheme *coal_conf;
-	bool   default_coal_mode;
 
 	dma_addr_t adapter_pa;
 	dma_addr_t pm_conf_pa;
@@ -418,8 +413,8 @@ struct vmxnet3_adapter {
 
 /* must be a multiple of VMXNET3_RING_SIZE_ALIGN */
 #define VMXNET3_DEF_TX_RING_SIZE    512
-#define VMXNET3_DEF_RX_RING_SIZE    256
-#define VMXNET3_DEF_RX_RING2_SIZE   128
+#define VMXNET3_DEF_RX_RING_SIZE    1024
+#define VMXNET3_DEF_RX_RING2_SIZE   256
 
 #define VMXNET3_DEF_RXDATA_DESC_SIZE 128
 
@@ -433,11 +428,6 @@ struct vmxnet3_adapter {
 #define VMXNET3_RX_DATA_RING(adapter, rqID)		\
 	(rqID >= 2 * adapter->num_rx_queues &&		\
 	rqID < 3 * adapter->num_rx_queues)		\
-
-#define VMXNET3_COAL_STATIC_DEFAULT_DEPTH	64
-
-#define VMXNET3_COAL_RBC_RATE(usecs) (1000000 / usecs)
-#define VMXNET3_COAL_RBC_USECS(rbc_rate) (1000000 / rbc_rate)
 
 int
 vmxnet3_quiesce_dev(struct vmxnet3_adapter *adapter);
@@ -457,6 +447,12 @@ vmxnet3_tq_destroy_all(struct vmxnet3_adapter *adapter);
 void
 vmxnet3_rq_destroy_all(struct vmxnet3_adapter *adapter);
 
+netdev_features_t
+vmxnet3_fix_features(struct net_device *netdev, netdev_features_t features);
+
+int
+vmxnet3_set_features(struct net_device *netdev, netdev_features_t features);
+
 int
 vmxnet3_create_queues(struct vmxnet3_adapter *adapter,
 		      u32 tx_ring_size, u32 rx_ring_size, u32 rx_ring2_size,
@@ -464,8 +460,8 @@ vmxnet3_create_queues(struct vmxnet3_adapter *adapter,
 
 void vmxnet3_set_ethtool_ops(struct net_device *netdev);
 
-struct rtnl_link_stats64 *
-vmxnet3_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats);
+void vmxnet3_get_stats64(struct net_device *dev,
+			 struct rtnl_link_stats64 *stats);
 
 extern char vmxnet3_driver_name[];
 #endif

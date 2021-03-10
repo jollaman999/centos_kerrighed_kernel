@@ -31,6 +31,7 @@
 #include <linux/fb.h>
 #include <linux/spinlock_types.h>
 #include <linux/spinlock.h>
+#include <linux/slab.h>
 
 #include <asm/io.h>
 
@@ -83,7 +84,7 @@ static const char *s1d13xxxfb_prod_names[] = {
 /*
  * here we define the default struct fb_fix_screeninfo
  */
-static struct fb_fix_screeninfo __devinitdata s1d13xxxfb_fix = {
+static struct fb_fix_screeninfo s1d13xxxfb_fix = {
 	.id		= S1D_FBID,
 	.type		= FB_TYPE_PACKED_PIXELS,
 	.visual		= FB_VISUAL_PSEUDOCOLOR,
@@ -409,28 +410,6 @@ s1d13xxxfb_pan_display(struct fb_var_screeninfo *var, struct fb_info *info)
  ************************************************************/
 
 /**
- *	bltbit_wait_bitset - waits for change in register value
- *	@info : framebuffer structure
- *	@bit  : value expected in register
- *	@timeout : ...
- *
- *	waits until value changes INTO bit
- */
-static u8
-bltbit_wait_bitset(struct fb_info *info, u8 bit, int timeout)
-{
-	while (!(s1d13xxxfb_readreg(info->par, S1DREG_BBLT_CTL0) & bit)) {
-		udelay(10);
-		if (!--timeout) {
-			dbg_blit("wait_bitset timeout\n");
-			break;
-		}
-	}
-
-	return timeout;
-}
-
-/**
  *	bltbit_wait_bitclear - waits for change in register value
  *	@info : frambuffer structure
  *	@bit  : value currently in register
@@ -451,34 +430,6 @@ bltbit_wait_bitclear(struct fb_info *info, u8 bit, int timeout)
 	}
 
 	return timeout;
-}
-
-/**
- *	bltbit_fifo_status - checks the current status of the fifo
- *	@info : framebuffer structure
- *
- *	returns number of free words in buffer
- */
-static u8
-bltbit_fifo_status(struct fb_info *info)
-{
-	u8 status;
-
-	status = s1d13xxxfb_readreg(info->par, S1DREG_BBLT_CTL0);
-
-	/* its empty so room for 16 words */
-	if (status & BBLT_FIFO_EMPTY)
-		return 16;
-
-	/* its full so we dont want to add */
-	if (status & BBLT_FIFO_FULL)
-		return 0;
-
-	/* its atleast half full but we can add one atleast */
-	if (status & BBLT_FIFO_NOT_FULL)
-		return 1;
-
-	return 0;
 }
 
 /*
@@ -517,12 +468,12 @@ s1d13xxxfb_bitblt_copyarea(struct fb_info *info, const struct fb_copyarea *area)
 		src = (sy * stride) + (bpp * sx);
 	}
 
-	/* set source adress */
+	/* set source address */
 	s1d13xxxfb_writereg(info->par, S1DREG_BBLT_SRC_START0, (src & 0xff));
 	s1d13xxxfb_writereg(info->par, S1DREG_BBLT_SRC_START1, (src >> 8) & 0x00ff);
 	s1d13xxxfb_writereg(info->par, S1DREG_BBLT_SRC_START2, (src >> 16) & 0x00ff);
 
-	/* set destination adress */
+	/* set destination address */
 	s1d13xxxfb_writereg(info->par, S1DREG_BBLT_DST_START0, (dst & 0xff));
 	s1d13xxxfb_writereg(info->par, S1DREG_BBLT_DST_START1, (dst >> 8) & 0x00ff);
 	s1d13xxxfb_writereg(info->par, S1DREG_BBLT_DST_START2, (dst >> 16) & 0x00ff);
@@ -671,7 +622,7 @@ static struct fb_ops s1d13xxxfb_fbops = {
 	.fb_imageblit	= cfb_imageblit,
 };
 
-static int s1d13xxxfb_width_tab[2][4] __devinitdata = {
+static int s1d13xxxfb_width_tab[2][4] = {
 	{4, 8, 16, -1},
 	{9, 12, 18, -1},
 };
@@ -691,8 +642,7 @@ static int s1d13xxxfb_width_tab[2][4] __devinitdata = {
  *	Note: some of the hardcoded values here might need some love to
  *	work on various chips, and might need to no longer be hardcoded.
  */
-static void __devinit
-s1d13xxxfb_fetch_hw_state(struct fb_info *info)
+static void s1d13xxxfb_fetch_hw_state(struct fb_info *info)
 {
 	struct fb_var_screeninfo *var = &info->var;
 	struct fb_fix_screeninfo *fix = &info->fix;
@@ -813,8 +763,7 @@ s1d13xxxfb_remove(struct platform_device *pdev)
 	return 0;
 }
 
-static int __devinit
-s1d13xxxfb_probe(struct platform_device *pdev)
+static int s1d13xxxfb_probe(struct platform_device *pdev)
 {
 	struct s1d13xxxfb_par *default_par;
 	struct fb_info *info;
@@ -913,7 +862,7 @@ s1d13xxxfb_probe(struct platform_device *pdev)
 		printk(KERN_INFO PFX
 			"unknown chip production id %i, revision %i\n",
 			prod_id, revision);
-		printk(KERN_INFO PFX "please contant maintainer\n");
+		printk(KERN_INFO PFX "please contact maintainer\n");
 		goto bail;
 	}
 

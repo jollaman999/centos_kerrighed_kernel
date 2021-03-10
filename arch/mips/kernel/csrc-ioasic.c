@@ -1,7 +1,7 @@
 /*
  *  DEC I/O ASIC's counter clocksource
  *
- *  Copyright (C) 2008  Yoichi Yuasa <yuasa@linux-mips.org>
+ *  Copyright (C) 2008	Yoichi Yuasa <yuasa@linux-mips.org>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -25,7 +25,7 @@
 #include <asm/dec/ioasic.h>
 #include <asm/dec/ioasic_addrs.h>
 
-static cycle_t dec_ioasic_hpt_read(struct clocksource *cs)
+static u64 dec_ioasic_hpt_read(struct clocksource *cs)
 {
 	return ioasic_read(IO_REG_FCTR);
 }
@@ -59,7 +59,5 @@ void __init dec_ioasic_clocksource_init(void)
 	printk(KERN_INFO "I/O ASIC clock frequency %dHz\n", freq);
 
 	clocksource_dec.rating = 200 + freq / 10000000;
-	clocksource_set_clock(&clocksource_dec, freq);
-
-	clocksource_register(&clocksource_dec);
+	clocksource_register_hz(&clocksource_dec, freq);
 }

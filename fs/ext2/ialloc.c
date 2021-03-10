@@ -81,7 +81,6 @@ static void ext2_release_inode(struct super_block *sb, int group, int dir)
 	spin_unlock(sb_bgl_lock(EXT2_SB(sb), group));
 	if (dir)
 		percpu_counter_dec(&EXT2_SB(sb)->s_dirs_counter);
-	sb->s_dirt = 1;
 	mark_buffer_dirty(bh);
 }
 
@@ -106,7 +105,7 @@ void ext2_free_inode (struct inode * inode)
 	struct super_block * sb = inode->i_sb;
 	int is_directory;
 	unsigned long ino;
-	struct buffer_head *bitmap_bh = NULL;
+	struct buffer_head *bitmap_bh;
 	unsigned long block_group;
 	unsigned long bit;
 	struct ext2_super_block * es;
@@ -118,31 +117,24 @@ void ext2_free_inode (struct inode * inode)
 	 * Note: we must free any quota before locking the superblock,
 	 * as writing the quota to disk may need the lock as well.
 	 */
-	if (!is_bad_inode(inode)) {
-		/* Quota is already initialized in iput() */
-		ext2_xattr_delete_inode(inode);
-		vfs_dq_free_inode(inode);
-		vfs_dq_drop(inode);
-	}
+	/* Quota is already initialized in iput() */
+	dquot_free_inode(inode);
+	dquot_drop(inode);
 
 	es = EXT2_SB(sb)->s_es;
 	is_directory = S_ISDIR(inode->i_mode);
-
-	/* Do this BEFORE marking the inode not in use or returning an error */
-	clear_inode (inode);
 
 	if (ino < EXT2_FIRST_INO(sb) ||
 	    ino > le32_to_cpu(es->s_inodes_count)) {
 		ext2_error (sb, "ext2_free_inode",
 			    "reserved or nonexistent inode %lu", ino);
-		goto error_return;
+		return;
 	}
 	block_group = (ino - 1) / EXT2_INODES_PER_GROUP(sb);
 	bit = (ino - 1) % EXT2_INODES_PER_GROUP(sb);
-	brelse(bitmap_bh);
 	bitmap_bh = read_inode_bitmap(sb, block_group);
 	if (!bitmap_bh)
-		goto error_return;
+		return;
 
 	/* Ok, now we can actually update the inode bitmaps.. */
 	if (!ext2_clear_bit_atomic(sb_bgl_lock(EXT2_SB(sb), block_group),
@@ -154,7 +146,7 @@ void ext2_free_inode (struct inode * inode)
 	mark_buffer_dirty(bitmap_bh);
 	if (sb->s_flags & MS_SYNCHRONOUS)
 		sync_dirty_buffer(bitmap_bh);
-error_return:
+
 	brelse(bitmap_bh);
 }
 
@@ -435,7 +427,8 @@ found:
 	return group;
 }
 
-struct inode *ext2_new_inode(struct inode *dir, int mode)
+struct inode *ext2_new_inode(struct inode *dir, umode_t mode,
+			     const struct qstr *qstr)
 {
 	struct super_block *sb;
 	struct buffer_head *bitmap_bh = NULL;
@@ -548,7 +541,6 @@ got:
 	}
 	spin_unlock(sb_bgl_lock(sbi, group));
 
-	sb->s_dirt = 1;
 	mark_buffer_dirty(bh2);
 	if (test_opt(sb, GRPID)) {
 		inode->i_mode = mode;
@@ -578,20 +570,23 @@ got:
 	inode->i_generation = sbi->s_next_generation++;
 	spin_unlock(&sbi->s_next_gen_lock);
 	if (insert_inode_locked(inode) < 0) {
-		err = -EINVAL;
-		goto fail_drop;
+		ext2_error(sb, "ext2_new_inode",
+			   "inode number already in use - inode=%lu",
+			   (unsigned long) ino);
+		err = -EIO;
+		goto fail;
 	}
 
-	if (vfs_dq_alloc_inode(inode)) {
-		err = -EDQUOT;
+	dquot_initialize(inode);
+	err = dquot_alloc_inode(inode);
+	if (err)
 		goto fail_drop;
-	}
 
 	err = ext2_init_acl(inode, dir);
 	if (err)
 		goto fail_free_drop;
 
-	err = ext2_init_security(inode,dir);
+	err = ext2_init_security(inode, dir, qstr);
 	if (err)
 		goto fail_free_drop;
 
@@ -601,12 +596,12 @@ got:
 	return inode;
 
 fail_free_drop:
-	vfs_dq_free_inode(inode);
+	dquot_free_inode(inode);
 
 fail_drop:
-	vfs_dq_drop(inode);
+	dquot_drop(inode);
 	inode->i_flags |= S_NOQUOTA;
-	inode->i_nlink = 0;
+	clear_nlink(inode);
 	unlock_new_inode(inode);
 	iput(inode);
 	return ERR_PTR(err);
@@ -648,6 +643,7 @@ unsigned long ext2_count_free_inodes (struct super_block * sb)
 	}
 	brelse(bitmap_bh);
 	printk("ext2_count_free_inodes: stored = %lu, computed = %lu, %lu\n",
+		(unsigned long)
 		percpu_counter_read(&EXT2_SB(sb)->s_freeinodes_counter),
 		desc_count, bitmap_count);
 	return desc_count;

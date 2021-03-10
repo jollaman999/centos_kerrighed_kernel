@@ -10,6 +10,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /*
  * Avermedia M135A with RM-JX and RM-K6 remote controls
@@ -108,7 +109,7 @@ static struct rc_map_table avermedia_m135a[] = {
 	{ 0x0414, KEY_TEXT },
 	{ 0x0415, KEY_EPG },
 	{ 0x041a, KEY_TV2 },      /* PIP */
-	{ 0x041b, KEY_MHP },      /* Snapshot */
+	{ 0x041b, KEY_CAMERA },      /* Snapshot */
 
 	{ 0x0417, KEY_RECORD },
 	{ 0x0416, KEY_PLAYPAUSE },

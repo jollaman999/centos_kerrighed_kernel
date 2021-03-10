@@ -23,12 +23,12 @@
 
 #include <linux/hid.h>
 #include <linux/input.h>
-#include <linux/usb.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 
 #include "hid-ids.h"
 
 #ifdef CONFIG_ZEROPLUS_FF
-#include "usbhid/usbhid.h"
 
 struct zpff_device {
 	struct hid_report *report;
@@ -57,7 +57,7 @@ static int zpff_play(struct input_dev *dev, void *data,
 	zpff->report->field[2]->value[0] = left;
 	zpff->report->field[3]->value[0] = right;
 	dbg_hid("running with 0x%02x 0x%02x\n", left, right);
-	usbhid_submit_report(hid, zpff->report, USB_DIR_OUT);
+	hid_hw_request(hid, zpff->report, HID_REQ_SET_REPORT);
 
 	return 0;
 }
@@ -94,10 +94,9 @@ static int zpff_init(struct hid_device *hid)
 	zpff->report->field[1]->value[0] = 0x02;
 	zpff->report->field[2]->value[0] = 0x00;
 	zpff->report->field[3]->value[0] = 0x00;
-	usbhid_submit_report(hid, zpff->report, USB_DIR_OUT);
+	hid_hw_request(hid, zpff->report, HID_REQ_SET_REPORT);
 
-	dev_info(&hid->dev, "force feedback for Zeroplus based devices by "
-	       "Anssi Hannula <anssi.hannula@gmail.com>\n");
+	hid_info(hid, "force feedback for Zeroplus based devices by Anssi Hannula <anssi.hannula@gmail.com>\n");
 
 	return 0;
 }
@@ -114,13 +113,13 @@ static int zp_probe(struct hid_device *hdev, const struct hid_device_id *id)
 
 	ret = hid_parse(hdev);
 	if (ret) {
-		dev_err(&hdev->dev, "parse failed\n");
+		hid_err(hdev, "parse failed\n");
 		goto err;
 	}
 
 	ret = hid_hw_start(hdev, HID_CONNECT_DEFAULT & ~HID_CONNECT_FF);
 	if (ret) {
-		dev_err(&hdev->dev, "hw start failed\n");
+		hid_err(hdev, "hw start failed\n");
 		goto err;
 	}
 
@@ -143,17 +142,6 @@ static struct hid_driver zp_driver = {
 	.id_table = zp_devices,
 	.probe = zp_probe,
 };
+module_hid_driver(zp_driver);
 
-static int __init zp_init(void)
-{
-	return hid_register_driver(&zp_driver);
-}
-
-static void __exit zp_exit(void)
-{
-	hid_unregister_driver(&zp_driver);
-}
-
-module_init(zp_init);
-module_exit(zp_exit);
 MODULE_LICENSE("GPL");

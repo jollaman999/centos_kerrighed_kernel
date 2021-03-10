@@ -1,5 +1,5 @@
 Tools that manage md devices can be found at
-   http://www.<country>.kernel.org/pub/linux/utils/raid/....
+   http://www.kernel.org/pub/linux/utils/raid/ 
 
 
 Boot time assembly of RAID arrays
@@ -136,7 +136,7 @@ raid_disks != 0.
 
 Then uninitialized devices can be added with ADD_NEW_DISK.  The
 structure passed to ADD_NEW_DISK must specify the state of the device
-and it's role in the array.
+and its role in the array.
 
 Once started with RUN_ARRAY, uninitialized spares can be added with
 HOT_ADD_DISK.
@@ -437,7 +437,6 @@ Each directory contains:
         written, it will be rejected.
 
       recovery_start
-
         When the device is not 'in_sync', this records the number of
 	sectors from the start of the device which are known to be
 	correct.  This is normally zero, but during a recovery
@@ -453,6 +452,20 @@ Each directory contains:
 	Setting this to 'none' is equivalent to setting 'in_sync'.
 	Setting to any other value also clears the 'in_sync' flag.
 	
+      bad_blocks
+	This gives the list of all known bad blocks in the form of
+	start address and length (in sectors respectively). If output
+	is too big to fit in a page, it will be truncated. Writing
+	"sector length" to this file adds new acknowledged (i.e.
+	recorded to disk safely) bad blocks.
+
+      unacknowledged_bad_blocks
+	This gives the list of known-but-not-yet-saved-to-disk bad
+	blocks in the same form of 'bad_blocks'. If output is too big
+	to fit in a page, it will be truncated. Writing to this file
+	adds bad blocks without acknowledging them. This is largely
+	for testing.
+
 
 
 An active md device will also contain an entry for each active device
@@ -520,7 +533,7 @@ also have
       found.  The count in 'mismatch_cnt' is the number of sectors
       that were re-written, or (for 'check') would have been
       re-written.  As most raid levels work in units of pages rather
-      than sectors, this my be larger than the number of actual errors
+      than sectors, this may be larger than the number of actual errors
       by a factor of the number of sectors in a page.
 
    bitmap_set_bits
@@ -536,7 +549,7 @@ also have
    sync_speed_max
      This are similar to /proc/sys/dev/raid/speed_limit_{min,max}
      however they only apply to the particular array.
-     If no value has been written to these, of if the word 'system'
+     If no value has been written to these, or if the word 'system'
      is written, then the system-wide value is used.  If a value,
      in kibibytes-per-second is written, then it is used.
      When the files are read, they show the currently active value
@@ -570,6 +583,16 @@ also have
      within the array where IO will be blocked.  This is currently
      only supported for raid4/5/6.
 
+   sync_min
+   sync_max
+     The two values, given as numbers of sectors, indicate a range
+     within the array where 'check'/'repair' will operate. Must be
+     a multiple of chunk_size. When it reaches "sync_max" it will
+     pause, rather than complete.
+     You can use 'select' or 'poll' on "sync_completed" to wait for
+     that number to reach sync_max.  Then you can either increase
+     "sync_max", or can write 'idle' to "sync_action".
+
 
 Each active md device may also have attributes specific to the
 personality module that manages it.
@@ -580,7 +603,7 @@ These currently include
 
   stripe_cache_size  (currently raid5 only)
       number of entries in the stripe cache.  This is writable, but
-      there are upper and lower limits (32768, 16).  Default is 128.
+      there are upper and lower limits (32768, 17).  Default is 256.
   strip_cache_active (currently raid5 only)
       number of active entries in the stripe cache
   preread_bypass_threshold (currently raid5 only)
@@ -589,3 +612,8 @@ These currently include
       to 1.  Setting this to 0 disables bypass accounting and
       requires preread stripes to wait until all full-width stripe-
       writes are complete.  Valid values are 0 to stripe_cache_size.
+
+  journal_mode (currently raid5 only)
+      The cache mode for raid5. raid5 could include an extra disk for
+      caching. The mode can be "write-throuth" and "write-back". The
+      default is "write-through".

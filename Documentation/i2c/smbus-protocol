@@ -23,6 +23,12 @@ don't match these function names.  For some of the operations which pass a
 single data byte, the functions using SMBus protocol operation names execute
 a different protocol operation entirely.
 
+Each transaction type corresponds to a functionality flag. Before calling a
+transaction function, a device driver should always check (just once) for
+the corresponding functionality flag to ensure that the underlying I2C
+adapter supports the transaction in question. See
+<file:Documentation/i2c/functionality> for the details.
+
 
 Key to symbols
 ==============
@@ -49,6 +55,8 @@ This sends a single bit to the device, at the place of the Rd/Wr bit.
 
 A Addr Rd/Wr [A] P
 
+Functionality flag: I2C_FUNC_SMBUS_QUICK
+
 
 SMBus Receive Byte:  i2c_smbus_read_byte()
 ==========================================
@@ -60,6 +68,8 @@ the previous SMBus command.
 
 S Addr Rd [A] [Data] NA P
 
+Functionality flag: I2C_FUNC_SMBUS_READ_BYTE
+
 
 SMBus Send Byte:  i2c_smbus_write_byte()
 ========================================
@@ -69,6 +79,8 @@ to a device.  See Receive Byte for more information.
 
 S Addr Wr [A] Data [A] P
 
+Functionality flag: I2C_FUNC_SMBUS_WRITE_BYTE
+
 
 SMBus Read Byte:  i2c_smbus_read_byte_data()
 ============================================
@@ -77,6 +89,8 @@ This reads a single byte from a device, from a designated register.
 The register is specified through the Comm byte.
 
 S Addr Wr [A] Comm [A] S Addr Rd [A] [Data] NA P
+
+Functionality flag: I2C_FUNC_SMBUS_READ_BYTE_DATA
 
 
 SMBus Read Word:  i2c_smbus_read_word_data()
@@ -88,6 +102,12 @@ byte. But this time, the data is a complete word (16 bits).
 
 S Addr Wr [A] Comm [A] S Addr Rd [A] [DataLow] A [DataHigh] NA P
 
+Functionality flag: I2C_FUNC_SMBUS_READ_WORD_DATA
+
+Note the convenience function i2c_smbus_read_word_swapped is
+available for reads where the two data bytes are the other way
+around (not SMBus compliant, but very popular.)
+
 
 SMBus Write Byte:  i2c_smbus_write_byte_data()
 ==============================================
@@ -97,6 +117,8 @@ register is specified through the Comm byte. This is the opposite of
 the Read Byte operation.
 
 S Addr Wr [A] Comm [A] Data [A] P
+
+Functionality flag: I2C_FUNC_SMBUS_WRITE_BYTE_DATA
 
 
 SMBus Write Word:  i2c_smbus_write_word_data()
@@ -108,15 +130,23 @@ specified through the Comm byte.
 
 S Addr Wr [A] Comm [A] DataLow [A] DataHigh [A] P
 
+Functionality flag: I2C_FUNC_SMBUS_WRITE_WORD_DATA
 
-SMBus Process Call:  i2c_smbus_process_call()
-=============================================
+Note the convenience function i2c_smbus_write_word_swapped is
+available for writes where the two data bytes are the other way
+around (not SMBus compliant, but very popular.)
+
+
+SMBus Process Call:
+===================
 
 This command selects a device register (through the Comm byte), sends
 16 bits of data to it, and reads 16 bits of data in return.
 
 S Addr Wr [A] Comm [A] DataLow [A] DataHigh [A] 
                              S Addr Rd [A] [DataLow] A [DataHigh] NA P
+
+Functionality flag: I2C_FUNC_SMBUS_PROC_CALL
 
 
 SMBus Block Read:  i2c_smbus_read_block_data()
@@ -129,6 +159,8 @@ of data is specified by the device in the Count byte.
 S Addr Wr [A] Comm [A] 
            S Addr Rd [A] [Count] A [Data] A [Data] A ... A [Data] NA P
 
+Functionality flag: I2C_FUNC_SMBUS_READ_BLOCK_DATA
+
 
 SMBus Block Write:  i2c_smbus_write_block_data()
 ================================================
@@ -138,6 +170,8 @@ a device, to a designated register that is specified through the
 Comm byte. The amount of data is specified in the Count byte.
 
 S Addr Wr [A] Comm [A] Count [A] Data [A] Data [A] ... [A] Data [A] P
+
+Functionality flag: I2C_FUNC_SMBUS_WRITE_BLOCK_DATA
 
 
 SMBus Block Write - Block Read Process Call
@@ -152,6 +186,8 @@ This command selects a device register (through the Comm byte), sends
 S Addr Wr [A] Comm [A] Count [A] Data [A] ...
                              S Addr Rd [A] [Count] A [Data] ... A P
 
+Functionality flag: I2C_FUNC_SMBUS_BLOCK_PROC_CALL
+
 
 SMBus Host Notify
 =================
@@ -162,6 +198,16 @@ It is the same form as Write Word, with the command code replaced by the
 alerting device's address.
 
 [S] [HostAddr] [Wr] A [DevAddr] A [DataLow] A [DataHigh] A [P]
+
+This is implemented in the following way in the Linux kernel:
+* I2C bus drivers which support SMBus Host Notify should report
+  I2C_FUNC_SMBUS_HOST_NOTIFY.
+* I2C bus drivers trigger SMBus Host Notify by a call to
+  i2c_handle_smbus_host_notify().
+* I2C drivers for devices which can trigger SMBus Host Notify will have
+  client->irq assigned to a Host Notify IRQ if noone else specified an other.
+
+There is currently no way to retrieve the data parameter from the client.
 
 
 Packet Error Checking (PEC)
@@ -185,6 +231,22 @@ the protocol. All ARP communications use slave address 0x61 and
 require PEC checksums.
 
 
+SMBus Alert
+===========
+
+SMBus Alert was introduced in Revision 1.0 of the specification.
+
+The SMBus alert protocol allows several SMBus slave devices to share a
+single interrupt pin on the SMBus master, while still allowing the master
+to know which slave triggered the interrupt.
+
+This is implemented the following way in the Linux kernel:
+* I2C bus drivers which support SMBus alert should call
+  i2c_setup_smbus_alert() to setup SMBus alert support.
+* I2C drivers for devices which can trigger SMBus alerts should implement
+  the optional alert() callback.
+
+
 I2C Block Transactions
 ======================
 
@@ -205,15 +267,7 @@ designated register that is specified through the Comm byte.
 S Addr Wr [A] Comm [A] 
            S Addr Rd [A] [Data] A [Data] A ... A [Data] NA P
 
-
-I2C Block Read (2 Comm bytes)
-=============================
-
-This command reads a block of bytes from a device, from a 
-designated register that is specified through the two Comm bytes.
-
-S Addr Wr [A] Comm1 [A] Comm2 [A] 
-           S Addr Rd [A] [Data] A [Data] A ... A [Data] NA P
+Functionality flag: I2C_FUNC_SMBUS_READ_I2C_BLOCK
 
 
 I2C Block Write:  i2c_smbus_write_i2c_block_data()
@@ -225,3 +279,5 @@ Comm byte. Note that command lengths of 0, 2, or more bytes are
 supported as they are indistinguishable from data.
 
 S Addr Wr [A] Comm [A] Data [A] Data [A] ... [A] Data [A] P
+
+Functionality flag: I2C_FUNC_SMBUS_WRITE_I2C_BLOCK

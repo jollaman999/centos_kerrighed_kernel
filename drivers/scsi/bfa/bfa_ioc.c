@@ -784,7 +784,7 @@ bfa_iocpf_sm_fwcheck(struct bfa_iocpf_s *iocpf, enum iocpf_event event)
 				bfa_fsm_set_state(iocpf, bfa_iocpf_sm_hwinit);
 			} else {
 				bfa_ioc_firmware_unlock(ioc);
-                                writel(1, ioc->ioc_regs.ioc_sem_reg);
+				writel(1, ioc->ioc_regs.ioc_sem_reg);
 				bfa_sem_timer_start(ioc);
 			}
 		} else {
@@ -1116,7 +1116,7 @@ static void
 bfa_iocpf_sm_disabled_entry(struct bfa_iocpf_s *iocpf)
 {
 	bfa_ioc_mbox_flush(iocpf->ioc);
-	bfa_fsm_send_event(iocpf->ioc, IOC_E_DISABLED);	
+	bfa_fsm_send_event(iocpf->ioc, IOC_E_DISABLED);
 }
 
 static void
@@ -2173,8 +2173,9 @@ bfa_ioc_fail_notify(struct bfa_ioc_s *ioc)
 	bfa_ioc_debug_save_ftrc(ioc);
 
 	BFA_LOG(KERN_CRIT, bfad, bfa_log_level,
-                "Heart Beat of IOC has failed\n");
+		"Heart Beat of IOC has failed\n");
 	bfa_ioc_aen_post(ioc, BFA_IOC_AEN_HBFAIL);
+
 }
 
 static void
@@ -3878,7 +3879,7 @@ bfa_sfp_show_comp(struct bfa_sfp_s *sfp, struct bfi_mbmsg_s *msg)
 		bfa_trc(sfp, sfp->data_valid);
 		if (sfp->data_valid) {
 			u32	size = sizeof(struct sfp_mem_s);
-			u8 *des = (u8 *)(sfp->sfpmem);
+			u8 *des = (u8 *) &(sfp->sfpmem->srlid_base);
 			memcpy(des, sfp->dbuf_kva, size);
 		}
 		/*
@@ -5860,7 +5861,7 @@ static bfa_status_t bfa_dconf_flash_write(struct bfa_dconf_mod_s *dconf);
 static void bfa_dconf_init_cb(void *arg, bfa_status_t status);
 
 /*
- * Begining state of dconf module. Waiting for an event to start.
+ * Beginning state of dconf module. Waiting for an event to start.
  */
 static void
 bfa_dconf_sm_uninit(struct bfa_dconf_mod_s *dconf, enum bfa_dconf_event event)

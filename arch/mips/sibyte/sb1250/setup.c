@@ -87,6 +87,21 @@ static int __init setup_bcm1250(void)
 	return ret;
 }
 
+int sb1250_m3_workaround_needed(void)
+{
+	switch (soc_type) {
+	case K_SYS_SOC_TYPE_BCM1250:
+	case K_SYS_SOC_TYPE_BCM1250_ALT:
+	case K_SYS_SOC_TYPE_BCM1250_ALT2:
+	case K_SYS_SOC_TYPE_BCM1125:
+	case K_SYS_SOC_TYPE_BCM1125H:
+		return soc_pass < K_SYS_REVISION_BCM1250_C0;
+
+	default:
+		return 0;
+	}
+}
+
 static int __init setup_bcm112x(void)
 {
 	int ret = 0;
@@ -188,8 +203,8 @@ void __init sb1250_setup(void)
 	case K_SYS_REVISION_BCM1250_PASS1:
 #ifndef CONFIG_SB1_PASS_1_WORKAROUNDS
 		printk("@@@@ This is a BCM1250 A0-A2 (Pass 1) board, "
-		            "and the kernel doesn't have the proper "
-		            "workarounds compiled in. @@@@\n");
+			    "and the kernel doesn't have the proper "
+			    "workarounds compiled in. @@@@\n");
 		bad_config = 1;
 #endif
 		break;
@@ -198,28 +213,28 @@ void __init sb1250_setup(void)
 #if !defined(CONFIG_SB1_PASS_2_WORKAROUNDS) || \
     !defined(CONFIG_SB1_PASS_2_1_WORKAROUNDS)
 		printk("@@@@ This is a BCM1250 A3-A10 board, and the "
-		            "kernel doesn't have the proper workarounds "
-		            "compiled in. @@@@\n");
+			    "kernel doesn't have the proper workarounds "
+			    "compiled in. @@@@\n");
 		bad_config = 1;
 #endif
 #ifdef CONFIG_CPU_HAS_PREFETCH
 		printk("@@@@ Prefetches may be enabled in this kernel, "
-		            "but are buggy on this board.  @@@@\n");
+			    "but are buggy on this board.  @@@@\n");
 		bad_config = 1;
 #endif
 		break;
 	case K_SYS_REVISION_BCM1250_PASS2_2:
 #ifndef CONFIG_SB1_PASS_2_WORKAROUNDS
 		printk("@@@@ This is a BCM1250 B1/B2. board, and the "
-		            "kernel doesn't have the proper workarounds "
-		            "compiled in. @@@@\n");
+			    "kernel doesn't have the proper workarounds "
+			    "compiled in. @@@@\n");
 		bad_config = 1;
 #endif
 #if defined(CONFIG_SB1_PASS_2_1_WORKAROUNDS) || \
     !defined(CONFIG_CPU_HAS_PREFETCH)
 		printk("@@@@ This is a BCM1250 B1/B2, but the kernel is "
-		            "conservatively configured for an 'A' stepping. "
-		            "@@@@\n");
+			    "conservatively configured for an 'A' stepping. "
+			    "@@@@\n");
 #endif
 		break;
 	default:

@@ -5,7 +5,11 @@
 
 #include <asm/alternative.h>
 #include <asm/alternative-asm.h>
-#include <asm/cpufeature.h>
+#include <asm/cpufeatures.h>
+#include <asm/bitsperlong.h>
+#include <asm/percpu.h>
+#include <asm/nops.h>
+#include <asm/jump_label.h>
 
 /*
  * Fill the CPU return stack buffer.
@@ -53,22 +57,24 @@
 
 #ifdef __ASSEMBLY__
 
-/*
- * This should be used immediately before a retpoline alternative.  It tells
- * objtool where the retpolines are so that it can make sense of the control
- * flow by just reading the original instruction(s) and ignoring the
- * alternatives.
- *
- * Since there is no objtool in RHEL6, the .discard.nospec object section
- * is not generated.
- */
-.macro ANNOTATE_NOSPEC_ALTERNATIVE
-#if 0
-	.Lannotate_\@:
-	.pushsection .discard.nospec
-	.long .Lannotate_\@ - .
+ /*
+  * A simpler FILL_RETURN_BUFFER macro. Don't make people use the CPP
+  * monstrosity above, manually.
+  */
+.macro FILL_RETURN_BUFFER_CLOBBER reg=%rax
+	661: __FILL_RETURN_BUFFER(\reg, RSB_CLEAR_LOOPS, %_ASM_SP); 662:
+	.pushsection .altinstr_replacement, "ax"
+	663: ASM_NOP8; ASM_NOP8; ASM_NOP8; ASM_NOP8; ASM_NOP8; ASM_NOP3; 664:
 	.popsection
-#endif
+	.pushsection .altinstructions, "a"
+	altinstruction_entry 661b, 663b, X86_FEATURE_SMEP, 662b-661b, 664b-663b
+	.popsection
+.endm
+
+.macro FILL_RETURN_BUFFER
+	push %rax
+	FILL_RETURN_BUFFER_CLOBBER reg=%rax
+	pop %rax
 .endm
 
 /*
@@ -99,61 +105,59 @@
 	call	.Ldo_retpoline_jmp_\@
 .endm
 
+.macro __JMP_NOSPEC reg:req
+	661: RETPOLINE_JMP \reg; 662:
+	.pushsection .altinstr_replacement, "ax"
+	663: lfence; jmp *\reg; 664:
+	.popsection
+	.pushsection .altinstructions, "a"
+	altinstruction_entry 661b, 663b, X86_FEATURE_RETPOLINE_AMD, 662b-661b, 664b-663b
+	.popsection
+.endm
+
+.macro __CALL_NOSPEC reg:req
+	661: RETPOLINE_CALL \reg; 662:
+	.pushsection .altinstr_replacement, "ax"
+	663: lfence; call *\reg; 664:
+	.popsection
+	.pushsection .altinstructions, "a"
+	altinstruction_entry 661b, 663b, X86_FEATURE_RETPOLINE_AMD, 662b-661b, 664b-663b
+	.popsection
+.endm
+
 /*
  * JMP_NOSPEC and CALL_NOSPEC macros can be used instead of a simple
  * indirect jmp/call which may be susceptible to the Spectre variant 2
  * attack.
  */
 .macro JMP_NOSPEC reg:req
-#ifdef CONFIG_RETPOLINE
-	ANNOTATE_NOSPEC_ALTERNATIVE
-	ALTERNATIVE_2 __stringify(jmp *\reg),				\
-		__stringify(RETPOLINE_JMP \reg), X86_FEATURE_RETPOLINE,	\
-		__stringify(lfence; jmp *\reg), X86_FEATURE_RETPOLINE_AMD
-#else
-	jmp	*\reg
-#endif
+	STATIC_JUMP .Lretp_\@, retp_enabled_key
+	jmp *\reg
+
+.Lretp_\@:
+	__JMP_NOSPEC \reg
 .endm
 
 .macro CALL_NOSPEC reg:req
-#ifdef CONFIG_RETPOLINE
-	ANNOTATE_NOSPEC_ALTERNATIVE
-	ALTERNATIVE_2 __stringify(call *\reg),				\
-		__stringify(RETPOLINE_CALL \reg), X86_FEATURE_RETPOLINE,\
-		__stringify(lfence; call *\reg), X86_FEATURE_RETPOLINE_AMD
-#else
-	call	*\reg
-#endif
-.endm
+	STATIC_JUMP .Lretp_\@, retp_enabled_key
+	call *\reg
+	jmp	.Ldone_\@
 
- /*
-  * A simpler FILL_RETURN_BUFFER macro. Don't make people use the CPP
-  * monstrosity above, manually.
-  */
-.macro FILL_RETURN_BUFFER_CLOBBER reg=%_ASM_AX
-	ALTERNATIVE "jmp .Lskip_rsb_\@",				\
-		__stringify(__FILL_RETURN_BUFFER(\reg,			\
-			    RSB_CLEAR_LOOPS, %_ASM_SP))			\
-		X86_FEATURE_SMEP
-.Lskip_rsb_\@:
-.endm
+.Lretp_\@:
+	__CALL_NOSPEC \reg
 
-.macro FILL_RETURN_BUFFER
-	push %_ASM_AX
-	FILL_RETURN_BUFFER_CLOBBER reg=%_ASM_AX
-	pop %_ASM_AX
+.Ldone_\@:
 .endm
 
 /*
  * MDS_USER_CLEAR_CPU_BUFFERS macro is the assembly equivalent of
- * upstream mds_user_clear_cpu_buffers(). Like the C version, the
- * __KERNEL_DS is used for verw. Alternative is used here as
- * static_key isn't available in RHEL6.
+ * mds_user_clear_cpu_buffers(). Like the C version, the __KERNEL_DS
+ * is used for verw.
+ * Note: The ZF flag will be clobbered after calling this macro.
  */
 .macro MDS_USER_CLEAR_CPU_BUFFERS
-	ALTERNATIVE "jmp .Ldone_\@", "", X86_FEATURE_MDS_USR_CLR
-
-	jmp	.Lverw_\@
+	STATIC_JUMP .Lverw_\@, mds_user_clear
+	jmp	.Ldone_\@
 	.balign 2
 .Lds_\@:
 	.word	__KERNEL_DS
@@ -164,54 +168,15 @@
 
 #else /* __ASSEMBLY__ */
 
-/*
- * Since there is no objtool in RHEL6, the .discard.nospec object section
- * is not generated.
- */
-#define ANNOTATE_NOSPEC_ALTERNATIVE
-#if 0
-	"999:\n\t"						\
-	".pushsection .discard.nospec\n\t"			\
-	".long 999b - .\n\t"					\
-	".popsection\n\t"
-#endif
-
 #if defined(CONFIG_X86_64) && defined(RETPOLINE)
-
 /*
  * Since the inline asm uses the %V modifier which is only in newer GCC,
  * the 64-bit one is dependent on RETPOLINE not CONFIG_RETPOLINE.
  */
-# define CALL_NOSPEC						\
-	ANNOTATE_NOSPEC_ALTERNATIVE				\
-	ALTERNATIVE(						\
-	"call *%[thunk_target]\n",				\
-	"call __x86_indirect_thunk_%V[thunk_target]\n",		\
-	X86_FEATURE_RETPOLINE)
-# define THUNK_TARGET(addr) [thunk_target] "r" (addr)
+#define CALL_NOSPEC						\
+	"call __x86_indirect_thunk_%V[thunk_target]\n"
+#define THUNK_TARGET(addr) [thunk_target] "r" (addr)
 
-#elif defined(CONFIG_X86_32) && defined(CONFIG_RETPOLINE)
-/*
- * For i386 we use the original ret-equivalent retpoline, because
- * otherwise we'll run out of registers. We don't care about CET
- * here, anyway.
- */
-# define CALL_NOSPEC ALTERNATIVE("call *%[thunk_target]\n",	\
-	"       jmp    904f;\n"					\
-	"       .align 16\n"					\
-	"901:	call   903f;\n"					\
-	"902:	pause;\n"					\
-	"    	lfence;\n"					\
-	"       jmp    902b;\n"					\
-	"       .align 16\n"					\
-	"903:	addl   $4, %%esp;\n"				\
-	"       pushl  %[thunk_target];\n"			\
-	"       ret;\n"						\
-	"       .align 16\n"					\
-	"904:	call   901b;\n",				\
-	X86_FEATURE_RETPOLINE)
-
-# define THUNK_TARGET(addr) [thunk_target] "rm" (addr)
 #else /* No retpoline for C / inline asm */
 # define CALL_NOSPEC "call *%[thunk_target]\n"
 # define THUNK_TARGET(addr) [thunk_target] "rm" (addr)
@@ -221,26 +186,29 @@
 enum spectre_v2_mitigation {
 	SPECTRE_V2_NONE,
 	SPECTRE_V2_RETPOLINE_MINIMAL,
-	SPECTRE_V2_RETPOLINE_MINIMAL_AMD,
 	SPECTRE_V2_RETPOLINE_NO_IBPB,
-	SPECTRE_V2_RETPOLINE_AMD,
 	SPECTRE_V2_RETPOLINE_UNSAFE_MODULE,
 	SPECTRE_V2_RETPOLINE,
 	SPECTRE_V2_RETPOLINE_IBRS_USER,
 	SPECTRE_V2_IBRS,
 	SPECTRE_V2_IBRS_ALWAYS,
 	SPECTRE_V2_IBP_DISABLED,
+	SPECTRE_V2_IBRS_ENHANCED,
 };
 
-/*
- * asm(_ASM_SP) doesn't work as the RHEL6 gcc compiler seems to have
- * problem with exact spaces.
- */
-#ifdef CONFIG_X86_64
-#define _ASM_STACK_POINTER	"rsp"
+extern enum spectre_v2_mitigation spectre_v2_enabled;
+
+void __spectre_v2_select_mitigation(void);
+void spectre_v2_print_mitigation(void);
+
+static inline bool retp_compiler(void)
+{
+#ifdef RETPOLINE
+	return true;
 #else
-#define _ASM_STACK_POINTER	"esp"
+	return false;
 #endif
+}
 
 /*
  * The Intel specification for the SPEC_CTRL MSR requires that we
@@ -273,21 +241,15 @@ extern u64 x86_amd_ls_cfg_ssbd_mask;
 static inline void fill_RSB(void)
 {
 	unsigned long loops;
-	register unsigned long sp asm(_ASM_STACK_POINTER);
+	register unsigned long sp asm(_ASM_SP);
 
 	asm volatile (__stringify(__FILL_RETURN_BUFFER(%0, RSB_CLEAR_LOOPS, %1))
 		      : "=r" (loops), "+r" (sp)
 		      : : "memory" );
 }
 
-extern enum spectre_v2_mitigation spectre_v2_get_mitigation(void);
-extern void spectre_v2_set_mitigation(enum spectre_v2_mitigation mode);
-extern void spectre_v2_retpoline_reset(void);
-extern void __spectre_v2_select_mitigation(void);
-extern void spectre_v2_print_mitigation(void);
-extern bool spectre_v2_has_full_retpoline(void);
-
-extern bool mds_idle_clear;
+extern struct static_key mds_user_clear;
+extern struct static_key mds_idle_clear;
 
 #include <asm/segment.h>
 
@@ -315,15 +277,67 @@ static inline void mds_clear_cpu_buffers(void)
 }
 
 /**
+ * mds_user_clear_cpu_buffers - Mitigation for MDS and TAA vulnerability
+ *
+ * Clear CPU buffers if the corresponding static key is enabled
+ *
+ * RHEL7: This inline function from upstream isn't being used. The
+ * equivalent MDS_USER_CLEAR_CPU_BUFFERS assembly macro is used in
+ * the entry code to achieve the same effect.
+ */
+static inline void mds_user_clear_cpu_buffers(void)
+{
+	if (static_key_false(&mds_user_clear))
+		mds_clear_cpu_buffers();
+}
+
+/**
  * mds_idle_clear_cpu_buffers - Mitigation for MDS vulnerability
  *
  * Clear CPU buffers if the corresponding static key is enabled
  */
 static inline void mds_idle_clear_cpu_buffers(void)
 {
-	if (unlikely(mds_idle_clear))
+	if (static_key_false(&mds_idle_clear))
 		mds_clear_cpu_buffers();
 }
 
 #endif /* __ASSEMBLY__ */
+
+/*
+ * Below is used in the eBPF JIT compiler and emits the byte sequence
+ * for the following assembly:
+ *
+ * With retpolines configured:
+ *
+ *    callq do_rop
+ *  spec_trap:
+ *    pause
+ *    lfence
+ *    jmp spec_trap
+ *  do_rop:
+ *    mov %rax,(%rsp)
+ *    retq
+ *
+ * Without retpolines configured:
+ *
+ *    jmp *%rax
+ */
+#ifdef CONFIG_RETPOLINE
+# define RETPOLINE_RAX_BPF_JIT_SIZE	17
+# define RETPOLINE_RAX_BPF_JIT()				\
+	EMIT1_off32(0xE8, 7);	 /* callq do_rop */		\
+	/* spec_trap: */					\
+	EMIT2(0xF3, 0x90);       /* pause */			\
+	EMIT3(0x0F, 0xAE, 0xE8); /* lfence */			\
+	EMIT2(0xEB, 0xF9);       /* jmp spec_trap */		\
+	/* do_rop: */						\
+	EMIT4(0x48, 0x89, 0x04, 0x24); /* mov %rax,(%rsp) */	\
+	EMIT1(0xC3);             /* retq */
+#else
+# define RETPOLINE_RAX_BPF_JIT_SIZE	2
+# define RETPOLINE_RAX_BPF_JIT()				\
+	EMIT2(0xFF, 0xE0);	 /* jmp *%rax */
+#endif
+
 #endif /* __NOSPEC_BRANCH_H__ */

@@ -10,11 +10,9 @@
  */
 
 #include <linux/oprofile.h>
-#include <linux/init.h>
 #include <linux/smp.h>
 #include <asm/firmware.h>
 #include <asm/ptrace.h>
-#include <asm/system.h>
 #include <asm/processor.h>
 #include <asm/cputable.h>
 #include <asm/rtas.h>
@@ -58,7 +56,7 @@ static int power7_marked_instr_event(u64 mmcr1)
 				 * OPROFILE_PMSEL_FIELD_WIDTH)) & ~1ULL;
 		unit = mmcr1 & (OPROFILE_PM_UNIT_MSK
 				<< (OPROFILE_PM_UNIT_SHIFT
-				    - (pmc * OPROFILE_PMSEL_FIELD_WIDTH)));
+				    - (pmc * OPROFILE_PMSEL_FIELD_WIDTH )));
 		unit = unit >> (OPROFILE_PM_UNIT_SHIFT
 				- (pmc * OPROFILE_PMSEL_FIELD_WIDTH));
 
@@ -119,7 +117,7 @@ static int power4_reg_setup(struct op_counter_config *ctr,
 	 * marked events if the SIAR valid bit is set.  For non marked events
 	 * the sample is always recorded.
 	 */
-	if (__is_processor(PVR_POWER7p))
+	if (pvr_version_is(PVR_POWER7p))
 		cntr_marked_events = power7_marked_instr_event(mmcr1_val);
 	else
 		cntr_marked_events = 0; /* For older processors, set the bit map
@@ -141,10 +139,10 @@ static int power4_reg_setup(struct op_counter_config *ctr,
 	else
 		mmcr0_val |= MMCR0_PROBLEM_DISABLE;
 
-	if (__is_processor(PV_POWER4) || __is_processor(PV_POWER4p) ||
-	    __is_processor(PV_970) || __is_processor(PV_970FX) ||
-	    __is_processor(PV_970MP) || __is_processor(PV_970GX) ||
-	    __is_processor(PV_POWER5) || __is_processor(PV_POWER5p))
+	if (pvr_version_is(PVR_POWER4) || pvr_version_is(PVR_POWER4p) ||
+	    pvr_version_is(PVR_970) || pvr_version_is(PVR_970FX) ||
+	    pvr_version_is(PVR_970MP) || pvr_version_is(PVR_970GX) ||
+	    pvr_version_is(PVR_POWER5) || pvr_version_is(PVR_POWER5p))
 		use_slot_nums = 1;
 
 	return 0;
@@ -164,9 +162,9 @@ extern void ppc_enable_pmcs(void);
  */
 static inline int mmcra_must_set_sample(void)
 {
-	if (__is_processor(PV_POWER4) || __is_processor(PV_POWER4p) ||
-	    __is_processor(PV_970) || __is_processor(PV_970FX) ||
-	    __is_processor(PV_970MP) || __is_processor(PV_970GX))
+	if (pvr_version_is(PVR_POWER4) || pvr_version_is(PVR_POWER4p) ||
+	    pvr_version_is(PVR_970) || pvr_version_is(PVR_970FX) ||
+	    pvr_version_is(PVR_970MP) || pvr_version_is(PVR_970GX))
 		return 1;
 
 	return 0;
@@ -286,7 +284,7 @@ static unsigned long get_pc(struct pt_regs *regs)
 	unsigned long mmcra;
 	unsigned long slot;
 
-	/* Cant do much about it */
+	/* Can't do much about it */
 	if (!cur_cpu_spec->oprofile_mmcra_sihv)
 		return pc;
 
@@ -356,7 +354,7 @@ static bool pmc_overflow(unsigned long val)
 	 * PMCs because a user might set a period of less than 256 and we
 	 * don't want to mistakenly reset them.
 	 */
-	if (__is_processor(PV_POWER7) && ((0x80000000 - val) <= 256))
+	if (pvr_version_is(PVR_POWER7) && ((0x80000000 - val) <= 256))
 		return true;
 
 	return false;

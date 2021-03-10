@@ -5,8 +5,8 @@
  * User space memory access functions
  */
 #include <asm/page.h>
-#include <asm/system.h>
 #include <asm/cache.h>
+#include <asm/errno.h>
 #include <asm-generic/uaccess-unaligned.h>
 
 #define VERIFY_READ 0
@@ -181,30 +181,24 @@ struct exception_data {
 #if !defined(CONFIG_64BIT)
 
 #define __put_kernel_asm64(__val,ptr) do {		    \
-	u64 __val64 = (u64)(__val);			    \
-	u32 hi = (__val64) >> 32;			    \
-	u32 lo = (__val64) & 0xffffffff;		    \
 	__asm__ __volatile__ (				    \
 		"\n1:\tstw %2,0(%1)"			    \
-		"\n2:\tstw %3,4(%1)\n\t"		    \
+		"\n2:\tstw %R2,4(%1)\n\t"		    \
 		ASM_EXCEPTIONTABLE_ENTRY(1b,fixup_put_user_skip_2)\
 		ASM_EXCEPTIONTABLE_ENTRY(2b,fixup_put_user_skip_1)\
 		: "=r"(__pu_err)                            \
-		: "r"(ptr), "r"(hi), "r"(lo), "0"(__pu_err) \
+		: "r"(ptr), "r"(__val), "0"(__pu_err) \
 		: "r1");				    \
 } while (0)
 
 #define __put_user_asm64(__val,ptr) do {	    	    \
-	u64 __val64 = (u64)(__val);			    \
-	u32 hi = (__val64) >> 32;			    \
-	u32 lo = (__val64) & 0xffffffff;		    \
 	__asm__ __volatile__ (				    \
 		"\n1:\tstw %2,0(%%sr3,%1)"		    \
-		"\n2:\tstw %3,4(%%sr3,%1)\n\t"		    \
+		"\n2:\tstw %R2,4(%%sr3,%1)\n\t"		    \
 		ASM_EXCEPTIONTABLE_ENTRY(1b,fixup_put_user_skip_2)\
 		ASM_EXCEPTIONTABLE_ENTRY(2b,fixup_put_user_skip_1)\
 		: "=r"(__pu_err)                            \
-		: "r"(ptr), "r"(hi), "r"(lo), "0"(__pu_err) \
+		: "r"(ptr), "r"(__val), "0"(__pu_err) \
 		: "r1");				    \
 } while (0)
 
@@ -218,15 +212,14 @@ struct exception_data {
 extern unsigned long lcopy_to_user(void __user *, const void *, unsigned long);
 extern unsigned long lcopy_from_user(void *, const void __user *, unsigned long);
 extern unsigned long lcopy_in_user(void __user *, const void __user *, unsigned long);
-extern long lstrncpy_from_user(char *, const char __user *, long);
+extern long strncpy_from_user(char *, const char __user *, long);
 extern unsigned lclear_user(void __user *,unsigned long);
 extern long lstrnlen_user(const char __user *,long);
-
 /*
  * Complex access routines -- macros
  */
+#define user_addr_max() (~0UL)
 
-#define strncpy_from_user lstrncpy_from_user
 #define strnlen_user lstrnlen_user
 #define strlen_user(str) lstrnlen_user(str, 0x7fffffffL)
 #define clear_user lclear_user
@@ -234,12 +227,34 @@ extern long lstrnlen_user(const char __user *,long);
 
 unsigned long copy_to_user(void __user *dst, const void *src, unsigned long len);
 #define __copy_to_user copy_to_user
-unsigned long copy_from_user(void *dst, const void __user *src, unsigned long len);
-#define __copy_from_user copy_from_user
+unsigned long __copy_from_user(void *dst, const void __user *src, unsigned long len);
 unsigned long copy_in_user(void __user *dst, const void __user *src, unsigned long len);
 #define __copy_in_user copy_in_user
 #define __copy_to_user_inatomic __copy_to_user
 #define __copy_from_user_inatomic __copy_from_user
+
+extern void copy_from_user_overflow(void)
+#ifdef CONFIG_DEBUG_STRICT_USER_COPY_CHECKS
+        __compiletime_error("copy_from_user() buffer size is not provably correct")
+#else
+        __compiletime_warning("copy_from_user() buffer size is not provably correct")
+#endif
+;
+
+static inline unsigned long __must_check copy_from_user(void *to,
+                                          const void __user *from,
+                                          unsigned long n)
+{
+        int sz = __compiletime_object_size(to);
+        int ret = -EFAULT;
+
+        if (likely(sz == -1 || !__builtin_constant_p(n) || sz >= n))
+                ret = __copy_from_user(to, from, n);
+        else
+                copy_from_user_overflow();
+
+        return ret;
+}
 
 struct pt_regs;
 int fixup_exception(struct pt_regs *regs);

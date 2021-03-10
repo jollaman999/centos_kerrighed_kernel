@@ -23,8 +23,8 @@ unsigned key_gc_delay = 5 * 60;
 /*
  * Reaper for unused keys.
  */
-static void key_garbage_collector_nonreentrant(struct work_struct *work);
-DECLARE_WORK(key_gc_work, key_garbage_collector_nonreentrant);
+static void key_garbage_collector(struct work_struct *work);
+DECLARE_WORK(key_gc_work, key_garbage_collector);
 
 /*
  * Reaper for links from keyrings to dead keys.
@@ -46,7 +46,7 @@ static unsigned long key_gc_flags;
  * immediately unlinked.
  */
 struct key_type key_type_dead = {
-	.name = "dead",
+	.name = ".dead",
 };
 
 /*
@@ -62,7 +62,7 @@ void key_schedule_gc(time_t gc_at)
 
 	if (gc_at <= now || test_bit(KEY_GC_REAP_KEYTYPE, &key_gc_flags)) {
 		kdebug("IMMEDIATE");
-		key_schedule_gc_work();
+		schedule_work(&key_gc_work);
 	} else if (gc_at < key_gc_next_run) {
 		kdebug("DEFERRED");
 		key_gc_next_run = gc_at;
@@ -77,7 +77,7 @@ void key_schedule_gc(time_t gc_at)
 void key_schedule_gc_links(void)
 {
 	set_bit(KEY_GC_KEY_EXPIRED, &key_gc_flags);
-	key_schedule_gc_work();
+	schedule_work(&key_gc_work);
 }
 
 /*
@@ -89,15 +89,6 @@ static void key_gc_timer_func(unsigned long data)
 	kenter("");
 	key_gc_next_run = LONG_MAX;
 	key_schedule_gc_links();
-}
-
-/*
- * wait_on_bit() sleep function for uninterruptible waiting
- */
-static int key_gc_wait_bit(void *flags)
-{
-	schedule();
-	return 0;
 }
 
 /*
@@ -120,58 +111,14 @@ void key_gc_keytype(struct key_type *ktype)
 	set_bit(KEY_GC_REAP_KEYTYPE, &key_gc_flags);
 
 	kdebug("schedule");
-	key_schedule_gc_work();
+	schedule_work(&key_gc_work);
 
 	kdebug("sleep");
-	wait_on_bit(&key_gc_flags, KEY_GC_REAPING_KEYTYPE, key_gc_wait_bit,
+	wait_on_bit(&key_gc_flags, KEY_GC_REAPING_KEYTYPE,
 		    TASK_UNINTERRUPTIBLE);
 
 	key_gc_dead_keytype = NULL;
 	kleave("");
-}
-
-/*
- * Garbage collect pointers from a keyring.
- *
- * Not called with any locks held.  The keyring's key struct will not be
- * deallocated under us as only our caller may deallocate it.
- */
-static void key_gc_keyring(struct key *keyring, time_t limit)
-{
-	struct keyring_list *klist;
-	int loop;
-
-	kenter("%x", key_serial(keyring));
-
-	if (keyring->flags & ((1 << KEY_FLAG_INVALIDATED) |
-			      (1 << KEY_FLAG_REVOKED)))
-		goto dont_gc;
-
-	/* scan the keyring looking for dead keys */
-	rcu_read_lock();
-	klist = rcu_dereference(keyring->payload.subscriptions);
-	if (!klist)
-		goto unlock_dont_gc;
-
-	loop = klist->nkeys;
-	smp_rmb();
-	for (loop--; loop >= 0; loop--) {
-		struct key *key = rcu_dereference(klist->keys[loop]);
-		if (key_is_dead(key, limit))
-			goto do_gc;
-	}
-
-unlock_dont_gc:
-	rcu_read_unlock();
-dont_gc:
-	kleave(" [no gc]");
-	return;
-
-do_gc:
-	rcu_read_unlock();
-
-	keyring_gc(keyring, limit);
-	kleave(" [gc]");
 }
 
 /*
@@ -182,15 +129,15 @@ static noinline void key_gc_unused_keys(struct list_head *keys)
 	while (!list_empty(keys)) {
 		struct key *key =
 			list_entry(keys->next, struct key, graveyard_link);
+		short state = key->state;
+
 		list_del(&key->graveyard_link);
 
 		kdebug("- %u", key->serial);
 		key_check(key);
 
 		/* Throw away the key data if the key is instantiated */
-		if (test_bit(KEY_FLAG_INSTANTIATED, &key->flags) &&
-		    !test_bit(KEY_FLAG_NEGATIVE, &key->flags) &&
-		    key->type->destroy)
+		if (state == KEY_IS_POSITIVE && key->type->destroy)
 			key->type->destroy(key);
 
 		security_key_free(key);
@@ -204,16 +151,14 @@ static noinline void key_gc_unused_keys(struct list_head *keys)
 		}
 
 		atomic_dec(&key->user->nkeys);
-		if (test_bit(KEY_FLAG_INSTANTIATED, &key->flags))
+		if (state != KEY_IS_UNINSTANTIATED)
 			atomic_dec(&key->user->nikeys);
 
 		key_user_put(key->user);
 
 		kfree(key->description);
 
-#ifdef KEY_DEBUGGING
-		key->magic = KEY_DEBUG_MAGIC_X;
-#endif
+		memzero_explicit(key, sizeof(*key));
 		kmem_cache_free(key_jar, key);
 	}
 }
@@ -371,7 +316,7 @@ maybe_resched:
 	}
 
 	if (gc_state & KEY_GC_REAP_AGAIN)
-		key_schedule_gc_work();
+		schedule_work(&key_gc_work);
 	kleave(" [end %x]", gc_state);
 	return;
 
@@ -394,8 +339,7 @@ found_unreferenced_key:
 	 */
 found_keyring:
 	spin_unlock(&key_serial_lock);
-	kdebug("scan keyring %d", key->serial);
-	key_gc_keyring(key, limit);
+	keyring_gc(key, limit);
 	goto maybe_resched;
 
 	/* We found a dead key that is still referenced.  Reset its type and
@@ -411,26 +355,4 @@ destroy_dead_key:
 	memset(&key->payload, KEY_DESTROY, sizeof(key->payload));
 	up_write(&key->sem);
 	goto maybe_resched;
-}
-
-/*
- * Nonreentrancy wrapper for the garbage collector workqueue item
- */
-bool key_need_gc;
-static void key_garbage_collector_nonreentrant(struct work_struct *work)
-{
-	static unsigned long running;
-
-	if (!key_need_gc)
-		return;
-
-	if (xchg(&running, 1) == 0) {
-		key_need_gc = false;
-		smp_mb();
-		key_garbage_collector(work);
-
-		running = 0;
-		if (key_need_gc)
-			schedule_work(&key_gc_work);
-	}
 }

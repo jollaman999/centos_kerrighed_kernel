@@ -21,7 +21,6 @@
 #include <linux/err.h>
 #include <linux/slab.h>
 #include <linux/powercap.h>
-#include <linux/nospec.h>
 
 #define to_powercap_zone(n) container_of(n, struct powercap_zone, dev)
 #define to_powercap_control_type(n) \
@@ -84,7 +83,6 @@ static ssize_t show_constraint_##_attr(struct device *dev, \
 		return -EINVAL; \
 	if (id >= power_zone->const_id_cnt)	\
 		return -EINVAL; \
-	id = array_index_nospec(id, power_zone->const_id_cnt); \
 	pconst = &power_zone->constraints[id]; \
 	if (pconst && pconst->ops && pconst->ops->get_##_attr) { \
 		if (!pconst->ops->get_##_attr(power_zone, id, &value)) \
@@ -110,7 +108,6 @@ static ssize_t store_constraint_##_attr(struct device *dev,\
 		return -EINVAL; \
 	if (id >= power_zone->const_id_cnt)	\
 		return -EINVAL; \
-	id = array_index_nospec(id, power_zone->const_id_cnt); \
 	pconst = &power_zone->constraints[id]; \
 	err = kstrtoull(buf, 10, &value); \
 	if (err) \
@@ -180,8 +177,6 @@ static ssize_t show_constraint_name(struct device *dev,
 		return -EINVAL;
 	if (id >= power_zone->const_id_cnt)
 		return -EINVAL;
-	id = array_index_nospec(id, power_zone->const_id_cnt);
-
 	pconst = &power_zone->constraints[id];
 
 	if (pconst && pconst->ops && pconst->ops->get_name) {
@@ -498,7 +493,7 @@ struct powercap_zone *powercap_register_zone(
 				int nr_constraints,
 				struct powercap_zone_constraint_ops *const_ops)
 {
-	int result, err;
+	int result;
 	int nr_attrs;
 
 	if (!name || !control_type || !ops ||
@@ -530,14 +525,7 @@ struct powercap_zone *powercap_register_zone(
 
 	mutex_lock(&control_type->lock);
 	/* Using idr to get the unique id */
-	err = idr_pre_get(power_zone->parent_idr, GFP_KERNEL);
-	if (!err)
-		goto err_idr_alloc;
-
-	err = idr_get_new_above(power_zone->parent_idr, NULL, 0, &result);
-	if (err)
-		result = err;
-
+	result = idr_alloc(power_zone->parent_idr, NULL, 0, 0, GFP_KERNEL);
 	if (result < 0)
 		goto err_idr_alloc;
 

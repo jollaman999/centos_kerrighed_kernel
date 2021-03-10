@@ -82,6 +82,13 @@ typedef enum {
 	AD_TRANSMIT		/* tx Machine */
 } tx_states_t;
 
+/* churn machine states(43.4.17 in the 802.3ad standard) */
+typedef enum {
+	 AD_CHURN_MONITOR, /* monitoring for churn */
+	 AD_CHURN,         /* churn detected (error) */
+	 AD_NO_CHURN       /* no churn (no error) */
+} churn_state_t;
+
 /* rx indication types */
 typedef enum {
 	AD_TYPE_LACPDU = 1,	/* type lacpdu */
@@ -173,6 +180,19 @@ struct port;
 #pragma pack(8)
 #endif
 
+struct bond_3ad_stats {
+	atomic64_t lacpdu_rx;
+	atomic64_t lacpdu_tx;
+	atomic64_t lacpdu_unknown_rx;
+	atomic64_t lacpdu_illegal_rx;
+
+	atomic64_t marker_rx;
+	atomic64_t marker_tx;
+	atomic64_t marker_resp_rx;
+	atomic64_t marker_resp_tx;
+	atomic64_t marker_unknown_rx;
+};
+
 /* aggregator structure(43.4.5 in the 802.3ad standard) */
 typedef struct aggregator {
 	struct mac_addr aggregator_mac_address;
@@ -229,6 +249,12 @@ typedef struct port {
 	u16 sm_mux_timer_counter;	/* state machine mux timer counter */
 	tx_states_t sm_tx_state;	/* state machine tx state */
 	u16 sm_tx_timer_counter;	/* state machine tx timer counter(allways on - enter to transmit state 3 time per second) */
+	u16 sm_churn_actor_timer_counter;
+	u16 sm_churn_partner_timer_counter;
+	u32 churn_actor_count;
+	u32 churn_partner_count;
+	churn_state_t sm_churn_actor_state;
+	churn_state_t sm_churn_partner_state;
 	struct slave *slave;		/* pointer to the bond slave that this port belongs to */
 	struct aggregator *aggregator;	/* pointer to an aggregator that this port related to */
 	struct port *next_port_in_aggregator;	/* Next port on the linked list of the parent aggregator */
@@ -251,16 +277,34 @@ struct ad_system {
 #define SLAVE_AD_INFO(slave) ((slave)->ad_info)
 
 struct ad_bond_info {
-	struct ad_system system;	    /* 802.3ad system structure */
-	u32 agg_select_timer;	    // Timer to select aggregator after all adapter's hand shakes
+	struct ad_system system;	/* 802.3ad system structure */
+	struct bond_3ad_stats stats;
+	u32 agg_select_timer;		/* Timer to select aggregator after all adapter's hand shakes */
 	u16 aggregator_identifier;
 };
 
 struct ad_slave_info {
 	struct aggregator aggregator;	/* 802.3ad aggregator structure */
 	struct port port;		/* 802.3ad port structure */
+	struct bond_3ad_stats stats;
 	u16 id;
 };
+
+static inline const char *bond_3ad_churn_desc(churn_state_t state)
+{
+	static const char *const churn_description[] = {
+		"monitoring",
+		"churned",
+		"none",
+		"unknown"
+	};
+	int max_size = sizeof(churn_description) / sizeof(churn_description[0]);
+
+	if (state >= max_size)
+		state = max_size - 1;
+
+	return churn_description[state];
+}
 
 /* ========== AD Exported functions to the main bonding code ========== */
 void bond_3ad_initialize(struct bonding *bond, u16 tick_resolution);
@@ -273,10 +317,12 @@ void bond_3ad_handle_link_change(struct slave *slave, char link);
 int  bond_3ad_get_active_agg_info(struct bonding *bond, struct ad_info *ad_info);
 int  __bond_3ad_get_active_agg_info(struct bonding *bond,
 				    struct ad_info *ad_info);
-int bond_3ad_xmit_xor(struct sk_buff *skb, struct net_device *dev);
 int bond_3ad_lacpdu_recv(const struct sk_buff *skb, struct bonding *bond,
 			 struct slave *slave);
 int bond_3ad_set_carrier(struct bonding *bond);
 void bond_3ad_update_lacp_rate(struct bonding *bond);
+void bond_3ad_update_ad_actor_settings(struct bonding *bond);
+int bond_3ad_stats_fill(struct sk_buff *skb, struct bond_3ad_stats *stats);
+size_t bond_3ad_stats_size(void);
 #endif /* _NET_BOND_3AD_H */
 

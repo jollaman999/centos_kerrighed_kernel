@@ -8,6 +8,7 @@
 
 #include <linux/capability.h>
 #include <linux/module.h>
+#include <linux/compat.h>
 #include <linux/mount.h>
 #include <linux/time.h>
 #include <linux/buffer_head.h>
@@ -31,7 +32,7 @@ static int fat_ioctl_get_attributes(struct inode *inode, u32 __user *user_attr)
 
 static int fat_ioctl_set_attributes(struct file *file, u32 __user *user_attr)
 {
-	struct inode *inode = file->f_path.dentry->d_inode;
+	struct inode *inode = file_inode(file);
 	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
 	int is_dir = S_ISDIR(inode->i_mode);
 	u32 attr, oldattr;
@@ -42,7 +43,7 @@ static int fat_ioctl_set_attributes(struct file *file, u32 __user *user_attr)
 	if (err)
 		goto out;
 
-	err = mnt_want_write(file->f_path.mnt);
+	err = mnt_want_write_file(file);
 	if (err)
 		goto out;
 	mutex_lock(&inode->i_mutex);
@@ -101,21 +102,21 @@ static int fat_ioctl_set_attributes(struct file *file, u32 __user *user_attr)
 		if (attr & ATTR_SYS)
 			inode->i_flags |= S_IMMUTABLE;
 		else
-			inode->i_flags &= S_IMMUTABLE;
+			inode->i_flags &= ~S_IMMUTABLE;
 	}
 
 	fat_save_attrs(inode, attr);
 	mark_inode_dirty(inode);
 out_unlock_inode:
 	mutex_unlock(&inode->i_mutex);
-	mnt_drop_write(file->f_path.mnt);
+	mnt_drop_write_file(file);
 out:
 	return err;
 }
 
-int fat_generic_ioctl(struct inode *inode, struct file *filp,
-		      unsigned int cmd, unsigned long arg)
+long fat_generic_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
+	struct inode *inode = file_inode(filp);
 	u32 __user *user_attr = (u32 __user *)arg;
 
 	switch (cmd) {
@@ -128,6 +129,15 @@ int fat_generic_ioctl(struct inode *inode, struct file *filp,
 	}
 }
 
+#ifdef CONFIG_COMPAT
+static long fat_generic_compat_ioctl(struct file *filp, unsigned int cmd,
+				      unsigned long arg)
+
+{
+	return fat_generic_ioctl(filp, cmd, (unsigned long)compat_ptr(arg));
+}
+#endif
+
 static int fat_file_release(struct inode *inode, struct file *filp)
 {
 	if ((filp->f_mode & FMODE_WRITE) &&
@@ -138,12 +148,12 @@ static int fat_file_release(struct inode *inode, struct file *filp)
 	return 0;
 }
 
-int fat_file_fsync(struct file *filp, struct dentry *dentry, int datasync)
+int fat_file_fsync(struct file *filp, loff_t start, loff_t end, int datasync)
 {
-	struct inode *inode = dentry->d_inode;
+	struct inode *inode = filp->f_mapping->host;
 	int res, err;
 
-	res = simple_fsync(filp, dentry, datasync);
+	res = generic_file_fsync(filp, start, end, datasync);
 	err = sync_mapping_buffers(MSDOS_SB(inode->i_sb)->fat_inode->i_mapping);
 
 	return res ? res : err;
@@ -158,7 +168,10 @@ const struct file_operations fat_file_operations = {
 	.aio_write	= generic_file_aio_write,
 	.mmap		= generic_file_mmap,
 	.release	= fat_file_release,
-	.ioctl		= fat_generic_ioctl,
+	.unlocked_ioctl	= fat_generic_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= fat_generic_compat_ioctl,
+#endif
 	.fsync		= fat_file_fsync,
 	.splice_read	= generic_file_splice_read,
 };
@@ -269,7 +282,7 @@ static int fat_free(struct inode *inode, int skip)
 	return fat_free_clusters(inode, free_start);
 }
 
-void fat_truncate(struct inode *inode)
+void fat_truncate_blocks(struct inode *inode, loff_t offset)
 {
 	struct msdos_sb_info *sbi = MSDOS_SB(inode->i_sb);
 	const unsigned int cluster_size = sbi->cluster_size;
@@ -279,10 +292,10 @@ void fat_truncate(struct inode *inode)
 	 * This protects against truncating a file bigger than it was then
 	 * trying to write into the hole.
 	 */
-	if (MSDOS_I(inode)->mmu_private > inode->i_size)
-		MSDOS_I(inode)->mmu_private = inode->i_size;
+	if (MSDOS_I(inode)->mmu_private > offset)
+		MSDOS_I(inode)->mmu_private = offset;
 
-	nr_clusters = (inode->i_size + (cluster_size - 1)) >> sbi->cluster_bits;
+	nr_clusters = (offset + (cluster_size - 1)) >> sbi->cluster_bits;
 
 	fat_free(inode, nr_clusters);
 	fat_flush_inodes(inode->i_sb, inode, NULL);
@@ -293,6 +306,11 @@ int fat_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
 	struct inode *inode = dentry->d_inode;
 	generic_fillattr(inode, stat);
 	stat->blksize = MSDOS_SB(inode->i_sb)->cluster_size;
+
+	if (MSDOS_SB(inode->i_sb)->options.nfs == FAT_NFS_NOSTALE_RO) {
+		/* Use i_pos for ino. This is used as fileid of nfs. */
+		stat->ino = fat_i_pos_read(MSDOS_SB(inode->i_sb), inode);
+	}
 	return 0;
 }
 EXPORT_SYMBOL_GPL(fat_getattr);
@@ -300,7 +318,7 @@ EXPORT_SYMBOL_GPL(fat_getattr);
 static int fat_sanitize_mode(const struct msdos_sb_info *sbi,
 			     struct inode *inode, umode_t *mode_ptr)
 {
-	mode_t mask, perm;
+	umode_t mask, perm;
 
 	/*
 	 * Note, the basic check is already done by a caller of
@@ -337,9 +355,9 @@ static int fat_sanitize_mode(const struct msdos_sb_info *sbi,
 
 static int fat_allow_set_time(struct msdos_sb_info *sbi, struct inode *inode)
 {
-	mode_t allow_utime = sbi->options.allow_utime;
+	umode_t allow_utime = sbi->options.allow_utime;
 
-	if (current_fsuid() != inode->i_uid) {
+	if (!uid_eq(current_fsuid(), inode->i_uid)) {
 		if (in_group_p(inode->i_gid))
 			allow_utime >>= 3;
 		if (allow_utime & MAY_WRITE)
@@ -361,20 +379,6 @@ int fat_setattr(struct dentry *dentry, struct iattr *attr)
 	unsigned int ia_valid;
 	int error;
 
-	/*
-	 * Expand the file. Since inode_setattr() updates ->i_size
-	 * before calling the ->truncate(), but FAT needs to fill the
-	 * hole before it.
-	 */
-	if (attr->ia_valid & ATTR_SIZE) {
-		if (attr->ia_size > inode->i_size) {
-			error = fat_cont_expand(inode, attr->ia_size);
-			if (error || attr->ia_valid == ATTR_SIZE)
-				goto out;
-			attr->ia_valid &= ~ATTR_SIZE;
-		}
-	}
-
 	/* Check for setting the inode time. */
 	ia_valid = attr->ia_valid;
 	if (ia_valid & TIMES_SET_FLAGS) {
@@ -390,10 +394,27 @@ int fat_setattr(struct dentry *dentry, struct iattr *attr)
 		goto out;
 	}
 
+	/*
+	 * Expand the file. Since inode_setattr() updates ->i_size
+	 * before calling the ->truncate(), but FAT needs to fill the
+	 * hole before it. XXX: this is no longer true with new truncate
+	 * sequence.
+	 */
+	if (attr->ia_valid & ATTR_SIZE) {
+		inode_dio_wait(inode);
+
+		if (attr->ia_size > inode->i_size) {
+			error = fat_cont_expand(inode, attr->ia_size);
+			if (error || attr->ia_valid == ATTR_SIZE)
+				goto out;
+			attr->ia_valid &= ~ATTR_SIZE;
+		}
+	}
+
 	if (((attr->ia_valid & ATTR_UID) &&
-	     (attr->ia_uid != sbi->options.fs_uid)) ||
+	     (!uid_eq(attr->ia_uid, sbi->options.fs_uid))) ||
 	    ((attr->ia_valid & ATTR_GID) &&
-	     (attr->ia_gid != sbi->options.fs_gid)) ||
+	     (!gid_eq(attr->ia_gid, sbi->options.fs_gid))) ||
 	    ((attr->ia_valid & ATTR_MODE) &&
 	     (attr->ia_mode & ~FAT_VALID_MODE)))
 		error = -EPERM;
@@ -413,15 +434,21 @@ int fat_setattr(struct dentry *dentry, struct iattr *attr)
 			attr->ia_valid &= ~ATTR_MODE;
 	}
 
-	if (attr->ia_valid)
-		error = inode_setattr(inode, attr);
+	if (attr->ia_valid & ATTR_SIZE) {
+		down_write(&MSDOS_I(inode)->truncate_lock);
+		truncate_setsize(inode, attr->ia_size);
+		fat_truncate_blocks(inode, attr->ia_size);
+		up_write(&MSDOS_I(inode)->truncate_lock);
+	}
+
+	setattr_copy(inode, attr);
+	mark_inode_dirty(inode);
 out:
 	return error;
 }
 EXPORT_SYMBOL_GPL(fat_setattr);
 
 const struct inode_operations fat_file_inode_operations = {
-	.truncate	= fat_truncate,
 	.setattr	= fat_setattr,
 	.getattr	= fat_getattr,
 };

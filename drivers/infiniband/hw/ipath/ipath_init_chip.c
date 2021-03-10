@@ -33,6 +33,7 @@
 
 #include <linux/pci.h>
 #include <linux/netdevice.h>
+#include <linux/moduleparam.h>
 #include <linux/slab.h>
 #include <linux/stat.h>
 #include <linux/vmalloc.h>
@@ -209,7 +210,7 @@ static int bringup_link(struct ipath_devdata *dd)
 
 static struct ipath_portdata *create_portdata0(struct ipath_devdata *dd)
 {
-	struct ipath_portdata *pd = NULL;
+	struct ipath_portdata *pd;
 
 	pd = kzalloc(sizeof(*pd), GFP_KERNEL);
 	if (pd) {
@@ -263,7 +264,7 @@ static int init_chip_first(struct ipath_devdata *dd)
 	 * Allocate full portcnt array, rather than just cfgports, because
 	 * cleanup iterates across all possible ports.
 	 */
-	dd->ipath_pd = kzalloc(sizeof(*dd->ipath_pd) * dd->ipath_portcnt,
+	dd->ipath_pd = kcalloc(dd->ipath_portcnt, sizeof(*dd->ipath_pd),
 			       GFP_KERNEL);
 
 	if (!dd->ipath_pd) {
@@ -718,16 +719,6 @@ int ipath_init_chip(struct ipath_devdata *dd, int reinit)
 		goto done;
 
 	/*
-	 * we ignore most issues after reporting them, but have to specially
-	 * handle hardware-disabled chips.
-	 */
-	if (ret == 2) {
-		/* unique error, known to ipath_init_one */
-		ret = -EPERM;
-		goto done;
-	}
-
-	/*
 	 * We could bump this to allow for full rcvegrcnt + rcvtidcnt,
 	 * but then it no longer nicely fits power of two, and since
 	 * we now use routines that backend onto __get_free_pages, the
@@ -959,9 +950,8 @@ int ipath_init_chip(struct ipath_devdata *dd, int reinit)
 		 * set up stats retrieval timer, even if we had errors
 		 * in last portion of setup
 		 */
-		init_timer(&dd->ipath_stats_timer);
-		dd->ipath_stats_timer.function = ipath_get_faststats;
-		dd->ipath_stats_timer.data = (unsigned long) dd;
+		setup_timer(&dd->ipath_stats_timer, ipath_get_faststats,
+				(unsigned long)dd);
 		/* every 5 seconds; */
 		dd->ipath_stats_timer.expires = jiffies + 5 * HZ;
 		/* takes ~16 seconds to overflow at full IB 4x bandwdith */
@@ -974,9 +964,8 @@ int ipath_init_chip(struct ipath_devdata *dd, int reinit)
 		ret = setup_sdma(dd);
 
 	/* Set up HoL state */
-	init_timer(&dd->ipath_hol_timer);
-	dd->ipath_hol_timer.function = ipath_hol_event;
-	dd->ipath_hol_timer.data = (unsigned long)dd;
+	setup_timer(&dd->ipath_hol_timer, ipath_hol_event, (unsigned long)dd);
+
 	dd->ipath_hol_state = IPATH_HOL_UP;
 
 done:
@@ -997,11 +986,9 @@ done:
 			 * to an alternate if necessary and possible
 			 */
 			if (!reinit) {
-				init_timer(&dd->ipath_intrchk_timer);
-				dd->ipath_intrchk_timer.function =
-					verify_interrupt;
-				dd->ipath_intrchk_timer.data =
-					(unsigned long) dd;
+				setup_timer(&dd->ipath_intrchk_timer,
+						verify_interrupt,
+						(unsigned long)dd);
 			}
 			dd->ipath_intrchk_timer.expires = jiffies + HZ/2;
 			add_timer(&dd->ipath_intrchk_timer);

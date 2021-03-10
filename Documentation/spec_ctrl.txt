@@ -40,14 +40,14 @@ Speculation control may be tuned from the kernel command line with the
 spectre_v2= parameter.  For the available options, see
 Documentation/kernel-parameters.txt.
 
-It may also be tuned from debugfs.  There is one control knob:
+It may also be tuned from debugfs.  There are two main control knobs:
 
+  /sys/kernel/debug/x86/retp_enabled
   /sys/kernel/debug/x86/ibrs_enabled
 
-There are also two read-only informational debugfs entries:
+There is also a read-only informational debugfs entry:
 
   /sys/kernel/debug/x86/ibpb_enabled (read-only)
-  /sys/kernel/debug/x86/retp_enabled (read-only)
 
 If both of the above microcode features aren't present, ibrs_enabled and
 ibpb_enabled are both set to 0, and ibrs_enabled cannot be changed.
@@ -64,11 +64,20 @@ restricted speculation and it slows down the CPU significantly,
 particularly on pre-Skylake CPUs.  This is why pre-Skylake CPUs default
 to using retpolines instead of IBRS.
 
-On all CPUs except for Intel Skylake+ and AMD 10h/12h, retpolines
-are the default.  This mitigation doesn't directly depend on any
-microcode features.  However, it's only considered a partial solution
-without the IBPB_SUPPORT microcode feature which adds user-to-user
-and guest-to-guest protection across context switches.
+retp_enabled 0: Disabled
+
+retp_enabled 1: Retpolines are enabled in the kernel, which replace all
+		indirect jumps and indirect calls with a special
+		instruction sequence which avoids the use of IBP.
+
+		This is the default mode on all CPUs except for Intel
+		Skylake+ and AMD 10h/12h.
+
+		This mitigation doesn't directly depend on any microcode
+		features.  However, it's only considered a partial
+		solution without the IBPB_SUPPORT microcode feature
+		which adds user-to-user and guest-to-guest protection
+		across context switches.
 
 ibrs_enabled 0: Disabled
 
@@ -91,10 +100,12 @@ ibrs_enabled 2: IBRS enabled in user mode and kernel mode. Only guest
 		userland from hyperthreading effects and from guest
 		mode too.
 
+		This option cannot be used with retp_enabled 1
+
 		This is the default mode on AMD 10h and AMD 12h
 		families, which have the ability to completely disable
 		the indirect branch predictor.  They don't actually have
-		IBRS, but the effect is the same.
+		IBRS or IBPB, but the effect is the same.
 
 		requires SPEC_CTRL present
 
@@ -102,10 +113,21 @@ ibrs_enabled 3: IBRS enabled in user mode.
 
 		Userland is protected from guest mode and from
 		hyperthreading effects.  This option can *only* be used
-		when retpolines are enabled at boot time. Retpolines
-		protects the kernel, and IBRS protects userland.
+		in combination with retp_enabled 1, with retpolines
+		protecting the kernel and IBRS protecting userland.
 
 		requires SPEC_CTRL present
+
+ibrs_enabled 4: Enhanced IBRS in kernel and user mode. Only guest can
+		disable it.
+
+		CPU supports enhanced IBRS feature which can enable
+		protection on both kernel and usermode with much better
+		performance. This option can be selected only if the
+		CPU can support it. The presence of the enhanced IBRS
+		feature will disable the use of ibrs_enabled modes 1-3.
+
+		requires SPEC_CTRL and enhanced IBRS present
 
 ibpb_enabled 0: Disabled
 
@@ -119,19 +141,9 @@ ibpb_enabled 1: IBPB IBP barrier is used to flush the IBP across mm
                 simultaneous multithreading effects.
 
 		This option is read-only.  It is automatically selected
-		when ibrs_enabled is 1 or 2, or retpolines are enabled.
+		when retp_enabled is 1 or ibrs_enabled is 1, 2, or 3.
 
 		requires IBPB_SUPPORT present
-
-retp_enabled 0: Retpolines are disabled in the kernel.
-
-retp_enabled 1: Retpolines are enabled in the kernel, which replace all
-		indirect jumps and indirect calls with a special
-		instruction sequence which avoids the use of IBP.
-
-		The state of retpolines can only be changed by
-		rebooting the system with a different spectre_v2=
-		command line option.
 
 = Speculation Control (Speculative Store Bypass Disable) =
 
@@ -193,3 +205,9 @@ ssbd_enabled 2: Speculative store bypass is enabled by default.
 		command option with the prctl(2) system call.  See
 		Documentation/userspace-api/spec_ctrl.txt for more
 		information of what options are available.
+
+ssbd_enabled 3: Similar to option 2, individual task can disable
+		speculative store bypass by using prctl(2).  In addition,
+		task that uses seccomp(2) or the PR_SET_SECCOMP option
+		of prctl(2) will also have speculative store bypass
+		disabled automatically.

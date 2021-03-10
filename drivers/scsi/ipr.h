@@ -32,15 +32,15 @@
 #include <linux/libata.h>
 #include <linux/list.h>
 #include <linux/kref.h>
-#include <linux/blk-iopoll.h>
+#include <linux/irq_poll.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
 
 /*
  * Literals
  */
-#define IPR_DRIVER_VERSION "2.6.3"
-#define IPR_DRIVER_DATE "(October 17, 2015)"
+#define IPR_DRIVER_VERSION "2.6.4"
+#define IPR_DRIVER_DATE "(March 14, 2017)"
 
 /*
  * IPR_MAX_CMD_PER_LUN: This defines the maximum number of outstanding
@@ -60,6 +60,7 @@
 
 #define PCI_DEVICE_ID_IBM_CROC_FPGA_E2          0x033D
 #define PCI_DEVICE_ID_IBM_CROCODILE             0x034A
+#define PCI_DEVICE_ID_IBM_RATTLESNAKE		0x04DA
 
 #define IPR_SUBS_DEV_ID_2780	0x0264
 #define IPR_SUBS_DEV_ID_5702	0x0266
@@ -111,6 +112,8 @@
 #define IPR_SUBS_DEV_ID_2CCA	0x04C7
 #define IPR_SUBS_DEV_ID_2CD2	0x04C8
 #define IPR_SUBS_DEV_ID_2CCD	0x04C9
+#define IPR_SUBS_DEV_ID_580A	0x04FC
+#define IPR_SUBS_DEV_ID_580B	0x04FB
 #define IPR_NAME				"ipr"
 
 /*
@@ -151,7 +154,9 @@
 #define IPR_DEFAULT_MAX_ERROR_DUMP			984
 #define IPR_NUM_LOG_HCAMS				2
 #define IPR_NUM_CFG_CHG_HCAMS				2
+#define IPR_NUM_HCAM_QUEUE				12
 #define IPR_NUM_HCAMS	(IPR_NUM_LOG_HCAMS + IPR_NUM_CFG_CHG_HCAMS)
+#define IPR_MAX_HCAMS	(IPR_NUM_HCAMS + IPR_NUM_HCAM_QUEUE)
 
 #define IPR_MAX_SIS64_TARGETS_PER_BUS			1024
 #define IPR_MAX_SIS64_LUNS_PER_TARGET			0xffffffff
@@ -517,7 +522,7 @@ struct ipr_hrr_queue {
 	u8 allow_cmds:1;
 	u8 removing_ioa:1;
 
-	struct blk_iopoll iopoll;
+	struct irq_poll iopoll;
 };
 
 /* Command packet structure */
@@ -1130,6 +1135,11 @@ struct ipr_hostrcb_type_30_error {
 	struct ipr_hostrcb64_fabric_desc desc[1];
 }__attribute__((packed, aligned (4)));
 
+struct ipr_hostrcb_type_41_error {
+	u8 failure_reason[64];
+	 __be32 data[200];
+}__attribute__((packed, aligned (4)));
+
 struct ipr_hostrcb_error {
 	__be32 fd_ioasc;
 	struct ipr_res_addr fd_res_addr;
@@ -1168,6 +1178,7 @@ struct ipr_hostrcb64_error {
 		struct ipr_hostrcb_type_23_error type_23_error;
 		struct ipr_hostrcb_type_24_error type_24_error;
 		struct ipr_hostrcb_type_30_error type_30_error;
+		struct ipr_hostrcb_type_41_error type_41_error;
 	} u;
 }__attribute__((packed, aligned (8)));
 
@@ -1213,6 +1224,7 @@ struct ipr_hcam {
 #define IPR_HOST_RCB_OVERLAY_ID_24				0x24
 #define IPR_HOST_RCB_OVERLAY_ID_26				0x26
 #define IPR_HOST_RCB_OVERLAY_ID_30				0x30
+#define IPR_HOST_RCB_OVERLAY_ID_41				0x41
 #define IPR_HOST_RCB_OVERLAY_ID_DEFAULT				0xFF
 
 	u8 reserved1[3];
@@ -1324,7 +1336,7 @@ struct ipr_resource_entry {
 	struct scsi_device *sdev;
 	struct ipr_sata_port *sata_port;
 	struct list_head queue;
-};
+}; /* struct ipr_resource_entry */
 
 struct ipr_resource_hdr {
 	u16 num_entries;
@@ -1486,6 +1498,8 @@ struct ipr_ioa_cfg {
 	u8 cfg_locked:1;
 	u8 clear_isr:1;
 	u8 probe_done:1;
+	u8 scsi_unblock:1;
+	u8 scsi_blocked:1;
 
 	u8 revid;
 
@@ -1501,6 +1515,7 @@ struct ipr_ioa_cfg {
 	u8 log_level;
 #define IPR_MAX_LOG_LEVEL			4
 #define IPR_DEFAULT_LOG_LEVEL		2
+#define IPR_DEBUG_LOG_LEVEL		3
 
 #define IPR_NUM_TRACE_INDEX_BITS	8
 #define IPR_NUM_TRACE_ENTRIES		(1 << IPR_NUM_TRACE_INDEX_BITS)
@@ -1529,10 +1544,11 @@ struct ipr_ioa_cfg {
 
 	char ipr_hcam_label[8];
 #define IPR_HCAM_LABEL			"hcams"
-	struct ipr_hostrcb *hostrcb[IPR_NUM_HCAMS];
-	dma_addr_t hostrcb_dma[IPR_NUM_HCAMS];
+	struct ipr_hostrcb *hostrcb[IPR_MAX_HCAMS];
+	dma_addr_t hostrcb_dma[IPR_MAX_HCAMS];
 	struct list_head hostrcb_free_q;
 	struct list_head hostrcb_pending_q;
+	struct list_head hostrcb_report_q;
 
 	struct ipr_hrr_queue hrrq[IPR_MAX_HRRQ_NUM];
 	u32 hrrq_num;
@@ -1562,6 +1578,7 @@ struct ipr_ioa_cfg {
 	u8 saved_mode_page_len;
 
 	struct work_struct work_q;
+	struct work_struct scsi_add_work_q;
 	struct workqueue_struct *reset_work_q;
 
 	wait_queue_head_t reset_wait_q;
@@ -1574,7 +1591,7 @@ struct ipr_ioa_cfg {
 	struct ipr_misc_cbs *vpd_cbs;
 	dma_addr_t vpd_cbs_dma;
 
-	struct dma_pool *ipr_cmd_pool;
+	struct pci_pool *ipr_cmd_pool;
 
 	struct ipr_cmnd *reset_cmd;
 	int (*reset) (struct ipr_cmnd *);
@@ -1596,7 +1613,7 @@ struct ipr_ioa_cfg {
 
 	u32 iopoll_weight;
 
-};
+}; /* struct ipr_ioa_cfg */
 
 struct ipr_cmnd {
 	struct ipr_ioarcb ioarcb;
@@ -1924,7 +1941,9 @@ static inline int ipr_is_gata(struct ipr_resource_entry *res)
  **/
 static inline int ipr_is_naca_model(struct ipr_resource_entry *res)
 {
-	return ipr_is_gscsi(res) && res->qmodel == IPR_QUEUE_NACA_MODEL;
+	if (ipr_is_gscsi(res) && res->qmodel == IPR_QUEUE_NACA_MODEL)
+		return 1;
+	return 0;
 }
 
 /**
@@ -1947,8 +1966,8 @@ static inline int ipr_is_device(struct ipr_hostrcb *hostrcb)
 	} else {
 		res_addr = &hostrcb->hcam.u.error.fd_res_addr;
 
-		if (res_addr->bus < IPR_MAX_NUM_BUSES &&
-		    res_addr->target < IPR_MAX_NUM_TARGETS_PER_BUS - 1)
+		if ((res_addr->bus < IPR_MAX_NUM_BUSES) &&
+		    (res_addr->target < (IPR_MAX_NUM_TARGETS_PER_BUS - 1)))
 			return 1;
 	}
 	return 0;
@@ -1982,8 +2001,8 @@ static inline int ipr_sdt_is_fmt2(u32 sdt_word)
 #ifndef writeq
 static inline void writeq(u64 val, void __iomem *addr)
 {
-	writel(((u32) (val >> 32)), addr);
-	writel(((u32) (val)), (addr + 4));
+        writel(((u32) (val >> 32)), addr);
+        writel(((u32) (val)), (addr + 4));
 }
 #endif
 

@@ -174,11 +174,7 @@ static void sas_smp_request(struct request_queue *q, struct Scsi_Host *shost,
 	int ret;
 	int (*handler)(struct Scsi_Host *, struct sas_rphy *, struct request *);
 
-	while (!blk_queue_plugged(q)) {
-		req = blk_fetch_request(q);
-		if (!req)
-			break;
-
+	while ((req = blk_fetch_request(q)) != NULL) {
 		spin_unlock_irq(q->queue_lock);
 
 		handler = to_sas_internal(shost->transportt)->f->smp_handler;
@@ -259,6 +255,7 @@ static int sas_bsg_initialize(struct Scsi_Host *shost, struct sas_rphy *rphy)
 		q->queuedata = shost;
 
 	queue_flag_set_unlocked(QUEUE_FLAG_BIDI, q);
+	queue_flag_set_unlocked(QUEUE_FLAG_SCSI_PASSTHROUGH, q);
 	return 0;
 }
 
@@ -361,14 +358,32 @@ EXPORT_SYMBOL(sas_remove_children);
  * sas_remove_host  -  tear down a Scsi_Host's SAS data structures
  * @shost:	Scsi Host that is torn down
  *
- * Removes all SAS PHYs and remote PHYs for a given Scsi_Host.
- * Must be called just before scsi_remove_host for SAS HBAs.
+ * Removes all SAS PHYs and remote PHYs for a given Scsi_Host and remove the
+ * Scsi_Host as well.
+ *
+ * Note: Do not call scsi_remove_host() on the Scsi_Host any more, as it is
+ * already removed.
  */
 void sas_remove_host(struct Scsi_Host *shost)
 {
 	sas_remove_children(&shost->shost_gendev);
+	scsi_remove_host(shost);
 }
 EXPORT_SYMBOL(sas_remove_host);
+
+/**
+ * sas_get_address - return the SAS address of the device
+ * @sdev: scsi device
+ *
+ * Returns the SAS address of the scsi device
+ */
+u64 sas_get_address(struct scsi_device *sdev)
+{
+	struct sas_end_device *rdev = sas_sdev_to_rdev(sdev);
+
+	return rdev->rphy.identify.sas_address;
+}
+EXPORT_SYMBOL(sas_get_address);
 
 /**
  * sas_tlr_supported - checking TLR bit in vpd 0x90
@@ -774,7 +789,7 @@ EXPORT_SYMBOL(sas_phy_add);
  *
  * Note:
  *   This function must only be called on a PHY that has not
- *   sucessfully been added using sas_phy_add().
+ *   successfully been added using sas_phy_add().
  */
 void sas_phy_free(struct sas_phy *phy)
 {
@@ -1004,7 +1019,7 @@ EXPORT_SYMBOL(sas_port_add);
  *
  * Note:
  *   This function must only be called on a PORT that has not
- *   sucessfully been added using sas_port_add().
+ *   successfully been added using sas_port_add().
  */
 void sas_port_free(struct sas_port *port)
 {
@@ -1597,7 +1612,8 @@ int sas_rphy_add(struct sas_rphy *rphy)
 		else
 			lun = 0;
 
-		scsi_scan_target(&rphy->dev, 0, rphy->scsi_target_id, lun, 0);
+		scsi_scan_target(&rphy->dev, 0, rphy->scsi_target_id, lun,
+				 SCSI_SCAN_INITIAL);
 	}
 
 	return 0;
@@ -1612,7 +1628,7 @@ EXPORT_SYMBOL(sas_rphy_add);
  *
  * Note:
  *   This function must only be called on a remote
- *   PHY that has not sucessfully been added using
+ *   PHY that has not successfully been added using
  *   sas_rphy_add() (or has been sas_rphy_remove()'d)
  */
 void sas_rphy_free(struct sas_rphy *rphy)
@@ -1624,8 +1640,6 @@ void sas_rphy_free(struct sas_rphy *rphy)
 	mutex_lock(&sas_host->lock);
 	list_del(&rphy->list);
 	mutex_unlock(&sas_host->lock);
-
-	sas_bsg_remove(shost, rphy);
 
 	transport_destroy_device(dev);
 
@@ -1685,6 +1699,7 @@ sas_rphy_remove(struct sas_rphy *rphy)
 	}
 
 	sas_rphy_unlink(rphy);
+	sas_bsg_remove(NULL, rphy);
 	transport_remove_device(dev);
 	device_del(dev);
 }
@@ -1723,8 +1738,8 @@ static int sas_user_scan(struct Scsi_Host *shost, uint channel,
 
 		if ((channel == SCAN_WILD_CARD || channel == 0) &&
 		    (id == SCAN_WILD_CARD || id == rphy->scsi_target_id)) {
-			scsi_scan_target(&rphy->dev, 0,
-					 rphy->scsi_target_id, lun, 1);
+			scsi_scan_target(&rphy->dev, 0, rphy->scsi_target_id,
+					 lun, SCSI_SCAN_MANUAL);
 		}
 	}
 	mutex_unlock(&sas_host->lock);

@@ -1,7 +1,7 @@
 /*
  *  sata_sx4.c - Promise SATA
  *
- *  Maintained by:  Jeff Garzik <jgarzik@pobox.com>
+ *  Maintained by:  Tejun Heo <tj@kernel.org>
  *  		    Please ALWAYS copy linux-ide@vger.kernel.org
  *		    on emails.
  *
@@ -81,7 +81,7 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
-#include <linux/init.h>
+#include <linux/slab.h>
 #include <linux/blkdev.h>
 #include <linux/delay.h>
 #include <linux/interrupt.h>
@@ -272,9 +272,8 @@ static struct ata_port_operations pdc_20621_ops = {
 static const struct ata_port_info pdc_port_info[] = {
 	/* board_20621 */
 	{
-		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
-				  ATA_FLAG_SRST | ATA_FLAG_MMIO |
-				  ATA_FLAG_NO_ATAPI | ATA_FLAG_PIO_POLLING,
+		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_ATAPI |
+				  ATA_FLAG_PIO_POLLING,
 		.pio_mask	= ATA_PIO4,
 		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
@@ -301,11 +300,6 @@ static int pdc_port_start(struct ata_port *ap)
 {
 	struct device *dev = ap->host->dev;
 	struct pdc_port_priv *pp;
-	int rc;
-
-	rc = ata_port_start(ap);
-	if (rc)
-		return rc;
 
 	pp = devm_kzalloc(dev, sizeof(*pp), GFP_KERNEL);
 	if (!pp)
@@ -320,9 +314,8 @@ static int pdc_port_start(struct ata_port *ap)
 	return 0;
 }
 
-static inline void pdc20621_ata_sg(struct ata_taskfile *tf, u8 *buf,
-				   unsigned int portno,
-					   unsigned int total_len)
+static inline void pdc20621_ata_sg(u8 *buf, unsigned int portno,
+				   unsigned int total_len)
 {
 	u32 addr;
 	unsigned int dw = PDC_DIMM_APKT_PRD >> 2;
@@ -342,9 +335,8 @@ static inline void pdc20621_ata_sg(struct ata_taskfile *tf, u8 *buf,
 		buf32[dw], buf32[dw + 1]);
 }
 
-static inline void pdc20621_host_sg(struct ata_taskfile *tf, u8 *buf,
-				    unsigned int portno,
-					    unsigned int total_len)
+static inline void pdc20621_host_sg(u8 *buf, unsigned int portno,
+				    unsigned int total_len)
 {
 	u32 addr;
 	unsigned int dw = PDC_DIMM_HPKT_PRD >> 2;
@@ -491,10 +483,10 @@ static void pdc20621_dma_prep(struct ata_queued_cmd *qc)
 	/*
 	 * Build ATA, host DMA packets
 	 */
-	pdc20621_host_sg(&qc->tf, &pp->dimm_buf[0], portno, total_len);
+	pdc20621_host_sg(&pp->dimm_buf[0], portno, total_len);
 	pdc20621_host_pkt(&qc->tf, &pp->dimm_buf[0], portno);
 
-	pdc20621_ata_sg(&qc->tf, &pp->dimm_buf[0], portno, total_len);
+	pdc20621_ata_sg(&pp->dimm_buf[0], portno, total_len);
 	i = pdc20621_ata_pkt(&qc->tf, qc->dev->devno, &pp->dimm_buf[0], portno);
 
 	if (qc->tf.flags & ATA_TFLAG_LBA48)
@@ -925,7 +917,7 @@ static void pdc_error_handler(struct ata_port *ap)
 	if (!(ap->pflags & ATA_PFLAG_FROZEN))
 		pdc_reset_port(ap);
 
-	ata_std_error_handler(ap);
+	ata_sff_error_handler(ap);
 }
 
 static void pdc_post_internal_cmd(struct ata_queued_cmd *qc)
@@ -1249,8 +1241,12 @@ static unsigned int pdc20621_prog_dimm_global(struct ata_host *host)
 	readl(mmio + PDC_SDRAM_CONTROL);
 
 	/* Turn on for ECC */
-	pdc20621_i2c_read(host, PDC_DIMM0_SPD_DEV_ADDRESS,
-			  PDC_DIMM_SPD_TYPE, &spd0);
+	if (!pdc20621_i2c_read(host, PDC_DIMM0_SPD_DEV_ADDRESS,
+			       PDC_DIMM_SPD_TYPE, &spd0)) {
+		pr_err("Failed in i2c read: device=%#x, subaddr=%#x\n",
+		       PDC_DIMM0_SPD_DEV_ADDRESS, PDC_DIMM_SPD_TYPE);
+		return 1;
+	}
 	if (spd0 == 0x02) {
 		data |= (0x01 << 16);
 		writel(data, mmio + PDC_SDRAM_CONTROL);
@@ -1391,14 +1387,20 @@ static unsigned int pdc20621_dimm_init(struct ata_host *host)
 
 	/* ECC initiliazation. */
 
-	pdc20621_i2c_read(host, PDC_DIMM0_SPD_DEV_ADDRESS,
-			  PDC_DIMM_SPD_TYPE, &spd0);
+	if (!pdc20621_i2c_read(host, PDC_DIMM0_SPD_DEV_ADDRESS,
+			       PDC_DIMM_SPD_TYPE, &spd0)) {
+		pr_err("Failed in i2c read: device=%#x, subaddr=%#x\n",
+		       PDC_DIMM0_SPD_DEV_ADDRESS, PDC_DIMM_SPD_TYPE);
+		return 1;
+	}
 	if (spd0 == 0x02) {
 		void *buf;
 		VPRINTK("Start ECC initialization\n");
 		addr = 0;
 		length = size * 1024 * 1024;
 		buf = kzalloc(ECC_ERASE_BUF_SZ, GFP_KERNEL);
+		if (!buf)
+			return 1;
 		while (addr < length) {
 			pdc20621_put_to_dimm(host, buf, addr,
 					     ECC_ERASE_BUF_SZ);
@@ -1445,15 +1447,13 @@ static void pdc_20621_init(struct ata_host *host)
 static int pdc_sata_init_one(struct pci_dev *pdev,
 			     const struct pci_device_id *ent)
 {
-	static int printed_version;
 	const struct ata_port_info *ppi[] =
 		{ &pdc_port_info[ent->driver_data], NULL };
 	struct ata_host *host;
 	struct pdc_host_priv *hpriv;
 	int i, rc;
 
-	if (!printed_version++)
-		dev_printk(KERN_DEBUG, &pdev->dev, "version " DRV_VERSION "\n");
+	ata_print_version_once(&pdev->dev, DRV_VERSION);
 
 	/* allocate host */
 	host = ata_host_alloc_pinfo(&pdev->dev, ppi, 4);
@@ -1505,24 +1505,10 @@ static int pdc_sata_init_one(struct pci_dev *pdev,
 				 IRQF_SHARED, &pdc_sata_sht);
 }
 
-
-static int __init pdc_sata_init(void)
-{
-	return pci_register_driver(&pdc_sata_pci_driver);
-}
-
-
-static void __exit pdc_sata_exit(void)
-{
-	pci_unregister_driver(&pdc_sata_pci_driver);
-}
-
+module_pci_driver(pdc_sata_pci_driver);
 
 MODULE_AUTHOR("Jeff Garzik");
 MODULE_DESCRIPTION("Promise SATA low-level driver");
 MODULE_LICENSE("GPL");
 MODULE_DEVICE_TABLE(pci, pdc_sata_pci_tbl);
 MODULE_VERSION(DRV_VERSION);
-
-module_init(pdc_sata_init);
-module_exit(pdc_sata_exit);

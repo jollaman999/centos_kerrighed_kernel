@@ -95,13 +95,24 @@
 #define INAT_MAKE_GROUP(grp)	((grp << INAT_GRP_OFFS) | INAT_MODRM)
 #define INAT_MAKE_IMM(imm)	(imm << INAT_IMM_OFFS)
 
+/* Identifiers for segment registers */
+#define INAT_SEG_REG_IGNORE	0
+#define INAT_SEG_REG_DEFAULT	1
+#define INAT_SEG_REG_CS		2
+#define INAT_SEG_REG_SS		3
+#define INAT_SEG_REG_DS		4
+#define INAT_SEG_REG_ES		5
+#define INAT_SEG_REG_FS		6
+#define INAT_SEG_REG_GS		7
+
 /* Attribute search APIs */
 extern insn_attr_t inat_get_opcode_attribute(insn_byte_t opcode);
+extern int inat_get_last_prefix_id(insn_byte_t last_pfx);
 extern insn_attr_t inat_get_escape_attribute(insn_byte_t opcode,
-					     insn_byte_t last_pfx,
+					     int lpfx_id,
 					     insn_attr_t esc_attr);
 extern insn_attr_t inat_get_group_attribute(insn_byte_t modrm,
-					    insn_byte_t last_pfx,
+					    int lpfx_id,
 					    insn_attr_t esc_attr);
 extern insn_attr_t inat_get_avx_attribute(insn_byte_t opcode,
 					  insn_byte_t vex_m,

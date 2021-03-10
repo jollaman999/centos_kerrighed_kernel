@@ -14,78 +14,116 @@
  */
 
 #include <linux/netdevice.h>
+#include <linux/notifier.h>
+#include <linux/export.h>
 
 #include <net/fib_rules.h>
 #include <net/ipv6.h>
 #include <net/addrconf.h>
 #include <net/ip6_route.h>
 #include <net/netlink.h>
-#include <linux/route.h>
 
-struct fib6_rule
-{
+struct fib6_rule {
 	struct fib_rule		common;
 	struct rt6key		src;
 	struct rt6key		dst;
 	u8			tclass;
 };
 
-struct dst_entry *fib6_rule_lookup(struct net *net, struct flowi *fl,
+static bool fib6_rule_matchall(const struct fib_rule *rule)
+{
+	struct fib6_rule *r = container_of(rule, struct fib6_rule, common);
+
+	if (r->dst.plen || r->src.plen || r->tclass)
+		return false;
+	return fib_rule_matchall(rule);
+}
+
+bool fib6_rule_default(const struct fib_rule *rule)
+{
+	if (!fib6_rule_matchall(rule) || rule->action != FR_ACT_TO_TBL ||
+	    0) /* rule->l3mdev - VRF is missing in RHEL */
+		return false;
+	if (rule->table != RT6_TABLE_LOCAL && rule->table != RT6_TABLE_MAIN)
+		return false;
+	return true;
+}
+EXPORT_SYMBOL_GPL(fib6_rule_default);
+
+int fib6_rules_dump(struct net *net, struct notifier_block *nb)
+{
+	return fib_rules_dump(net, nb, AF_INET6);
+}
+
+unsigned int fib6_rules_seq_read(struct net *net)
+{
+	return fib_rules_seq_read(net, AF_INET6);
+}
+
+struct dst_entry *fib6_rule_lookup(struct net *net, struct flowi6 *fl6,
 				   int flags, pol_lookup_t lookup)
 {
 	struct rt6_info *rt;
 	struct fib_lookup_arg arg = {
 		.lookup_ptr = lookup,
+		.flags = FIB_LOOKUP_NOREF,
 	};
 
-	fib_rules_lookup(net->ipv6.fib6_rules_ops, fl, flags, &arg);
-	if (arg.rule)
-		fib_rule_put(arg.rule);
+	fib_rules_lookup(net->ipv6.fib6_rules_ops,
+			 flowi6_to_flowi(fl6), flags, &arg);
 
 	rt = arg.result;
 
 	if (!rt) {
-		dst_hold(&net->ipv6.ip6_null_entry->u.dst);
-		return &net->ipv6.ip6_null_entry->u.dst;
+		dst_hold(&net->ipv6.ip6_null_entry->dst);
+		return &net->ipv6.ip6_null_entry->dst;
 	}
 
 	if (rt->rt6i_flags & RTF_REJECT &&
-	    rt->u.dst.error == -EAGAIN) {
-		dst_release(&rt->u.dst);
+	    rt->dst.error == -EAGAIN) {
+		ip6_rt_put(rt);
 		rt = net->ipv6.ip6_null_entry;
-		dst_hold(&rt->u.dst);
+		dst_hold(&rt->dst);
 	}
 
-	return &rt->u.dst;
+	return &rt->dst;
 }
 
 static int fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 			    int flags, struct fib_lookup_arg *arg)
 {
+	struct flowi6 *flp6 = &flp->u.ip6;
 	struct rt6_info *rt = NULL;
 	struct fib6_table *table;
 	struct net *net = rule->fr_net;
 	pol_lookup_t lookup = arg->lookup_ptr;
+	int err = 0;
 
 	switch (rule->action) {
 	case FR_ACT_TO_TBL:
 		break;
 	case FR_ACT_UNREACHABLE:
+		err = -ENETUNREACH;
 		rt = net->ipv6.ip6_null_entry;
 		goto discard_pkt;
 	default:
 	case FR_ACT_BLACKHOLE:
+		err = -EINVAL;
 		rt = net->ipv6.ip6_blk_hole_entry;
 		goto discard_pkt;
 	case FR_ACT_PROHIBIT:
+		err = -EACCES;
 		rt = net->ipv6.ip6_prohibit_entry;
 		goto discard_pkt;
 	}
 
 	table = fib6_get_table(net, rule->table);
-	if (table)
-		rt = lookup(net, table, flp, flags);
+	if (!table) {
+		err = -EAGAIN;
+		goto out;
+	}
 
+	rt = lookup(net, table, flp6, flags);
 	if (rt != net->ipv6.ip6_null_entry) {
 		struct fib6_rule *r = (struct fib6_rule *)rule;
 
@@ -96,46 +134,53 @@ static int fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 		if ((rule->flags & FIB_RULE_FIND_SADDR) &&
 		    r->src.plen && !(flags & RT6_LOOKUP_F_HAS_SADDR)) {
 			struct in6_addr saddr;
-			unsigned int srcprefs = 0;
-
-			if (flags & RT6_LOOKUP_F_SRCPREF_TMP)
-				srcprefs |= IPV6_PREFER_SRC_TMP;
-			if (flags & RT6_LOOKUP_F_SRCPREF_PUBLIC)
-				srcprefs |= IPV6_PREFER_SRC_PUBLIC;
-			if (flags & RT6_LOOKUP_F_SRCPREF_COA)
-				srcprefs |= IPV6_PREFER_SRC_COA;
 
 			if (ipv6_dev_get_saddr(net,
-					       ip6_dst_idev(&rt->u.dst)->dev,
-					       &flp->fl6_dst, srcprefs,
+					       ip6_dst_idev(&rt->dst)->dev,
+					       &flp6->daddr,
+					       rt6_flags2srcprefs(flags),
 					       &saddr))
 				goto again;
 			if (!ipv6_prefix_equal(&saddr, &r->src.addr,
 					       r->src.plen))
 				goto again;
-			ipv6_addr_copy(&flp->fl6_src, &saddr);
+			flp6->saddr = saddr;
 		}
 		goto out;
 	}
 again:
-	dst_release(&rt->u.dst);
+	ip6_rt_put(rt);
+	err = -EAGAIN;
 	rt = NULL;
 	goto out;
 
 discard_pkt:
-	dst_hold(&rt->u.dst);
+	dst_hold(&rt->dst);
 out:
 	arg->result = rt;
-	return rt == NULL ? -EAGAIN : 0;
+	return err;
 }
 
+static bool fib6_rule_suppress(struct fib_rule *rule, struct fib_lookup_arg *arg)
+{
+	struct rt6_info *rt = (struct rt6_info *) arg->result;
+	/* do not accept result if the route does
+	 * not meet the required prefix length
+	 */
+	if (rt->rt6i_dst.plen <= rule->suppress_prefixlen) {
+		ip6_rt_put(rt);
+		return true;
+	}
+	return false;
+}
 
 static int fib6_rule_match(struct fib_rule *rule, struct flowi *fl, int flags)
 {
 	struct fib6_rule *r = (struct fib6_rule *) rule;
+	struct flowi6 *fl6 = &fl->u.ip6;
 
 	if (r->dst.plen &&
-	    !ipv6_prefix_equal(&fl->fl6_dst, &r->dst.addr, r->dst.plen))
+	    !ipv6_prefix_equal(&fl6->daddr, &r->dst.addr, r->dst.plen))
 		return 0;
 
 	/*
@@ -145,14 +190,14 @@ static int fib6_rule_match(struct fib_rule *rule, struct flowi *fl, int flags)
 	 */
 	if (r->src.plen) {
 		if (flags & RT6_LOOKUP_F_HAS_SADDR) {
-			if (!ipv6_prefix_equal(&fl->fl6_src, &r->src.addr,
+			if (!ipv6_prefix_equal(&fl6->saddr, &r->src.addr,
 					       r->src.plen))
 				return 0;
 		} else if (!(r->common.flags & FIB_RULE_FIND_SADDR))
 			return 0;
 	}
 
-	if (r->tclass && r->tclass != ((ntohl(fl->fl6_flowlabel) >> 20) & 0xff))
+	if (r->tclass && r->tclass != ip6_tclass(fl6->flowlabel))
 		return 0;
 
 	return 1;
@@ -181,12 +226,10 @@ static int fib6_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
 	}
 
 	if (frh->src_len)
-		nla_memcpy(&rule6->src.addr, tb[FRA_SRC],
-			   sizeof(struct in6_addr));
+		rule6->src.addr = nla_get_in6_addr(tb[FRA_SRC]);
 
 	if (frh->dst_len)
-		nla_memcpy(&rule6->dst.addr, tb[FRA_DST],
-			   sizeof(struct in6_addr));
+		rule6->dst.addr = nla_get_in6_addr(tb[FRA_DST]);
 
 	rule6->src.plen = frh->src_len;
 	rule6->dst.plen = frh->dst_len;
@@ -231,14 +274,11 @@ static int fib6_rule_fill(struct fib_rule *rule, struct sk_buff *skb,
 	frh->src_len = rule6->src.plen;
 	frh->tos = rule6->tclass;
 
-	if (rule6->dst.plen)
-		NLA_PUT(skb, FRA_DST, sizeof(struct in6_addr),
-			&rule6->dst.addr);
-
-	if (rule6->src.plen)
-		NLA_PUT(skb, FRA_SRC, sizeof(struct in6_addr),
-			&rule6->src.addr);
-
+	if ((rule6->dst.plen &&
+	     nla_put_in6_addr(skb, FRA_DST, &rule6->dst.addr)) ||
+	    (rule6->src.plen &&
+	     nla_put_in6_addr(skb, FRA_SRC, &rule6->src.addr)))
+		goto nla_put_failure;
 	return 0;
 
 nla_put_failure:
@@ -251,12 +291,13 @@ static size_t fib6_rule_nlmsg_payload(struct fib_rule *rule)
 	       + nla_total_size(16); /* src */
 }
 
-static struct fib_rules_ops fib6_rules_ops_template = {
+static const struct fib_rules_ops __net_initconst fib6_rules_ops_template = {
 	.family			= AF_INET6,
 	.rule_size		= sizeof(struct fib6_rule),
 	.addr_size		= sizeof(struct in6_addr),
 	.action			= fib6_rule_action,
 	.match			= fib6_rule_match,
+	.suppress		= fib6_rule_suppress,
 	.configure		= fib6_rule_configure,
 	.compare		= fib6_rule_compare,
 	.fill			= fib6_rule_fill,
@@ -267,46 +308,38 @@ static struct fib_rules_ops fib6_rules_ops_template = {
 	.fro_net		= &init_net,
 };
 
-static int fib6_rules_net_init(struct net *net)
+static int __net_init fib6_rules_net_init(struct net *net)
 {
+	struct fib_rules_ops *ops;
 	int err = -ENOMEM;
 
-	net->ipv6.fib6_rules_ops = kmemdup(&fib6_rules_ops_template,
-					   sizeof(*net->ipv6.fib6_rules_ops),
-					   GFP_KERNEL);
-	if (!net->ipv6.fib6_rules_ops)
-		goto out;
+	ops = fib_rules_register(&fib6_rules_ops_template, net);
+	if (IS_ERR(ops))
+		return PTR_ERR(ops);
+	net->ipv6.fib6_rules_ops = ops;
 
-	net->ipv6.fib6_rules_ops->fro_net = net;
-	INIT_LIST_HEAD(&net->ipv6.fib6_rules_ops->rules_list);
 
 	err = fib_default_rule_add(net->ipv6.fib6_rules_ops, 0,
-				   RT6_TABLE_LOCAL, FIB_RULE_PERMANENT);
+				   RT6_TABLE_LOCAL, 0);
 	if (err)
 		goto out_fib6_rules_ops;
 
 	err = fib_default_rule_add(net->ipv6.fib6_rules_ops,
 				   0x7FFE, RT6_TABLE_MAIN, 0);
 	if (err)
-		goto out_fib6_default_rule_add;
+		goto out_fib6_rules_ops;
 
-	err = fib_rules_register(net->ipv6.fib6_rules_ops);
-	if (err)
-		goto out_fib6_default_rule_add;
 out:
 	return err;
 
-out_fib6_default_rule_add:
-	fib_rules_cleanup_ops(net->ipv6.fib6_rules_ops);
 out_fib6_rules_ops:
-	kfree(net->ipv6.fib6_rules_ops);
+	fib_rules_unregister(ops);
 	goto out;
 }
 
-static void fib6_rules_net_exit(struct net *net)
+static void __net_exit fib6_rules_net_exit(struct net *net)
 {
 	fib_rules_unregister(net->ipv6.fib6_rules_ops);
-	kfree(net->ipv6.fib6_rules_ops);
 }
 
 static struct pernet_operations fib6_rules_net_ops = {

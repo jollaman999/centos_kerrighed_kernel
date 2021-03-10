@@ -36,7 +36,7 @@ static int dtc_abort(Scsi_Cmnd *);
 static int dtc_biosparam(struct scsi_device *, struct block_device *,
 		         sector_t, int*);
 static int dtc_detect(struct scsi_host_template *);
-static int dtc_queue_command(Scsi_Cmnd *, void (*done)(Scsi_Cmnd *));
+static int dtc_queue_command(struct Scsi_Host *, struct scsi_cmnd *);
 static int dtc_bus_reset(Scsi_Cmnd *);
 
 #ifndef CMD_PER_LUN
@@ -88,7 +88,8 @@ static int dtc_bus_reset(Scsi_Cmnd *);
 #define NCR5380_queue_command		dtc_queue_command
 #define NCR5380_abort			dtc_abort
 #define NCR5380_bus_reset		dtc_bus_reset
-#define NCR5380_proc_info		dtc_proc_info 
+#define NCR5380_show_info		dtc_show_info 
+#define NCR5380_write_info		dtc_write_info 
 
 /* 15 12 11 10
    1001 1100 0000 0000 */

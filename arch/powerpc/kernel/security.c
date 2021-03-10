@@ -8,6 +8,7 @@
 #include <linux/device.h>
 #include <linux/seq_buf.h>
 #include <linux/debugfs.h>
+#include <linux/cpu.h>
 
 #include <asm/asm-prototypes.h>
 #include <asm/code-patching.h>
@@ -57,7 +58,7 @@ void setup_barrier_nospec(void)
 	enable = security_ftr_enabled(SEC_FTR_FAVOUR_SECURITY) &&
 		 security_ftr_enabled(SEC_FTR_BNDS_CHK_SPEC_BAR);
 
-	if (!no_nospec)
+	if (!no_nospec && !cpu_mitigations_off())
 		enable_barrier_nospec(enable);
 }
 
@@ -119,7 +120,7 @@ early_param("nospectre_v2", handle_nospectre_v2);
 #ifdef CONFIG_PPC_FSL_BOOK3E
 void setup_spectre_v2(void)
 {
-	if (no_spectrev2)
+	if (no_spectrev2 || cpu_mitigations_off())
 		do_btb_flush_fixups();
 	else
 		btb_flush_enabled = true;
@@ -272,7 +273,6 @@ early_param("nospec_store_bypass_disable", handle_no_ssbd);
 
 static void stf_barrier_enable(bool enable)
 {
-
 	if (enable)
 		do_stf_barrier_fixups(stf_enabled_flush_types);
 	else
@@ -286,19 +286,14 @@ void setup_stf_barrier(void)
 	enum stf_barrier_type type;
 	bool enable, hv;
 
-#ifdef CPU_FTR_HVMODE
 	hv = cpu_has_feature(CPU_FTR_HVMODE);
-#else
-	hv = false;
-#endif
 
 	/* Default to fallback in case fw-features are not available */
-
-	/*
-	 * RHEL 6 does not support POWER9 nor POWER8, only POWER7.
-	 * Use CPU_FTR_ASYM_SMT to detect POWER7 (no CPU_FTR_ARCH_206 yet).
-	 * */
-	if (cpu_has_feature(CPU_FTR_ASYM_SMT))
+	if (cpu_has_feature(CPU_FTR_ARCH_300))
+		type = STF_BARRIER_EIEIO;
+	else if (cpu_has_feature(CPU_FTR_ARCH_207S))
+		type = STF_BARRIER_SYNC_ORI;
+	else if (cpu_has_feature(CPU_FTR_ARCH_206))
 		type = STF_BARRIER_FALLBACK;
 	else
 		type = STF_BARRIER_NONE;
@@ -317,7 +312,7 @@ void setup_stf_barrier(void)
 
 	stf_enabled_flush_types = type;
 
-	if (!no_stf_barrier)
+	if (!no_stf_barrier && !cpu_mitigations_off())
 		stf_barrier_enable(enable);
 }
 
@@ -397,6 +392,9 @@ static void toggle_count_cache_flush(bool enable)
 
 	if (!enable) {
 		patch_instruction_site(&patch__call_flush_count_cache, PPC_INST_NOP);
+#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+		patch_instruction_site(&patch__call_kvm_flush_link_stack, PPC_INST_NOP);
+#endif
 		pr_info("link-stack-flush: software flush disabled.\n");
 		link_stack_flush_enabled = false;
 		no_count_cache_flush();
@@ -406,6 +404,12 @@ static void toggle_count_cache_flush(bool enable)
 	// This enables the branch from _switch to flush_count_cache
 	patch_branch_site(&patch__call_flush_count_cache,
 			  (u64)&flush_count_cache, BRANCH_SET_LINK);
+
+#ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+	// This enables the branch from guest_exit_cont to kvm_flush_link_stack
+	patch_branch_site(&patch__call_kvm_flush_link_stack,
+			  (u64)&kvm_flush_link_stack, BRANCH_SET_LINK);
+#endif
 
 	pr_info("link-stack-flush: software flush enabled.\n");
 	link_stack_flush_enabled = true;
@@ -432,7 +436,7 @@ void setup_count_cache_flush(void)
 {
 	bool enable = true;
 
-	if (no_spectrev2) {
+	if (no_spectrev2 || cpu_mitigations_off()) {
 		if (security_ftr_enabled(SEC_FTR_BCCTRL_SERIALISED) ||
 		    security_ftr_enabled(SEC_FTR_COUNT_CACHE_DISABLED))
 			pr_warn("Spectre v2 mitigations not fully under software control, can't disable\n");

@@ -17,7 +17,6 @@
 #include <linux/types.h>
 #include <linux/ptrace.h>
 #include <linux/mman.h>
-#include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/swap.h>
@@ -27,9 +26,9 @@
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
 #include <linux/bootmem.h>
+#include <linux/gfp.h>
 
 #include <asm/processor.h>
-#include <asm/system.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -37,9 +36,11 @@
 #include <asm/tlb.h>
 #include <asm/sections.h>
 
-DEFINE_PER_CPU(struct mmu_gather, mmu_gathers);
-
 unsigned long highstart_pfn, highend_pfn;
+
+#ifdef CONFIG_MN10300_HAS_ATOMIC_OPS_UNIT
+static struct vm_struct user_iomap_vm;
+#endif
 
 /*
  * set up paging
@@ -73,7 +74,24 @@ void __init paging_init(void)
 	/* pass the memory from the bootmem allocator to the main allocator */
 	free_area_init(zones_size);
 
-	__flush_tlb_all();
+#ifdef CONFIG_MN10300_HAS_ATOMIC_OPS_UNIT
+	/* The Atomic Operation Unit registers need to be mapped to userspace
+	 * for all processes.  The following uses vm_area_register_early() to
+	 * reserve the first page of the vmalloc area and sets the pte for that
+	 * page.
+	 *
+	 * glibc hardcodes this virtual mapping, so we're pretty much stuck with
+	 * it from now on.
+	 */
+	user_iomap_vm.flags = VM_USERMAP;
+	user_iomap_vm.size = 1 << PAGE_SHIFT;
+	vm_area_register_early(&user_iomap_vm, PAGE_SIZE);
+	ppte = kernel_vmalloc_ptes;
+	set_pte(ppte, pfn_pte(USER_ATOMIC_OPS_PAGE_ADDR >> PAGE_SHIFT,
+			      PAGE_USERIO));
+#endif
+
+	local_flush_tlb_all();
 }
 
 /*
@@ -84,8 +102,7 @@ void __init mem_init(void)
 	int codesize, reservedpages, datasize, initsize;
 	int tmp;
 
-	if (!mem_map)
-		BUG();
+	BUG_ON(!mem_map);
 
 #define START_PFN	(contig_page_data.bdata->node_min_pfn)
 #define MAX_LOW_PFN	(contig_page_data.bdata->node_low_pfn)
@@ -118,25 +135,7 @@ void __init mem_init(void)
 	       reservedpages << (PAGE_SHIFT - 10),
 	       datasize >> 10,
 	       initsize >> 10,
-	       (unsigned long) (totalhigh_pages << (PAGE_SHIFT - 10))
-	       );
-}
-
-/*
- *
- */
-void free_init_pages(char *what, unsigned long begin, unsigned long end)
-{
-	unsigned long addr;
-
-	for (addr = begin; addr < end; addr += PAGE_SIZE) {
-		ClearPageReserved(virt_to_page(addr));
-		init_page_count(virt_to_page(addr));
-		memset((void *) addr, 0xcc, PAGE_SIZE);
-		free_page(addr);
-		totalram_pages++;
-	}
-	printk(KERN_INFO "Freeing %s: %ldk freed\n", what, (end - begin) >> 10);
+	       totalhigh_pages << (PAGE_SHIFT - 10));
 }
 
 /*
@@ -144,9 +143,7 @@ void free_init_pages(char *what, unsigned long begin, unsigned long end)
  */
 void free_initmem(void)
 {
-	free_init_pages("unused kernel memory",
-			(unsigned long) &__init_begin,
-			(unsigned long) &__init_end);
+	free_initmem_default(POISON_FREE_INITMEM);
 }
 
 /*
@@ -155,6 +152,6 @@ void free_initmem(void)
 #ifdef CONFIG_BLK_DEV_INITRD
 void free_initrd_mem(unsigned long start, unsigned long end)
 {
-	free_init_pages("initrd memory", start, end);
+	free_reserved_area(start, end, POISON_FREE_INITMEM, "initrd");
 }
 #endif

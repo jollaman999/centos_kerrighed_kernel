@@ -11,6 +11,8 @@
 #include <linux/fb.h>
 #include <linux/interrupt.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
+#include <linux/module.h>
 
 #include "carminefb.h"
 #include "carminefb_regs.h"
@@ -31,11 +33,11 @@
 #define CARMINEFB_DEFAULT_VIDEO_MODE	1
 
 static unsigned int fb_mode = CARMINEFB_DEFAULT_VIDEO_MODE;
-module_param(fb_mode, uint, 444);
+module_param(fb_mode, uint, 0444);
 MODULE_PARM_DESC(fb_mode, "Initial video mode as integer.");
 
 static char *fb_mode_str;
-module_param(fb_mode_str, charp, 444);
+module_param(fb_mode_str, charp, 0444);
 MODULE_PARM_DESC(fb_mode_str, "Initial video mode in characters.");
 
 /*
@@ -45,7 +47,7 @@ MODULE_PARM_DESC(fb_mode_str, "Initial video mode in characters.");
  * 0b010 Display 1
  */
 static int fb_displays = CARMINE_USE_DISPLAY0 | CARMINE_USE_DISPLAY1;
-module_param(fb_displays, int, 444);
+module_param(fb_displays, int, 0444);
 MODULE_PARM_DESC(fb_displays, "Bit mode, which displays are used");
 
 struct carmine_hw {
@@ -76,7 +78,7 @@ struct carmine_fb {
 	u32 pseudo_palette[16];
 };
 
-static struct fb_fix_screeninfo carminefb_fix __devinitdata = {
+static struct fb_fix_screeninfo carminefb_fix = {
 	.id = "Carmine",
 	.type = FB_TYPE_PACKED_PIXELS,
 	.visual = FB_VISUAL_TRUECOLOR,
@@ -431,7 +433,7 @@ static int init_hardware(struct carmine_hw *hw)
 	u32 loops;
 	u32 ret;
 
-	/* Initalize Carmine */
+	/* Initialize Carmine */
 	/* Sets internal clock */
 	c_set_hw_reg(hw, CARMINE_CTL_REG + CARMINE_CTL_REG_CLOCK_ENABLE,
 			CARMINE_DFLT_IP_CLOCK_ENABLE);
@@ -535,8 +537,9 @@ static struct fb_ops carminefb_ops = {
 	.fb_setcolreg	= carmine_setcolreg,
 };
 
-static int __devinit alloc_carmine_fb(void __iomem *regs, void __iomem *smem_base,
-		int smem_offset, struct device *device, struct fb_info **rinfo)
+static int alloc_carmine_fb(void __iomem *regs, void __iomem *smem_base,
+			    int smem_offset, struct device *device,
+			    struct fb_info **rinfo)
 {
 	int ret;
 	struct fb_info *info;
@@ -604,8 +607,7 @@ static void cleanup_fb_device(struct fb_info *info)
 	}
 }
 
-static int __devinit carminefb_probe(struct pci_dev *dev,
-		const struct pci_device_id *ent)
+static int carminefb_probe(struct pci_dev *dev, const struct pci_device_id *ent)
 {
 	struct carmine_hw *hw;
 	struct device *device = &dev->dev;
@@ -653,7 +655,7 @@ static int __devinit carminefb_probe(struct pci_dev *dev,
 		printk(KERN_ERR "carminefb: Memory bar is only %d bytes, %d "
 				"are required.", carminefb_fix.smem_len,
 				CARMINE_TOTAL_DIPLAY_MEM);
-		goto err_free_reg_mmio;
+		goto err_unmap_vregs;
 	}
 
 	if (!request_mem_region(carminefb_fix.smem_start,
@@ -666,8 +668,6 @@ static int __devinit carminefb_probe(struct pci_dev *dev,
 			carminefb_fix.smem_len);
 	if (!hw->screen_mem) {
 		printk(KERN_ERR "carmine: Can't ioremap smem area.\n");
-		release_mem_region(carminefb_fix.smem_start,
-				carminefb_fix.smem_len);
 		goto err_reg_smem;
 	}
 
@@ -709,7 +709,7 @@ err_deinit_hw:
 err_unmap_screen:
 	iounmap(hw->screen_mem);
 err_reg_smem:
-	release_mem_region(carminefb_fix.mmio_start, carminefb_fix.mmio_len);
+	release_mem_region(carminefb_fix.smem_start, carminefb_fix.smem_len);
 err_unmap_vregs:
 	iounmap(hw->v_regs);
 err_free_reg_mmio:
@@ -721,7 +721,7 @@ err_enable_pci:
 	return ret;
 }
 
-static void __devexit carminefb_remove(struct pci_dev *dev)
+static void carminefb_remove(struct pci_dev *dev)
 {
 	struct carmine_hw *hw = pci_get_drvdata(dev);
 	struct fb_fix_screeninfo fix;
@@ -752,7 +752,7 @@ static void __devexit carminefb_remove(struct pci_dev *dev)
 }
 
 #define PCI_VENDOR_ID_FUJITU_LIMITED 0x10cf
-static struct pci_device_id carmine_devices[] __devinitdata = {
+static struct pci_device_id carmine_devices[] = {
 {
 	PCI_DEVICE(PCI_VENDOR_ID_FUJITU_LIMITED, 0x202b)},
 	{0, 0, 0, 0, 0, 0, 0}
@@ -764,7 +764,7 @@ static struct pci_driver carmine_pci_driver = {
 	.name		= "carminefb",
 	.id_table	= carmine_devices,
 	.probe		= carminefb_probe,
-	.remove		= __devexit_p(carminefb_remove),
+	.remove		= carminefb_remove,
 };
 
 static int __init carminefb_init(void)

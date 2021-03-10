@@ -233,6 +233,7 @@
 #include <linux/interrupt.h>
 #include <linux/init.h>
 #include <linux/spinlock.h>
+#include <linux/slab.h>
 #include <asm/io.h>
 
 #include <scsi/scsi.h>
@@ -564,12 +565,12 @@ dc390_StartSCSI( struct dc390_acb* pACB, struct dc390_dcb* pDCB, struct dc390_sr
 	pDCB->TagMask |= 1 << tag[1];
 	pSRB->TagNumber = tag[1];
 	DC390_write8(ScsiFifo, tag[1]);
-	DEBUG1(printk(KERN_INFO "DC390: Select w/DisCn for Cmd %li (SRB %p), block tag %02x\n", scmd->serial_number, pSRB, tag[1]));
+	DEBUG1(printk(KERN_INFO "DC390: Select w/DisCn for SRB %p, block tag %02x\n", pSRB, tag[1]));
 	cmd = SEL_W_ATN3;
     } else {
 	/* No TagQ */
 //no_tag:
-	DEBUG1(printk(KERN_INFO "DC390: Select w%s/DisCn for Cmd %li (SRB %p), No TagQ\n", disc_allowed ? "" : "o", scmd->serial_number, pSRB));
+	DEBUG1(printk(KERN_INFO "DC390: Select w%s/DisCn for SRB %p, No TagQ\n", disc_allowed ? "" : "o", pSRB));
     }
 
     pSRB->SRBState = SRB_START_;
@@ -619,8 +620,8 @@ dc390_StartSCSI( struct dc390_acb* pACB, struct dc390_dcb* pDCB, struct dc390_sr
     if (DC390_read8 (Scsi_Status) & INTERRUPT)
     {
 	dc390_freetag (pDCB, pSRB);
-	DEBUG0(printk ("DC390: Interrupt during Start SCSI (pid %li, target %02i-%02i)\n",
-		scmd->serial_number, scmd->device->id, scmd->device->lun));
+	DEBUG0(printk ("DC390: Interrupt during Start SCSI (target %02i-%02i)\n",
+		scmd->device->id, scmd->device->lun));
 	pSRB->SRBState = SRB_READY;
 	//DC390_write8 (ScsiCmd, CLEAR_FIFO_CMD);
 	pACB->SelLost++;
@@ -1704,8 +1705,7 @@ dc390_SRBdone( struct dc390_acb* pACB, struct dc390_dcb* pDCB, struct dc390_srb*
 
     status = pSRB->TargetStatus;
 
-    DEBUG0(printk (" SRBdone (%02x,%08x), SRB %p, pid %li\n", status, pcmd->result,\
-		pSRB, pcmd->serial_number));
+    DEBUG0(printk (" SRBdone (%02x,%08x), SRB %p\n", status, pcmd->result, pSRB));
     if(pSRB->SRBFlag & AUTO_REQSENSE)
     {	/* Last command was a Request Sense */
 	pSRB->SRBFlag &= ~AUTO_REQSENSE;
@@ -1726,7 +1726,7 @@ dc390_SRBdone( struct dc390_acb* pACB, struct dc390_dcb* pDCB, struct dc390_srb*
 	    } else {
 		SET_RES_DRV(pcmd->result, DRIVER_SENSE);
 		//pSRB->ScsiCmdLen	 = (u8) (pSRB->Segment1[0] >> 8);
-		DEBUG0 (printk ("DC390: RETRY pid %li (%02x), target %02i-%02i\n", pcmd->serial_number, pcmd->cmnd[0], pcmd->device->id, pcmd->device->lun));
+		DEBUG0 (printk ("DC390: RETRY (%02x), target %02i-%02i\n", pcmd->cmnd[0], pcmd->device->id, pcmd->device->lun));
 		pSRB->TotalXferredLen = 0;
 		SET_RES_DID(pcmd->result, DID_SOFT_ERROR);
 	    }
@@ -1746,7 +1746,7 @@ dc390_SRBdone( struct dc390_acb* pACB, struct dc390_dcb* pDCB, struct dc390_srb*
 	else if (status == SAM_STAT_TASK_SET_FULL)
 	{
 	    scsi_track_queue_full(pcmd->device, pDCB->GoingSRBCnt - 1);
-	    DEBUG0 (printk ("DC390: RETRY pid %li (%02x), target %02i-%02i\n", pcmd->serial_number, pcmd->cmnd[0], pcmd->device->id, pcmd->device->lun));
+	    DEBUG0 (printk ("DC390: RETRY (%02x), target %02i-%02i\n", pcmd->cmnd[0], pcmd->device->id, pcmd->device->lun));
 	    pSRB->TotalXferredLen = 0;
 	    SET_RES_DID(pcmd->result, DID_SOFT_ERROR);
 	}
@@ -1800,7 +1800,7 @@ cmd_done:
     /* Add to free list */
     dc390_Free_insert (pACB, pSRB);
 
-    DEBUG0(printk (KERN_DEBUG "DC390: SRBdone: done pid %li\n", pcmd->serial_number));
+    DEBUG0(printk (KERN_DEBUG "DC390: SRBdone: done\n"));
     pcmd->scsi_done (pcmd);
 
     return;
@@ -1882,7 +1882,7 @@ dc390_ScsiRstDetect( struct dc390_acb* pACB )
     return;
 }
 
-static int DC390_queuecommand(struct scsi_cmnd *cmd,
+static int DC390_queuecommand_lck(struct scsi_cmnd *cmd,
 		void (*done)(struct scsi_cmnd *))
 {
 	struct scsi_device *sdev = cmd->device;
@@ -1943,6 +1943,8 @@ static int DC390_queuecommand(struct scsi_cmnd *cmd,
 	return SCSI_MLQUEUE_DEVICE_BUSY;
 }
 
+static DEF_SCSI_QCMD(DC390_queuecommand)
+
 static void dc390_dumpinfo (struct dc390_acb* pACB, struct dc390_dcb* pDCB, struct dc390_srb* pSRB)
 {
     struct pci_dev *pdev;
@@ -1994,8 +1996,7 @@ static int DC390_abort(struct scsi_cmnd *cmd)
 	struct dc390_acb *pACB = (struct dc390_acb*) cmd->device->host->hostdata;
 	struct dc390_dcb *pDCB = (struct dc390_dcb*) cmd->device->hostdata;
 
-	scmd_printk(KERN_WARNING, cmd,
-		"DC390: Abort command (pid %li)\n", cmd->serial_number);
+	scmd_printk(KERN_WARNING, cmd, "DC390: Abort command\n");
 
 	/* abort() is too stupid for already sent commands at the moment. 
 	 * If it's called we are in trouble anyway, so let's dump some info 
@@ -2003,7 +2004,7 @@ static int DC390_abort(struct scsi_cmnd *cmd)
 	dc390_dumpinfo(pACB, pDCB, NULL);
 
 	pDCB->DCBFlag |= ABORT_DEV_;
-	printk(KERN_INFO "DC390: Aborted pid %li\n", cmd->serial_number);
+	printk(KERN_INFO "DC390: Aborted.\n");
 
 	return FAILED;
 }
@@ -2218,7 +2219,7 @@ static struct scsi_host_template driver_template = {
  *
  **********************************************************************/
 
-static void __devinit dc390_eeprom_prepare_read(struct pci_dev *pdev, u8 cmd)
+static void dc390_eeprom_prepare_read(struct pci_dev *pdev, u8 cmd)
 {
 	u8 carryFlag = 1, j = 0x80, bval;
 	int i;
@@ -2241,7 +2242,7 @@ static void __devinit dc390_eeprom_prepare_read(struct pci_dev *pdev, u8 cmd)
 	}
 }
 
-static u16 __devinit dc390_eeprom_get_data(struct pci_dev *pdev)
+static u16 dc390_eeprom_get_data(struct pci_dev *pdev)
 {
 	int i;
 	u16 wval = 0;
@@ -2263,7 +2264,7 @@ static u16 __devinit dc390_eeprom_get_data(struct pci_dev *pdev)
 	return wval;
 }
 
-static void __devinit dc390_read_eeprom(struct pci_dev *pdev, u16 *ptr)
+static void dc390_read_eeprom(struct pci_dev *pdev, u16 *ptr)
 {
 	u8 cmd = EEPROM_READ, i;
 
@@ -2281,7 +2282,7 @@ static void __devinit dc390_read_eeprom(struct pci_dev *pdev, u16 *ptr)
 }
 
 /* Override EEprom values with explicitly set values */
-static void __devinit dc390_eeprom_override(u8 index)
+static void dc390_eeprom_override(u8 index)
 {
 	u8 *ptr = (u8 *) dc390_eepromBuf[index], id;
 
@@ -2304,7 +2305,7 @@ static void __devinit dc390_eeprom_override(u8 index)
 	}
 }
 
-static int __devinitdata tmscsim_def[] = {
+static int tmscsim_def[] = {
 	7,
 	0 /* 10MHz */,
 	PARITY_CHK_ | SEND_START_ | EN_DISCONNECT_ | SYNC_NEGO_ | TAG_QUEUEING_,
@@ -2314,7 +2315,7 @@ static int __devinitdata tmscsim_def[] = {
 };
 
 /* Copy defaults over set values where missing */
-static void __devinit dc390_fill_with_defaults (void)
+static void dc390_fill_with_defaults (void)
 {
 	int i;
 
@@ -2334,7 +2335,7 @@ static void __devinit dc390_fill_with_defaults (void)
 		tmscsim[5] = 180;
 }
 
-static void __devinit dc390_check_eeprom(struct pci_dev *pdev, u8 index)
+static void dc390_check_eeprom(struct pci_dev *pdev, u8 index)
 {
 	u8 interpd[] = {1, 3, 5, 10, 16, 30, 60, 120};
 	u8 EEbuf[128];
@@ -2371,7 +2372,7 @@ static void __devinit dc390_check_eeprom(struct pci_dev *pdev, u8 index)
 	}
 }
 
-static void __devinit dc390_init_hw(struct dc390_acb *pACB, u8 index)
+static void dc390_init_hw(struct dc390_acb *pACB, u8 index)
 {
 	struct Scsi_Host *shost = pACB->pScsiHost;
 	u8 dstate;
@@ -2421,8 +2422,7 @@ static void __devinit dc390_init_hw(struct dc390_acb *pACB, u8 index)
 	DC390_write8(DMA_Status, dstate);
 }
 
-static int __devinit dc390_probe_one(struct pci_dev *pdev,
-				    const struct pci_device_id *id)
+static int dc390_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct dc390_acb *pACB;
 	struct Scsi_Host *shost;
@@ -2531,7 +2531,7 @@ static int __devinit dc390_probe_one(struct pci_dev *pdev,
  *
  * @dev: The PCI device to remove.
  */
-static void __devexit dc390_remove_one(struct pci_dev *dev)
+static void dc390_remove_one(struct pci_dev *dev)
 {
 	struct Scsi_Host *scsi_host = pci_get_drvdata(dev);
 	unsigned long iflags;
@@ -2567,7 +2567,7 @@ static struct pci_driver dc390_driver = {
 	.name           = "tmscsim",
 	.id_table       = tmscsim_pci_tbl,
 	.probe          = dc390_probe_one,
-	.remove         = __devexit_p(dc390_remove_one),
+	.remove         = dc390_remove_one,
 };
 
 static int __init dc390_module_init(void)

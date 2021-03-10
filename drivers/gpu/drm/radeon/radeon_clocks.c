@@ -29,6 +29,7 @@
 #include <drm/radeon_drm.h>
 #include "radeon_reg.h"
 #include "radeon.h"
+#include "radeon_asic.h"
 #include "atom.h"
 
 /* 10 khz */
@@ -99,7 +100,7 @@ uint32_t radeon_legacy_get_memory_clock(struct radeon_device *rdev)
 static bool radeon_read_clocks_OF(struct drm_device *dev)
 {
 	struct radeon_device *rdev = dev->dev_private;
-	struct device_node *dp = rdev->pdev->dev.archdata.of_node;
+	struct device_node *dp = rdev->pdev->dev.of_node;
 	const u32 *val;
 	struct radeon_pll *p1pll = &rdev->clock.p1pll;
 	struct radeon_pll *p2pll = &rdev->clock.p2pll;
@@ -110,7 +111,7 @@ static bool radeon_read_clocks_OF(struct drm_device *dev)
 		return false;
 	val = of_get_property(dp, "ATY,RefCLK", NULL);
 	if (!val || !*val) {
-		printk(KERN_WARNING "radeonfb: No ATY,RefCLK property !\n");
+		pr_warn("radeonfb: No ATY,RefCLK property !\n");
 		return false;
 	}
 	p1pll->reference_freq = p2pll->reference_freq = (*val) / 10;

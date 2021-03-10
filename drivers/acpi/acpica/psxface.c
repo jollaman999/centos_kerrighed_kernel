@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -46,7 +46,7 @@
 #include "acparser.h"
 #include "acdispat.h"
 #include "acinterp.h"
-#include "amlcode.h"
+#include "actables.h"
 
 #define _COMPONENT          ACPI_PARSER
 ACPI_MODULE_NAME("psxface")
@@ -66,7 +66,7 @@ acpi_ps_update_parameter_list(struct acpi_evaluate_info *info, u16 action);
  * PARAMETERS:  method_name     - Valid ACPI name string
  *              debug_level     - Optional level mask. 0 to use default
  *              debug_layer     - Optional layer mask. 0 to use default
- *              Flags           - bit 1: one shot(1) or persistent(0)
+ *              flags           - bit 1: one shot(1) or persistent(0)
  *
  * RETURN:      Status
  *
@@ -105,7 +105,7 @@ acpi_debug_trace(char *name, u32 debug_level, u32 debug_layer, u32 flags)
  *
  * FUNCTION:    acpi_ps_start_trace
  *
- * PARAMETERS:  Info        - Method info struct
+ * PARAMETERS:  info        - Method info struct
  *
  * RETURN:      None
  *
@@ -125,7 +125,7 @@ static void acpi_ps_start_trace(struct acpi_evaluate_info *info)
 	}
 
 	if ((!acpi_gbl_trace_method_name) ||
-	    (acpi_gbl_trace_method_name != info->resolved_node->name.integer)) {
+	    (acpi_gbl_trace_method_name != info->node->name.integer)) {
 		goto exit;
 	}
 
@@ -150,7 +150,7 @@ static void acpi_ps_start_trace(struct acpi_evaluate_info *info)
  *
  * FUNCTION:    acpi_ps_stop_trace
  *
- * PARAMETERS:  Info        - Method info struct
+ * PARAMETERS:  info        - Method info struct
  *
  * RETURN:      None
  *
@@ -170,7 +170,7 @@ static void acpi_ps_stop_trace(struct acpi_evaluate_info *info)
 	}
 
 	if ((!acpi_gbl_trace_method_name) ||
-	    (acpi_gbl_trace_method_name != info->resolved_node->name.integer)) {
+	    (acpi_gbl_trace_method_name != info->node->name.integer)) {
 		goto exit;
 	}
 
@@ -193,10 +193,10 @@ static void acpi_ps_stop_trace(struct acpi_evaluate_info *info)
  *
  * FUNCTION:    acpi_ps_execute_method
  *
- * PARAMETERS:  Info            - Method info block, contains:
- *                  Node            - Method Node to execute
+ * PARAMETERS:  info            - Method info block, contains:
+ *                  node            - Method Node to execute
  *                  obj_desc        - Method object
- *                  Parameters      - List of parameters to pass to the method,
+ *                  parameters      - List of parameters to pass to the method,
  *                                    terminated by NULL. Params itself may be
  *                                    NULL if no parameters are being passed.
  *                  return_object   - Where to put method's return value (if
@@ -220,17 +220,20 @@ acpi_status acpi_ps_execute_method(struct acpi_evaluate_info *info)
 
 	ACPI_FUNCTION_TRACE(ps_execute_method);
 
+	/* Quick validation of DSDT header */
+
+	acpi_tb_check_dsdt_header();
+
 	/* Validate the Info and method Node */
 
-	if (!info || !info->resolved_node) {
+	if (!info || !info->node) {
 		return_ACPI_STATUS(AE_NULL_ENTRY);
 	}
 
 	/* Init for new method, wait on concurrency semaphore */
 
 	status =
-	    acpi_ds_begin_method_execution(info->resolved_node, info->obj_desc,
-					   NULL);
+	    acpi_ds_begin_method_execution(info->node, info->obj_desc, NULL);
 	if (ACPI_FAILURE(status)) {
 		return_ACPI_STATUS(status);
 	}
@@ -249,8 +252,7 @@ acpi_status acpi_ps_execute_method(struct acpi_evaluate_info *info)
 	 */
 	ACPI_DEBUG_PRINT((ACPI_DB_PARSE,
 			  "**** Begin Method Parse/Execute [%4.4s] **** Node=%p Obj=%p\n",
-			  info->resolved_node->name.ascii, info->resolved_node,
-			  info->obj_desc));
+			  info->node->name.ascii, info->node, info->obj_desc));
 
 	/* Create and init a Root Node */
 
@@ -271,7 +273,7 @@ acpi_status acpi_ps_execute_method(struct acpi_evaluate_info *info)
 		goto cleanup;
 	}
 
-	status = acpi_ds_init_aml_walk(walk_state, op, info->resolved_node,
+	status = acpi_ds_init_aml_walk(walk_state, op, info->node,
 				       info->obj_desc->method.aml_start,
 				       info->obj_desc->method.aml_length, info,
 				       info->pass_number);
@@ -280,14 +282,15 @@ acpi_status acpi_ps_execute_method(struct acpi_evaluate_info *info)
 		goto cleanup;
 	}
 
-	if (info->obj_desc->method.flags & AOPOBJ_MODULE_LEVEL) {
+	if (info->obj_desc->method.info_flags & ACPI_METHOD_MODULE_LEVEL) {
 		walk_state->parse_flags |= ACPI_PARSE_MODULE_LEVEL;
 	}
 
 	/* Invoke an internal method if necessary */
 
-	if (info->obj_desc->method.method_flags & AML_METHOD_INTERNAL_ONLY) {
-		status = info->obj_desc->method.implementation(walk_state);
+	if (info->obj_desc->method.info_flags & ACPI_METHOD_INTERNAL_ONLY) {
+		status =
+		    info->obj_desc->method.dispatch.implementation(walk_state);
 		info->return_object = walk_state->return_desc;
 
 		/* Cleanup states */
@@ -306,14 +309,12 @@ acpi_status acpi_ps_execute_method(struct acpi_evaluate_info *info)
 	 */
 	if (acpi_gbl_enable_interpreter_slack) {
 		walk_state->implicit_return_obj =
-		    acpi_ut_create_internal_object(ACPI_TYPE_INTEGER);
+		    acpi_ut_create_integer_object((u64) 0);
 		if (!walk_state->implicit_return_obj) {
 			status = AE_NO_MEMORY;
 			acpi_ds_delete_walk_state(walk_state);
 			goto cleanup;
 		}
-
-		walk_state->implicit_return_obj->integer.value = 0;
 	}
 
 	/* Parse the AML */
@@ -358,9 +359,9 @@ acpi_status acpi_ps_execute_method(struct acpi_evaluate_info *info)
  *
  * FUNCTION:    acpi_ps_update_parameter_list
  *
- * PARAMETERS:  Info            - See struct acpi_evaluate_info
+ * PARAMETERS:  info            - See struct acpi_evaluate_info
  *                                (Used: parameter_type and Parameters)
- *              Action          - Add or Remove reference
+ *              action          - Add or Remove reference
  *
  * RETURN:      Status
  *

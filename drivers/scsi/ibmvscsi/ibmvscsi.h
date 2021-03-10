@@ -48,9 +48,8 @@ struct Scsi_Host;
 #define IBMVSCSI_CMDS_PER_LUN_DEFAULT 16
 #define IBMVSCSI_MAX_SECTORS_DEFAULT 256 /* 32 * 8 = default max I/O 32 pages */
 #define IBMVSCSI_MAX_CMDS_PER_LUN 64
+#define IBMVSCSI_MAX_LUN 32
 
-#define IBMVSCSI_CRQ_INIT		0xC001000000000000LL
-#define IBMVSCSI_CRQ_INIT_COMPLETE	0xC002000000000000LL
 /* ------------------------------------------------------------
  * Data Structures
  */
@@ -108,28 +107,5 @@ struct ibmvscsi_host_data {
 	dma_addr_t caps_addr;
 	dma_addr_t adapter_info_addr;
 };
-
-/* routines for managing a command/response queue */
-void ibmvscsi_handle_crq(struct viosrp_crq *crq,
-			 struct ibmvscsi_host_data *hostdata);
-
-struct ibmvscsi_ops {
-	int (*init_crq_queue)(struct crq_queue *queue,
-			      struct ibmvscsi_host_data *hostdata,
-			      int max_requests);
-	void (*release_crq_queue)(struct crq_queue *queue,
-				  struct ibmvscsi_host_data *hostdata,
-				  int max_requests);
-	int (*reset_crq_queue)(struct crq_queue *queue,
-			       struct ibmvscsi_host_data *hostdata);
-	int (*reenable_crq_queue)(struct crq_queue *queue,
-				  struct ibmvscsi_host_data *hostdata);
-	int (*send_crq)(struct ibmvscsi_host_data *hostdata,
-		       u64 word1, u64 word2);
-	int (*resume) (struct ibmvscsi_host_data *hostdata);
-};
-
-extern struct ibmvscsi_ops iseriesvscsi_ops;
-extern struct ibmvscsi_ops rpavscsi_ops;
 
 #endif				/* IBMVSCSI_H */

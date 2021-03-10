@@ -1,7 +1,5 @@
 /*
- *  drivers/s390/cio/idset.h
- *
- *    Copyright IBM Corp. 2007
+ *    Copyright IBM Corp. 2007, 2012
  *    Author(s): Peter Oberparleiter <peter.oberparleiter@de.ibm.com>
  */
 

@@ -9,7 +9,6 @@
 #include <linux/mm.h>
 #include <linux/kexec.h>
 #include <linux/delay.h>
-#include <linux/init.h>
 #include <linux/numa.h>
 #include <linux/ftrace.h>
 #include <linux/suspend.h>
@@ -23,14 +22,8 @@
 #include <asm/apic.h>
 #include <asm/cpufeature.h>
 #include <asm/desc.h>
-#include <asm/system.h>
 #include <asm/cacheflush.h>
-
-#ifdef CONFIG_PAGE_TABLE_ISOLATION
-#define PGD_ALLOCATION_ORDER 1
-#else
-#define PGD_ALLOCATION_ORDER 0
-#endif
+#include <asm/debugreg.h>
 
 static void set_idt(void *newidt, __u16 limit)
 {
@@ -76,7 +69,7 @@ static void load_segments(void)
 
 static void machine_kexec_free_page_tables(struct kimage *image)
 {
-	free_pages((unsigned long)image->arch.pgd, PGD_ALLOCATION_ORDER);
+	free_page((unsigned long)image->arch.pgd);
 #ifdef CONFIG_X86_PAE
 	free_page((unsigned long)image->arch.pmd0);
 	free_page((unsigned long)image->arch.pmd1);
@@ -87,8 +80,7 @@ static void machine_kexec_free_page_tables(struct kimage *image)
 
 static int machine_kexec_alloc_page_tables(struct kimage *image)
 {
-	image->arch.pgd = (pgd_t *)__get_free_pages(GFP_KERNEL | __GFP_ZERO,
-						    PGD_ALLOCATION_ORDER);
+	image->arch.pgd = (pgd_t *)get_zeroed_page(GFP_KERNEL);
 #ifdef CONFIG_X86_PAE
 	image->arch.pmd0 = (pmd_t *)get_zeroed_page(GFP_KERNEL);
 	image->arch.pmd1 = (pmd_t *)get_zeroed_page(GFP_KERNEL);
@@ -164,8 +156,7 @@ int machine_kexec_prepare(struct kimage *image)
 {
 	int error;
 
-	if (nx_enabled)
-		set_pages_x(image->control_code_page, 1);
+	set_pages_x(image->control_code_page, 1);
 	error = machine_kexec_alloc_page_tables(image);
 	if (error)
 		return error;
@@ -179,8 +170,7 @@ int machine_kexec_prepare(struct kimage *image)
  */
 void machine_kexec_cleanup(struct kimage *image)
 {
-	if (nx_enabled)
-		set_pages_nx(image->control_code_page, 1);
+	set_pages_nx(image->control_code_page, 1);
 	machine_kexec_free_page_tables(image);
 }
 
@@ -209,17 +199,18 @@ void machine_kexec(struct kimage *image)
 
 	/* Interrupts aren't acceptable while we reboot */
 	local_irq_disable();
+	hw_breakpoint_disable();
 
 	if (image->preserve_context) {
 #ifdef CONFIG_X86_IO_APIC
 		/*
 		 * We need to put APICs in legacy mode so that we can
 		 * get timer interrupts in second kernel. kexec/kdump
-		 * paths already have calls to disable_IO_APIC() in
-		 * one form or other. kexec jump path also need
-		 * one.
+		 * paths already have calls to restore_boot_irq_mode()
+		 * in one form or other. kexec jump path also need one.
 		 */
-		disable_IO_APIC(0);
+		clear_IO_APIC();
+		restore_boot_irq_mode();
 #endif
 	}
 
@@ -256,7 +247,8 @@ void machine_kexec(struct kimage *image)
 	/* now call it */
 	image->start = relocate_kernel_ptr((unsigned long)image->head,
 					   (unsigned long)page_list,
-					   image->start, cpu_has_pae,
+					   image->start,
+					   boot_cpu_has(X86_FEATURE_PAE),
 					   image->preserve_context);
 
 #ifdef CONFIG_KEXEC_JUMP

@@ -19,6 +19,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /* Initial keytable is from Jose Alberto Reguero <jareguero@telefonica.net>
    and Felipe Morales Moreno <felipe.morales.moreno@gmail.com> */
@@ -31,7 +32,7 @@ static struct rc_map_table avermedia_rm_ks[] = {
 	{ 0x0505, KEY_VOLUMEDOWN },
 	{ 0x0506, KEY_MUTE },
 	{ 0x0507, KEY_RIGHT },
-	{ 0x0508, KEY_PROG1 },
+	{ 0x0508, KEY_RED },
 	{ 0x0509, KEY_1 },
 	{ 0x050a, KEY_2 },
 	{ 0x050b, KEY_3 },

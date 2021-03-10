@@ -31,10 +31,10 @@ struct xen_memory_reservation {
      *   OUT: GMFN bases of extents that were allocated
      *   (NB. This command also updates the mach_to_phys translation table)
      */
-    GUEST_HANDLE(ulong) extent_start;
+    GUEST_HANDLE(xen_pfn_t) extent_start;
 
     /* Number of extents, and size/alignment of each (2^extent_order pages). */
-    unsigned long  nr_extents;
+    xen_ulong_t  nr_extents;
     unsigned int   extent_order;
 
     /*
@@ -54,6 +54,48 @@ struct xen_memory_reservation {
 };
 DEFINE_GUEST_HANDLE_STRUCT(xen_memory_reservation);
 
+/*
+ * An atomic exchange of memory pages. If return code is zero then
+ * @out.extent_list provides GMFNs of the newly-allocated memory.
+ * Returns zero on complete success, otherwise a negative error code.
+ * On complete success then always @nr_exchanged == @in.nr_extents.
+ * On partial success @nr_exchanged indicates how much work was done.
+ */
+#define XENMEM_exchange             11
+struct xen_memory_exchange {
+    /*
+     * [IN] Details of memory extents to be exchanged (GMFN bases).
+     * Note that @in.address_bits is ignored and unused.
+     */
+    struct xen_memory_reservation in;
+
+    /*
+     * [IN/OUT] Details of new memory extents.
+     * We require that:
+     *  1. @in.domid == @out.domid
+     *  2. @in.nr_extents  << @in.extent_order ==
+     *     @out.nr_extents << @out.extent_order
+     *  3. @in.extent_start and @out.extent_start lists must not overlap
+     *  4. @out.extent_start lists GPFN bases to be populated
+     *  5. @out.extent_start is overwritten with allocated GMFN bases
+     */
+    struct xen_memory_reservation out;
+
+    /*
+     * [OUT] Number of input extents that were successfully exchanged:
+     *  1. The first @nr_exchanged input extents were successfully
+     *     deallocated.
+     *  2. The corresponding first entries in the output extent list correctly
+     *     indicate the GMFNs that were successfully exchanged.
+     *  3. All other input and output extents are untouched.
+     *  4. If not all input exents are exchanged then the return code of this
+     *     command will be non-zero.
+     *  5. THIS FIELD MUST BE INITIALISED TO ZERO BY THE CALLER!
+     */
+    xen_ulong_t nr_exchanged;
+};
+
+DEFINE_GUEST_HANDLE_STRUCT(xen_memory_exchange);
 /*
  * Returns the maximum machine frame number of mapped RAM in this system.
  * This command always succeeds (it never returns an error code).
@@ -88,7 +130,7 @@ struct xen_machphys_mfn_list {
      * any large discontiguities in the machine address space, 2MB gaps in
      * the machphys table will be represented by an MFN base of zero.
      */
-    GUEST_HANDLE(ulong) extent_start;
+    GUEST_HANDLE(xen_pfn_t) extent_start;
 
     /*
      * Number of extents written to the above array. This will be smaller
@@ -97,6 +139,27 @@ struct xen_machphys_mfn_list {
     unsigned int nr_extents;
 };
 DEFINE_GUEST_HANDLE_STRUCT(xen_machphys_mfn_list);
+
+/*
+ * Returns the location in virtual address space of the machine_to_phys
+ * mapping table. Architectures which do not have a m2p table, or which do not
+ * map it by default into guest address space, do not implement this command.
+ * arg == addr of xen_machphys_mapping_t.
+ */
+#define XENMEM_machphys_mapping     12
+struct xen_machphys_mapping {
+    xen_ulong_t v_start, v_end; /* Start and end virtual addresses.   */
+    xen_ulong_t max_mfn;        /* Maximum MFN that can be looked up. */
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_machphys_mapping_t);
+
+#define XENMAPSPACE_shared_info  0 /* shared info page */
+#define XENMAPSPACE_grant_table  1 /* grant table page */
+#define XENMAPSPACE_gmfn         2 /* GMFN */
+#define XENMAPSPACE_gmfn_range   3 /* GMFN range, XENMEM_add_to_physmap only. */
+#define XENMAPSPACE_gmfn_foreign 4 /* GMFN from another dom,
+				    * XENMEM_add_to_physmap_range only.
+				    */
 
 /*
  * Sets the GPFN at which a particular page appears in the specified guest's
@@ -108,41 +171,46 @@ struct xen_add_to_physmap {
     /* Which domain to change the mapping for. */
     domid_t domid;
 
+    /* Number of pages to go through for gmfn_range */
+    uint16_t    size;
+
     /* Source mapping space. */
-#define XENMAPSPACE_shared_info 0 /* shared info page */
-#define XENMAPSPACE_grant_table 1 /* grant table page */
     unsigned int space;
 
     /* Index into source mapping space. */
-    unsigned long idx;
+    xen_ulong_t idx;
 
     /* GPFN where the source mapping page should appear. */
-    unsigned long gpfn;
+    xen_pfn_t gpfn;
 };
 DEFINE_GUEST_HANDLE_STRUCT(xen_add_to_physmap);
 
-/*
- * Translates a list of domain-specific GPFNs into MFNs. Returns a -ve error
- * code on failure. This call only works for auto-translated guests.
- */
-#define XENMEM_translate_gpfn_list  8
-struct xen_translate_gpfn_list {
-    /* Which domain to translate for? */
+/*** REMOVED ***/
+/*#define XENMEM_translate_gpfn_list  8*/
+
+#define XENMEM_add_to_physmap_range 23
+struct xen_add_to_physmap_range {
+    /* IN */
+    /* Which domain to change the mapping for. */
     domid_t domid;
+    uint16_t space; /* => enum phys_map_space */
 
-    /* Length of list. */
-    unsigned long nr_gpfns;
+    /* Number of pages to go through */
+    uint16_t size;
+    domid_t foreign_domid; /* IFF gmfn_foreign */
 
-    /* List of GPFNs to translate. */
-    GUEST_HANDLE(ulong) gpfn_list;
+    /* Indexes into space being mapped. */
+    GUEST_HANDLE(xen_ulong_t) idxs;
 
-    /*
-     * Output list to contain MFN translations. May be the same as the input
-     * list (in which case each input GPFN is overwritten with the output MFN).
-     */
-    GUEST_HANDLE(ulong) mfn_list;
+    /* GPFN in domid where the source mapping page should appear. */
+    GUEST_HANDLE(xen_pfn_t) gpfns;
+
+    /* OUT */
+
+    /* Per index error code. */
+    GUEST_HANDLE(int) errs;
 };
-DEFINE_GUEST_HANDLE_STRUCT(xen_translate_gpfn_list);
+DEFINE_GUEST_HANDLE_STRUCT(xen_add_to_physmap_range);
 
 /*
  * Returns the pseudo-physical memory map as it was when the domain
@@ -179,4 +247,20 @@ DEFINE_GUEST_HANDLE_STRUCT(xen_memory_map);
  * during a driver critical region.
  */
 extern spinlock_t xen_reservation_lock;
+
+/*
+ * Unmaps the page appearing at a particular GPFN from the specified guest's
+ * pseudophysical address space.
+ * arg == addr of xen_remove_from_physmap_t.
+ */
+#define XENMEM_remove_from_physmap      15
+struct xen_remove_from_physmap {
+    /* Which domain to change the mapping for. */
+    domid_t domid;
+
+    /* GPFN of the current mapping of the page. */
+    xen_pfn_t gpfn;
+};
+DEFINE_GUEST_HANDLE_STRUCT(xen_remove_from_physmap);
+
 #endif /* __XEN_PUBLIC_MEMORY_H__ */

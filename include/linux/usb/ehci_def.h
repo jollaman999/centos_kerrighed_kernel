@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0+
 /*
  * Copyright (c) 2001-2002 by David Brownell
  *
@@ -19,16 +20,23 @@
 #ifndef __LINUX_USB_EHCI_DEF_H
 #define __LINUX_USB_EHCI_DEF_H
 
+#include <linux/usb/ehci-dbgp.h>
+
 /* EHCI register interface, corresponds to EHCI Revision 0.95 specification */
 
 /* Section 2.2 Host Controller Capability Registers */
 struct ehci_caps {
 	/* these fields are specified as 8 and 16 bit registers,
 	 * but some hosts can't perform 8 or 16 bit PCI accesses.
+	 * some hosts treat caplength and hciversion as parts of a 32-bit
+	 * register, others treat them as two separate registers, this
+	 * affects the memory map for big endian controllers.
 	 */
 	u32		hc_capbase;
-#define HC_LENGTH(p)		(((p)>>00)&0x00ff)	/* bits 7:0 */
-#define HC_VERSION(p)		(((p)>>16)&0xffff)	/* bits 31:16 */
+#define HC_LENGTH(ehci, p)	(0x00ff&((p) >> /* bits 7:0 / offset 00h */ \
+				(ehci_big_endian_capbase(ehci) ? 24 : 0)))
+#define HC_VERSION(ehci, p)	(0xffff&((p) >> /* bits 31:16 / offset 02h */ \
+				(ehci_big_endian_capbase(ehci) ? 0 : 16)))
 	u32		hcs_params;     /* HCSPARAMS - offset 0x4 */
 #define HCS_DEBUG_PORT(p)	(((p)>>20)&0xf)	/* bits 23:20, debug port? */
 #define HCS_INDICATOR(p)	((p)&(1 << 16))	/* true: has port indicators */
@@ -52,7 +60,7 @@ struct ehci_caps {
 #define HCC_PGM_FRAMELISTLEN(p) ((p)&(1 << 1))  /* true: periodic_size changes*/
 #define HCC_64BIT_ADDR(p)       ((p)&(1))       /* true: can use 64-bit addr */
 	u8		portroute[8];	 /* nibbles for routing - offset 0xC */
-} __attribute__ ((packed));
+};
 
 
 /* Section 2.3 Host Controller Operational Registers */
@@ -106,14 +114,20 @@ struct ehci_regs {
 	/* ASYNCLISTADDR: offset 0x18 */
 	u32		async_next;	/* address of next async queue head */
 
-	u32		reserved[9];
+	u32		reserved1[2];
+
+	/* TXFILLTUNING: offset 0x24 */
+	u32		txfill_tuning;	/* TX FIFO Tuning register */
+#define TXFIFO_DEFAULT	(8<<16)		/* FIFO burst threshold 8 */
+
+	u32		reserved2[6];
 
 	/* CONFIGFLAG: offset 0x40 */
 	u32		configured_flag;
 #define FLAG_CF		(1<<0)		/* true: we'll support "high speed" */
 
 	/* PORTSC: offset 0x44 */
-	u32		port_status [0];	/* up to N_PORTS */
+	u32		port_status[0];	/* up to N_PORTS */
 /* EHCI 1.1 addendum */
 #define PORTSC_SUSPEND_STS_ACK 0
 #define PORTSC_SUSPEND_STS_NYET 1
@@ -127,7 +141,9 @@ struct ehci_regs {
 #define PORT_WKDISC_E	(1<<21)		/* wake on disconnect (enable) */
 #define PORT_WKCONN_E	(1<<20)		/* wake on connect (enable) */
 /* 19:16 for port testing */
-#define PORT_TEST_PKT	(0x4<<16)	/* Port Test Control - packet test */
+#define PORT_TEST(x)	(((x)&0xf)<<16)	/* Port Test Control */
+#define PORT_TEST_PKT	PORT_TEST(0x4)	/* Port Test Control - packet test */
+#define PORT_TEST_FORCE	PORT_TEST(0x5)	/* Port Test Control - force enable */
 #define PORT_LED_OFF	(0<<14)
 #define PORT_LED_AMBER	(1<<14)
 #define PORT_LED_GREEN	(2<<14)
@@ -148,71 +164,33 @@ struct ehci_regs {
 #define PORT_CSC	(1<<1)		/* connect status change */
 #define PORT_CONNECT	(1<<0)		/* device connected */
 #define PORT_RWC_BITS   (PORT_CSC | PORT_PEC | PORT_OCC)
-} __attribute__ ((packed));
 
-#define USBMODE		0x68		/* USB Device mode */
+	u32		reserved3[9];
+
+	/* USBMODE: offset 0x68 */
+	u32		usbmode;	/* USB Device mode */
 #define USBMODE_SDIS	(1<<3)		/* Stream disable */
 #define USBMODE_BE	(1<<2)		/* BE/LE endianness select */
 #define USBMODE_CM_HC	(3<<0)		/* host controller mode */
 #define USBMODE_CM_IDLE	(0<<0)		/* idle state */
 
+	u32		reserved4[6];
+
 /* Moorestown has some non-standard registers, partially due to the fact that
- * its EHCI controller has both TT and LPM support. HOSTPCx are extentions to
+ * its EHCI controller has both TT and LPM support. HOSTPCx are extensions to
  * PORTSCx
  */
-#define HOSTPC0		0x84		/* HOSTPC extension */
+	/* HOSTPC: offset 0x84 */
+	u32		hostpc[0];	/* HOSTPC extension */
 #define HOSTPC_PHCD	(1<<22)		/* Phy clock disable */
 #define HOSTPC_PSPD	(3<<25)		/* Port speed detection */
-#define USBMODE_EX	0xc8		/* USB Device mode extension */
+
+	u32		reserved5[17];
+
+	/* USBMODE_EX: offset 0xc8 */
+	u32		usbmode_ex;	/* USB Device mode extension */
 #define USBMODE_EX_VBPS	(1<<5)		/* VBus Power Select On */
 #define USBMODE_EX_HC	(3<<0)		/* host controller mode */
-#define TXFILLTUNING	0x24		/* TX FIFO Tuning register */
-#define TXFIFO_DEFAULT	(8<<16)		/* FIFO burst threshold 8 */
-
-/* Appendix C, Debug port ... intended for use with special "debug devices"
- * that can help if there's no serial console.  (nonstandard enumeration.)
- */
-struct ehci_dbg_port {
-	u32	control;
-#define DBGP_OWNER	(1<<30)
-#define DBGP_ENABLED	(1<<28)
-#define DBGP_DONE	(1<<16)
-#define DBGP_INUSE	(1<<10)
-#define DBGP_ERRCODE(x)	(((x)>>7)&0x07)
-#	define DBGP_ERR_BAD	1
-#	define DBGP_ERR_SIGNAL	2
-#define DBGP_ERROR	(1<<6)
-#define DBGP_GO		(1<<5)
-#define DBGP_OUT	(1<<4)
-#define DBGP_LEN(x)	(((x)>>0)&0x0f)
-	u32	pids;
-#define DBGP_PID_GET(x)		(((x)>>16)&0xff)
-#define DBGP_PID_SET(data, tok)	(((data)<<8)|(tok))
-	u32	data03;
-	u32	data47;
-	u32	address;
-#define DBGP_EPADDR(dev, ep)	(((dev)<<8)|(ep))
-} __attribute__ ((packed));
-
-#ifdef CONFIG_EARLY_PRINTK_DBGP
-#include <linux/init.h>
-extern int __init early_dbgp_init(char *s);
-extern struct console early_dbgp_console;
-#endif /* CONFIG_EARLY_PRINTK_DBGP */
-
-#ifdef CONFIG_EARLY_PRINTK_DBGP
-/* Call backs from ehci host driver to ehci debug driver */
-extern int dbgp_external_startup(void);
-extern int dbgp_reset_prep(void);
-#else
-static inline int dbgp_reset_prep(void)
-{
-	return 1;
-}
-static inline int dbgp_external_startup(void)
-{
-	return -1;
-}
-#endif
+};
 
 #endif /* __LINUX_USB_EHCI_DEF_H */

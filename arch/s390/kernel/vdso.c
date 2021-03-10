@@ -23,13 +23,14 @@
 #include <linux/security.h>
 #include <linux/bootmem.h>
 #include <linux/compat.h>
+#include <asm/asm-offsets.h>
 #include <asm/pgtable.h>
-#include <asm/system.h>
 #include <asm/processor.h>
 #include <asm/mmu.h>
 #include <asm/mmu_context.h>
 #include <asm/sections.h>
 #include <asm/vdso.h>
+#include <asm/facility.h>
 
 #if defined(CONFIG_32BIT) || defined(CONFIG_COMPAT)
 extern char vdso32_start, vdso32_end;
@@ -83,31 +84,16 @@ struct vdso_data *vdso_data = &vdso_data_store.data;
  */
 static void vdso_init_data(struct vdso_data *vd)
 {
-	unsigned int facility_list;
-
-	facility_list = stfl();
-	vd->ectg_available =
-		user_mode != HOME_SPACE_MODE && (facility_list & 1);
+	vd->ectg_available = test_facility(31);
 }
 
 #ifdef CONFIG_64BIT
-/*
- * Setup per cpu vdso data page.
- */
-static void vdso_init_per_cpu_data(int cpu, struct vdso_per_cpu_data *vpcd)
-{
-}
-
 /*
  * Allocate/free per cpu vdso data.
  */
-#ifdef CONFIG_64BIT
 #define SEGMENT_ORDER	2
-#else
-#define SEGMENT_ORDER	1
-#endif
 
-int vdso_alloc_per_cpu(int cpu, struct _lowcore *lowcore)
+int vdso_alloc_per_cpu(struct _lowcore *lowcore)
 {
 	unsigned long segment_table, page_table, page_frame;
 	u32 *psal, *aste;
@@ -115,7 +101,7 @@ int vdso_alloc_per_cpu(int cpu, struct _lowcore *lowcore)
 
 	lowcore->vdso_per_cpu_data = __LC_PASTE;
 
-	if (user_mode == HOME_SPACE_MODE || !vdso_enabled)
+	if (!vdso_enabled)
 		return 0;
 
 	segment_table = __get_free_pages(GFP_KERNEL, SEGMENT_ORDER);
@@ -126,11 +112,11 @@ int vdso_alloc_per_cpu(int cpu, struct _lowcore *lowcore)
 
 	clear_table((unsigned long *) segment_table, _SEGMENT_ENTRY_EMPTY,
 		    PAGE_SIZE << SEGMENT_ORDER);
-	clear_table((unsigned long *) page_table, _PAGE_TYPE_EMPTY,
+	clear_table((unsigned long *) page_table, _PAGE_INVALID,
 		    256*sizeof(unsigned long));
 
 	*(unsigned long *) segment_table = _SEGMENT_ENTRY + page_table;
-	*(unsigned long *) page_table = _PAGE_RO + page_frame;
+	*(unsigned long *) page_table = _PAGE_PROTECT + page_frame;
 
 	psal = (u32 *) (page_table + 256*sizeof(unsigned long));
 	aste = psal + 32;
@@ -139,14 +125,13 @@ int vdso_alloc_per_cpu(int cpu, struct _lowcore *lowcore)
 		psal[i] = 0x80000000;
 
 	lowcore->paste[4] = (u32)(addr_t) psal;
-	psal[0] = 0x20000000;
+	psal[0] = 0x02000000;
 	psal[2] = (u32)(addr_t) aste;
 	*(unsigned long *) (aste + 2) = segment_table +
 		_ASCE_TABLE_LENGTH + _ASCE_USER_BITS + _ASCE_TYPE_SEGMENT;
 	aste[4] = (u32)(addr_t) psal;
 	lowcore->vdso_per_cpu_data = page_frame;
 
-	vdso_init_per_cpu_data(cpu, (struct vdso_per_cpu_data *) page_frame);
 	return 0;
 
 out:
@@ -156,12 +141,12 @@ out:
 	return -ENOMEM;
 }
 
-void vdso_free_per_cpu(int cpu, struct _lowcore *lowcore)
+void vdso_free_per_cpu(struct _lowcore *lowcore)
 {
 	unsigned long segment_table, page_table, page_frame;
 	u32 *psal, *aste;
 
-	if (user_mode == HOME_SPACE_MODE || !vdso_enabled)
+	if (!vdso_enabled)
 		return;
 
 	psal = (u32 *)(addr_t) lowcore->paste[4];
@@ -175,18 +160,14 @@ void vdso_free_per_cpu(int cpu, struct _lowcore *lowcore)
 	free_pages(segment_table, SEGMENT_ORDER);
 }
 
-static void __vdso_init_cr5(void *dummy)
+static void vdso_init_cr5(void)
 {
 	unsigned long cr5;
 
+	if (!vdso_enabled)
+		return;
 	cr5 = offsetof(struct _lowcore, paste);
 	__ctl_load(cr5, 5, 5);
-}
-
-static void vdso_init_cr5(void)
-{
-	if (user_mode != HOME_SPACE_MODE && vdso_enabled)
-		on_each_cpu(__vdso_init_cr5, NULL, 1);
 }
 #endif /* CONFIG_64BIT */
 
@@ -323,10 +304,8 @@ static int __init vdso_init(void)
 	}
 	vdso64_pagelist[vdso64_pages - 1] = virt_to_page(vdso_data);
 	vdso64_pagelist[vdso64_pages] = NULL;
-#ifndef CONFIG_SMP
-	if (vdso_alloc_per_cpu(0, &S390_lowcore))
+	if (vdso_alloc_per_cpu(&S390_lowcore))
 		BUG();
-#endif
 	vdso_init_cr5();
 #endif /* CONFIG_64BIT */
 
@@ -336,7 +315,7 @@ static int __init vdso_init(void)
 
 	return 0;
 }
-arch_initcall(vdso_init);
+early_initcall(vdso_init);
 
 int in_gate_area_no_mm(unsigned long addr)
 {

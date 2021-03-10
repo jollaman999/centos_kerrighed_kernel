@@ -10,6 +10,7 @@
  */
 
 #include <linux/init.h>
+#include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/circ_buf.h>
 #include "internal.h"
@@ -41,6 +42,8 @@ static void xdr_decode_AFSFetchStatus(const __be32 **_bp,
 	umode_t mode;
 	u64 data_version, size;
 	u32 changed = 0; /* becomes non-zero if ctime-type changes seen */
+	kuid_t owner;
+	kgid_t group;
 
 #define EXTRACT(DST)				\
 	do {					\
@@ -55,7 +58,9 @@ static void xdr_decode_AFSFetchStatus(const __be32 **_bp,
 	size = ntohl(*bp++);
 	data_version = ntohl(*bp++);
 	EXTRACT(status->author);
-	EXTRACT(status->owner);
+	owner = make_kuid(&init_user_ns, ntohl(*bp++));
+	changed |= !uid_eq(owner, status->owner);
+	status->owner = owner;
 	EXTRACT(status->caller_access); /* call ticket dependent */
 	EXTRACT(status->anon_access);
 	EXTRACT(status->mode);
@@ -64,7 +69,9 @@ static void xdr_decode_AFSFetchStatus(const __be32 **_bp,
 	bp++; /* seg size */
 	status->mtime_client = ntohl(*bp++);
 	status->mtime_server = ntohl(*bp++);
-	EXTRACT(status->group);
+	group = make_kgid(&init_user_ns, ntohl(*bp++));
+	changed |= !gid_eq(group, status->group);
+	status->group = group;
 	bp++; /* sync counter */
 	data_version |= (u64) ntohl(*bp++) << 32;
 	EXTRACT(status->lock_count);
@@ -88,8 +95,8 @@ static void xdr_decode_AFSFetchStatus(const __be32 **_bp,
 			i_size_write(&vnode->vfs_inode, size);
 			vnode->vfs_inode.i_uid = status->owner;
 			vnode->vfs_inode.i_gid = status->group;
-			vnode->vfs_inode.i_version = vnode->fid.unique;
-			vnode->vfs_inode.i_nlink = status->nlink;
+			vnode->vfs_inode.i_generation = vnode->fid.unique;
+			set_nlink(&vnode->vfs_inode, status->nlink);
 
 			mode = vnode->vfs_inode.i_mode;
 			mode &= ~S_IALLUGO;
@@ -101,6 +108,7 @@ static void xdr_decode_AFSFetchStatus(const __be32 **_bp,
 		vnode->vfs_inode.i_ctime.tv_sec	= status->mtime_server;
 		vnode->vfs_inode.i_mtime	= vnode->vfs_inode.i_ctime;
 		vnode->vfs_inode.i_atime	= vnode->vfs_inode.i_ctime;
+		vnode->vfs_inode.i_version	= data_version;
 	}
 
 	expected_version = status->data_version;
@@ -179,12 +187,12 @@ static void xdr_encode_AFS_StoreStatus(__be32 **_bp, struct iattr *attr)
 
 	if (attr->ia_valid & ATTR_UID) {
 		mask |= AFS_SET_OWNER;
-		owner = attr->ia_uid;
+		owner = from_kuid(&init_user_ns, attr->ia_uid);
 	}
 
 	if (attr->ia_valid & ATTR_GID) {
 		mask |= AFS_SET_GROUP;
-		group = attr->ia_gid;
+		group = from_kgid(&init_user_ns, attr->ia_gid);
 	}
 
 	if (attr->ia_valid & ATTR_MODE) {
@@ -363,10 +371,10 @@ static int afs_deliver_fs_fetch_data(struct afs_call *call,
 		_debug("extract data");
 		if (call->count > 0) {
 			page = call->reply3;
-			buffer = kmap_atomic(page, KM_USER0);
+			buffer = kmap_atomic(page);
 			ret = afs_extract_data(call, skb, last, buffer,
 					       call->count);
-			kunmap_atomic(buffer, KM_USER0);
+			kunmap_atomic(buffer);
 			switch (ret) {
 			case 0:		break;
 			case -EAGAIN:	return 0;
@@ -409,9 +417,9 @@ static int afs_deliver_fs_fetch_data(struct afs_call *call,
 	if (call->count < PAGE_SIZE) {
 		_debug("clear");
 		page = call->reply3;
-		buffer = kmap_atomic(page, KM_USER0);
+		buffer = kmap_atomic(page);
 		memset(buffer + call->count, 0, PAGE_SIZE - call->count);
-		kunmap_atomic(buffer, KM_USER0);
+		kunmap_atomic(buffer);
 	}
 
 	_leave(" = 0 [done]");

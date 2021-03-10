@@ -72,13 +72,9 @@ static int ecb_aes_nx_crypt(struct blkcipher_desc *desc,
 	struct nx_csbcpb *csbcpb = nx_ctx->csbcpb;
 	unsigned long irq_flags;
 	unsigned int processed = 0, to_process;
-	u32 max_sg_len;
 	int rc;
 
 	spin_lock_irqsave(&nx_ctx->lock, irq_flags);
-
-	max_sg_len = min_t(u32, nx_driver.of.max_sg_len/sizeof(struct nx_sg),
-			   nx_ctx->ap->sglen);
 
 	if (enc)
 		NX_CPB_FDM(csbcpb) |= NX_FDM_ENDE_ENCRYPT;
@@ -86,13 +82,9 @@ static int ecb_aes_nx_crypt(struct blkcipher_desc *desc,
 		NX_CPB_FDM(csbcpb) &= ~NX_FDM_ENDE_ENCRYPT;
 
 	do {
-		to_process = min_t(u64, nbytes - processed,
-				   nx_ctx->ap->databytelen);
-		to_process = min_t(u64, to_process,
-				   NX_PAGE_SIZE * (max_sg_len - 1));
-		to_process = to_process & ~(AES_BLOCK_SIZE - 1);
+		to_process = nbytes - processed;
 
-		rc = nx_build_sg_lists(nx_ctx, desc, dst, src, to_process,
+		rc = nx_build_sg_lists(nx_ctx, desc, dst, src, &to_process,
 				processed, NULL);
 		if (rc)
 			goto out;
@@ -145,7 +137,6 @@ struct crypto_alg nx_ecb_aes_alg = {
 	.cra_ctxsize     = sizeof(struct nx_crypto_ctx),
 	.cra_type        = &crypto_blkcipher_type,
 	.cra_module      = THIS_MODULE,
-	.cra_list        = LIST_HEAD_INIT(nx_ecb_aes_alg.cra_list),
 	.cra_init        = nx_crypto_ctx_aes_ecb_init,
 	.cra_exit        = nx_crypto_ctx_exit,
 	.cra_blkcipher = {

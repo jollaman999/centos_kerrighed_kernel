@@ -25,14 +25,92 @@
 
 #include <mach/dma.h>
 
-#include <mach/regs-sdi.h>
-#include <mach/regs-gpio.h>
-
-#include <plat/mci.h>
+#include <linux/platform_data/mmc-s3cmci.h>
 
 #include "s3cmci.h"
 
 #define DRIVER_NAME "s3c-mci"
+
+#define S3C2410_SDICON			(0x00)
+#define S3C2410_SDIPRE			(0x04)
+#define S3C2410_SDICMDARG		(0x08)
+#define S3C2410_SDICMDCON		(0x0C)
+#define S3C2410_SDICMDSTAT		(0x10)
+#define S3C2410_SDIRSP0			(0x14)
+#define S3C2410_SDIRSP1			(0x18)
+#define S3C2410_SDIRSP2			(0x1C)
+#define S3C2410_SDIRSP3			(0x20)
+#define S3C2410_SDITIMER		(0x24)
+#define S3C2410_SDIBSIZE		(0x28)
+#define S3C2410_SDIDCON			(0x2C)
+#define S3C2410_SDIDCNT			(0x30)
+#define S3C2410_SDIDSTA			(0x34)
+#define S3C2410_SDIFSTA			(0x38)
+
+#define S3C2410_SDIDATA			(0x3C)
+#define S3C2410_SDIIMSK			(0x40)
+
+#define S3C2440_SDIDATA			(0x40)
+#define S3C2440_SDIIMSK			(0x3C)
+
+#define S3C2440_SDICON_SDRESET		(1 << 8)
+#define S3C2410_SDICON_SDIOIRQ		(1 << 3)
+#define S3C2410_SDICON_FIFORESET	(1 << 1)
+#define S3C2410_SDICON_CLOCKTYPE	(1 << 0)
+
+#define S3C2410_SDICMDCON_LONGRSP	(1 << 10)
+#define S3C2410_SDICMDCON_WAITRSP	(1 << 9)
+#define S3C2410_SDICMDCON_CMDSTART	(1 << 8)
+#define S3C2410_SDICMDCON_SENDERHOST	(1 << 6)
+#define S3C2410_SDICMDCON_INDEX		(0x3f)
+
+#define S3C2410_SDICMDSTAT_CRCFAIL	(1 << 12)
+#define S3C2410_SDICMDSTAT_CMDSENT	(1 << 11)
+#define S3C2410_SDICMDSTAT_CMDTIMEOUT	(1 << 10)
+#define S3C2410_SDICMDSTAT_RSPFIN	(1 << 9)
+
+#define S3C2440_SDIDCON_DS_WORD		(2 << 22)
+#define S3C2410_SDIDCON_TXAFTERRESP	(1 << 20)
+#define S3C2410_SDIDCON_RXAFTERCMD	(1 << 19)
+#define S3C2410_SDIDCON_BLOCKMODE	(1 << 17)
+#define S3C2410_SDIDCON_WIDEBUS		(1 << 16)
+#define S3C2410_SDIDCON_DMAEN		(1 << 15)
+#define S3C2410_SDIDCON_STOP		(1 << 14)
+#define S3C2440_SDIDCON_DATSTART	(1 << 14)
+
+#define S3C2410_SDIDCON_XFER_RXSTART	(2 << 12)
+#define S3C2410_SDIDCON_XFER_TXSTART	(3 << 12)
+
+#define S3C2410_SDIDCON_BLKNUM_MASK	(0xFFF)
+
+#define S3C2410_SDIDSTA_SDIOIRQDETECT	(1 << 9)
+#define S3C2410_SDIDSTA_FIFOFAIL	(1 << 8)
+#define S3C2410_SDIDSTA_CRCFAIL		(1 << 7)
+#define S3C2410_SDIDSTA_RXCRCFAIL	(1 << 6)
+#define S3C2410_SDIDSTA_DATATIMEOUT	(1 << 5)
+#define S3C2410_SDIDSTA_XFERFINISH	(1 << 4)
+#define S3C2410_SDIDSTA_TXDATAON	(1 << 1)
+#define S3C2410_SDIDSTA_RXDATAON	(1 << 0)
+
+#define S3C2440_SDIFSTA_FIFORESET	(1 << 16)
+#define S3C2440_SDIFSTA_FIFOFAIL	(3 << 14)
+#define S3C2410_SDIFSTA_TFDET		(1 << 13)
+#define S3C2410_SDIFSTA_RFDET		(1 << 12)
+#define S3C2410_SDIFSTA_COUNTMASK	(0x7f)
+
+#define S3C2410_SDIIMSK_RESPONSECRC	(1 << 17)
+#define S3C2410_SDIIMSK_CMDSENT		(1 << 16)
+#define S3C2410_SDIIMSK_CMDTIMEOUT	(1 << 15)
+#define S3C2410_SDIIMSK_RESPONSEND	(1 << 14)
+#define S3C2410_SDIIMSK_SDIOIRQ		(1 << 12)
+#define S3C2410_SDIIMSK_FIFOFAIL	(1 << 11)
+#define S3C2410_SDIIMSK_CRCSTATUS	(1 << 10)
+#define S3C2410_SDIIMSK_DATACRC		(1 << 9)
+#define S3C2410_SDIIMSK_DATATIMEOUT	(1 << 8)
+#define S3C2410_SDIIMSK_DATAFINISH	(1 << 7)
+#define S3C2410_SDIIMSK_TXFIFOHALF	(1 << 4)
+#define S3C2410_SDIIMSK_RXFIFOLAST	(1 << 2)
+#define S3C2410_SDIIMSK_RXFIFOHALF	(1 << 0)
 
 enum dbg_channels {
 	dbg_err   = (1 << 0),
@@ -247,7 +325,7 @@ static void s3cmci_check_sdio_irq(struct s3cmci_host *host)
 {
 	if (host->sdio_irqen) {
 		if (gpio_get_value(S3C2410_GPE(8)) == 0) {
-			printk(KERN_DEBUG "%s: signalling irq\n", __func__);
+			pr_debug("%s: signalling irq\n", __func__);
 			mmc_signal_sdio_irq(host->mmc);
 		}
 	}
@@ -344,7 +422,7 @@ static void s3cmci_disable_irq(struct s3cmci_host *host, bool transfer)
 
 	local_irq_save(flags);
 
-	//printk(KERN_DEBUG "%s: transfer %d\n", __func__, transfer);
+	/* pr_debug("%s: transfer %d\n", __func__, transfer); */
 
 	host->irq_disabled = transfer;
 
@@ -820,7 +898,7 @@ fail_request:
 static void finalize_request(struct s3cmci_host *host)
 {
 	struct mmc_request *mrq = host->mrq;
-	struct mmc_command *cmd = host->cmd_is_stop ? mrq->stop : mrq->cmd;
+	struct mmc_command *cmd;
 	int debug_as_failure = 0;
 
 	if (host->complete_what != COMPLETION_FINALIZE)
@@ -828,6 +906,7 @@ static void finalize_request(struct s3cmci_host *host)
 
 	if (!mrq)
 		return;
+	cmd = host->cmd_is_stop ? mrq->stop : mrq->cmd;
 
 	if (cmd->data && (cmd->error == 0) &&
 	    (cmd->data->error == 0)) {
@@ -873,7 +952,7 @@ static void finalize_request(struct s3cmci_host *host)
 	if (!mrq->data)
 		goto request_done;
 
-	/* Calulate the amout of bytes transfer if there was no error */
+	/* Calculate the amout of bytes transfer if there was no error */
 	if (mrq->data->error == 0) {
 		mrq->data->bytes_xfered =
 			(mrq->data->blocks * mrq->data->blksz);
@@ -881,7 +960,7 @@ static void finalize_request(struct s3cmci_host *host)
 		mrq->data->bytes_xfered = 0;
 	}
 
-	/* If we had an error while transfering data we flush the
+	/* If we had an error while transferring data we flush the
 	 * DMA channel and the fifo to clear out any garbage. */
 	if (mrq->data->error != 0) {
 		if (s3cmci_host_usedma(host))
@@ -912,9 +991,9 @@ request_done:
 }
 
 static void s3cmci_dma_setup(struct s3cmci_host *host,
-			     enum s3c2410_dmasrc source)
+			     enum dma_data_direction source)
 {
-	static enum s3c2410_dmasrc last_source = -1;
+	static enum dma_data_direction last_source = -1;
 	static int setup_ok;
 
 	if (last_source == source)
@@ -979,7 +1058,7 @@ static int s3cmci_setup_data(struct s3cmci_host *host, struct mmc_data *data)
 
 	if ((data->blksz & 3) != 0) {
 		/* We cannot deal with unaligned blocks with more than
-		 * one block being transfered. */
+		 * one block being transferred. */
 
 		if (data->blocks > 1) {
 			pr_warning("%s: can't do non-word sized block transfers (blksz %d)\n", __func__, data->blksz);
@@ -1086,7 +1165,7 @@ static int s3cmci_prepare_dma(struct s3cmci_host *host, struct mmc_data *data)
 
 	BUG_ON((data->flags & BOTH_DIR) == BOTH_DIR);
 
-	s3cmci_dma_setup(host, rw ? S3C2410_DMASRC_MEM : S3C2410_DMASRC_HW);
+	s3cmci_dma_setup(host, rw ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
 	s3c2410_dma_ctrl(host->dma, S3C2410_DMAOP_FLUSH);
 
 	dma_len = dma_map_sg(mmc_dev(host->mmc), data->sg, data->sg_len,
@@ -1178,7 +1257,7 @@ static int s3cmci_card_present(struct mmc_host *mmc)
 	struct s3c24xx_mci_pdata *pdata = host->pdata;
 	int ret;
 
-	if (pdata->gpio_detect == 0)
+	if (pdata->no_detect)
 		return -ENOSYS;
 
 	ret = gpio_get_value(pdata->gpio_detect) ? 0 : 1;
@@ -1236,12 +1315,9 @@ static void s3cmci_set_ios(struct mmc_host *mmc, struct mmc_ios *ios)
 	switch (ios->power_mode) {
 	case MMC_POWER_ON:
 	case MMC_POWER_UP:
-		s3c2410_gpio_cfgpin(S3C2410_GPE(5), S3C2410_GPE5_SDCLK);
-		s3c2410_gpio_cfgpin(S3C2410_GPE(6), S3C2410_GPE6_SDCMD);
-		s3c2410_gpio_cfgpin(S3C2410_GPE(7), S3C2410_GPE7_SDDAT0);
-		s3c2410_gpio_cfgpin(S3C2410_GPE(8), S3C2410_GPE8_SDDAT1);
-		s3c2410_gpio_cfgpin(S3C2410_GPE(9), S3C2410_GPE9_SDDAT2);
-		s3c2410_gpio_cfgpin(S3C2410_GPE(10), S3C2410_GPE10_SDDAT3);
+		/* Configure GPE5...GPE10 pins in SD mode */
+		s3c_gpio_cfgall_range(S3C2410_GPE(5), 6, S3C_GPIO_SFN(2),
+				      S3C_GPIO_PULL_NONE);
 
 		if (host->pdata->set_power)
 			host->pdata->set_power(ios->power_mode, ios->vdd);
@@ -1302,10 +1378,8 @@ static int s3cmci_get_ro(struct mmc_host *mmc)
 	if (pdata->no_wprotect)
 		return 0;
 
-	ret = s3c2410_gpio_getpin(pdata->gpio_wprotect);
-
-	if (pdata->wprotect_invert)
-		ret = !ret;
+	ret = gpio_get_value(pdata->gpio_wprotect) ? 1 : 0;
+	ret ^= pdata->wprotect_invert;
 
 	return ret;
 }
@@ -1360,7 +1434,9 @@ static struct mmc_host_ops s3cmci_ops = {
 
 static struct s3c24xx_mci_pdata s3cmci_def_pdata = {
 	/* This is currently here to avoid a number of if (host->pdata)
-	 * checks. Any zero fields to ensure reaonable defaults are picked. */
+	 * checks. Any zero fields to ensure reasonable defaults are picked. */
+	 .no_wprotect = 1,
+	 .no_detect = 1,
 };
 
 #ifdef CONFIG_CPU_FREQ
@@ -1543,7 +1619,7 @@ static inline void s3cmci_debugfs_remove(struct s3cmci_host *host) { }
 
 #endif /* CONFIG_DEBUG_FS */
 
-static int __devinit s3cmci_probe(struct platform_device *pdev)
+static int s3cmci_probe(struct platform_device *pdev)
 {
 	struct s3cmci_host *host;
 	struct mmc_host	*mmc;
@@ -1599,13 +1675,13 @@ static int __devinit s3cmci_probe(struct platform_device *pdev)
 	host->pio_active 	= XFER_NONE;
 
 #ifdef CONFIG_MMC_S3C_PIODMA
-	host->dodma		= host->pdata->dma;
+	host->dodma		= host->pdata->use_dma;
 #endif
 
 	host->mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!host->mem) {
 		dev_err(&pdev->dev,
-			"failed to get io memory region resouce.\n");
+			"failed to get io memory region resource.\n");
 
 		ret = -ENOENT;
 		goto probe_free_gpio;
@@ -1629,7 +1705,7 @@ static int __devinit s3cmci_probe(struct platform_device *pdev)
 
 	host->irq = platform_get_irq(pdev, 0);
 	if (host->irq == 0) {
-		dev_err(&pdev->dev, "failed to get interrupt resouce.\n");
+		dev_err(&pdev->dev, "failed to get interrupt resource.\n");
 		ret = -EINVAL;
 		goto probe_iounmap;
 	}
@@ -1654,7 +1730,7 @@ static int __devinit s3cmci_probe(struct platform_device *pdev)
 			goto probe_free_irq;
 		}
 
-		host->irq_cd = s3c2410_gpio_getirq(host->pdata->gpio_detect);
+		host->irq_cd = gpio_to_irq(host->pdata->gpio_detect);
 
 		if (host->irq_cd >= 0) {
 			if (request_irq(host->irq_cd, s3cmci_irq_cd,
@@ -1735,8 +1811,7 @@ static int __devinit s3cmci_probe(struct platform_device *pdev)
 	mmc->max_req_size	= 4095 * 512;
 	mmc->max_seg_size	= mmc->max_req_size;
 
-	mmc->max_phys_segs	= 128;
-	mmc->max_hw_segs	= 128;
+	mmc->max_segs		= 128;
 
 	dbg(host, dbg_debug,
 	    "probe: mode:%s mapped mci_base:%p irq:%u irq_cd:%u dma:%u.\n",
@@ -1823,7 +1898,7 @@ static void s3cmci_shutdown(struct platform_device *pdev)
 	clk_disable(host->clk);
 }
 
-static int __devexit s3cmci_remove(struct platform_device *pdev)
+static int s3cmci_remove(struct platform_device *pdev)
 {
 	struct mmc_host		*mmc  = platform_get_drvdata(pdev);
 	struct s3cmci_host	*host = mmc_priv(mmc);
@@ -1880,9 +1955,8 @@ MODULE_DEVICE_TABLE(platform, s3cmci_driver_ids);
 static int s3cmci_suspend(struct device *dev)
 {
 	struct mmc_host *mmc = platform_get_drvdata(to_platform_device(dev));
-	struct pm_message event = { PM_EVENT_SUSPEND };
 
-	return mmc_suspend_host(mmc, event);
+	return mmc_suspend_host(mmc);
 }
 
 static int s3cmci_resume(struct device *dev)
@@ -1892,7 +1966,7 @@ static int s3cmci_resume(struct device *dev)
 	return mmc_resume_host(mmc);
 }
 
-static struct dev_pm_ops s3cmci_pm = {
+static const struct dev_pm_ops s3cmci_pm = {
 	.suspend	= s3cmci_suspend,
 	.resume		= s3cmci_resume,
 };
@@ -1911,22 +1985,11 @@ static struct platform_driver s3cmci_driver = {
 	},
 	.id_table	= s3cmci_driver_ids,
 	.probe		= s3cmci_probe,
-	.remove		= __devexit_p(s3cmci_remove),
+	.remove		= s3cmci_remove,
 	.shutdown	= s3cmci_shutdown,
 };
 
-static int __init s3cmci_init(void)
-{
-	return platform_driver_register(&s3cmci_driver);
-}
-
-static void __exit s3cmci_exit(void)
-{
-	platform_driver_unregister(&s3cmci_driver);
-}
-
-module_init(s3cmci_init);
-module_exit(s3cmci_exit);
+module_platform_driver(s3cmci_driver);
 
 MODULE_DESCRIPTION("Samsung S3C MMC/SD Card Interface driver");
 MODULE_LICENSE("GPL v2");

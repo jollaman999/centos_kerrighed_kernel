@@ -2,7 +2,8 @@
  *  Linux MegaRAID driver for SAS based RAID controllers
  *
  *  Copyright (c) 2009-2013  LSI Corporation
- *  Copyright (c) 2013-2014  Avago Technologies
+ *  Copyright (c) 2013-2016  Avago Technologies
+ *  Copyright (c) 2016-2018  Broadcom Inc.
  *
  *  This program is free software; you can redistribute it and/or
  *  modify it under the terms of the GNU General Public License
@@ -19,17 +20,14 @@
  *
  *  FILE: megaraid_sas_fp.c
  *
- *  Authors: Avago Technologies
+ *  Authors: Broadcom Inc.
  *           Sumant Patro
  *           Varad Talamacki
  *           Manoj Jose
- *           Kashyap Desai <kashyap.desai@avagotech.com>
- *           Sumit Saxena <sumit.saxena@avagotech.com>
+ *           Kashyap Desai <kashyap.desai@broadcom.com>
+ *           Sumit Saxena <sumit.saxena@broadcom.com>
  *
- *  Send feedback to: megaraidlinux.pdl@avagotech.com
- *
- *  Mail to: Avago Technologies, 350 West Trimble Road, Building 90,
- *  San Jose, California 95131
+ *  Send feedback to: megaraidlinux.pdl@broadcom.com
  */
 
 #include <linux/kernel.h>
@@ -41,13 +39,13 @@
 #include <linux/spinlock.h>
 #include <linux/interrupt.h>
 #include <linux/delay.h>
-#include <linux/smp_lock.h>
 #include <linux/uio.h>
 #include <linux/uaccess.h>
 #include <linux/fs.h>
 #include <linux/compat.h>
 #include <linux/blkdev.h>
 #include <linux/poll.h>
+#include <linux/irq_poll.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -60,7 +58,7 @@
 
 #define LB_PENDING_CMDS_DEFAULT 4
 static unsigned int lb_pending_cmds = LB_PENDING_CMDS_DEFAULT;
-module_param(lb_pending_cmds, int, S_IRUGO);
+module_param(lb_pending_cmds, int, 0444);
 MODULE_PARM_DESC(lb_pending_cmds, "Change raid-1 load balancing outstanding "
 	"threshold. Valid Values are 1-128. Default: 4");
 
@@ -68,17 +66,6 @@ MODULE_PARM_DESC(lb_pending_cmds, "Change raid-1 load balancing outstanding "
 #define ABS_DIFF(a, b)   (((a) > (b)) ? ((a) - (b)) : ((b) - (a)))
 #define MR_LD_STATE_OPTIMAL 3
 
-#ifdef FALSE
-#undef FALSE
-#endif
-#define FALSE 0
-
-#ifdef TRUE
-#undef TRUE
-#endif
-#define TRUE 1
-
-#define SPAN_DEBUG 0
 #define SPAN_ROW_SIZE(map, ld, index_) (MR_LdSpanPtrGet(ld, index_, map)->spanRowSize)
 #define SPAN_ROW_DATA_SIZE(map_, ld, index_)   (MR_LdSpanPtrGet(ld, index_, map)->spanRowDataSize)
 #define SPAN_INVALID  0xff
@@ -110,7 +97,7 @@ u32 mega_mod64(u64 dividend, u32 divisor)
  *
  * @return quotient
  **/
-u64 mega_div64_32(uint64_t dividend, uint32_t divisor)
+static u64 mega_div64_32(uint64_t dividend, uint32_t divisor)
 {
 	u32 remainder;
 	u64 d;
@@ -156,12 +143,17 @@ __le16 MR_PdDevHandleGet(u32 pd, struct MR_DRV_RAID_MAP_ALL *map)
 	return map->raidMap.devHndlInfo[pd].curDevHdl;
 }
 
+static u8 MR_PdInterfaceTypeGet(u32 pd, struct MR_DRV_RAID_MAP_ALL *map)
+{
+	return map->raidMap.devHndlInfo[pd].interfaceType;
+}
+
 u16 MR_GetLDTgtId(u32 ld, struct MR_DRV_RAID_MAP_ALL *map)
 {
 	return le16_to_cpu(map->raidMap.ldSpanMap[ld].ldRaid.targetId);
 }
 
-u8 MR_TargetIdToLdGet(u32 ldTgtId, struct MR_DRV_RAID_MAP_ALL *map)
+u16 MR_TargetIdToLdGet(u32 ldTgtId, struct MR_DRV_RAID_MAP_ALL *map)
 {
 	return map->raidMap.ldTgtIdToLd[ldTgtId];
 }
@@ -175,7 +167,7 @@ static struct MR_LD_SPAN *MR_LdSpanPtrGet(u32 ld, u32 span,
 /*
  * This function will Populate Driver Map using firmware raid map
  */
-void MR_PopulateDrvRaidMap(struct megasas_instance *instance)
+static int MR_PopulateDrvRaidMap(struct megasas_instance *instance, u64 map_id)
 {
 	struct fusion_context *fusion = instance->ctrl_context;
 	struct MR_FW_RAID_MAP_ALL     *fw_map_old    = NULL;
@@ -188,141 +180,73 @@ void MR_PopulateDrvRaidMap(struct megasas_instance *instance)
 
 
 	struct MR_DRV_RAID_MAP_ALL *drv_map =
-			fusion->ld_drv_map[(instance->map_id & 1)];
+			fusion->ld_drv_map[(map_id & 1)];
 	struct MR_DRV_RAID_MAP *pDrvRaidMap = &drv_map->raidMap;
 	void *raid_map_data = NULL;
 
 	memset(drv_map, 0, fusion->drv_map_sz);
 	memset(pDrvRaidMap->ldTgtIdToLd,
-		0xff, (sizeof(u16) * MAX_LOGICAL_DRIVES_DYN));
+	       0xff, (sizeof(u16) * MAX_LOGICAL_DRIVES_DYN));
 
 	if (instance->max_raid_mapsize) {
-		fw_map_dyn = fusion->ld_map[(instance->map_id & 1)];
-		if (fw_map_dyn->pci_threshold_bandwidth)
-			instance->pci_threshold_bandwidth =
-			le64_to_cpu(fw_map_dyn->pci_threshold_bandwidth);
-#if VD_EXT_DEBUG
-		dev_dbg(&instance->pdev->dev,
-		" raidMapSize 0x%x fw_map_dyn->descTableOffset 0x%x, "
-		" descTableSize 0x%x descTableNumElements 0x%x, "
-		" PCIThreasholdBandwidth %llu\n",
-		le32_to_cpu(fw_map_dyn->raid_map_size),
-		le32_to_cpu(fw_map_dyn->desc_table_offset),
-		le32_to_cpu(fw_map_dyn->desc_table_size),
-		le32_to_cpu(fw_map_dyn->desc_table_num_elements),
-		instance->pci_threshold_bandwidth);
-		dev_dbg(&instance->pdev->dev,
-		"drv map %p ldCount %d\n", drv_map, fw_map_dyn->ld_count);
-#endif
+		fw_map_dyn = fusion->ld_map[(map_id & 1)];
 		desc_table =
-		(struct MR_RAID_MAP_DESC_TABLE *)((void *)fw_map_dyn +
-		le32_to_cpu(fw_map_dyn->desc_table_offset));
-		if (desc_table != fw_map_dyn->raid_map_desc_table) {
-			dev_err(&instance->pdev->dev,
-			"offsets of desc table are not matching returning "
-			" FW raid map has been changed: desc %p original %p\n",
-			desc_table, fw_map_dyn->raid_map_desc_table);
-		}
+		(struct MR_RAID_MAP_DESC_TABLE *)((void *)fw_map_dyn + le32_to_cpu(fw_map_dyn->desc_table_offset));
+		if (desc_table != fw_map_dyn->raid_map_desc_table)
+			dev_dbg(&instance->pdev->dev, "offsets of desc table are not matching desc %p original %p\n",
+				desc_table, fw_map_dyn->raid_map_desc_table);
+
 		ld_count = (u16)le16_to_cpu(fw_map_dyn->ld_count);
 		pDrvRaidMap->ldCount = (__le16)cpu_to_le16(ld_count);
-		pDrvRaidMap->fpPdIoTimeoutSec = fw_map_dyn->fp_pd_io_timeout_sec;
-		pDrvRaidMap->totalSize = sizeof(struct MR_DRV_RAID_MAP_ALL);
+		pDrvRaidMap->fpPdIoTimeoutSec =
+			fw_map_dyn->fp_pd_io_timeout_sec;
+		pDrvRaidMap->totalSize =
+			cpu_to_le32(sizeof(struct MR_DRV_RAID_MAP_ALL));
 		/* point to actual data starting point*/
 		raid_map_data = (void *)fw_map_dyn +
 			le32_to_cpu(fw_map_dyn->desc_table_offset) +
 			le32_to_cpu(fw_map_dyn->desc_table_size);
 
 		for (i = 0; i < le32_to_cpu(fw_map_dyn->desc_table_num_elements); ++i) {
-
-#if VD_EXT_DEBUG
-			dev_err(&instance->pdev->dev,
-				"desc table %p \n", desc_table);
-			dev_err(&instance->pdev->dev,
-			"raidmap type %d, raidmapOffset 0x%x, "
-			" raid map number of elements 0%x, raidmapsize 0x%x\n",
-			desc_table->raid_map_desc_type,
-			desc_table->raid_map_desc_offset,
-			desc_table->raid_map_desc_elements,
-			desc_table->raid_map_desc_buffer_size);
-#endif
 			switch (le32_to_cpu(desc_table->raid_map_desc_type)) {
 			case RAID_MAP_DESC_TYPE_DEVHDL_INFO:
-				fw_map_dyn->dev_hndl_info = (struct MR_DEV_HANDLE_INFO *)
-				(raid_map_data +
-				le32_to_cpu(desc_table->raid_map_desc_offset));
-#if VD_EXT_DEBUG
-				dev_err(&instance->pdev->dev,
-				"devHndlInfo  address %p\n",
-				 fw_map_dyn->dev_hndl_info);
-#endif
-				memcpy(pDrvRaidMap->devHndlInfo, fw_map_dyn->dev_hndl_info,
+				fw_map_dyn->dev_hndl_info =
+				(struct MR_DEV_HANDLE_INFO *)(raid_map_data + le32_to_cpu(desc_table->raid_map_desc_offset));
+				memcpy(pDrvRaidMap->devHndlInfo,
+					fw_map_dyn->dev_hndl_info,
 					sizeof(struct MR_DEV_HANDLE_INFO) *
 					le32_to_cpu(desc_table->raid_map_desc_elements));
 			break;
 			case RAID_MAP_DESC_TYPE_TGTID_INFO:
-					fw_map_dyn->ld_tgt_id_to_ld = (u16 *) (raid_map_data +
+				fw_map_dyn->ld_tgt_id_to_ld =
+					(u16 *)(raid_map_data +
 					le32_to_cpu(desc_table->raid_map_desc_offset));
-#if VD_EXT_DEBUG
-			dev_err(&instance->pdev->dev,
-				"ldTgtIdToLd  address %p\n",
-					fw_map_dyn->ld_tgt_id_to_ld);
-#endif
-			for (j = 0; j < le32_to_cpu(desc_table->raid_map_desc_elements); j++) {
-				pDrvRaidMap->ldTgtIdToLd[j] =
-					fw_map_dyn->ld_tgt_id_to_ld[j];
-#if VD_EXT_DEBUG
-				dev_err(&instance->pdev->dev,
-					" %d drv ldTgtIdToLd %d\n",
-						j, pDrvRaidMap->ldTgtIdToLd[j]);
-#endif
-			}
+				for (j = 0; j < le32_to_cpu(desc_table->raid_map_desc_elements); j++) {
+					pDrvRaidMap->ldTgtIdToLd[j] =
+						le16_to_cpu(fw_map_dyn->ld_tgt_id_to_ld[j]);
+				}
 			break;
 			case RAID_MAP_DESC_TYPE_ARRAY_INFO:
-				fw_map_dyn->ar_map_info = (struct MR_ARRAY_INFO *)
-				(raid_map_data + le32_to_cpu(desc_table->raid_map_desc_offset));
-#if VD_EXT_DEBUG
-				dev_err(&instance->pdev->dev,
-					"arMapInfo  address %p\n",
-					 fw_map_dyn->ar_map_info);
-#endif
-
+				fw_map_dyn->ar_map_info =
+					(struct MR_ARRAY_INFO *)
+					(raid_map_data + le32_to_cpu(desc_table->raid_map_desc_offset));
 				memcpy(pDrvRaidMap->arMapInfo,
-				fw_map_dyn->ar_map_info,
-				sizeof(struct MR_ARRAY_INFO) *
-				le32_to_cpu(desc_table->raid_map_desc_elements));
+				       fw_map_dyn->ar_map_info,
+				       sizeof(struct MR_ARRAY_INFO) *
+				       le32_to_cpu(desc_table->raid_map_desc_elements));
 			break;
 			case RAID_MAP_DESC_TYPE_SPAN_INFO:
-				fw_map_dyn->ld_span_map = (struct MR_LD_SPAN_MAP *)
-				(raid_map_data + le32_to_cpu(desc_table->raid_map_desc_offset));
+				fw_map_dyn->ld_span_map =
+					(struct MR_LD_SPAN_MAP *)
+					(raid_map_data +
+					le32_to_cpu(desc_table->raid_map_desc_offset));
 				memcpy(pDrvRaidMap->ldSpanMap,
-				fw_map_dyn->ld_span_map,
-				sizeof(struct MR_LD_SPAN_MAP) *
-				le32_to_cpu(desc_table->raid_map_desc_elements));
-#if VD_EXT_DEBUG
-				dev_err(&instance->pdev->dev,
-					"ldSpanMap  address %p\n",
-						fw_map_dyn->ld_span_map);
-				dev_err(&instance->pdev->dev,
-				"MR_LD_SPAN_MAP size 0x%lx\n", sizeof(struct MR_LD_SPAN_MAP));
-				for (j = 0; j < ld_count; j++) {
-					printk(KERN_DEBUG "megaraid_sas(%d) : fw_map_dyn->ldSpanMap[%d].ldRaid.targetId 0x%x fw_map_dyn->ldSpanMap[%d].ldRaid.seqNum 0x%x size 0x%x\n",
-					j, j, fw_map_dyn->ld_span_map[j].ldRaid.targetId, j,
-					fw_map_dyn->ld_span_map[j].ldRaid.seqNum,
-					(u32)fw_map_dyn->ld_span_map[j].ldRaid.rowSize);
-					printk(KERN_DEBUG "megaraid_sas(%d) :pDrvRaidMap->ldSpanMap[%d].ldRaid.targetId 0x%x pDrvRaidMap->ldSpanMap[%d].ldRaid.seqNum 0x%x size 0x%x\n",
-					j, j, pDrvRaidMap->ldSpanMap[j].ldRaid.targetId, j,
-					pDrvRaidMap->ldSpanMap[j].ldRaid.seqNum,
-					(u32)pDrvRaidMap->ldSpanMap[j].ldRaid.rowSize);
-					printk(KERN_DEBUG "megaraid_sas(%d) : drv raid map all %p raid map %p LD RAID MAP %p/%p\n",
-					instance->unique_id, drv_map, pDrvRaidMap,
-					&fw_map_dyn->ld_span_map[j].ldRaid,
-					&pDrvRaidMap->ldSpanMap[j].ldRaid);
-				}
-#endif
+				       fw_map_dyn->ld_span_map,
+				       sizeof(struct MR_LD_SPAN_MAP) *
+				       le32_to_cpu(desc_table->raid_map_desc_elements));
 			break;
 			default:
-				dev_err(&instance->pdev->dev,
-					"wrong number of desctableElements %d\n",
+				dev_dbg(&instance->pdev->dev, "wrong number of desctableElements %d\n",
 					fw_map_dyn->desc_table_num_elements);
 			}
 			++desc_table;
@@ -330,54 +254,25 @@ void MR_PopulateDrvRaidMap(struct megasas_instance *instance)
 
 	} else if (instance->supportmax256vd) {
 		fw_map_ext =
-		(struct MR_FW_RAID_MAP_EXT *) fusion->ld_map[(instance->map_id & 1)];
+			(struct MR_FW_RAID_MAP_EXT *)fusion->ld_map[(map_id & 1)];
 		ld_count = (u16)le16_to_cpu(fw_map_ext->ldCount);
 		if (ld_count > MAX_LOGICAL_DRIVES_EXT) {
-			printk(KERN_DEBUG "megaraid_sas: LD count exposed in RAID map in not valid\n");
-			return;
+			dev_dbg(&instance->pdev->dev, "megaraid_sas: LD count exposed in RAID map in not valid\n");
+			return 1;
 		}
-#if VD_EXT_DEBUG
-		for (i = 0; i < ld_count; i++) {
-			printk(KERN_DEBUG "megaraid_sas(%d) :Index 0x%x Target Id 0x%x Seq Num 0x%x Size 0/%llx\n",
-				instance->unique_id,
-				i, fw_map_ext->ldSpanMap[i].ldRaid.targetId,
-				fw_map_ext->ldSpanMap[i].ldRaid.seqNum,
-				fw_map_ext->ldSpanMap[i].ldRaid.size);
-		}
-#endif
 
 		pDrvRaidMap->ldCount = (__le16)cpu_to_le16(ld_count);
-		pDrvRaidMap->fpPdIoTimeoutSec =
-						fw_map_ext->fpPdIoTimeoutSec;
+		pDrvRaidMap->fpPdIoTimeoutSec = fw_map_ext->fpPdIoTimeoutSec;
 		for (i = 0; i < (MAX_LOGICAL_DRIVES_EXT); i++)
 			pDrvRaidMap->ldTgtIdToLd[i] =
-			(u16)fw_map_ext->ldTgtIdToLd[i];
-		memcpy(pDrvRaidMap->ldSpanMap,
-				fw_map_ext->ldSpanMap,
-				sizeof(struct MR_LD_SPAN_MAP) *
-				ld_count);
-#if VD_EXT_DEBUG
-		for (i = 0; i < ld_count; i++) {
-			printk(KERN_DEBUG "megaraid_sas(%d) : fw_map_ext->ldSpanMap[%d].ldRaid.targetId 0x%x fw_map_ext->ldSpanMap[%d].ldRaid.seqNum 0x%x size 0x%x\n",
-			i, i, fw_map_ext->ldSpanMap[i].ldRaid.targetId, i,
-			fw_map_ext->ldSpanMap[i].ldRaid.seqNum,
-			(u32)fw_map_ext->ldSpanMap[i].ldRaid.rowSize);
-			printk(KERN_DEBUG "megaraid_sas(%d) : pDrvRaidMap->ldSpanMap[%d].ldRaid.targetId 0x%x"
-			"pDrvRaidMap->ldSpanMap[%d].ldRaid.seqNum 0x%x size 0x%x\n",
-			i, i, pDrvRaidMap->ldSpanMap[i].ldRaid.targetId, i,
-			pDrvRaidMap->ldSpanMap[i].ldRaid.seqNum,
-			(u32)pDrvRaidMap->ldSpanMap[i].ldRaid.rowSize);
-			printk(KERN_DEBUG "megaraid_sas(%d) : drv raid map all %p raid map %p LD RAID MAP %p %p\n",
-			instance->unique_id, drv_map, pDrvRaidMap,
-			&fw_map_ext->ldSpanMap[i].ldRaid,
-				&pDrvRaidMap->ldSpanMap[i].ldRaid);
-		}
-#endif
+				(u16)fw_map_ext->ldTgtIdToLd[i];
+		memcpy(pDrvRaidMap->ldSpanMap, fw_map_ext->ldSpanMap,
+		       sizeof(struct MR_LD_SPAN_MAP) * ld_count);
 		memcpy(pDrvRaidMap->arMapInfo, fw_map_ext->arMapInfo,
-			sizeof(struct MR_ARRAY_INFO) * MAX_API_ARRAYS_EXT);
+		       sizeof(struct MR_ARRAY_INFO) * MAX_API_ARRAYS_EXT);
 		memcpy(pDrvRaidMap->devHndlInfo, fw_map_ext->devHndlInfo,
-			sizeof(struct MR_DEV_HANDLE_INFO) *
-					MAX_RAIDMAP_PHYSICAL_DEVICES);
+		       sizeof(struct MR_DEV_HANDLE_INFO) *
+		       MAX_RAIDMAP_PHYSICAL_DEVICES);
 
 		/* New Raid map will not set totalSize, so keep expected value
 		 * for legacy code in ValidateMapInfo
@@ -386,20 +281,14 @@ void MR_PopulateDrvRaidMap(struct megasas_instance *instance)
 			cpu_to_le32(sizeof(struct MR_FW_RAID_MAP_EXT));
 	} else {
 		fw_map_old = (struct MR_FW_RAID_MAP_ALL *)
-			fusion->ld_map[(instance->map_id & 1)];
+				fusion->ld_map[(map_id & 1)];
 		pFwRaidMap = &fw_map_old->raidMap;
 		ld_count = (u16)le32_to_cpu(pFwRaidMap->ldCount);
-
-#if VD_EXT_DEBUG
-		for (i = 0; i < ld_count; i++) {
-			dev_dbg(&instance->pdev->dev, "(%d) :Index 0x%x "
-				"Target Id 0x%x Seq Num 0x%x Size 0/%llx\n",
-				instance->unique_id, i,
-				fw_map_old->raidMap.ldSpanMap[i].ldRaid.targetId,
-				fw_map_old->raidMap.ldSpanMap[i].ldRaid.seqNum,
-				fw_map_old->raidMap.ldSpanMap[i].ldRaid.size);
+		if (ld_count > MAX_LOGICAL_DRIVES) {
+			dev_dbg(&instance->pdev->dev,
+				"LD count exposed in RAID map in not valid\n");
+			return 1;
 		}
-#endif
 
 		pDrvRaidMap->totalSize = pFwRaidMap->totalSize;
 		pDrvRaidMap->ldCount = (__le16)cpu_to_le16(ld_count);
@@ -409,26 +298,6 @@ void MR_PopulateDrvRaidMap(struct megasas_instance *instance)
 				(u8)pFwRaidMap->ldTgtIdToLd[i];
 		for (i = 0; i < ld_count; i++) {
 			pDrvRaidMap->ldSpanMap[i] = pFwRaidMap->ldSpanMap[i];
-#if VD_EXT_DEBUG
-			dev_dbg(&instance->pdev->dev,
-				"pFwRaidMap->ldSpanMap[%d].ldRaid.targetId 0x%x "
-				"pFwRaidMap->ldSpanMap[%d].ldRaid.seqNum 0x%x "
-				"size 0x%x\n", i, i,
-				pFwRaidMap->ldSpanMap[i].ldRaid.targetId,
-				pFwRaidMap->ldSpanMap[i].ldRaid.seqNum,
-				(u32)pFwRaidMap->ldSpanMap[i].ldRaid.rowSize);
-			dev_dbg(&instance->pdev->dev,
-				"pDrvRaidMap->ldSpanMap[%d].ldRaid.targetId 0x%x "
-				"pDrvRaidMap->ldSpanMap[%d].ldRaid.seqNum 0x%x "
-				"size 0x%x\n", i, i,
-				pDrvRaidMap->ldSpanMap[i].ldRaid.targetId,
-				pDrvRaidMap->ldSpanMap[i].ldRaid.seqNum,
-				(u32)pDrvRaidMap->ldSpanMap[i].ldRaid.rowSize);
-			dev_dbg(&instance->pdev->dev, "Driver raid map all %p "
-				"raid map %p LD RAID MAP %p/%p\n", drv_map,
-				pDrvRaidMap, &pFwRaidMap->ldSpanMap[i].ldRaid,
-				&pDrvRaidMap->ldSpanMap[i].ldRaid);
-#endif
 		}
 		memcpy(pDrvRaidMap->arMapInfo, pFwRaidMap->arMapInfo,
 			sizeof(struct MR_ARRAY_INFO) * MAX_RAIDMAP_ARRAYS);
@@ -436,14 +305,14 @@ void MR_PopulateDrvRaidMap(struct megasas_instance *instance)
 			sizeof(struct MR_DEV_HANDLE_INFO) *
 			MAX_RAIDMAP_PHYSICAL_DEVICES);
 	}
-	if (instance->is_ventura && !instance->pci_threshold_bandwidth)
-		instance->pci_threshold_bandwidth = ULLONG_MAX;
+
+	return 0;
 }
 
 /*
  * This function will validate Map info data provided by FW
  */
-u8 MR_ValidateMapInfo(struct megasas_instance *instance)
+u8 MR_ValidateMapInfo(struct megasas_instance *instance, u64 map_id)
 {
 	struct fusion_context *fusion;
 	struct MR_DRV_RAID_MAP_ALL *drv_map;
@@ -451,15 +320,15 @@ u8 MR_ValidateMapInfo(struct megasas_instance *instance)
 	struct LD_LOAD_BALANCE_INFO *lbInfo;
 	PLD_SPAN_INFO ldSpanInfo;
 	struct MR_LD_RAID         *raid;
-	u16 ldCount, num_lds;
+	u16 num_lds, i;
 	u16 ld;
 	u32 expected_size;
 
-
-	MR_PopulateDrvRaidMap(instance);
+	if (MR_PopulateDrvRaidMap(instance, map_id))
+		return 0;
 
 	fusion = instance->ctrl_context;
-	drv_map = fusion->ld_drv_map[(instance->map_id & 1)];
+	drv_map = fusion->ld_drv_map[(map_id & 1)];
 	pDrvRaidMap = &drv_map->raidMap;
 
 	lbInfo = fusion->load_balance_info;
@@ -475,10 +344,10 @@ u8 MR_ValidateMapInfo(struct megasas_instance *instance)
 			(sizeof(struct MR_LD_SPAN_MAP) * le16_to_cpu(pDrvRaidMap->ldCount)));
 
 	if (le32_to_cpu(pDrvRaidMap->totalSize) != expected_size) {
-		dev_err(&instance->pdev->dev, "megasas: map info structure"
-		" size 0x%x is not matching expected size 0x%x\n",
-			le32_to_cpu(pDrvRaidMap->totalSize),
-			(unsigned int) expected_size);
+		dev_dbg(&instance->pdev->dev, "megasas: map info structure size 0x%x",
+			le32_to_cpu(pDrvRaidMap->totalSize));
+		dev_dbg(&instance->pdev->dev, "is not matching expected size 0x%x\n",
+			(unsigned int)expected_size);
 		dev_err(&instance->pdev->dev, "megasas: span map %x, pDrvRaidMap->totalSize : %x\n",
 			(unsigned int)sizeof(struct MR_LD_SPAN_MAP),
 			le32_to_cpu(pDrvRaidMap->totalSize));
@@ -488,21 +357,29 @@ u8 MR_ValidateMapInfo(struct megasas_instance *instance)
 	if (instance->UnevenSpanSupport)
 		mr_update_span_set(drv_map, ldSpanInfo);
 
-	mr_update_load_balance_params(drv_map, lbInfo);
+	if (lbInfo)
+		mr_update_load_balance_params(drv_map, lbInfo);
 
 	num_lds = le16_to_cpu(drv_map->raidMap.ldCount);
 
 	/*Convert Raid capability values to CPU arch */
-	for (ldCount = 0; ldCount < num_lds; ldCount++) {
-		ld = MR_TargetIdToLdGet(ldCount, drv_map);
+	for (i = 0; (num_lds > 0) && (i < MAX_LOGICAL_DRIVES_EXT); i++) {
+		ld = MR_TargetIdToLdGet(i, drv_map);
+
+		/* For non existing VDs, iterate to next VD*/
+		if (ld >= (MAX_LOGICAL_DRIVES_EXT - 1))
+			continue;
+
 		raid = MR_LdRaidGet(ld, drv_map);
 		le32_to_cpus((u32 *)&raid->capability);
+
+		num_lds--;
 	}
 
 	return 1;
 }
 
-u32 MR_GetSpanBlock(u32 ld, u64 row, u64 *span_blk,
+static u32 MR_GetSpanBlock(u32 ld, u64 row, u64 *span_blk,
 		    struct MR_DRV_RAID_MAP_ALL *map)
 {
 	struct MR_SPAN_BLOCK_INFO *pSpanBlock = MR_LdSpanInfoGet(ld, map);
@@ -521,9 +398,8 @@ u32 MR_GetSpanBlock(u32 ld, u64 row, u64 *span_blk,
 				le64_to_cpu(quad->logEnd) && (mega_mod64(row - le64_to_cpu(quad->logStart),
 				le32_to_cpu(quad->diff))) == 0) {
 				if (span_blk != NULL) {
-					u64  blk, debugBlk;
+					u64  blk;
 					blk =  mega_div64_32((row-le64_to_cpu(quad->logStart)), le32_to_cpu(quad->diff));
-					debugBlk = blk;
 
 					blk = (blk + le64_to_cpu(quad->offsetInSpan)) << raid->stripeShift;
 					*span_blk = blk;
@@ -534,91 +410,6 @@ u32 MR_GetSpanBlock(u32 ld, u64 row, u64 *span_blk,
 	}
 	return SPAN_INVALID;
 }
-
-/*
-******************************************************************************
-*
-* Function to print info about span set created in driver from FW raid map
-*
-* Inputs :
-* map    - LD map
-* ldSpanInfo - ldSpanInfo per HBA instance
-*/
-#if SPAN_DEBUG
-static int getSpanInfo(struct MR_DRV_RAID_MAP_ALL *map,
-	PLD_SPAN_INFO ldSpanInfo)
-{
-
-	u8   span;
-	u32    element;
-	struct MR_LD_RAID *raid;
-	LD_SPAN_SET *span_set;
-	struct MR_QUAD_ELEMENT    *quad;
-	int ldCount;
-	u16 ld;
-
-	for (ldCount = 0; ldCount < MAX_LOGICAL_DRIVES_EXT; ldCount++) {
-		ld = MR_TargetIdToLdGet(ldCount, map);
-			if (ld >= (MAX_LOGICAL_DRIVES_EXT - 1))
-				continue;
-		raid = MR_LdRaidGet(ld, map);
-		dev_dbg(&instance->pdev->dev, "LD %x: span_depth=%x\n",
-			ld, raid->spanDepth);
-		for (span = 0; span < raid->spanDepth; span++)
-			dev_dbg(&instance->pdev->dev, "Span=%x,"
-			" number of quads=%x\n", span,
-			le32_to_cpu(map->raidMap.ldSpanMap[ld].spanBlock[span].
-			block_span_info.noElements));
-		for (element = 0; element < MAX_QUAD_DEPTH; element++) {
-			span_set = &(ldSpanInfo[ld].span_set[element]);
-			if (span_set->span_row_data_width == 0)
-				break;
-
-			dev_dbg(&instance->pdev->dev, "Span Set %x:"
-				"width=%x, diff=%x\n", element,
-				(unsigned int)span_set->span_row_data_width,
-				(unsigned int)span_set->diff);
-			dev_dbg(&instance->pdev->dev, "logical LBA"
-				"start=0x%08lx, end=0x%08lx\n",
-				(long unsigned int)span_set->log_start_lba,
-				(long unsigned int)span_set->log_end_lba);
-			dev_dbg(&instance->pdev->dev, "span row start=0x%08lx,"
-				" end=0x%08lx\n",
-				(long unsigned int)span_set->span_row_start,
-				(long unsigned int)span_set->span_row_end);
-			dev_dbg(&instance->pdev->dev, "data row start=0x%08lx,"
-				" end=0x%08lx\n",
-				(long unsigned int)span_set->data_row_start,
-				(long unsigned int)span_set->data_row_end);
-			dev_dbg(&instance->pdev->dev, "data strip start=0x%08lx,"
-				" end=0x%08lx\n",
-				(long unsigned int)span_set->data_strip_start,
-				(long unsigned int)span_set->data_strip_end);
-
-			for (span = 0; span < raid->spanDepth; span++) {
-				if (le32_to_cpu(map->raidMap.ldSpanMap[ld].spanBlock[span].
-					block_span_info.noElements) >=
-					element + 1) {
-					quad = &map->raidMap.ldSpanMap[ld].
-						spanBlock[span].block_span_info.
-						quad[element];
-				dev_dbg(&instance->pdev->dev, "Span=%x,"
-					"Quad=%x, diff=%x\n", span,
-					element, le32_to_cpu(quad->diff));
-				dev_dbg(&instance->pdev->dev,
-					"offset_in_span=0x%08lx\n",
-					(long unsigned int)le64_to_cpu(quad->offsetInSpan));
-				dev_dbg(&instance->pdev->dev,
-					"logical start=0x%08lx, end=0x%08lx\n",
-					(long unsigned int)le64_to_cpu(quad->logStart),
-					(long unsigned int)le64_to_cpu(quad->logEnd));
-				}
-			}
-		}
-	}
-	return 0;
-}
-#endif
 
 /*
 ******************************************************************************
@@ -638,7 +429,7 @@ static int getSpanInfo(struct MR_DRV_RAID_MAP_ALL *map,
 *    div_error	   - Devide error code.
 */
 
-u32 mr_spanset_get_span_block(struct megasas_instance *instance,
+static u32 mr_spanset_get_span_block(struct megasas_instance *instance,
 		u32 ld, u64 row, u64 *span_blk, struct MR_DRV_RAID_MAP_ALL *map)
 {
 	struct fusion_context *fusion = instance->ctrl_context;
@@ -733,19 +524,7 @@ static u64  get_row_from_strip(struct megasas_instance *instance,
 				else
 					break;
 			}
-#if SPAN_DEBUG
-		dev_info(&instance->pdev->dev, "Strip 0x%llx,"
-			"span_set_Strip 0x%llx, span_set_Row 0x%llx"
-			"data width 0x%llx span offset 0x%x\n", strip,
-			(unsigned long long)span_set_Strip,
-			(unsigned long long)span_set_Row,
-			(unsigned long long)span_set->span_row_data_width,
-			span_offset);
-		dev_info(&instance->pdev->dev, "For strip 0x%llx"
-			"row is 0x%llx\n", strip,
-			(unsigned long long) span_set->data_row_start +
-			(unsigned long long) span_set_Row + (span_offset - 1));
-#endif
+
 		retval = (span_set->data_row_start + span_set_Row +
 				(span_offset - 1));
 		return retval;
@@ -862,11 +641,7 @@ static u32 get_arm_from_strip(struct megasas_instance *instance,
 				else
 					break;
 			}
-#if SPAN_DEBUG
-		dev_info(&instance->pdev->dev, "get_arm_from_strip:"
-			"for ld=0x%x strip=0x%lx arm is  0x%x\n", ld,
-			(long unsigned int)strip, (strip_offset - span_offset));
-#endif
+
 		retval = (strip_offset - span_offset);
 		return retval;
 	}
@@ -879,7 +654,7 @@ static u32 get_arm_from_strip(struct megasas_instance *instance,
 }
 
 /* This Function will return Phys arm */
-u8 get_arm(struct megasas_instance *instance, u32 ld, u8 span, u64 stripe,
+static u8 get_arm(struct megasas_instance *instance, u32 ld, u8 span, u64 stripe,
 		struct MR_DRV_RAID_MAP_ALL *map)
 {
 	struct MR_LD_RAID  *raid = MR_LdRaidGet(ld, map);
@@ -930,13 +705,13 @@ static u8 mr_spanset_get_phy_params(struct megasas_instance *instance, u32 ld,
 	u32     pd, arRef, r1_alt_pd;
 	u8      physArm, span;
 	u64     row;
-	u8	retval = TRUE;
+	u8	retval = true;
 	u64	*pdBlock = &io_info->pdBlock;
 	__le16	*pDevHandle = &io_info->devHandle;
+	u8	*pPdInterface = &io_info->pd_interface;
 	u32	logArm, rowMod, armQ, arm;
-	struct fusion_context *fusion;
 
-	fusion = instance->ctrl_context;
+	*pDevHandle = cpu_to_le16(MR_DEVHANDLE_INVALID);
 
 	/*Get row and span from io_info for Uneven Span IO.*/
 	row	    = io_info->start_row;
@@ -946,7 +721,7 @@ static u8 mr_spanset_get_phy_params(struct megasas_instance *instance, u32 ld,
 	if (raid->level == 6) {
 		logArm = get_arm_from_strip(instance, ld, stripRow, map);
 		if (logArm == -1U)
-			return FALSE;
+			return false;
 		rowMod = mega_mod64(row, SPAN_ROW_SIZE(map, ld, span));
 		armQ = SPAN_ROW_SIZE(map, ld, span) - 1 - rowMod;
 		arm = armQ + 1 + logArm;
@@ -957,38 +732,42 @@ static u8 mr_spanset_get_phy_params(struct megasas_instance *instance, u32 ld,
 		/* Calculate the arm */
 		physArm = get_arm(instance, ld, span, stripRow, map);
 	if (physArm == 0xFF)
-		return FALSE;
+		return false;
 
 	arRef       = MR_LdSpanArrayGet(ld, span, map);
 	pd          = MR_ArPdGet(arRef, physArm, map);
 
 	if (pd != MR_PD_INVALID) {
 		*pDevHandle = MR_PdDevHandleGet(pd, map);
+		*pPdInterface = MR_PdInterfaceTypeGet(pd, map);
 		/* get second pd also for raid 1/10 fast path writes*/
-		if (raid->level == 1) {
+		if ((instance->adapter_type >= VENTURA_SERIES) &&
+		    (raid->level == 1) &&
+		    !io_info->isRead) {
 			r1_alt_pd = MR_ArPdGet(arRef, physArm + 1, map);
 			if (r1_alt_pd != MR_PD_INVALID)
 				io_info->r1_alt_dev_handle =
 				MR_PdDevHandleGet(r1_alt_pd, map);
 		}
 	} else {
-		*pDevHandle = cpu_to_le16(MR_PD_INVALID);
 		if ((raid->level >= 5) &&
-			((fusion->adapter_type == THUNDERBOLT_SERIES)  ||
-			((fusion->adapter_type == INVADER_SERIES) &&
+			((instance->adapter_type == THUNDERBOLT_SERIES)  ||
+			((instance->adapter_type == INVADER_SERIES) &&
 			(raid->regTypeReqOnRead != REGION_TYPE_UNUSED))))
 			pRAID_Context->reg_lock_flags = REGION_TYPE_EXCLUSIVE;
 		else if (raid->level == 1) {
 			physArm = physArm + 1;
 			pd = MR_ArPdGet(arRef, physArm, map);
-			if (pd != MR_PD_INVALID)
+			if (pd != MR_PD_INVALID) {
 				*pDevHandle = MR_PdDevHandleGet(pd, map);
+				*pPdInterface = MR_PdInterfaceTypeGet(pd, map);
+			}
 		}
 	}
 
 	*pdBlock += stripRef + le64_to_cpu(MR_LdSpanPtrGet(ld, span, map)->startBlk);
-	if (instance->is_ventura) {
-		((struct RAID_CONTEXT_G35 *) pRAID_Context)->span_arm =
+	if (instance->adapter_type >= VENTURA_SERIES) {
+		((struct RAID_CONTEXT_G35 *)pRAID_Context)->span_arm =
 			(span << RAID_CTX_SPANARM_SPAN_SHIFT) | physArm;
 		io_info->span_arm =
 			(span << RAID_CTX_SPANARM_SPAN_SHIFT) | physArm;
@@ -997,6 +776,7 @@ static u8 mr_spanset_get_phy_params(struct megasas_instance *instance, u32 ld,
 			(span << RAID_CTX_SPANARM_SPAN_SHIFT) | physArm;
 		io_info->span_arm = pRAID_Context->span_arm;
 	}
+	io_info->pd_after_lb = pd;
 	return retval;
 }
 
@@ -1017,7 +797,7 @@ static u8 mr_spanset_get_phy_params(struct megasas_instance *instance, u32 ld,
 *    span          - Span number
 *    block         - Absolute Block number in the physical disk
 */
-u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
+static u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
 		u16 stripRef, struct IO_REQUEST_INFO *io_info,
 		struct RAID_CONTEXT *pRAID_Context,
 		struct MR_DRV_RAID_MAP_ALL *map)
@@ -1026,13 +806,12 @@ u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
 	u32         pd, arRef, r1_alt_pd;
 	u8          physArm, span;
 	u64         row;
-	u8	    retval = TRUE;
+	u8	    retval = true;
 	u64	    *pdBlock = &io_info->pdBlock;
 	__le16	    *pDevHandle = &io_info->devHandle;
-	struct fusion_context *fusion;
+	u8	    *pPdInterface = &io_info->pd_interface;
 
-	fusion = instance->ctrl_context;
-
+	*pDevHandle = cpu_to_le16(MR_DEVHANDLE_INVALID);
 
 	row =  mega_div64_32(stripRow, raid->rowDataSize);
 
@@ -1042,7 +821,7 @@ u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
 		u32 rowMod, armQ, arm;
 
 		if (raid->rowSize == 0)
-			return FALSE;
+			return false;
 		/* get logical row mod */
 		rowMod = mega_mod64(row, raid->rowSize);
 		armQ = raid->rowSize-1-rowMod; /* index of Q drive */
@@ -1052,7 +831,7 @@ u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
 		physArm = (u8)arm;
 	} else  {
 		if (raid->modFactor == 0)
-			return FALSE;
+			return false;
 		physArm = MR_LdDataArmGet(ld,  mega_mod64(stripRow,
 							  raid->modFactor),
 					  map);
@@ -1064,7 +843,7 @@ u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
 	} else {
 		span = (u8)MR_GetSpanBlock(ld, row, pdBlock, map);
 		if (span == SPAN_INVALID)
-			return FALSE;
+			return false;
 	}
 
 	/* Get the array on which this span is present */
@@ -1074,34 +853,37 @@ u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
 	if (pd != MR_PD_INVALID) {
 		/* Get dev handle from Pd. */
 		*pDevHandle = MR_PdDevHandleGet(pd, map);
+		*pPdInterface = MR_PdInterfaceTypeGet(pd, map);
 		/* get second pd also for raid 1/10 fast path writes*/
-		if (raid->level == 1) {
+		if ((instance->adapter_type >= VENTURA_SERIES) &&
+		    (raid->level == 1) &&
+		    !io_info->isRead) {
 			r1_alt_pd = MR_ArPdGet(arRef, physArm + 1, map);
 			if (r1_alt_pd != MR_PD_INVALID)
 				io_info->r1_alt_dev_handle =
-				MR_PdDevHandleGet(r1_alt_pd, map);
+					MR_PdDevHandleGet(r1_alt_pd, map);
 		}
 	} else {
-		/* set dev handle as invalid. */
-		*pDevHandle = cpu_to_le16(MR_PD_INVALID);
 		if ((raid->level >= 5) &&
-			((fusion->adapter_type == THUNDERBOLT_SERIES)  ||
-			((fusion->adapter_type == INVADER_SERIES) &&
+			((instance->adapter_type == THUNDERBOLT_SERIES)  ||
+			((instance->adapter_type == INVADER_SERIES) &&
 			(raid->regTypeReqOnRead != REGION_TYPE_UNUSED))))
 			pRAID_Context->reg_lock_flags = REGION_TYPE_EXCLUSIVE;
 		else if (raid->level == 1) {
 			/* Get alternate Pd. */
 			physArm = physArm + 1;
 			pd = MR_ArPdGet(arRef, physArm, map);
-			if (pd != MR_PD_INVALID)
+			if (pd != MR_PD_INVALID) {
 				/* Get dev handle from Pd */
 				*pDevHandle = MR_PdDevHandleGet(pd, map);
+				*pPdInterface = MR_PdInterfaceTypeGet(pd, map);
+			}
 		}
 	}
 
 	*pdBlock += stripRef + le64_to_cpu(MR_LdSpanPtrGet(ld, span, map)->startBlk);
-	if (instance->is_ventura) {
-		((struct RAID_CONTEXT_G35 *) pRAID_Context)->span_arm =
+	if (instance->adapter_type >= VENTURA_SERIES) {
+		((struct RAID_CONTEXT_G35 *)pRAID_Context)->span_arm =
 				(span << RAID_CTX_SPANARM_SPAN_SHIFT) | physArm;
 		io_info->span_arm =
 				(span << RAID_CTX_SPANARM_SPAN_SHIFT) | physArm;
@@ -1110,7 +892,79 @@ u8 MR_GetPhyParams(struct megasas_instance *instance, u32 ld, u64 stripRow,
 			(span << RAID_CTX_SPANARM_SPAN_SHIFT) | physArm;
 		io_info->span_arm = pRAID_Context->span_arm;
 	}
+	io_info->pd_after_lb = pd;
 	return retval;
+}
+
+/*
+ * mr_get_phy_params_r56_rmw -  Calculate parameters for R56 CTIO write operation
+ * @instance:			Adapter soft state
+ * @ld:				LD index
+ * @stripNo:			Strip Number
+ * @io_info:			IO info structure pointer
+ * pRAID_Context:		RAID context pointer
+ * map:				RAID map pointer
+ *
+ * This routine calculates the logical arm, data Arm, row number and parity arm
+ * for R56 CTIO write operation.
+ */
+static void mr_get_phy_params_r56_rmw(struct megasas_instance *instance,
+			    u32 ld, u64 stripNo,
+			    struct IO_REQUEST_INFO *io_info,
+			    struct RAID_CONTEXT_G35 *pRAID_Context,
+			    struct MR_DRV_RAID_MAP_ALL *map)
+{
+	struct MR_LD_RAID  *raid = MR_LdRaidGet(ld, map);
+	u8          span, dataArms, arms, dataArm, logArm;
+	s8          rightmostParityArm, PParityArm;
+	u64         rowNum;
+	u64 *pdBlock = &io_info->pdBlock;
+
+	dataArms = raid->rowDataSize;
+	arms = raid->rowSize;
+
+	rowNum =  mega_div64_32(stripNo, dataArms);
+	/* parity disk arm, first arm is 0 */
+	rightmostParityArm = (arms - 1) - mega_mod64(rowNum, arms);
+
+	/* logical arm within row */
+	logArm =  mega_mod64(stripNo, dataArms);
+	/* physical arm for data */
+	dataArm = mega_mod64((rightmostParityArm + 1 + logArm), arms);
+
+	if (raid->spanDepth == 1) {
+		span = 0;
+	} else {
+		span = (u8)MR_GetSpanBlock(ld, rowNum, pdBlock, map);
+		if (span == SPAN_INVALID)
+			return;
+	}
+
+	if (raid->level == 6) {
+		/* P Parity arm, note this can go negative adjust if negative */
+		PParityArm = (arms - 2) - mega_mod64(rowNum, arms);
+
+		if (PParityArm < 0)
+			PParityArm += arms;
+
+		/* rightmostParityArm is P-Parity for RAID 5 and Q-Parity for RAID */
+		pRAID_Context->flow_specific.r56_arm_map = rightmostParityArm;
+		pRAID_Context->flow_specific.r56_arm_map |=
+				    (u16)(PParityArm << RAID_CTX_R56_P_ARM_SHIFT);
+	} else {
+		pRAID_Context->flow_specific.r56_arm_map |=
+				    (u16)(rightmostParityArm << RAID_CTX_R56_P_ARM_SHIFT);
+	}
+
+	pRAID_Context->reg_lock_row_lba = cpu_to_le64(rowNum);
+	pRAID_Context->flow_specific.r56_arm_map |=
+				   (u16)(logArm << RAID_CTX_R56_LOG_ARM_SHIFT);
+	cpu_to_le16s(&pRAID_Context->flow_specific.r56_arm_map);
+	pRAID_Context->span_arm = (span << RAID_CTX_SPANARM_SPAN_SHIFT) | dataArm;
+	pRAID_Context->raid_flags = (MR_RAID_FLAGS_IO_SUB_TYPE_R56_DIV_OFFLOAD <<
+				    MR_RAID_CTX_RAID_FLAGS_IO_SUB_TYPE_SHIFT);
+
+	return;
 }
 
 /*
@@ -1130,7 +984,7 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 {
 	struct fusion_context *fusion;
 	struct MR_LD_RAID  *raid;
-	u32         ld, stripSize, stripe_mask;
+	u32         stripSize, stripe_mask;
 	u64         endLba, endStrip, endRow, start_row, start_strip;
 	u64         regStart;
 	u32         regSize;
@@ -1142,6 +996,7 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 	u8	    retval = 0;
 	u8	    startlba_span = SPAN_INVALID;
 	u64 *pdBlock = &io_info->pdBlock;
+	u16	    ld;
 
 	ldStartBlock = io_info->ldStartBlock;
 	numBlocks = io_info->numBlocks;
@@ -1162,7 +1017,7 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 	 */
 	if (raid->rowDataSize == 0) {
 		if (MR_LdSpanPtrGet(ld, 0, map)->spanRowDataSize == 0)
-			return FALSE;
+			return false;
 		else if (instance->UnevenSpanSupport) {
 			io_info->IoforUnevenSpan = 1;
 		} else {
@@ -1171,13 +1026,14 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 				"rowDataSize = 0x%0x,"
 				"but there is _NO_ UnevenSpanSupport\n",
 				MR_LdSpanPtrGet(ld, 0, map)->spanRowDataSize);
-			return FALSE;
+			return false;
 		}
 	}
 
 	stripSize = 1 << raid->stripeShift;
 	stripe_mask = stripSize-1;
 
+	io_info->data_arms = raid->rowDataSize;
 
 	/*
 	 * calculate starting row and stripe, and number of strips and rows
@@ -1196,7 +1052,7 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 			dev_info(&instance->pdev->dev, "return from %s %d."
 				"Send IO w/o region lock.\n",
 				__func__, __LINE__);
-			return FALSE;
+			return false;
 		}
 
 		if (raid->spanDepth == 1) {
@@ -1212,21 +1068,10 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 				(unsigned long long)start_row,
 				(unsigned long long)start_strip,
 				(unsigned long long)endStrip);
-			return FALSE;
+			return false;
 		}
 		io_info->start_span	= startlba_span;
 		io_info->start_row	= start_row;
-#if SPAN_DEBUG
-		dev_dbg(&instance->pdev->dev, "Check Span number from %s %d"
-			"for row 0x%llx, start strip 0x%llx end strip 0x%llx"
-			" span 0x%x\n", __func__, __LINE__,
-			(unsigned long long)start_row,
-			(unsigned long long)start_strip,
-			(unsigned long long)endStrip, startlba_span);
-		dev_dbg(&instance->pdev->dev, "start_row 0x%llx endRow 0x%llx"
-			"Start span 0x%x\n", (unsigned long long)start_row,
-			(unsigned long long)endRow, startlba_span);
-#endif
 	} else {
 		start_row = mega_div64_32(start_strip, raid->rowDataSize);
 		endRow    = mega_div64_32(endStrip, raid->rowDataSize);
@@ -1257,7 +1102,7 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 					       raid->capability.
 					       fpWriteAcrossStripe));
 	} else
-		io_info->fpOkForIo = FALSE;
+		io_info->fpOkForIo = false;
 
 	if (numRows == 1) {
 		/* single-strip IOs can always lock only the data needed */
@@ -1317,10 +1162,10 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 		cpu_to_le16(raid->fpIoTimeoutForLd ?
 			    raid->fpIoTimeoutForLd :
 			    map->raidMap.fpPdIoTimeoutSec);
-	if (fusion->adapter_type == INVADER_SERIES)
+	if (instance->adapter_type == INVADER_SERIES)
 		pRAID_Context->reg_lock_flags = (isRead) ?
 			raid->regTypeReqOnRead : raid->regTypeReqOnWrite;
-	else if (!instance->is_ventura)
+	else if (instance->adapter_type == THUNDERBOLT_SERIES)
 		pRAID_Context->reg_lock_flags = (isRead) ?
 			REGION_TYPE_SHARED_READ : raid->regTypeReqOnWrite;
 	pRAID_Context->virtual_disk_tgt_id = raid->targetId;
@@ -1330,6 +1175,13 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 	/* save pointer to raid->LUN array */
 	*raidLUN = raid->LUN;
 
+	/* Aero R5/6 Division Offload for WRITE */
+	if (fusion->r56_div_offload && (raid->level >= 5) && !isRead) {
+		mr_get_phy_params_r56_rmw(instance, ld, start_strip, io_info,
+				       (struct RAID_CONTEXT_G35 *)pRAID_Context,
+				       map);
+		return true;
+	}
 
 	/*Get Phy Params only if FP capable, or else leave it to MR firmware
 	  to do the calculation.*/
@@ -1342,21 +1194,8 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 					ref_in_start_stripe, io_info,
 					pRAID_Context, map);
 		/* If IO on an invalid Pd, then FP is not possible.*/
-		if (io_info->devHandle == cpu_to_le16(MR_PD_INVALID))
-			io_info->fpOkForIo = FALSE;
-		/* if FP possible, set the SLUD bit in
-		*  regLockFlags for ventura
-		*/
-		else if ((instance->is_ventura) && !isRead &&
-				(raid->writeMode == MR_RL_WRITE_BACK_MODE) &&
-				raid->capability.fp_cache_bypass_capable)
-				((struct RAID_CONTEXT_G35 *) pRAID_Context)->routing_flags.bits.sld
-					= 1;
-		/* set raid 1/10 fast path write capable bit in io_info */
-		if (io_info->fpOkForIo &&
-		    (io_info->r1_alt_dev_handle != MR_PD_INVALID) &&
-		    (raid->level == 1) && !isRead)
-			io_info->is_raid_1_fp_write = 1;
+		if (io_info->devHandle == MR_DEVHANDLE_INVALID)
+			io_info->fpOkForIo = false;
 		return retval;
 	} else if (isRead) {
 		uint stripIdx;
@@ -1370,16 +1209,10 @@ MR_BuildRaidContext(struct megasas_instance *instance,
 				    start_strip + stripIdx, ref_in_start_stripe,
 				    io_info, pRAID_Context, map);
 			if (!retval)
-				return TRUE;
+				return true;
 		}
 	}
-
-#if SPAN_DEBUG
-	/* Just for testing what arm we get for strip.*/
-	if (io_info->IoforUnevenSpan)
-		get_arm_from_strip(instance, ld, start_strip, map);
-#endif
-	return TRUE;
+	return true;
 }
 
 /*
@@ -1492,10 +1325,6 @@ void mr_update_span_set(struct MR_DRV_RAID_MAP_ALL *map,
 			break;
 	    }
 	}
-#if SPAN_DEBUG
-	getSpanInfo(map, ldSpanInfo);
-#endif
-
 }
 
 void mr_update_load_balance_params(struct MR_DRV_RAID_MAP_ALL *drv_map,
@@ -1510,7 +1339,7 @@ void mr_update_load_balance_params(struct MR_DRV_RAID_MAP_ALL *drv_map,
 
 	for (ldCount = 0; ldCount < MAX_LOGICAL_DRIVES_EXT; ldCount++) {
 		ld = MR_TargetIdToLdGet(ldCount, drv_map);
-		if (ld >= MAX_LOGICAL_DRIVES_EXT) {
+		if (ld >= MAX_LOGICAL_DRIVES_EXT - 1) {
 			lbInfo[ldCount].loadBalanceFlag = 0;
 			continue;
 		}
@@ -1525,12 +1354,12 @@ void mr_update_load_balance_params(struct MR_DRV_RAID_MAP_ALL *drv_map,
 	}
 }
 
-u8 megasas_get_best_arm_pd(struct megasas_instance *instance,
-	struct LD_LOAD_BALANCE_INFO *lbInfo, struct IO_REQUEST_INFO *io_info)
+static u8 megasas_get_best_arm_pd(struct megasas_instance *instance,
+			   struct LD_LOAD_BALANCE_INFO *lbInfo,
+			   struct IO_REQUEST_INFO *io_info,
+			   struct MR_DRV_RAID_MAP_ALL *drv_map)
 {
-	struct fusion_context *fusion;
 	struct MR_LD_RAID  *raid;
-	struct MR_DRV_RAID_MAP_ALL *drv_map;
 	u16	pd1_dev_handle;
 	u16     pend0, pend1, ld;
 	u64     diff0, diff1;
@@ -1544,9 +1373,6 @@ u8 megasas_get_best_arm_pd(struct megasas_instance *instance,
 			>> RAID_CTX_SPANARM_SPAN_SHIFT);
 	arm = (io_info->span_arm & RAID_CTX_SPANARM_ARM_MASK);
 
-
-	fusion = instance->ctrl_context;
-	drv_map = fusion->ld_drv_map[(instance->map_id & 1)];
 	ld = MR_TargetIdToLdGet(io_info->ldTgtId, drv_map);
 	raid = MR_LdRaidGet(ld, drv_map);
 	span_row_size = instance->UnevenSpanSupport ?
@@ -1561,7 +1387,7 @@ u8 megasas_get_best_arm_pd(struct megasas_instance *instance,
 
 	pd1_dev_handle = MR_PdDevHandleGet(pd1, drv_map);
 
-	if (pd1_dev_handle == MR_PD_INVALID) {
+	if (pd1_dev_handle == MR_DEVHANDLE_INVALID) {
 		bestArm = arm;
 	} else {
 		/* get the pending cmds for the data and mirror arms */
@@ -1571,14 +1397,13 @@ u8 megasas_get_best_arm_pd(struct megasas_instance *instance,
 		/* Determine the disk whose head is nearer to the req. block */
 		diff0 = ABS_DIFF(block, lbInfo->last_accessed_block[pd0]);
 		diff1 = ABS_DIFF(block, lbInfo->last_accessed_block[pd1]);
-		/*bestArm = diff0<=diff1 ? arm : arm ^ 1;*/
 		bestArm = (diff0 <= diff1 ? arm : arm ^ 1);
 
 		/* Make balance count from 16 to 4 to
-		*  keep driver in sync with Firmware
-		*/
+		 *  keep driver in sync with Firmware
+		 */
 		if ((bestArm == arm && pend0 > pend1 + lb_pending_cmds)  ||
-			(bestArm != arm && pend1 > pend0 + lb_pending_cmds))
+		    (bestArm != arm && pend1 > pend0 + lb_pending_cmds))
 			bestArm ^= 1;
 
 		/* Update the last accessed block on the correct pd */
@@ -1588,30 +1413,22 @@ u8 megasas_get_best_arm_pd(struct megasas_instance *instance,
 	}
 
 	lbInfo->last_accessed_block[io_info->pd_after_lb] = block + count - 1;
-#if SPAN_DEBUG
-	if (arm != bestArm)
-		dev_dbg(&instance->pdev->dev, "LSI Debug R1 Load balance "
-			"occur - span 0x%x arm 0x%x bestArm 0x%x "
-			"io_info->span_arm 0x%x\n",
-			span, arm, bestArm, io_info->span_arm);
-#endif
 	return io_info->pd_after_lb;
 }
 
 __le16 get_updated_dev_handle(struct megasas_instance *instance,
-	struct LD_LOAD_BALANCE_INFO *lbInfo, struct IO_REQUEST_INFO *io_info)
+			      struct LD_LOAD_BALANCE_INFO *lbInfo,
+			      struct IO_REQUEST_INFO *io_info,
+			      struct MR_DRV_RAID_MAP_ALL *drv_map)
 {
 	u8 arm_pd;
 	__le16 devHandle;
-	struct fusion_context *fusion;
-	struct MR_DRV_RAID_MAP_ALL *drv_map;
-
-	fusion = instance->ctrl_context;
-	drv_map = fusion->ld_drv_map[(instance->map_id & 1)];
 
 	/* get best new arm (PD ID) */
-	arm_pd  = megasas_get_best_arm_pd(instance, lbInfo, io_info);
+	arm_pd  = megasas_get_best_arm_pd(instance, lbInfo, io_info, drv_map);
 	devHandle = MR_PdDevHandleGet(arm_pd, drv_map);
+	io_info->pd_interface = MR_PdInterfaceTypeGet(arm_pd, drv_map);
 	atomic_inc(&lbInfo->scsi_pending_cmds[arm_pd]);
+
 	return devHandle;
 }

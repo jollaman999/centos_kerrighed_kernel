@@ -1,9 +1,9 @@
 /*
- * GE Fanuc SBC610 board support
+ * GE SBC610 board support
  *
- * Author: Martyn Welch <martyn.welch@gefanuc.com>
+ * Author: Martyn Welch <martyn.welch@ge.com>
  *
- * Copyright 2008 GE Fanuc Intelligent Platforms Embedded Systems, Inc.
+ * Copyright 2008 GE Intelligent Platforms Embedded Systems, Inc.
  *
  * This program is free software; you can redistribute  it and/or modify it
  * under  the terms of  the GNU General  Public License as published by the
@@ -24,7 +24,6 @@
 #include <linux/seq_file.h>
 #include <linux/of_platform.h>
 
-#include <asm/system.h>
 #include <asm/time.h>
 #include <asm/machdep.h>
 #include <asm/pci-bridge.h>
@@ -33,12 +32,13 @@
 #include <asm/udbg.h>
 
 #include <asm/mpic.h>
+#include <asm/nvram.h>
 
 #include <sysdev/fsl_pci.h>
 #include <sysdev/fsl_soc.h>
+#include <sysdev/ge/ge_pic.h>
 
 #include "mpc86xx.h"
-#include "gef_pic.h"
 
 #undef DEBUG
 
@@ -73,19 +73,14 @@ static void __init gef_sbc610_init_irq(void)
 static void __init gef_sbc610_setup_arch(void)
 {
 	struct device_node *regs;
-#ifdef CONFIG_PCI
-	struct device_node *np;
 
-	for_each_compatible_node(np, "pci", "fsl,mpc8641-pcie") {
-		fsl_add_bridge(np, 1);
-	}
-#endif
-
-	printk(KERN_INFO "GE Fanuc Intelligent Platforms SBC610 6U VPX SBC\n");
+	printk(KERN_INFO "GE Intelligent Platforms SBC610 6U VPX SBC\n");
 
 #ifdef CONFIG_SMP
 	mpc86xx_smp_init();
 #endif
+
+	fsl_pci_assign_primary();
 
 	/* Remap basic board registers */
 	regs = of_find_compatible_node(NULL, NULL, "gef,fpga-regs");
@@ -95,6 +90,10 @@ static void __init gef_sbc610_setup_arch(void)
 			printk(KERN_WARNING "Unable to map board registers\n");
 		of_node_put(regs);
 	}
+
+#if defined(CONFIG_MMIO_NVRAM)
+	mmio_nvram_init();
+#endif
 }
 
 /* Return the PCB revision */
@@ -128,7 +127,7 @@ static void gef_sbc610_show_cpuinfo(struct seq_file *m)
 {
 	uint svid = mfspr(SPRN_SVR);
 
-	seq_printf(m, "Vendor\t\t: GE Fanuc Intelligent Platforms\n");
+	seq_printf(m, "Vendor\t\t: GE Intelligent Platforms\n");
 
 	seq_printf(m, "Revision\t: %u%c\n", gef_sbc610_get_pcb_rev(),
 		('A' + gef_sbc610_get_board_rev() - 1));
@@ -137,7 +136,7 @@ static void gef_sbc610_show_cpuinfo(struct seq_file *m)
 	seq_printf(m, "SVR\t\t: 0x%x\n", svid);
 }
 
-static void __init gef_sbc610_nec_fixup(struct pci_dev *pdev)
+static void gef_sbc610_nec_fixup(struct pci_dev *pdev)
 {
 	unsigned int val;
 
@@ -194,6 +193,7 @@ static long __init mpc86xx_time_init(void)
 static __initdata struct of_device_id of_bus_ids[] = {
 	{ .compatible = "simple-bus", },
 	{ .compatible = "gianfar", },
+	{ .compatible = "fsl,mpc8641-pcie", },
 	{},
 };
 
@@ -204,10 +204,10 @@ static int __init declare_of_platform_devices(void)
 
 	return 0;
 }
-machine_device_initcall(gef_sbc610, declare_of_platform_devices);
+machine_arch_initcall(gef_sbc610, declare_of_platform_devices);
 
 define_machine(gef_sbc610) {
-	.name			= "GE Fanuc SBC610",
+	.name			= "GE SBC610",
 	.probe			= gef_sbc610_probe,
 	.setup_arch		= gef_sbc610_setup_arch,
 	.init_IRQ		= gef_sbc610_init_irq,

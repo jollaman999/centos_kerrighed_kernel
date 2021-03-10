@@ -25,6 +25,7 @@
  */
 #include <linux/kernel.h>
 #include <linux/interrupt.h>
+#include <linux/module.h>
 #include <linux/mm.h>
 #include <linux/dma-mapping.h>
 #include <linux/raid/xor.h>
@@ -94,7 +95,7 @@ do_async_xor(struct dma_chan *chan, struct page *dest, struct page **src_list,
 		if (unlikely(!tx))
 			async_tx_quiesce(&submit->depend_tx);
 
-		/* spin wait for the preceeding transactions to complete */
+		/* spin wait for the preceding transactions to complete */
 		while (unlikely(!tx)) {
 			dma_async_issue_pending(chan);
 			tx = dma->device_prep_dma_xor(chan, dma_dest,
@@ -229,9 +230,7 @@ EXPORT_SYMBOL_GPL(async_xor);
 
 static int page_is_zero(struct page *p, unsigned int offset, size_t len)
 {
-	char *a = page_address(p) + offset;
-	return ((*(u32 *) a) == 0 &&
-		memcmp(a, a + 4, len - 4) == 0);
+	return !memchr_inv(page_address(p) + offset, 0, len);
 }
 
 static inline struct dma_chan *

@@ -52,9 +52,10 @@
  *	document number TBD : Lynx Point-LP
  *	document number TBD : Wellsburg
  *	document number TBD : Avoton SoC
- *	document number TBD : Wildcat Point-LP
  *	document number TBD : Coleto Creek
+ *	document number TBD : Wildcat Point-LP
  *	document number TBD : Lewisburg
+ *	document number TBD : Apollo Lake SoC
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -82,6 +83,8 @@
 
 #define ACPIBASE_GCS_OFF	0x3410
 #define ACPIBASE_GCS_END	0x3414
+
+#define SPIBASE_APL_SZ		4096
 
 #define GPIOBASE_ICH0		0x58
 #define GPIOCTRL_ICH0		0x5C
@@ -143,17 +146,13 @@ static struct mfd_cell lpc_ich_cells[] = {
 		.name = "iTCO_wdt",
 		.num_resources = ARRAY_SIZE(wdt_ich_res),
 		.resources = wdt_ich_res,
-#if 0
 		.ignore_resource_conflicts = true,
-#endif
 	},
 	[LPC_GPIO] = {
 		.name = "gpio_ich",
 		.num_resources = ARRAY_SIZE(gpio_ich_res),
 		.resources = gpio_ich_res,
-#if 0
 		.ignore_resource_conflicts = true,
-#endif
 	},
 };
 
@@ -221,12 +220,13 @@ enum lpc_chipsets {
 	LPC_WBG,	/* Wellsburg */
 	LPC_AVN,	/* Avoton SoC */
 	LPC_BAYTRAIL,   /* Bay Trail SoC */
-	LPC_WPT_LP,	/* Wildcat Point-LP */
 	LPC_COLETO,	/* Coleto Creek */
+	LPC_WPT_LP,	/* Wildcat Point-LP */
 	LPC_LEWISBURG,	/* Lewisburg */
+	LPC_APL,	/* Apollo Lake SoC */
 };
 
-struct lpc_ich_info lpc_chipset_info[] __devinitdata = {
+struct lpc_ich_info lpc_chipset_info[] = {
 	[LPC_ICH] = {
 		.name = "ICH",
 		.iTCO_version = 1,
@@ -314,7 +314,6 @@ struct lpc_ich_info lpc_chipset_info[] __devinitdata = {
 	[LPC_NM10] = {
 		.name = "NM10",
 		.iTCO_version = 2,
-		.gpio_version = ICH_V7_GPIO,
 	},
 	[LPC_ICH8] = {
 		.name = "ICH8 or ICH8R",
@@ -514,10 +513,6 @@ struct lpc_ich_info lpc_chipset_info[] __devinitdata = {
 		.iTCO_version = 3,
 		.gpio_version = AVOTON_GPIO,
 	},
-	[LPC_WPT_LP] = {
-		.name = "Lynx Point_LP",
-		.iTCO_version = 2,
-	},
 	[LPC_BAYTRAIL] = {
 		.name = "Bay Trail SoC",
 		.iTCO_version = 3,
@@ -526,9 +521,17 @@ struct lpc_ich_info lpc_chipset_info[] __devinitdata = {
 		.name = "Coleto Creek",
 		.iTCO_version = 2,
 	},
+	[LPC_WPT_LP] = {
+		.name = "Lynx Point_LP",
+		.iTCO_version = 2,
+	},
 	[LPC_LEWISBURG] = {
 		.name = "Lewisburg",
 		.iTCO_version = 2,
+	},
+	[LPC_APL] = {
+		.name = "Apollo Lake SoC",
+		.iTCO_version = 5,
 	},
 };
 
@@ -671,6 +674,7 @@ static const struct pci_device_id lpc_ich_ids[] = {
 	{ PCI_VDEVICE(INTEL, 0x1e5d), LPC_PPT},
 	{ PCI_VDEVICE(INTEL, 0x1e5e), LPC_PPT},
 	{ PCI_VDEVICE(INTEL, 0x1e5f), LPC_PPT},
+	{ PCI_VDEVICE(INTEL, 0x5ae8), LPC_APL},
 	{ PCI_VDEVICE(INTEL, 0x8c40), LPC_LPT},
 	{ PCI_VDEVICE(INTEL, 0x8c41), LPC_LPT},
 	{ PCI_VDEVICE(INTEL, 0x8c42), LPC_LPT},
@@ -748,6 +752,7 @@ static const struct pci_device_id lpc_ich_ids[] = {
 	{ PCI_VDEVICE(INTEL, 0x1f3a), LPC_AVN},
 	{ PCI_VDEVICE(INTEL, 0x1f3b), LPC_AVN},
 	{ PCI_VDEVICE(INTEL, 0x0f1c), LPC_BAYTRAIL},
+	{ PCI_VDEVICE(INTEL, 0x2390), LPC_COLETO},
 	{ PCI_VDEVICE(INTEL, 0x9cc1), LPC_WPT_LP},
 	{ PCI_VDEVICE(INTEL, 0x9cc2), LPC_WPT_LP},
 	{ PCI_VDEVICE(INTEL, 0x9cc3), LPC_WPT_LP},
@@ -755,7 +760,6 @@ static const struct pci_device_id lpc_ich_ids[] = {
 	{ PCI_VDEVICE(INTEL, 0x9cc6), LPC_WPT_LP},
 	{ PCI_VDEVICE(INTEL, 0x9cc7), LPC_WPT_LP},
 	{ PCI_VDEVICE(INTEL, 0x9cc9), LPC_WPT_LP},
-	{ PCI_VDEVICE(INTEL, 0x2390), LPC_COLETO},
 	{ PCI_VDEVICE(INTEL, 0xa1c1), LPC_LEWISBURG},
 	{ PCI_VDEVICE(INTEL, 0xa1c2), LPC_LEWISBURG},
 	{ PCI_VDEVICE(INTEL, 0xa1c3), LPC_LEWISBURG},
@@ -790,7 +794,7 @@ static void lpc_ich_restore_config_space(struct pci_dev *dev)
 	}
 }
 
-static void __devinit lpc_ich_enable_acpi_space(struct pci_dev *dev)
+static void lpc_ich_enable_acpi_space(struct pci_dev *dev)
 {
 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
 	u8 reg_save;
@@ -817,7 +821,7 @@ static void __devinit lpc_ich_enable_acpi_space(struct pci_dev *dev)
 	}
 }
 
-static void __devinit lpc_ich_enable_gpio_space(struct pci_dev *dev)
+static void lpc_ich_enable_gpio_space(struct pci_dev *dev)
 {
 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
 	u8 reg_save;
@@ -838,7 +842,7 @@ static void lpc_ich_enable_pmc_space(struct pci_dev *dev)
 	priv->actrl_pbase_save = reg_save;
 }
 
-static int __devinit lpc_ich_finalize_wdt_cell(struct pci_dev *dev)
+static int lpc_ich_finalize_wdt_cell(struct pci_dev *dev)
 {
 	struct itco_wdt_platform_data *pdata;
 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
@@ -855,7 +859,7 @@ static int __devinit lpc_ich_finalize_wdt_cell(struct pci_dev *dev)
 	strlcpy(pdata->name, info->name, sizeof(pdata->name));
 
 	cell->platform_data = pdata;
-	cell->data_size = sizeof(*pdata);
+	cell->pdata_size = sizeof(*pdata);
 	return 0;
 }
 
@@ -865,7 +869,7 @@ static void lpc_ich_finalize_gpio_cell(struct pci_dev *dev)
 	struct mfd_cell *cell = &lpc_ich_cells[LPC_GPIO];
 
 	cell->platform_data = &lpc_chipset_info[priv->chipset];
-	cell->data_size = sizeof(struct lpc_ich_info);
+	cell->pdata_size = sizeof(struct lpc_ich_info);
 }
 
 /*
@@ -873,7 +877,6 @@ static void lpc_ich_finalize_gpio_cell(struct pci_dev *dev)
  * GPIO groups and it's enough to have access to one of these to instantiate
  * the device.
  */
-#if 0
 static int lpc_ich_check_conflict_gpio(struct resource *res)
 {
 	int ret;
@@ -892,13 +895,14 @@ static int lpc_ich_check_conflict_gpio(struct resource *res)
 
 	return use_gpio ? use_gpio : ret;
 }
-#endif
-static int __devinit lpc_ich_init_gpio(struct pci_dev *dev)
+
+static int lpc_ich_init_gpio(struct pci_dev *dev)
 {
 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
 	u32 base_addr_cfg;
 	u32 base_addr;
 	int ret;
+	bool acpi_conflict = false;
 	struct resource *res;
 
 	/* Setup power management base register */
@@ -913,7 +917,18 @@ static int __devinit lpc_ich_init_gpio(struct pci_dev *dev)
 	res = &gpio_ich_res[ICH_RES_GPE0];
 	res->start = base_addr + ACPIBASE_GPE_OFF;
 	res->end = base_addr + ACPIBASE_GPE_END;
-	lpc_ich_enable_acpi_space(dev);
+	ret = acpi_check_resource_conflict(res);
+	if (ret) {
+		/*
+		 * This isn't fatal for the GPIO, but we have to make sure that
+		 * the platform_device subsystem doesn't see this resource
+		 * or it will register an invalid region.
+		 */
+		lpc_ich_cells[LPC_GPIO].num_resources--;
+		acpi_conflict = true;
+	} else {
+		lpc_ich_enable_acpi_space(dev);
+	}
 
 gpe0_done:
 	/* Setup GPIO base register */
@@ -938,20 +953,27 @@ gpe0_done:
 		break;
 	}
 
-#if 0
+	ret = lpc_ich_check_conflict_gpio(res);
+	if (ret < 0) {
+		/* this isn't necessarily fatal for the GPIO */
+		acpi_conflict = true;
+		goto gpio_done;
+	}
 	lpc_chipset_info[priv->chipset].use_gpio = ret;
-#endif
 	lpc_ich_enable_gpio_space(dev);
 
 	lpc_ich_finalize_gpio_cell(dev);
-	ret = mfd_add_devices(&dev->dev, -2, &lpc_ich_cells[LPC_GPIO],
-				1, NULL, 0);
+	ret = mfd_add_devices(&dev->dev, PLATFORM_DEVID_AUTO,
+			      &lpc_ich_cells[LPC_GPIO], 1, NULL, 0, NULL);
 
 gpio_done:
+	if (acpi_conflict)
+		pr_warn("Resource conflict(s) found affecting %s\n",
+				lpc_ich_cells[LPC_GPIO].name);
 	return ret;
 }
 
-static int __devinit lpc_ich_init_wdt(struct pci_dev *dev)
+static int lpc_ich_init_wdt(struct pci_dev *dev)
 {
 	struct lpc_ich_priv *priv = pci_get_drvdata(dev);
 	u32 base_addr_cfg;
@@ -1018,14 +1040,14 @@ static int __devinit lpc_ich_init_wdt(struct pci_dev *dev)
 	if (ret)
 		goto wdt_done;
 
-	ret = mfd_add_devices(&dev->dev, -2, &lpc_ich_cells[LPC_WDT],
-				1, NULL, 0);
+	ret = mfd_add_devices(&dev->dev, PLATFORM_DEVID_AUTO,
+			      &lpc_ich_cells[LPC_WDT], 1, NULL, 0, NULL);
 
 wdt_done:
 	return ret;
 }
 
-static int __devinit lpc_ich_probe(struct pci_dev *dev,
+static int lpc_ich_probe(struct pci_dev *dev,
 				const struct pci_device_id *id)
 {
 	struct lpc_ich_priv *priv;
@@ -1082,7 +1104,7 @@ static int __devinit lpc_ich_probe(struct pci_dev *dev,
 	return 0;
 }
 
-static void __devexit lpc_ich_remove(struct pci_dev *dev)
+static void lpc_ich_remove(struct pci_dev *dev)
 {
 	mfd_remove_devices(&dev->dev);
 	lpc_ich_restore_config_space(dev);
@@ -1093,7 +1115,7 @@ static struct pci_driver lpc_ich_driver = {
 	.name		= "lpc_ich",
 	.id_table	= lpc_ich_ids,
 	.probe		= lpc_ich_probe,
-	.remove		= __devexit_p(lpc_ich_remove),
+	.remove		= lpc_ich_remove,
 };
 
 static int __init lpc_ich_init(void)

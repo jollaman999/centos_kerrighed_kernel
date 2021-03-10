@@ -251,8 +251,7 @@ static void display_on(void *sohandle,
 	write_memory_start(sohandle, so);
 }
 
-int kfr2r09_lcd_setup(void *board_data, void *sohandle,
-		      struct sh_mobile_lcdc_sys_bus_ops *so)
+int kfr2r09_lcd_setup(void *sohandle, struct sh_mobile_lcdc_sys_bus_ops *so)
 {
 	/* power on */
 	gpio_set_value(GPIO_PTF4, 0);  /* PROTECT/ -> L */
@@ -273,13 +272,18 @@ int kfr2r09_lcd_setup(void *board_data, void *sohandle,
 	return 0;
 }
 
+void kfr2r09_lcd_start(void *sohandle, struct sh_mobile_lcdc_sys_bus_ops *so)
+{
+	write_memory_start(sohandle, so);
+}
+
 #define CTRL_CKSW       0x10
 #define CTRL_C10        0x20
 #define CTRL_CPSW       0x80
 #define MAIN_MLED4      0x40
 #define MAIN_MSW        0x80
 
-static int kfr2r09_lcd_backlight(int on)
+int kfr2r09_lcd_set_brightness(int brightness)
 {
 	struct i2c_adapter *a;
 	struct i2c_msg msg;
@@ -291,7 +295,7 @@ static int kfr2r09_lcd_backlight(int on)
 		return -ENODEV;
 
 	buf[0] = 0x00;
-	if (on)
+	if (brightness)
 		buf[1] = CTRL_CPSW | CTRL_C10 | CTRL_CKSW;
 	else
 		buf[1] = 0;
@@ -305,7 +309,7 @@ static int kfr2r09_lcd_backlight(int on)
 		return -ENODEV;
 
 	buf[0] = 0x01;
-	if (on)
+	if (brightness)
 		buf[1] = MAIN_MSW | MAIN_MLED4 | 0x0c;
 	else
 		buf[1] = 0;
@@ -319,14 +323,4 @@ static int kfr2r09_lcd_backlight(int on)
 		return -ENODEV;
 
 	return 0;
-}
-
-void kfr2r09_lcd_on(void *board_data)
-{
-	kfr2r09_lcd_backlight(1);
-}
-
-void kfr2r09_lcd_off(void *board_data)
-{
-	kfr2r09_lcd_backlight(0);
 }

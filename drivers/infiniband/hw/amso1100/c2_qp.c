@@ -36,6 +36,7 @@
  */
 
 #include <linux/delay.h>
+#include <linux/gfp.h>
 
 #include "c2.h"
 #include "c2_vq.h"
@@ -381,14 +382,16 @@ static int c2_alloc_qpn(struct c2_dev *c2dev, struct c2_qp *qp)
 {
 	int ret;
 
-        do {
-		spin_lock_irq(&c2dev->qp_table.lock);
-		ret = idr_get_new_above(&c2dev->qp_table.idr, qp,
-					c2dev->qp_table.last++, &qp->qpn);
-		spin_unlock_irq(&c2dev->qp_table.lock);
-        } while ((ret == -EAGAIN) &&
-	 	 idr_pre_get(&c2dev->qp_table.idr, GFP_KERNEL));
-	return ret;
+	idr_preload(GFP_KERNEL);
+	spin_lock_irq(&c2dev->qp_table.lock);
+
+	ret = idr_alloc_cyclic(&c2dev->qp_table.idr, qp, 0, 0, GFP_NOWAIT);
+	if (ret >= 0)
+		qp->qpn = ret;
+
+	spin_unlock_irq(&c2dev->qp_table.lock);
+	idr_preload_end();
+	return ret < 0 ? ret : 0;
 }
 
 static void c2_free_qpn(struct c2_dev *c2dev, int qpn)
@@ -857,9 +860,9 @@ int c2_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
 				flags |= SQ_READ_FENCE;
 			}
 			wr.sqwr.rdma_write.remote_stag =
-			    cpu_to_be32(ib_wr->wr.rdma.rkey);
+			    cpu_to_be32(rdma_wr(ib_wr)->rkey);
 			wr.sqwr.rdma_write.remote_to =
-			    cpu_to_be64(ib_wr->wr.rdma.remote_addr);
+			    cpu_to_be64(rdma_wr(ib_wr)->remote_addr);
 			err = move_sgl((struct c2_data_addr *)
 				       & (wr.sqwr.rdma_write.data),
 				       ib_wr->sg_list,
@@ -886,9 +889,9 @@ int c2_post_send(struct ib_qp *ibqp, struct ib_send_wr *ib_wr,
 			wr.sqwr.rdma_read.local_to =
 			    cpu_to_be64(ib_wr->sg_list->addr);
 			wr.sqwr.rdma_read.remote_stag =
-			    cpu_to_be32(ib_wr->wr.rdma.rkey);
+			    cpu_to_be32(rdma_wr(ib_wr)->rkey);
 			wr.sqwr.rdma_read.remote_to =
-			    cpu_to_be64(ib_wr->wr.rdma.remote_addr);
+			    cpu_to_be64(rdma_wr(ib_wr)->remote_addr);
 			wr.sqwr.rdma_read.length =
 			    cpu_to_be32(ib_wr->sg_list->length);
 			break;
@@ -1009,13 +1012,13 @@ out:
 	return err;
 }
 
-void __devinit c2_init_qp_table(struct c2_dev *c2dev)
+void c2_init_qp_table(struct c2_dev *c2dev)
 {
 	spin_lock_init(&c2dev->qp_table.lock);
 	idr_init(&c2dev->qp_table.idr);
 }
 
-void __devexit c2_cleanup_qp_table(struct c2_dev *c2dev)
+void c2_cleanup_qp_table(struct c2_dev *c2dev)
 {
 	idr_destroy(&c2dev->qp_table.idr);
 }

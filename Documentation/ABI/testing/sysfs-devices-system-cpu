@@ -9,31 +9,6 @@ Description:
 
 		/sys/devices/system/cpu/cpu#/
 
-What:		/sys/devices/system/cpu/sched_mc_power_savings
-		/sys/devices/system/cpu/sched_smt_power_savings
-Date:		June 2006
-Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
-Description:	Discover and adjust the kernel's multi-core scheduler support.
-
-		Possible values are:
-
-		0 - No power saving load balance (default value)
-		1 - Fill one thread/core/package first for long running threads
-		2 - Also bias task wakeups to semi-idle cpu package for power
-		    savings
-
-		sched_mc_power_savings is dependent upon SCHED_MC, which is
-		itself architecture dependent.
-
-		sched_smt_power_savings is dependent upon SCHED_SMT, which
-		is itself architecture dependent.
-
-		The two files are independent of each other. It is possible
-		that one file may be present without the other.
-
-		Introduced by git commit 5c45bf27.
-
-
 What:		/sys/devices/system/cpu/kernel_max
 		/sys/devices/system/cpu/offline
 		/sys/devices/system/cpu/online
@@ -62,6 +37,21 @@ Description:	CPU topology files that describe kernel limits related to
 		See Documentation/cputopology.txt for more information.
 
 
+What:		/sys/devices/system/cpu/probe
+		/sys/devices/system/cpu/release
+Date:		November 2009
+Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+Description:	Dynamic addition and removal of CPU's.  This is not hotplug
+		removal, this is meant complete removal/addition of the CPU
+		from the system.
+
+		probe: writes to this file will dynamically add a CPU to the
+		system.  Information written to the file to add CPU's is
+		architecture specific.
+
+		release: writes to this file dynamically remove a CPU from
+		the system.  Information writtento the file to remove CPU's
+		is architecture specific.
 
 What:		/sys/devices/system/cpu/cpu#/node
 Date:		October 2009
@@ -136,24 +126,149 @@ Description:	Discover cpuidle policy and mechanism
 		See files in Documentation/cpuidle/ for more information.
 
 
-What:      /sys/devices/system/cpu/cpu*/cache/index*/cache_disable_X
-Date:      August 2008
-KernelVersion:	2.6.27
-Contact:	mark.langsdorf@amd.com
-Description:	These files exist in every cpu's cache index directories.
-		There are currently 2 cache_disable_# files in each
-		directory.  Reading from these files on a supported
-		processor will return that cache disable index value
-		for that processor and node.  Writing to one of these
-		files will cause the specificed cache index to be disabled.
+What:		/sys/devices/system/cpu/cpu#/cpufreq/*
+Date:		pre-git history
+Contact:	linux-pm@vger.kernel.org
+Description:	Discover and change clock speed of CPUs
 
-		Currently, only AMD Family 10h Processors support cache index
-		disable, and only for their L3 caches.  See the BIOS and
-		Kernel Developer's Guide at
-		http://www.amd.com/us-en/assets/content_type/white_papers_and_tech_docs/31116-Public-GH-BKDG_3.20_2-4-09.pdf
-		for formatting information and other details on the
-		cache index disable.
-Users:    joachim.deguara@amd.com
+		Clock scaling allows you to change the clock speed of the
+		CPUs on the fly. This is a nice method to save battery
+		power, because the lower the clock speed, the less power
+		the CPU consumes.
+
+		There are many knobs to tweak in this directory.
+
+		See files in Documentation/cpu-freq/ for more information.
+
+		In particular, read Documentation/cpu-freq/user-guide.txt
+		to learn how to control the knobs.
+
+
+What:		/sys/devices/system/cpu/cpu#/cpufreq/freqdomain_cpus
+Date:		June 2013
+Contact:	linux-pm@vger.kernel.org
+Description:	Discover CPUs in the same CPU frequency coordination domain
+
+		freqdomain_cpus is the list of CPUs (online+offline) that share
+		the same clock/freq domain (possibly at the hardware level).
+		That information may be hidden from the cpufreq core and the
+		value of related_cpus may be different from freqdomain_cpus. This
+		attribute is useful for user space DVFS controllers to get better
+		power/performance results for platforms using acpi-cpufreq.
+
+		This file is only present if the acpi-cpufreq driver is in use.
+
+
+What:		/sys/devices/system/cpu/cpu*/cache/index3/cache_disable_{0,1}
+Date:		August 2008
+KernelVersion:	2.6.27
+Contact:	discuss@x86-64.org
+Description:	Disable L3 cache indices
+
+		These files exist in every CPU's cache/index3 directory. Each
+		cache_disable_{0,1} file corresponds to one disable slot which
+		can be used to disable a cache index. Reading from these files
+		on a processor with this functionality will return the currently
+		disabled index for that node. There is one L3 structure per
+		node, or per internal node on MCM machines. Writing a valid
+		index to one of these files will cause the specificed cache
+		index to be disabled.
+
+		All AMD processors with L3 caches provide this functionality.
+		For details, see BKDGs at
+		http://developer.amd.com/documentation/guides/Pages/default.aspx
+
+
+What:		/sys/devices/system/cpu/cpufreq/boost
+Date:		August 2012
+Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+Description:	Processor frequency boosting control
+
+		This switch controls the boost setting for the whole system.
+		Boosting allows the CPU and the firmware to run at a frequency
+		beyound it's nominal limit.
+		More details can be found in Documentation/cpu-freq/boost.txt
+
+
+What:		/sys/devices/system/cpu/cpu#/crash_notes
+		/sys/devices/system/cpu/cpu#/crash_notes_size
+Date:		April 2013
+Contact:	kexec@lists.infradead.org
+Description:	address and size of the percpu note.
+
+		crash_notes: the physical address of the memory that holds the
+		note of cpu#.
+
+		crash_notes_size: size of the note of cpu#.
+
+What:		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/turbo_stat
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/sub_turbo_stat
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/unthrottle
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/powercap
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/overtemp
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/supply_fault
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/overcurrent
+		/sys/devices/system/cpu/cpuX/cpufreq/throttle_stats/occ_reset
+Date:		March 2016
+Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+		Linux for PowerPC mailing list <linuxppc-dev@ozlabs.org>
+Description:	POWERNV CPUFreq driver's frequency throttle stats directory and
+		attributes
+
+		'cpuX/cpufreq/throttle_stats' directory contains the CPU frequency
+		throttle stat attributes for the chip. The throttle stats of a cpu
+		is common across all the cpus belonging to a chip. Below are the
+		throttle attributes exported in the 'throttle_stats' directory:
+
+		- turbo_stat : This file gives the total number of times the max
+		frequency is throttled to lower frequency in turbo (at and above
+		nominal frequency) range of frequencies.
+
+		- sub_turbo_stat : This file gives the total number of times the
+		max frequency is throttled to lower frequency in sub-turbo(below
+		nominal frequency) range of frequencies.
+
+		- unthrottle : This file gives the total number of times the max
+		frequency is unthrottled after being throttled.
+
+		- powercap : This file gives the total number of times the max
+		frequency is throttled due to 'Power Capping'.
+
+		- overtemp : This file gives the total number of times the max
+		frequency is throttled due to 'CPU Over Temperature'.
+
+		- supply_fault : This file gives the total number of times the
+		max frequency is throttled due to 'Power Supply Failure'.
+
+		- overcurrent : This file gives the total number of times the
+		max frequency is throttled due to 'Overcurrent'.
+
+		- occ_reset : This file gives the total number of times the max
+		frequency is throttled due to 'OCC Reset'.
+
+		The sysfs attributes representing different throttle reasons like
+		powercap, overtemp, supply_fault, overcurrent and occ_reset map to
+		the reasons provided by OCC firmware for throttling the frequency.
+
+What:		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/turbo_stat
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/sub_turbo_stat
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/unthrottle
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/powercap
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/overtemp
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/supply_fault
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/overcurrent
+		/sys/devices/system/cpu/cpufreq/policyX/throttle_stats/occ_reset
+Date:		March 2016
+Contact:	Linux kernel mailing list <linux-kernel@vger.kernel.org>
+		Linux for PowerPC mailing list <linuxppc-dev@ozlabs.org>
+Description:	POWERNV CPUFreq driver's frequency throttle stats directory and
+		attributes
+
+		'policyX/throttle_stats' directory and all the attributes are same as
+		the /sys/devices/system/cpu/cpuX/cpufreq/throttle_stats directory and
+		attributes which give the frequency throttle information of the chip.
 
 What:		/sys/devices/system/cpu/vulnerabilities
 		/sys/devices/system/cpu/vulnerabilities/meltdown
@@ -190,10 +305,12 @@ Description:	Control Symetric Multi Threading (SMT)
 		control: Read/write interface to control SMT. Possible
 			 values:
 
-			 "on"		SMT is enabled
-			 "off"		SMT is disabled
-			 "forceoff"	SMT is force disabled. Cannot be changed.
-			 "notsupported"	SMT is not supported by the CPU
+			 "on"		  SMT is enabled
+			 "off"		  SMT is disabled
+			 "forceoff"	  SMT is force disabled. Cannot be changed.
+			 "notsupported"   SMT is not supported by the CPU
+			 "notimplemented" SMT runtime toggling is not
+					  implemented for the architecture
 
 			 If control status is "forceoff" or "notsupported" writes
 			 are rejected.

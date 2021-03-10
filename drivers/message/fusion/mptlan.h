@@ -51,9 +51,7 @@
 #define LINUX_MPTLAN_H_INCLUDED
 /*****************************************************************************/
 
-#if !defined(__GENKSYMS__)
 #include <linux/module.h>
-#endif
 
 #include <linux/netdevice.h>
 #include <linux/errno.h>
@@ -69,7 +67,6 @@
 #include <linux/spinlock.h>
 #include <linux/workqueue.h>
 #include <linux/delay.h>
-// #include <linux/trdevice.h>
 
 #include <asm/uaccess.h>
 #include <asm/io.h>

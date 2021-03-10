@@ -11,7 +11,6 @@
  */
 
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
@@ -27,6 +26,7 @@
 #include <linux/net.h>
 #include <linux/proc_fs.h>
 #include <linux/init.h>
+#include <linux/export.h>
 #include <net/arp.h>
 
 /*
@@ -35,7 +35,7 @@
 
 static int fc_header(struct sk_buff *skb, struct net_device *dev,
 		     unsigned short type,
-		     const void *daddr, const void *saddr, unsigned len)
+		     const void *daddr, const void *saddr, unsigned int len)
 {
 	struct fch_hdr *fch;
 	int hdr_len;
@@ -49,7 +49,7 @@ static int fc_header(struct sk_buff *skb, struct net_device *dev,
 		struct fcllc *fcllc;
 
 		hdr_len = sizeof(struct fch_hdr) + sizeof(struct fcllc);
-		fch = (struct fch_hdr *)skb_push(skb, hdr_len);
+		fch = skb_push(skb, hdr_len);
 		fcllc = (struct fcllc *)(fch+1);
 		fcllc->dsap = fcllc->ssap = EXTENDED_SAP;
 		fcllc->llc = UI_CMD;
@@ -59,7 +59,7 @@ static int fc_header(struct sk_buff *skb, struct net_device *dev,
 	else
 	{
 		hdr_len = sizeof(struct fch_hdr);
-		fch = (struct fch_hdr *)skb_push(skb, hdr_len);
+		fch = skb_push(skb, hdr_len);
 	}
 
 	if(saddr)
@@ -70,7 +70,7 @@ static int fc_header(struct sk_buff *skb, struct net_device *dev,
 	if(daddr)
 	{
 		memcpy(fch->daddr,daddr,dev->addr_len);
-		return(hdr_len);
+		return hdr_len;
 	}
 	return -hdr_len;
 }

@@ -2,7 +2,7 @@
  * Squashfs - a compressed read only filesystem for Linux
  *
  * Copyright (c) 2002, 2003, 2004, 2005, 2006, 2007, 2008
- * Phillip Lougher <phillip@lougher.demon.co.uk>
+ * Phillip Lougher <phillip@squashfs.org.uk>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -33,15 +33,15 @@
 #include <linux/fs.h>
 #include <linux/vfs.h>
 #include <linux/kernel.h>
-#include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/pagemap.h>
-#include <linux/zlib.h>
+#include <linux/xattr.h>
 
 #include "squashfs_fs.h"
 #include "squashfs_fs_sb.h"
 #include "squashfs_fs_i.h"
 #include "squashfs.h"
+#include "xattr.h"
 
 static int squashfs_symlink_readpage(struct file *file, struct page *page)
 {
@@ -90,14 +90,14 @@ static int squashfs_symlink_readpage(struct file *file, struct page *page)
 			goto error_out;
 		}
 
-		pageaddr = kmap_atomic(page, KM_USER0);
+		pageaddr = kmap_atomic(page);
 		copied = squashfs_copy_data(pageaddr + bytes, entry, offset,
 								length - bytes);
 		if (copied == length - bytes)
 			memset(pageaddr + length, 0, PAGE_CACHE_SIZE - length);
 		else
 			block = entry->next_index;
-		kunmap_atomic(pageaddr, KM_USER0);
+		kunmap_atomic(pageaddr);
 		squashfs_cache_put(entry);
 	}
 
@@ -116,3 +116,12 @@ error_out:
 const struct address_space_operations squashfs_symlink_aops = {
 	.readpage = squashfs_symlink_readpage
 };
+
+const struct inode_operations squashfs_symlink_inode_ops = {
+	.readlink = generic_readlink,
+	.follow_link = page_follow_link_light,
+	.put_link = page_put_link,
+	.getxattr = generic_getxattr,
+	.listxattr = squashfs_listxattr
+};
+

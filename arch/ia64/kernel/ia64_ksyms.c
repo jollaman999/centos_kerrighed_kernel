@@ -12,7 +12,7 @@ EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(memcpy);
 EXPORT_SYMBOL(strlen);
 
-#include<asm/pgtable.h>
+#include <asm/pgtable.h>
 EXPORT_SYMBOL_GPL(empty_zero_page);
 
 #include <asm/checksum.h>
@@ -30,9 +30,9 @@ EXPORT_SYMBOL(max_low_pfn);	/* defined by bootmem.c, but not exported by generic
 #endif
 
 #include <asm/processor.h>
-EXPORT_SYMBOL(per_cpu__cpu_info);
+EXPORT_SYMBOL(ia64_cpu_info);
 #ifdef CONFIG_SMP
-EXPORT_SYMBOL(per_cpu__local_per_cpu_offset);
+EXPORT_SYMBOL(local_per_cpu_offset);
 #endif
 
 #include <asm/uaccess.h>
@@ -83,9 +83,6 @@ EXPORT_SYMBOL(ia64_save_scratch_fpregs);
 
 #include <asm/unwind.h>
 EXPORT_SYMBOL(unw_init_running);
-
-#include <linux/efi.h>
-EXPORT_SYMBOL_GPL(efi_mem_type);
 
 #if defined(CONFIG_IA64_ESI) || defined(CONFIG_IA64_ESI_MODULE)
 extern void esi_call_phys (void);

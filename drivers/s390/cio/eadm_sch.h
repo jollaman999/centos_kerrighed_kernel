@@ -14,7 +14,7 @@ struct eadm_private {
 	struct subchannel *sch;
 } __aligned(8);
 
-#define get_eadm_private(n) ((struct eadm_private *) sch->private)
-#define set_eadm_private(n, p) (sch->private = p)
+#define get_eadm_private(n) ((struct eadm_private *)dev_get_drvdata(&n->dev))
+#define set_eadm_private(n, p) (dev_set_drvdata(&n->dev, p))
 
 #endif

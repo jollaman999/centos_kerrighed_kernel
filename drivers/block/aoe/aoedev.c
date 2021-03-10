@@ -1,4 +1,4 @@
-/* Copyright (c) 2013 Coraid, Inc.  See COPYING for GPL terms. */
+/* Copyright (c) 2012 Coraid, Inc.  See COPYING for GPL terms. */
 /*
  * aoedev.c
  * AoE device utility functions; maintains device list.
@@ -278,7 +278,6 @@ freedev(struct aoedev *d)
 
 	del_timer_sync(&d->timer);
 	if (d->gd) {
-		aoedisk_rm_sysfs(d);
 		del_gendisk(d->gd);
 		put_disk(d->gd);
 		blk_cleanup_queue(d->blkq);
@@ -518,6 +517,7 @@ void
 aoedev_exit(void)
 {
 	flush_scheduled_work();
+	aoe_flush_iocq();
 	flush(NULL, 0, EXITING);
 }
 

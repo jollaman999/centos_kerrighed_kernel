@@ -10,12 +10,15 @@
 
 #include <linux/percpu_counter.h>
 #include <linux/log2.h>
-#include <linux/proportions.h>
+#include <linux/flex_proportions.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
 #include <linux/sched.h>
+#include <linux/timer.h>
 #include <linux/writeback.h>
-#include <asm/atomic.h>
+#include <linux/atomic.h>
+#include <linux/sysctl.h>
+#include <linux/workqueue.h>
 
 struct page;
 struct device;
@@ -25,7 +28,6 @@ struct dentry;
  * Bits in backing_dev_info.state
  */
 enum bdi_state {
-	BDI_pending,		/* On its way to being activated */
 	BDI_wb_alloc,		/* Default embedded wb allocated */
 	BDI_async_congested,	/* The async (write) queue is getting full */
 	BDI_sync_congested,	/* The sync queue is getting full */
@@ -39,64 +41,67 @@ typedef int (congested_fn)(void *, int);
 enum bdi_stat_item {
 	BDI_RECLAIMABLE,
 	BDI_WRITEBACK,
+	BDI_DIRTIED,
+	BDI_WRITTEN,
 	NR_BDI_STAT_ITEMS
 };
 
 #define BDI_STAT_BATCH (8*(1+ilog2(nr_cpu_ids)))
 
-struct bdi_wb_aux {
-	unsigned long last_active;	/* last time bdi thread was active */
-	struct timer_list wakeup_timer; /* used for delayed bdi thread wakeup */
-};
-
 struct bdi_writeback {
-#ifdef __GENKSYMS__
-	struct list_head list;			/* DEPRECATED */
-#else
-	union {
-		struct list_head list;
-		struct bdi_wb_aux *aux;
-	};
-#endif
 	struct backing_dev_info *bdi;	/* our parent bdi */
 	unsigned int nr;
 
 	unsigned long last_old_flush;	/* last old data flush */
 
-	struct task_struct *task;	/* writeback thread */
+	struct delayed_work dwork;	/* work item used for writeback */
 	struct list_head b_dirty;	/* dirty inodes */
 	struct list_head b_io;		/* parked for writeback */
 	struct list_head b_more_io;	/* parked for more writeback */
+	spinlock_t list_lock;		/* protects the b_* lists */
 };
 
 struct backing_dev_info {
 	struct list_head bdi_list;
-	struct rcu_head rcu_head; /* DEPRECATED */
 	unsigned long ra_pages;	/* max readahead in PAGE_CACHE_SIZE units */
 	unsigned long state;	/* Always use atomic bitops on this */
 	unsigned int capabilities; /* Device capabilities */
 	congested_fn *congested_fn; /* Function pointer if device is md/dm */
 	void *congested_data;	/* Pointer to aux data for congested func */
-	void (*unplug_io_fn)(struct backing_dev_info *, struct page *);
-	void *unplug_io_data;
 
 	char *name;
 
 	struct percpu_counter bdi_stat[NR_BDI_STAT_ITEMS];
 
-	struct prop_local_percpu completions;
+	unsigned long bw_time_stamp;	/* last time write bw is updated */
+	unsigned long dirtied_stamp;
+	unsigned long written_stamp;	/* pages written at bw_time_stamp */
+	unsigned long write_bandwidth;	/* the estimated write bandwidth */
+	unsigned long avg_write_bandwidth; /* further smoothed write bw */
+
+	/*
+	 * The base dirty throttle rate, re-calculated on every 200ms.
+	 * All the bdi tasks' dirty rate will be curbed under it.
+	 * @dirty_ratelimit tracks the estimated @balanced_dirty_ratelimit
+	 * in small steps and is much more smooth/stable than the latter.
+	 */
+	unsigned long dirty_ratelimit;
+	unsigned long balanced_dirty_ratelimit;
+
+	struct fprop_local_percpu completions;
 	int dirty_exceeded;
 
 	unsigned int min_ratio;
 	unsigned int max_ratio, max_prop_frac;
 
 	struct bdi_writeback wb;  /* default writeback info for this bdi */
-	spinlock_t wb_lock;	  /* protects work_list */
-	struct list_head wb_list; /* DEPRECATED */
+	spinlock_t wb_lock;	  /* protects work_list & wb.dwork scheduling */
 
 	struct list_head work_list;
 
 	struct device *dev;
+
+	struct timer_list laptop_mode_wb_timer;
 
 #ifdef CONFIG_DEBUG_FS
 	struct dentry *debug_dir;
@@ -107,19 +112,23 @@ struct backing_dev_info {
 int bdi_init(struct backing_dev_info *bdi);
 void bdi_destroy(struct backing_dev_info *bdi);
 
+__printf(3, 4)
 int bdi_register(struct backing_dev_info *bdi, struct device *parent,
 		const char *fmt, ...);
 int bdi_register_dev(struct backing_dev_info *bdi, dev_t dev);
 void bdi_unregister(struct backing_dev_info *bdi);
-void bdi_start_writeback(struct backing_dev_info *bdi, long nr_pages);
+int bdi_setup_and_register(struct backing_dev_info *, char *, unsigned int);
+void bdi_start_writeback(struct backing_dev_info *bdi, long nr_pages,
+			enum wb_reason reason);
 void bdi_start_background_writeback(struct backing_dev_info *bdi);
-int bdi_writeback_thread(void *data);
+void bdi_writeback_workfn(struct work_struct *work);
 int bdi_has_dirty_io(struct backing_dev_info *bdi);
-void bdi_arm_supers_timer(void);
 void bdi_wakeup_thread_delayed(struct backing_dev_info *bdi);
 
 extern spinlock_t bdi_lock;
 extern struct list_head bdi_list;
+
+extern struct workqueue_struct *bdi_wq;
 
 static inline int wb_has_dirty_io(struct bdi_writeback *wb)
 {
@@ -233,6 +242,8 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
  * BDI_CAP_EXEC_MAP:       Can be mapped for execution
  *
  * BDI_CAP_SWAP_BACKED:    Count shmem/tmpfs objects as swap-backed.
+ *
+ * BDI_CAP_STRICTLIMIT:    Keep number of dirty pages below bdi threshold.
  */
 #define BDI_CAP_NO_ACCT_DIRTY	0x00000001
 #define BDI_CAP_NO_WRITEBACK	0x00000002
@@ -244,6 +255,7 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
 #define BDI_CAP_NO_ACCT_WB	0x00000080
 #define BDI_CAP_SWAP_BACKED	0x00000100
 #define BDI_CAP_STABLE_WRITES	0x00000200
+#define BDI_CAP_STRICTLIMIT	0x00000400
 
 #define BDI_CAP_VMFLAGS \
 	(BDI_CAP_READ_MAP | BDI_CAP_WRITE_MAP | BDI_CAP_EXEC_MAP)
@@ -259,9 +271,19 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
 #endif
 
 extern struct backing_dev_info default_backing_dev_info;
-void default_unplug_io_fn(struct backing_dev_info *bdi, struct page *page);
+extern struct backing_dev_info noop_backing_dev_info;
 
 int writeback_in_progress(struct backing_dev_info *bdi);
+
+static inline struct backing_dev_info *inode_to_bdi(struct inode *inode)
+{
+	struct super_block *sb = inode->i_sb;
+
+	if (sb_is_blkdev_sb(sb))
+		return inode->i_mapping->backing_dev_info;
+
+	return sb->s_bdi;
+}
 
 static inline int bdi_congested(struct backing_dev_info *bdi, int bdi_bits)
 {
@@ -295,6 +317,8 @@ void clear_bdi_congested(struct backing_dev_info *bdi, int sync);
 void set_bdi_congested(struct backing_dev_info *bdi, int sync);
 long congestion_wait(int sync, long timeout);
 long wait_iff_congested(struct zone *zone, int sync, long timeout);
+int pdflush_proc_obsolete(struct ctl_table *table, int write,
+		void __user *buffer, size_t *lenp, loff_t *ppos);
 
 static inline bool bdi_cap_stable_pages_required(struct backing_dev_info *bdi)
 {
@@ -321,11 +345,6 @@ static inline bool bdi_cap_account_writeback(struct backing_dev_info *bdi)
 static inline bool bdi_cap_swap_backed(struct backing_dev_info *bdi)
 {
 	return bdi->capabilities & BDI_CAP_SWAP_BACKED;
-}
-
-static inline bool bdi_cap_flush_forker(struct backing_dev_info *bdi)
-{
-	return bdi == &default_backing_dev_info;
 }
 
 static inline bool mapping_cap_writeback_dirty(struct address_space *mapping)

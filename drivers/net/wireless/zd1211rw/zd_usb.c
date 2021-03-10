@@ -155,7 +155,6 @@ static int upload_code(struct usb_device *udev,
 	 */
 	p = kmalloc(MAX_TRANSFER_SIZE, GFP_KERNEL);
 	if (!p) {
-		dev_err(&udev->dev, "out of memory\n");
 		r = -ENOMEM;
 		goto error;
 	}
@@ -550,7 +549,7 @@ int zd_usb_enable_int(struct zd_usb *usb)
 	spin_unlock_irq(&intr->lock);
 
 	r = -ENOMEM;
-	intr->buffer = usb_buffer_alloc(udev, USB_MAX_EP_INT_BUFFER,
+	intr->buffer = usb_alloc_coherent(udev, USB_MAX_EP_INT_BUFFER,
 					  GFP_KERNEL, &intr->buffer_dma);
 	if (!intr->buffer) {
 		dev_dbg_f(zd_usb_dev(usb),
@@ -575,7 +574,7 @@ int zd_usb_enable_int(struct zd_usb *usb)
 
 	return 0;
 error:
-	usb_buffer_free(udev, USB_MAX_EP_INT_BUFFER,
+	usb_free_coherent(udev, USB_MAX_EP_INT_BUFFER,
 			  intr->buffer, intr->buffer_dma);
 error_set_urb_null:
 	spin_lock_irq(&intr->lock);
@@ -613,7 +612,7 @@ void zd_usb_disable_int(struct zd_usb *usb)
 	usb_free_urb(urb);
 
 	if (buffer)
-		usb_buffer_free(udev, USB_MAX_EP_INT_BUFFER,
+		usb_free_coherent(udev, USB_MAX_EP_INT_BUFFER,
 				  buffer, buffer_dma);
 }
 
@@ -733,7 +732,7 @@ static struct urb *alloc_rx_urb(struct zd_usb *usb)
 	urb = usb_alloc_urb(0, GFP_KERNEL);
 	if (!urb)
 		return NULL;
-	buffer = usb_buffer_alloc(udev, USB_MAX_RX_SIZE, GFP_KERNEL,
+	buffer = usb_alloc_coherent(udev, USB_MAX_RX_SIZE, GFP_KERNEL,
 				    &urb->transfer_dma);
 	if (!buffer) {
 		usb_free_urb(urb);
@@ -752,7 +751,7 @@ static void free_rx_urb(struct urb *urb)
 {
 	if (!urb)
 		return;
-	usb_buffer_free(urb->dev, urb->transfer_buffer_length,
+	usb_free_coherent(urb->dev, urb->transfer_buffer_length,
 			  urb->transfer_buffer, urb->transfer_dma);
 	usb_free_urb(urb);
 }
@@ -1104,7 +1103,7 @@ static void zd_tx_watchdog_handler(struct work_struct *work)
 		goto out;
 
 	/* TX halted, try reset */
-	dev_warn(zd_usb_dev(usb), "TX-stall detected, reseting device...");
+	dev_warn(zd_usb_dev(usb), "TX-stall detected, resetting device...");
 
 	usb_queue_reset_device(usb->intf);
 
@@ -1164,8 +1163,7 @@ void zd_usb_reset_rx_idle_timer(struct zd_usb *usb)
 {
 	struct zd_usb_rx *rx = &usb->rx;
 
-	cancel_delayed_work(&rx->idle_work);
-	queue_delayed_work(zd_workqueue, &rx->idle_work, ZD_RX_IDLE_INTERVAL);
+	mod_delayed_work(zd_workqueue, &rx->idle_work, ZD_RX_IDLE_INTERVAL);
 }
 
 static inline void init_usb_interrupt(struct zd_usb *usb)

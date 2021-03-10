@@ -11,7 +11,8 @@ nf_conntrack_buckets - INTEGER (read-only)
 	Size of hash table. If not specified as parameter during module
 	loading, the default size is calculated by dividing total memory
 	by 16384 to determine the number of buckets but the hash table will
-	never have fewer than 32 or more than 16384 buckets.
+	never have fewer than 32 and limited to 16384 buckets. For systems
+	with more than 4GB of memory it will be 65536 buckets.
 
 nf_conntrack_checksum - BOOLEAN
 	0 - disabled
@@ -76,6 +77,12 @@ nf_conntrack_generic_timeout - INTEGER (seconds)
 
 	Default for generic timeout.  This refers to layer 4 unknown/unsupported
 	protocols.
+
+nf_conntrack_helper - BOOLEAN
+	0 - disabled
+	not 0 - enabled (default)
+
+	Enable automatic conntrack helper assignment.
 
 nf_conntrack_icmp_timeout - INTEGER (seconds)
 	default 30
@@ -153,6 +160,12 @@ nf_conntrack_tcp_timeout_time_wait - INTEGER (seconds)
 
 nf_conntrack_tcp_timeout_unacknowledged - INTEGER (seconds)
 	default 300
+
+nf_conntrack_timestamp - BOOLEAN
+	0 - disabled (default)
+	not 0 - enabled
+
+	Enable connection tracking flow timestamping.
 
 nf_conntrack_udp_timeout - INTEGER (seconds)
 	default 30

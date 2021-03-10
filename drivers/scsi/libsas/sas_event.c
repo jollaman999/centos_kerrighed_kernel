@@ -22,6 +22,7 @@
  *
  */
 
+#include <linux/export.h>
 #include <scsi/scsi_host.h>
 #include "sas_internal.h"
 #include "sas_dump.h"
@@ -52,23 +53,18 @@ static void sas_queue_event(int event, unsigned long *pending,
 	}
 }
 
+
 void __sas_drain_work(struct sas_ha_struct *ha)
 {
-	struct Scsi_Host *shost = ha->core.shost;
+	struct workqueue_struct *wq = ha->core.shost->work_q;
 	struct sas_work *sw, *_sw;
-	int i;
 
 	set_bit(SAS_HA_DRAINING, &ha->state);
 	/* flush submitters */
 	spin_lock_irq(&ha->lock);
 	spin_unlock_irq(&ha->lock);
 
-	/* 
-	   For RHEL6 substitute drain_workqueue with manual flush,
-	   this will still flush late to arrive unchained events.
-	*/
-	for (i=0; i<3; i++)
-		scsi_flush_work(shost);
+	drain_workqueue(wq);
 
 	spin_lock_irq(&ha->lock);
 	clear_bit(SAS_HA_DRAINING, &ha->state);

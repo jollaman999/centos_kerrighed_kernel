@@ -1,9 +1,8 @@
 /*
- * File...........: linux/drivers/s390/block/dasd_eckd.h
  * Author(s)......: Holger Smolinski <Holger.Smolinski@de.ibm.com>
  *		    Horst Hummel <Horst.Hummel@de.ibm.com>
  * Bugreports.to..: <Linux390@de.ibm.com>
- * (C) IBM Corporation, IBM Deutschland Entwicklung GmbH, 1999,2000
+ * Copyright IBM Corp. 1999, 2000
  *
  */
 
@@ -30,12 +29,14 @@
 #define DASD_ECKD_CCW_SNID		 0x34
 #define DASD_ECKD_CCW_RSSD		 0x3e
 #define DASD_ECKD_CCW_LOCATE_RECORD	 0x47
+#define DASD_ECKD_CCW_LOCATE_RECORD_EXT	 0x4b
 #define DASD_ECKD_CCW_SNSS		 0x54
 #define DASD_ECKD_CCW_DEFINE_EXTENT	 0x63
 #define DASD_ECKD_CCW_WRITE_MT		 0x85
 #define DASD_ECKD_CCW_READ_MT		 0x86
 #define DASD_ECKD_CCW_WRITE_KD_MT	 0x8d
 #define DASD_ECKD_CCW_READ_KD_MT	 0x8e
+#define DASD_ECKD_CCW_READ_COUNT_MT	 0x92
 #define DASD_ECKD_CCW_RELEASE		 0x94
 #define DASD_ECKD_CCW_WRITE_FULL_TRACK	 0x95
 #define DASD_ECKD_CCW_READ_CKD_MT	 0x9e
@@ -54,6 +55,7 @@
  */
 #define PSF_ORDER_PRSSD			 0x18
 #define PSF_ORDER_CUIR_RESPONSE		 0x1A
+#define PSF_SUBORDER_QHA		 0x1C
 #define PSF_ORDER_SSC			 0x1D
 
 /*
@@ -82,6 +84,8 @@
 #define ATTENTION_LENGTH_CUIR		 0x0e
 #define ATTENTION_FORMAT_CUIR		 0x01
 
+#define DASD_ECKD_PG_GROUPED		 0x10
+
 /*
  * Size that is reportet for large volumes in the old 16-bit no_cyl field
  */
@@ -91,6 +95,8 @@
 #define FCX_MAX_DATA_FACTOR 65536
 #define DASD_ECKD_RCD_DATA_SIZE 256
 
+#define DASD_ECKD_PATH_THRHLD		 256
+#define DASD_ECKD_PATH_INTERVAL		 300
 
 /*****************************************************************************
  * SECTION: Type Definitions
@@ -356,7 +362,8 @@ struct dasd_gneq {
 		__u8 identifier:2;
 		__u8 reserved:6;
 	} __attribute__ ((packed)) flags;
-	__u8 reserved[5];
+	__u8 record_selector;
+	__u8 reserved[4];
 	struct {
 		__u8 value:2;
 		__u8 number:6;
@@ -403,13 +410,41 @@ struct dasd_psf_cuir_response {
 	__u8 ssid;
 } __packed;
 
+struct dasd_ckd_path_group_entry {
+	__u8 status_flags;
+	__u8 pgid[11];
+	__u8 sysplex_name[8];
+	__u32 timestamp;
+	__u32 cylinder;
+	__u8 reserved[4];
+} __packed;
+
+struct dasd_ckd_host_information {
+	__u8 access_flags;
+	__u8 entry_size;
+	__u16 entry_count;
+	__u8 entry[16390];
+} __packed;
+
+struct dasd_psf_query_host_access {
+	__u8 access_flag;
+	__u8 version;
+	__u16 CKD_length;
+	__u16 SCSI_length;
+	__u8 unused[10];
+	__u8 host_access_information[16394];
+} __packed;
+
 /*
  * Perform Subsystem Function - Prepare for Read Subsystem Data
  */
 struct dasd_psf_prssd_data {
 	unsigned char order;
 	unsigned char flags;
-	unsigned char reserved[4];
+	unsigned char reserved1;
+	unsigned char reserved2;
+	unsigned char lss;
+	unsigned char volume;
 	unsigned char suborder;
 	unsigned char varies[5];
 } __attribute__ ((packed));
@@ -493,10 +528,17 @@ struct alias_pav_group {
 	struct dasd_device *next;
 };
 
+struct dasd_conf_data {
+	struct dasd_ned neds[5];
+	u8 reserved[64];
+	struct dasd_gneq gneq;
+} __packed;
+
 struct dasd_eckd_private {
 	struct dasd_eckd_characteristics rdc_data;
 	u8 *conf_data;
 	int conf_len;
+
 	/* pointers to specific parts in the conf_data */
 	struct dasd_ned *ned;
 	struct dasd_sneq *sneq;

@@ -28,6 +28,7 @@
 #include <linux/quotaops.h>
 #include <linux/slab.h>
 #include <linux/log2.h>
+#include <linux/aio.h>
 
 #include "aops.h"
 #include "attrib.h"
@@ -54,7 +55,7 @@
  *
  * Return 1 if the attributes match and 0 if not.
  *
- * NOTE: This function runs with the inode_lock spin lock held so it is not
+ * NOTE: This function runs with the inode->i_lock spin lock held so it is not
  * allowed to sleep.
  */
 int ntfs_test_inode(struct inode *vi, ntfs_attr *na)
@@ -98,7 +99,7 @@ int ntfs_test_inode(struct inode *vi, ntfs_attr *na)
  *
  * Return 0 on success and -errno on error.
  *
- * NOTE: This function runs with the inode_lock spin lock held so it is not
+ * NOTE: This function runs with the inode->i_lock spin lock held so it is not
  * allowed to sleep. (Hence the GFP_ATOMIC allocation.)
  */
 static int ntfs_init_locked_inode(struct inode *vi, ntfs_attr *na)
@@ -332,6 +333,12 @@ struct inode *ntfs_alloc_big_inode(struct super_block *sb)
 	return NULL;
 }
 
+static void ntfs_i_callback(struct rcu_head *head)
+{
+	struct inode *inode = container_of(head, struct inode, i_rcu);
+	kmem_cache_free(ntfs_big_inode_cache, NTFS_I(inode));
+}
+
 void ntfs_destroy_big_inode(struct inode *inode)
 {
 	ntfs_inode *ni = NTFS_I(inode);
@@ -340,7 +347,7 @@ void ntfs_destroy_big_inode(struct inode *inode)
 	BUG_ON(ni->page);
 	if (!atomic_dec_and_test(&ni->count))
 		BUG();
-	kmem_cache_free(ntfs_big_inode_cache, NTFS_I(inode));
+	call_rcu(&inode->i_rcu, ntfs_i_callback);
 }
 
 static inline ntfs_inode *ntfs_alloc_extent_inode(void)
@@ -530,7 +537,7 @@ err_corrupt_attr:
  * the ntfs inode.
  *
  * Q: What locks are held when the function is called?
- * A: i_state has I_LOCK set, hence the inode is locked, also
+ * A: i_state has I_NEW set, hence the inode is locked, also
  *    i_count is set to 1, so it is not going to go away
  *    i_flags is set to 0 and we have no business touching it.  Only an ioctl()
  *    is allowed to write to them. We should of course be honouring them but
@@ -605,7 +612,7 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	 * might be tricky due to vfs interactions. Need to think about this
 	 * some more when implementing the unlink command.
 	 */
-	vi->i_nlink = le16_to_cpu(m->link_count);
+	set_nlink(vi, le16_to_cpu(m->link_count));
 	/*
 	 * FIXME: Reparse points can have the directory bit set even though
 	 * they would be S_IFLNK. Need to deal with this further below when we
@@ -615,7 +622,7 @@ static int ntfs_read_locked_inode(struct inode *vi)
 	 */
 	/* Everyone gets all permissions. */
 	vi->i_mode |= S_IRWXUGO;
-	/* If read-only, noone gets write permissions. */
+	/* If read-only, no one gets write permissions. */
 	if (IS_RDONLY(vi))
 		vi->i_mode &= ~S_IWUGO;
 	if (m->flags & MFT_RECORD_IS_DIRECTORY) {
@@ -627,7 +634,7 @@ static int ntfs_read_locked_inode(struct inode *vi)
 		vi->i_mode &= ~vol->dmask;
 		/* Things break without this kludge! */
 		if (vi->i_nlink > 1)
-			vi->i_nlink = 1;
+			set_nlink(vi, 1);
 	} else {
 		vi->i_mode |= S_IFREG;
 		/* Apply the file permissions mask set in the mount options. */
@@ -1207,7 +1214,7 @@ err_out:
  * necessary fields in @vi as well as initializing the ntfs inode.
  *
  * Q: What locks are held when the function is called?
- * A: i_state has I_LOCK set, hence the inode is locked, also
+ * A: i_state has I_NEW set, hence the inode is locked, also
  *    i_count is set to 1, so it is not going to go away
  *
  * Return 0 on success and -errno on error.  In the error case, the inode will
@@ -1235,7 +1242,7 @@ static int ntfs_read_locked_attr_inode(struct inode *base_vi, struct inode *vi)
 	vi->i_version	= base_vi->i_version;
 	vi->i_uid	= base_vi->i_uid;
 	vi->i_gid	= base_vi->i_gid;
-	vi->i_nlink	= base_vi->i_nlink;
+	set_nlink(vi, base_vi->i_nlink);
 	vi->i_mtime	= base_vi->i_mtime;
 	vi->i_ctime	= base_vi->i_ctime;
 	vi->i_atime	= base_vi->i_atime;
@@ -1474,7 +1481,7 @@ err_out:
  * normal directory inodes.
  *
  * Q: What locks are held when the function is called?
- * A: i_state has I_LOCK set, hence the inode is locked, also
+ * A: i_state has I_NEW set, hence the inode is locked, also
  *    i_count is set to 1, so it is not going to go away
  *
  * Return 0 on success and -errno on error.  In the error case, the inode will
@@ -1501,7 +1508,7 @@ static int ntfs_read_locked_index_inode(struct inode *base_vi, struct inode *vi)
 	vi->i_version	= base_vi->i_version;
 	vi->i_uid	= base_vi->i_uid;
 	vi->i_gid	= base_vi->i_gid;
-	vi->i_nlink	= base_vi->i_nlink;
+	set_nlink(vi, base_vi->i_nlink);
 	vi->i_mtime	= base_vi->i_mtime;
 	vi->i_ctime	= base_vi->i_ctime;
 	vi->i_atime	= base_vi->i_atime;
@@ -2118,7 +2125,8 @@ int ntfs_read_inode_mount(struct inode *vi)
 			 * ntfs_read_inode() will have set up the default ones.
 			 */
 			/* Set uid and gid to root. */
-			vi->i_uid = vi->i_gid = 0;
+			vi->i_uid = GLOBAL_ROOT_UID;
+			vi->i_gid = GLOBAL_ROOT_GID;
 			/* Regular file. No access for anyone. */
 			vi->i_mode = S_IFREG;
 			/* No VFS initiated operations allowed for $MFT. */
@@ -2238,7 +2246,7 @@ void ntfs_clear_extent_inode(ntfs_inode *ni)
 }
 
 /**
- * ntfs_clear_big_inode - clean up the ntfs specific part of an inode
+ * ntfs_evict_big_inode - clean up the ntfs specific part of an inode
  * @vi:		vfs inode pending annihilation
  *
  * When the VFS is going to remove an inode from memory, ntfs_clear_big_inode()
@@ -2247,9 +2255,12 @@ void ntfs_clear_extent_inode(ntfs_inode *ni)
  *
  * If the MFT record is dirty, we commit it before doing anything else.
  */
-void ntfs_clear_big_inode(struct inode *vi)
+void ntfs_evict_big_inode(struct inode *vi)
 {
 	ntfs_inode *ni = NTFS_I(vi);
+
+	truncate_inode_pages_final(&vi->i_data);
+	clear_inode(vi);
 
 #ifdef NTFS_RW
 	if (NInoDirty(ni)) {
@@ -2291,20 +2302,20 @@ void ntfs_clear_big_inode(struct inode *vi)
 /**
  * ntfs_show_options - show mount options in /proc/mounts
  * @sf:		seq_file in which to write our mount options
- * @mnt:	vfs mount whose mount options to display
+ * @root:	root of the mounted tree whose mount options to display
  *
  * Called by the VFS once for each mounted ntfs volume when someone reads
  * /proc/mounts in order to display the NTFS specific mount options of each
- * mount. The mount options of the vfs mount @mnt are written to the seq file
+ * mount. The mount options of fs specified by @root are written to the seq file
  * @sf and success is returned.
  */
-int ntfs_show_options(struct seq_file *sf, struct vfsmount *mnt)
+int ntfs_show_options(struct seq_file *sf, struct dentry *root)
 {
-	ntfs_volume *vol = NTFS_SB(mnt->mnt_sb);
+	ntfs_volume *vol = NTFS_SB(root->d_sb);
 	int i;
 
-	seq_printf(sf, ",uid=%i", vol->uid);
-	seq_printf(sf, ",gid=%i", vol->gid);
+	seq_printf(sf, ",uid=%i", from_kuid_munged(&init_user_ns, vol->uid));
+	seq_printf(sf, ",gid=%i", from_kgid_munged(&init_user_ns, vol->gid));
 	if (vol->fmask == vol->dmask)
 		seq_printf(sf, ",umask=0%o", vol->fmask);
 	else {
@@ -2347,12 +2358,7 @@ static const char *es = "  Leaving inconsistent metadata.  Unmount and run "
  *
  * Returns 0 on success or -errno on error.
  *
- * Called with ->i_mutex held.  In all but one case ->i_alloc_sem is held for
- * writing.  The only case in the kernel where ->i_alloc_sem is not held is
- * mm/filemap.c::generic_file_buffered_write() where vmtruncate() is called
- * with the current i_size as the offset.  The analogous place in NTFS is in
- * fs/ntfs/file.c::ntfs_file_buffered_write() where we call vmtruncate() again
- * without holding ->i_alloc_sem.
+ * Called with ->i_mutex held.
  */
 int ntfs_truncate(struct inode *vi)
 {
@@ -2519,7 +2525,7 @@ retry_truncate:
 		 * specifies that the behaviour is unspecified thus we do not
 		 * have to do anything.  This means that in our implementation
 		 * in the rare case that the file is mmap()ped and a write
-		 * occured into the mmap()ped region just beyond the file size
+		 * occurred into the mmap()ped region just beyond the file size
 		 * and writepage has not yet been called to write out the page
 		 * (which would clear the area beyond the file size) and we now
 		 * extend the file size to incorporate this dirty region
@@ -2861,9 +2867,11 @@ conv_err_out:
  *
  * See ntfs_truncate() description above for details.
  */
+#ifdef NTFS_RW
 void ntfs_truncate_vfs(struct inode *vi) {
 	ntfs_truncate(vi);
 }
+#endif
 
 /**
  * ntfs_setattr - called from notify_change() when an attribute is being changed
@@ -2877,11 +2885,7 @@ void ntfs_truncate_vfs(struct inode *vi) {
  * We also abort all changes of user, group, and mode as we do not implement
  * the NTFS ACLs yet.
  *
- * Called with ->i_mutex held.  For the ATTR_SIZE (i.e. ->truncate) case, also
- * called with ->i_alloc_sem held for writing.
- *
- * Basically this is a copy of generic notify_change() and inode_setattr()
- * functionality, except we intercept and abort changes in i_size.
+ * Called with ->i_mutex held.
  */
 int ntfs_setattr(struct dentry *dentry, struct iattr *attr)
 {
@@ -2913,8 +2917,10 @@ int ntfs_setattr(struct dentry *dentry, struct iattr *attr)
 						NInoCompressed(ni) ?
 						"compressed" : "encrypted");
 				err = -EOPNOTSUPP;
-			} else
-				err = vmtruncate(vi, attr->ia_size);
+			} else {
+				truncate_setsize(vi, attr->ia_size);
+				ntfs_truncate_vfs(vi);
+			}
 			if (err || ia_valid == ATTR_SIZE)
 				goto out;
 		} else {

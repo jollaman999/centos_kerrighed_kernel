@@ -19,10 +19,10 @@
 #include <linux/kdebug.h>
 
 #include <asm/fpswa.h>
-#include <asm/ia32.h>
 #include <asm/intrinsics.h>
 #include <asm/processor.h>
 #include <asm/uaccess.h>
+#include <asm/setup.h>
 
 fpswa_interface_t *fpswa_interface;
 EXPORT_SYMBOL(fpswa_interface);
@@ -72,7 +72,7 @@ die (const char *str, struct pt_regs *regs, long err)
 
 	bust_spinlocks(0);
 	die.lock_owner = -1;
-	add_taint(TAINT_DIE);
+	add_taint(TAINT_DIE, LOCKDEP_NOW_UNRELIABLE);
 	spin_unlock_irq(&die.lock);
 
 	if (!regs)
@@ -626,10 +626,6 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 		break;
 
 	      case 45:
-#ifdef CONFIG_IA32_SUPPORT
-		if (ia32_exception(&regs, isr) == 0)
-			return;
-#endif
 		printk(KERN_ERR "Unexpected IA-32 exception (Trap 45)\n");
 		printk(KERN_ERR "  iip - 0x%lx, ifa - 0x%lx, isr - 0x%lx\n",
 		       iip, ifa, isr);
@@ -637,10 +633,6 @@ ia64_fault (unsigned long vector, unsigned long isr, unsigned long ifa,
 		break;
 
 	      case 46:
-#ifdef CONFIG_IA32_SUPPORT
-		if (ia32_intercept(&regs, isr) == 0)
-			return;
-#endif
 		printk(KERN_ERR "Unexpected IA-32 intercept trap (Trap 46)\n");
 		printk(KERN_ERR "  iip - 0x%lx, ifa - 0x%lx, isr - 0x%lx, iim - 0x%lx\n",
 		       iip, ifa, isr, iim);

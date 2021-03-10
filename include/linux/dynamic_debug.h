@@ -1,13 +1,6 @@
 #ifndef _DYNAMIC_DEBUG_H
 #define _DYNAMIC_DEBUG_H
 
-/* dynamic_printk_enabled, and dynamic_printk_enabled2 are bitmasks in which
- * bit n is set to 1 if any modname hashes into the bucket n, 0 otherwise. They
- * use independent hash functions, to reduce the chance of false positives.
- */
-extern long long dynamic_debug_enabled;
-extern long long dynamic_debug_enabled2;
-
 /*
  * An instance of this structure is created in a special
  * ELF section at every dynamic debug callsite.  At runtime,
@@ -22,9 +15,7 @@ struct _ddebug {
 	const char *function;
 	const char *filename;
 	const char *format;
-	char primary_hash;
-	char secondary_hash;
-	unsigned int lineno:24;
+	unsigned int lineno:18;
 	/*
 	 * The flags field controls the behaviour at the callsite.
 	 * The bits here are changed dynamically when the user
@@ -69,14 +60,6 @@ int __dynamic_netdev_dbg(struct _ddebug *descriptor,
 			 const struct net_device *dev,
 			 const char *fmt, ...);
 
-#define __dynamic_dbg_enabled(dd)  ({	     \
-	int __ret = 0;							     \
-	if (unlikely((dynamic_debug_enabled & (1LL << DEBUG_HASH)) &&	     \
-			(dynamic_debug_enabled2 & (1LL << DEBUG_HASH2))))   \
-				if (unlikely(dd.flags & _DPRINTK_FLAGS_PRINT)) \
-					__ret = 1;			     \
-	__ret; })
-
 #define DEFINE_DYNAMIC_DEBUG_METADATA(name, fmt)		\
 	static struct _ddebug  __aligned(8)			\
 	__attribute__((section("__verbose"))) name = {		\
@@ -84,8 +67,6 @@ int __dynamic_netdev_dbg(struct _ddebug *descriptor,
 		.function = __func__,				\
 		.filename = __FILE__,				\
 		.format = (fmt),				\
-		.primary_hash = DEBUG_HASH,			\
-		.secondary_hash = DEBUG_HASH2,			\
 		.lineno = __LINE__,				\
 		.flags =  _DPRINTK_FLAGS_DEFAULT,		\
 	}
@@ -93,15 +74,15 @@ int __dynamic_netdev_dbg(struct _ddebug *descriptor,
 #define dynamic_pr_debug(fmt, ...)				\
 do {								\
 	DEFINE_DYNAMIC_DEBUG_METADATA(descriptor, fmt);		\
-	if (__dynamic_dbg_enabled(descriptor))			\
+	if (unlikely(descriptor.flags & _DPRINTK_FLAGS_PRINT))	\
 		__dynamic_pr_debug(&descriptor, pr_fmt(fmt),	\
 				   ##__VA_ARGS__);		\
 } while (0)
 
 #define dynamic_dev_dbg(dev, fmt, ...)				\
 do {								\
-	DEFINE_DYNAMIC_DEBUG_METADATA(descriptor, fmt);	\
-	if (__dynamic_dbg_enabled(descriptor))			\
+	DEFINE_DYNAMIC_DEBUG_METADATA(descriptor, fmt);		\
+	if (unlikely(descriptor.flags & _DPRINTK_FLAGS_PRINT))	\
 		__dynamic_dev_dbg(&descriptor, dev, fmt,	\
 				  ##__VA_ARGS__);		\
 } while (0)
@@ -109,7 +90,7 @@ do {								\
 #define dynamic_netdev_dbg(dev, fmt, ...)			\
 do {								\
 	DEFINE_DYNAMIC_DEBUG_METADATA(descriptor, fmt);		\
-	if (__dynamic_dbg_enabled(descriptor))			\
+	if (unlikely(descriptor.flags & _DPRINTK_FLAGS_PRINT))	\
 		__dynamic_netdev_dbg(&descriptor, dev, fmt,	\
 				     ##__VA_ARGS__);		\
 } while (0)
@@ -119,7 +100,7 @@ do {								\
 do {								\
 	DEFINE_DYNAMIC_DEBUG_METADATA(descriptor,		\
 		__builtin_constant_p(prefix_str) ? prefix_str : "hexdump");\
-	if (__dynamic_dbg_enabled(descriptor))			\
+	if (unlikely(descriptor.flags & _DPRINTK_FLAGS_PRINT))	\
 		print_hex_dump(KERN_DEBUG, prefix_str,		\
 			       prefix_type, rowsize, groupsize,	\
 			       buf, len, ascii);		\

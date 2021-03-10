@@ -13,31 +13,37 @@
  * GNU General Public License for more details.
  */
 #include <linux/kernel.h>
-#include <linux/module.h>
 #include <linux/init.h>
-#include <linux/dma-mapping.h>
+#include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/io.h>
 #include <linux/clk.h>
-#include <linux/i2c/at24.h>
+#include <linux/platform_data/at24.h>
 #include <linux/leds.h>
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/partitions.h>
+#include <linux/slab.h>
 #include <linux/mtd/nand.h>
-#include <asm/setup.h>
+#include <linux/input.h>
+#include <linux/spi/spi.h>
+#include <linux/spi/eeprom.h>
+#include <linux/v4l2-dv-timings.h>
+
 #include <asm/mach-types.h>
 #include <asm/mach/arch.h>
-#include <asm/mach/map.h>
-#include <mach/mux.h>
-#include <mach/hardware.h>
-#include <mach/dm365.h>
-#include <mach/psc.h>
-#include <mach/common.h>
-#include <mach/i2c.h>
-#include <mach/serial.h>
-#include <mach/mmc.h>
-#include <mach/nand.h>
 
+#include <mach/mux.h>
+#include <mach/common.h>
+#include <linux/platform_data/i2c-davinci.h>
+#include <mach/serial.h>
+#include <linux/platform_data/mmc-davinci.h>
+#include <linux/platform_data/mtd-davinci.h>
+#include <linux/platform_data/keyscan-davinci.h>
+
+#include <media/ths7303.h>
+#include <media/tvp514x.h>
+
+#include "davinci.h"
 
 static inline int have_imager(void)
 {
@@ -51,14 +57,7 @@ static inline int have_tvp7002(void)
 	return 0;
 }
 
-
-#define DM365_ASYNC_EMIF_CONTROL_BASE	0x01d10000
-#define DM365_ASYNC_EMIF_DATA_CE0_BASE	0x02000000
-#define DM365_ASYNC_EMIF_DATA_CE1_BASE	0x04000000
-
-#define DM365_EVM_PHY_MASK		(0x2)
-#define DM365_EVM_MDIO_FREQUENCY	(2200000) /* PHY bus frequency */
-
+#define DM365_EVM_PHY_ID		"davinci_mdio-0:01"
 /*
  * A MAX-II CPLD is used for various board control functions.
  */
@@ -111,7 +110,7 @@ static struct mtd_partition davinci_nand_partitions[] = {
 		/* UBL (a few copies) plus U-Boot */
 		.name		= "bootloader",
 		.offset		= 0,
-		.size		= 28 * NAND_BLOCK_SIZE,
+		.size		= 30 * NAND_BLOCK_SIZE,
 		.mask_flags	= MTD_WRITEABLE, /* force read-only */
 	}, {
 		/* U-Boot environment */
@@ -143,7 +142,8 @@ static struct davinci_nand_pdata davinci_nand_data = {
 	.parts			= davinci_nand_partitions,
 	.nr_parts		= ARRAY_SIZE(davinci_nand_partitions),
 	.ecc_mode		= NAND_ECC_HW,
-	.options		= NAND_USE_FLASH_BBT,
+	.bbt_options		= NAND_BBT_USE_FLASH,
+	.ecc_bits		= 4,
 };
 
 static struct resource davinci_nand_resources[] = {
@@ -176,16 +176,59 @@ static struct at24_platform_data eeprom_info = {
 	.context	= (void *)0x7f00,
 };
 
+static struct snd_platform_data dm365_evm_snd_data = {
+	.asp_chan_q = EVENTQ_3,
+};
+
 static struct i2c_board_info i2c_info[] = {
 	{
 		I2C_BOARD_INFO("24c256", 0x50),
 		.platform_data	= &eeprom_info,
+	},
+	{
+		I2C_BOARD_INFO("tlv320aic3x", 0x18),
 	},
 };
 
 static struct davinci_i2c_platform_data i2c_pdata = {
 	.bus_freq	= 400	/* kHz */,
 	.bus_delay	= 0	/* usec */,
+};
+
+static int dm365evm_keyscan_enable(struct device *dev)
+{
+	return davinci_cfg_reg(DM365_KEYSCAN);
+}
+
+static unsigned short dm365evm_keymap[] = {
+	KEY_KP2,
+	KEY_LEFT,
+	KEY_EXIT,
+	KEY_DOWN,
+	KEY_ENTER,
+	KEY_UP,
+	KEY_KP1,
+	KEY_RIGHT,
+	KEY_MENU,
+	KEY_RECORD,
+	KEY_REWIND,
+	KEY_KPMINUS,
+	KEY_STOP,
+	KEY_FASTFORWARD,
+	KEY_KPPLUS,
+	KEY_PLAYPAUSE,
+	0
+};
+
+static struct davinci_ks_platform_data dm365evm_ks_data = {
+	.device_enable	= dm365evm_keyscan_enable,
+	.keymap		= dm365evm_keymap,
+	.keymapsize	= ARRAY_SIZE(dm365evm_keymap),
+	.rep		= 1,
+	/* Scan period = strobe + interval */
+	.strobe		= 0x5,
+	.interval	= 0x2,
+	.matrix_type	= DAVINCI_KEYSCAN_MATRIX_4X4,
 };
 
 static int cpld_mmc_get_cd(int module)
@@ -212,7 +255,6 @@ static struct davinci_mmc_config dm365evm_mmc_config = {
 	.wires		= 4,
 	.max_freq	= 50000000,
 	.caps		= MMC_CAP_MMC_HIGHSPEED | MMC_CAP_SD_HIGHSPEED,
-	.version	= MMC_CTLR_VERSION_2,
 };
 
 static void dm365evm_emac_configure(void)
@@ -265,6 +307,233 @@ static void dm365evm_mmc_configure(void)
 	davinci_cfg_reg(DM365_SD1_DATA1);
 	davinci_cfg_reg(DM365_SD1_DATA0);
 }
+
+static struct tvp514x_platform_data tvp5146_pdata = {
+	.clk_polarity = 0,
+	.hs_polarity = 1,
+	.vs_polarity = 1
+};
+
+#define TVP514X_STD_ALL        (V4L2_STD_NTSC | V4L2_STD_PAL)
+/* Inputs available at the TVP5146 */
+static struct v4l2_input tvp5146_inputs[] = {
+	{
+		.index = 0,
+		.name = "Composite",
+		.type = V4L2_INPUT_TYPE_CAMERA,
+		.std = TVP514X_STD_ALL,
+	},
+	{
+		.index = 1,
+		.name = "S-Video",
+		.type = V4L2_INPUT_TYPE_CAMERA,
+		.std = TVP514X_STD_ALL,
+	},
+};
+
+/*
+ * this is the route info for connecting each input to decoder
+ * ouput that goes to vpfe. There is a one to one correspondence
+ * with tvp5146_inputs
+ */
+static struct vpfe_route tvp5146_routes[] = {
+	{
+		.input = INPUT_CVBS_VI2B,
+		.output = OUTPUT_10BIT_422_EMBEDDED_SYNC,
+	},
+{
+		.input = INPUT_SVIDEO_VI2C_VI1C,
+		.output = OUTPUT_10BIT_422_EMBEDDED_SYNC,
+	},
+};
+
+static struct vpfe_subdev_info vpfe_sub_devs[] = {
+	{
+		.name = "tvp5146",
+		.grp_id = 0,
+		.num_inputs = ARRAY_SIZE(tvp5146_inputs),
+		.inputs = tvp5146_inputs,
+		.routes = tvp5146_routes,
+		.can_route = 1,
+		.ccdc_if_params = {
+			.if_type = VPFE_BT656,
+			.hdpol = VPFE_PINPOL_POSITIVE,
+			.vdpol = VPFE_PINPOL_POSITIVE,
+		},
+		.board_info = {
+			I2C_BOARD_INFO("tvp5146", 0x5d),
+			.platform_data = &tvp5146_pdata,
+		},
+	},
+};
+
+static struct vpfe_config vpfe_cfg = {
+	.num_subdevs = ARRAY_SIZE(vpfe_sub_devs),
+	.sub_devs = vpfe_sub_devs,
+	.i2c_adapter_id = 1,
+	.card_name = "DM365 EVM",
+	.ccdc = "ISIF",
+};
+
+/* venc standards timings */
+static struct vpbe_enc_mode_info dm365evm_enc_std_timing[] = {
+	{
+		.name		= "ntsc",
+		.timings_type	= VPBE_ENC_STD,
+		.std_id		= V4L2_STD_NTSC,
+		.interlaced	= 1,
+		.xres		= 720,
+		.yres		= 480,
+		.aspect		= {11, 10},
+		.fps		= {30000, 1001},
+		.left_margin	= 0x79,
+		.upper_margin	= 0x10,
+	},
+	{
+		.name		= "pal",
+		.timings_type	= VPBE_ENC_STD,
+		.std_id		= V4L2_STD_PAL,
+		.interlaced	= 1,
+		.xres		= 720,
+		.yres		= 576,
+		.aspect		= {54, 59},
+		.fps		= {25, 1},
+		.left_margin	= 0x7E,
+		.upper_margin	= 0x16,
+	},
+};
+
+/* venc dv timings */
+static struct vpbe_enc_mode_info dm365evm_enc_preset_timing[] = {
+	{
+		.name		= "480p59_94",
+		.timings_type	= VPBE_ENC_DV_TIMINGS,
+		.dv_timings	= V4L2_DV_BT_CEA_720X480P59_94,
+		.interlaced	= 0,
+		.xres		= 720,
+		.yres		= 480,
+		.aspect		= {1, 1},
+		.fps		= {5994, 100},
+		.left_margin	= 0x8F,
+		.upper_margin	= 0x2D,
+	},
+	{
+		.name		= "576p50",
+		.timings_type	= VPBE_ENC_DV_TIMINGS,
+		.dv_timings	= V4L2_DV_BT_CEA_720X576P50,
+		.interlaced	= 0,
+		.xres		= 720,
+		.yres		= 576,
+		.aspect		= {1, 1},
+		.fps		= {50, 1},
+		.left_margin	= 0x8C,
+		.upper_margin   = 0x36,
+	},
+	{
+		.name		= "720p60",
+		.timings_type	= VPBE_ENC_DV_TIMINGS,
+		.dv_timings	= V4L2_DV_BT_CEA_1280X720P60,
+		.interlaced	= 0,
+		.xres		= 1280,
+		.yres		= 720,
+		.aspect		= {1, 1},
+		.fps		= {60, 1},
+		.left_margin	= 0x117,
+		.right_margin	= 70,
+		.upper_margin	= 38,
+		.lower_margin	= 3,
+		.hsync_len	= 80,
+		.vsync_len	= 5,
+	},
+	{
+		.name		= "1080i60",
+		.timings_type	= VPBE_ENC_DV_TIMINGS,
+		.dv_timings	= V4L2_DV_BT_CEA_1920X1080I60,
+		.interlaced	= 1,
+		.xres		= 1920,
+		.yres		= 1080,
+		.aspect		= {1, 1},
+		.fps		= {30, 1},
+		.left_margin	= 0xc9,
+		.right_margin	= 80,
+		.upper_margin	= 30,
+		.lower_margin	= 3,
+		.hsync_len	= 88,
+		.vsync_len	= 5,
+	},
+};
+
+#define VENC_STD_ALL	(V4L2_STD_NTSC | V4L2_STD_PAL)
+
+/*
+ * The outputs available from VPBE + ecnoders. Keep the
+ * the order same as that of encoders. First those from venc followed by that
+ * from encoders. Index in the output refers to index on a particular
+ * encoder.Driver uses this index to pass it to encoder when it supports more
+ * than one output. Application uses index of the array to set an output.
+ */
+static struct vpbe_output dm365evm_vpbe_outputs[] = {
+	{
+		.output		= {
+			.index		= 0,
+			.name		= "Composite",
+			.type		= V4L2_OUTPUT_TYPE_ANALOG,
+			.std		= VENC_STD_ALL,
+			.capabilities	= V4L2_OUT_CAP_STD,
+		},
+		.subdev_name	= DM365_VPBE_VENC_SUBDEV_NAME,
+		.default_mode	= "ntsc",
+		.num_modes	= ARRAY_SIZE(dm365evm_enc_std_timing),
+		.modes		= dm365evm_enc_std_timing,
+		.if_params	= V4L2_MBUS_FMT_FIXED,
+	},
+	{
+		.output		= {
+			.index		= 1,
+			.name		= "Component",
+			.type		= V4L2_OUTPUT_TYPE_ANALOG,
+			.capabilities	= V4L2_OUT_CAP_DV_TIMINGS,
+		},
+		.subdev_name	= DM365_VPBE_VENC_SUBDEV_NAME,
+		.default_mode	= "480p59_94",
+		.num_modes	= ARRAY_SIZE(dm365evm_enc_preset_timing),
+		.modes		= dm365evm_enc_preset_timing,
+		.if_params	= V4L2_MBUS_FMT_FIXED,
+	},
+};
+
+/*
+ * Amplifiers on the board
+ */
+struct ths7303_platform_data ths7303_pdata = {
+	.ch_1 = 3,
+	.ch_2 = 3,
+	.ch_3 = 3,
+	.init_enable = 1,
+};
+
+static struct amp_config_info vpbe_amp = {
+	.module_name	= "ths7303",
+	.is_i2c		= 1,
+	.board_info	= {
+		I2C_BOARD_INFO("ths7303", 0x2c),
+		.platform_data = &ths7303_pdata,
+	}
+};
+
+static struct vpbe_config dm365evm_display_cfg = {
+	.module_name	= "dm365-vpbe-display",
+	.i2c_adapter_id	= 1,
+	.amp		= &vpbe_amp,
+	.osd		= {
+		.module_name	= DM365_VPBE_OSD_SUBDEV_NAME,
+	},
+	.venc		= {
+		.module_name	= DM365_VPBE_VENC_SUBDEV_NAME,
+	},
+	.num_outputs	= ARRAY_SIZE(dm365evm_vpbe_outputs),
+	.outputs	= dm365evm_vpbe_outputs,
+};
 
 static void __init evm_init_i2c(void)
 {
@@ -370,7 +639,7 @@ static void __init evm_init_cpld(void)
 	aemif_clk = clk_get(NULL, "aemif");
 	if (IS_ERR(aemif_clk))
 		return;
-	clk_enable(aemif_clk);
+	clk_prepare_enable(aemif_clk);
 
 	if (request_mem_region(DM365_ASYNC_EMIF_DATA_CE1_BASE, SECTION_SIZE,
 			"cpld") == NULL)
@@ -381,7 +650,7 @@ static void __init evm_init_cpld(void)
 				SECTION_SIZE);
 fail:
 		pr_err("ERROR: can't map CPLD\n");
-		clk_disable(aemif_clk);
+		clk_disable_unprepare(aemif_clk);
 		return;
 	}
 
@@ -413,7 +682,7 @@ fail:
 	 */
 	if (have_imager()) {
 		label = "HD imager";
-		mux |= 1;
+		mux |= 2;
 
 		/* externally mux MMC1/ENET/AIC33 to imager */
 		mux |= BIT(6) | BIT(5) | BIT(3);
@@ -426,15 +695,14 @@ fail:
 
 		/* ... and ENET ... */
 		dm365evm_emac_configure();
-		soc_info->emac_pdata->phy_mask = DM365_EVM_PHY_MASK;
-		soc_info->emac_pdata->mdio_max_freq = DM365_EVM_MDIO_FREQUENCY;
+		soc_info->emac_pdata->phy_id = DM365_EVM_PHY_ID;
 		resets &= ~BIT(3);
 
 		/* ... and AIC33 */
 		resets &= ~BIT(1);
 
 		if (have_tvp7002()) {
-			mux |= 2;
+			mux |= 1;
 			resets &= ~BIT(2);
 			label = "tvp7002 HD";
 		} else {
@@ -460,6 +728,24 @@ static void __init dm365_evm_map_io(void)
 	dm365_init();
 }
 
+static struct spi_eeprom at25640 = {
+	.byte_len	= SZ_64K / 8,
+	.name		= "at25640",
+	.page_size	= 32,
+	.flags		= EE_ADDR2,
+};
+
+static struct spi_board_info dm365_evm_spi_info[] __initconst = {
+	{
+		.modalias	= "at25",
+		.platform_data	= &at25640,
+		.max_speed_hz	= 10 * 1000 * 1000,
+		.bus_num	= 0,
+		.chip_select	= 0,
+		.mode		= SPI_MODE_0,
+	},
+};
+
 static __init void dm365_evm_init(void)
 {
 	evm_init_i2c();
@@ -470,22 +756,31 @@ static __init void dm365_evm_init(void)
 
 	davinci_setup_mmc(0, &dm365evm_mmc_config);
 
+	dm365_init_video(&vpfe_cfg, &dm365evm_display_cfg);
+
 	/* maybe setup mmc1/etc ... _after_ mmc0 */
 	evm_init_cpld();
-}
 
-static __init void dm365_evm_irq_init(void)
-{
-	davinci_irq_init();
+#ifdef CONFIG_SND_DM365_AIC3X_CODEC
+	dm365_init_asp(&dm365_evm_snd_data);
+#elif defined(CONFIG_SND_DM365_VOICE_CODEC)
+	dm365_init_vc(&dm365_evm_snd_data);
+#endif
+	dm365_init_rtc();
+	dm365_init_ks(&dm365evm_ks_data);
+
+	dm365_init_spi0(BIT(0), dm365_evm_spi_info,
+			ARRAY_SIZE(dm365_evm_spi_info));
 }
 
 MACHINE_START(DAVINCI_DM365_EVM, "DaVinci DM365 EVM")
-	.phys_io	= IO_PHYS,
-	.io_pg_offst	= (__IO_ADDRESS(IO_PHYS) >> 18) & 0xfffc,
-	.boot_params	= (0x80000100),
+	.atag_offset	= 0x100,
 	.map_io		= dm365_evm_map_io,
-	.init_irq	= dm365_evm_irq_init,
-	.timer		= &davinci_timer,
+	.init_irq	= davinci_irq_init,
+	.init_time	= davinci_timer_init,
 	.init_machine	= dm365_evm_init,
+	.init_late	= davinci_init_late,
+	.dma_zone_size	= SZ_128M,
+	.restart	= davinci_restart,
 MACHINE_END
 

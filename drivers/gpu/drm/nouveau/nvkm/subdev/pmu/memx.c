@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 #ifndef __NVKM_PMU_MEMX_H__
 #define __NVKM_PMU_MEMX_H__
 #include "priv.h"
@@ -126,7 +127,7 @@ nvkm_memx_wait_vblank(struct nvkm_memx *memx)
 	struct nvkm_subdev *subdev = &memx->pmu->subdev;
 	struct nvkm_device *device = subdev->device;
 	u32 heads, x, y, px = 0;
-	int i, head_sync = 0;
+	int i, head_sync;
 
 	if (device->chipset < 0xd0) {
 		heads = nvkm_rd32(device, 0x610050);

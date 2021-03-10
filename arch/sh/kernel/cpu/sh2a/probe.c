@@ -13,7 +13,7 @@
 #include <asm/processor.h>
 #include <asm/cache.h>
 
-int __init detect_cpu_and_cache_system(void)
+void __cpuinit cpu_probe(void)
 {
 	boot_cpu_data.family			= CPU_FAMILY_SH2A;
 
@@ -28,6 +28,12 @@ int __init detect_cpu_and_cache_system(void)
 	boot_cpu_data.flags			|= CPU_HAS_FPU;
 #elif defined(CONFIG_CPU_SUBTYPE_SH7263)
 	boot_cpu_data.type			= CPU_SH7263;
+	boot_cpu_data.flags			|= CPU_HAS_FPU;
+#elif defined(CONFIG_CPU_SUBTYPE_SH7264)
+	boot_cpu_data.type			= CPU_SH7264;
+	boot_cpu_data.flags			|= CPU_HAS_FPU;
+#elif defined(CONFIG_CPU_SUBTYPE_SH7269)
+	boot_cpu_data.type			= CPU_SH7269;
 	boot_cpu_data.flags			|= CPU_HAS_FPU;
 #elif defined(CONFIG_CPU_SUBTYPE_SH7206)
 	boot_cpu_data.type			= CPU_SH7206;
@@ -51,6 +57,4 @@ int __init detect_cpu_and_cache_system(void)
 	 * on the cache info.
 	 */
 	boot_cpu_data.icache		= boot_cpu_data.dcache;
-
-	return 0;
 }

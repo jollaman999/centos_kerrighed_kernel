@@ -36,7 +36,7 @@ extern int fg_console, last_console, want_console;
 int vc_allocate(unsigned int console);
 int vc_cons_allocated(unsigned int console);
 int vc_resize(struct vc_data *vc, unsigned int cols, unsigned int lines);
-void vc_deallocate(unsigned int console);
+struct vc_data *vc_deallocate(unsigned int console);
 void reset_palette(struct vc_data *vc);
 void do_blank_screen(int entering_gfx);
 void do_unblank_screen(int leaving_gfx);
@@ -71,23 +71,57 @@ int con_set_unimap(struct vc_data *vc, ushort ct, struct unipair __user *list);
 int con_get_unimap(struct vc_data *vc, ushort ct, ushort __user *uct, struct unipair __user *list);
 int con_set_default_unimap(struct vc_data *vc);
 void con_free_unimap(struct vc_data *vc);
-void con_protect_unimap(struct vc_data *vc, int rdonly);
 int con_copy_unimap(struct vc_data *dst_vc, struct vc_data *src_vc);
 
 #define vc_translate(vc, c) ((vc)->vc_translate[(c) |			\
 					((vc)->vc_toggle_meta ? 0x80 : 0)])
 #else
-#define con_set_trans_old(arg) (0)
-#define con_get_trans_old(arg) (-EINVAL)
-#define con_set_trans_new(arg) (0)
-#define con_get_trans_new(arg) (-EINVAL)
-#define con_clear_unimap(vc, ui) (0)
-#define con_set_unimap(vc, ct, list) (0)
-#define con_set_default_unimap(vc) (0)
-#define con_copy_unimap(d, s) (0)
-#define con_get_unimap(vc, ct, uct, list) (-EINVAL)
-#define con_free_unimap(vc) do { ; } while (0)
-#define con_protect_unimap(vc, rdonly) do { ; } while (0)
+static inline int con_set_trans_old(unsigned char __user *table)
+{
+	return 0;
+}
+static inline int con_get_trans_old(unsigned char __user *table)
+{
+	return -EINVAL;
+}
+static inline int con_set_trans_new(unsigned short __user *table)
+{
+	return 0;
+}
+static inline int con_get_trans_new(unsigned short __user *table)
+{
+	return -EINVAL;
+}
+static inline int con_clear_unimap(struct vc_data *vc, struct unimapinit *ui)
+{
+	return 0;
+}
+static inline
+int con_set_unimap(struct vc_data *vc, ushort ct, struct unipair __user *list)
+{
+	return 0;
+}
+static inline
+int con_get_unimap(struct vc_data *vc, ushort ct, ushort __user *uct,
+		   struct unipair __user *list)
+{
+	return -EINVAL;
+}
+static inline int con_set_default_unimap(struct vc_data *vc)
+{
+	return 0;
+}
+static inline void con_free_unimap(struct vc_data *vc)
+{
+}
+static inline void con_protect_unimap(struct vc_data *vc, int rdonly)
+{
+}
+static inline
+int con_copy_unimap(struct vc_data *dst_vc, struct vc_data *src_vc)
+{
+	return 0;
+}
 
 #define vc_translate(vc, c) (c)
 #endif
@@ -105,21 +139,14 @@ int vty_init(const struct file_operations *console_fops);
 
 static inline bool vt_force_oops_output(struct vc_data *vc)
 {
-	if (oops_in_progress && vc->vc_panic_force_write)
+	if (oops_in_progress && vc->vc_panic_force_write  && panic_timeout >= 0)
 		return true;
 	return false;
 }
 
-/*
- * vc_screen.c shares this temporary buffer with the console write code so that
- * we can easily avoid touching user space while holding the console spinlock.
- */
-
-#define CON_BUF_SIZE (CONFIG_BASE_SMALL ? 256 : PAGE_SIZE)
-extern char con_buf[CON_BUF_SIZE];
-extern struct mutex con_buf_mtx;
 extern char vt_dont_switch;
 extern int default_utf8;
+extern int global_cursor_default;
 
 struct vt_spawn_console {
 	spinlock_t lock;
@@ -139,5 +166,35 @@ struct vt_notifier_param {
 
 extern int register_vt_notifier(struct notifier_block *nb);
 extern int unregister_vt_notifier(struct notifier_block *nb);
+
+extern void hide_boot_cursor(bool hide);
+
+/* keyboard  provided interfaces */
+extern int vt_do_diacrit(unsigned int cmd, void __user *up, int eperm);
+extern int vt_do_kdskbmode(int console, unsigned int arg);
+extern int vt_do_kdskbmeta(int console, unsigned int arg);
+extern int vt_do_kbkeycode_ioctl(int cmd, struct kbkeycode __user *user_kbkc,
+								int perm);
+extern int vt_do_kdsk_ioctl(int cmd, struct kbentry __user *user_kbe,
+					int perm, int console);
+extern int vt_do_kdgkb_ioctl(int cmd, struct kbsentry __user *user_kdgkb,
+                                        int perm);
+extern int vt_do_kdskled(int console, int cmd, unsigned long arg, int perm);
+extern int vt_do_kdgkbmode(int console);
+extern int vt_do_kdgkbmeta(int console);
+extern void vt_reset_unicode(int console);
+extern int vt_get_shift_state(void);
+extern void vt_reset_keyboard(int console);
+extern int vt_get_leds(int console, int flag);
+extern int vt_get_kbd_mode_bit(int console, int bit);
+extern void vt_set_kbd_mode_bit(int console, int bit);
+extern void vt_clr_kbd_mode_bit(int console, int bit);
+extern void vt_set_led_state(int console, int leds);
+extern void vt_set_led_state(int console, int leds);
+extern void vt_kbd_con_start(int console);
+extern void vt_kbd_con_stop(int console);
+
+void vc_scrolldelta_helper(struct vc_data *c, int lines,
+		unsigned int rolled_over, void *_base, unsigned int size);
 
 #endif /* _VT_KERN_H */

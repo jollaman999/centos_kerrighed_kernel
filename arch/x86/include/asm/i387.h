@@ -14,7 +14,6 @@
 
 #include <linux/sched.h>
 #include <linux/hardirq.h>
-#include <asm/system.h>
 
 struct pt_regs;
 struct user_i387_struct;
@@ -41,8 +40,8 @@ extern void __kernel_fpu_end(void);
 
 static inline void kernel_fpu_begin(void)
 {
-	preempt_disable();
 	WARN_ON_ONCE(!irq_fpu_usable());
+	preempt_disable();
 	__kernel_fpu_begin();
 }
 
@@ -51,10 +50,6 @@ static inline void kernel_fpu_end(void)
 	__kernel_fpu_end();
 	preempt_enable();
 }
-
-/* Must be called with preempt disabled */
-extern void kernel_fpu_disable(void);
-extern void kernel_fpu_enable(void);
 
 /*
  * Some instructions like VIA's padlock instructions generate a spurious
@@ -99,7 +94,7 @@ static inline void irq_ts_restore(int TS_state)
  */
 static inline int user_has_fpu(void)
 {
-	return current->has_fpu;
+	return current->thread.fpu.has_fpu;
 }
 
 extern void unlazy_fpu(struct task_struct *tsk);

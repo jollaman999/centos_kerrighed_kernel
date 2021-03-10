@@ -17,6 +17,7 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>
+#include <linux/slab.h>
 #include <linux/time.h>
 #include <linux/pci.h>
 #include <linux/blkdev.h>
@@ -36,11 +37,11 @@
 #include <scsi/scsi_eh.h>
 
 #define DRV_NAME "stex"
-#define ST_DRIVER_VERSION "4.6.0000.3"
+#define ST_DRIVER_VERSION "4.6.0000.4"
 #define ST_VER_MAJOR		4
 #define ST_VER_MINOR		6
 #define ST_OEM			0
-#define ST_BUILD_VER		3
+#define ST_BUILD_VER		4
 
 enum {
 	/* MU register offset */
@@ -162,6 +163,7 @@ enum {
 	INQUIRY_EVPD				= 0x01,
 
 	ST_ADDITIONAL_MEM			= 0x200000,
+	ST_ADDITIONAL_MEM_MIN			= 0x80000,
 };
 
 struct st_sgitem {
@@ -570,7 +572,7 @@ stex_slave_destroy(struct scsi_device *sdev)
 }
 
 static int
-stex_queuecommand(struct scsi_cmnd *cmd, void (* done)(struct scsi_cmnd *))
+stex_queuecommand_lck(struct scsi_cmnd *cmd, void (*done)(struct scsi_cmnd *))
 {
 	struct st_hba *hba;
 	struct Scsi_Host *host;
@@ -695,6 +697,8 @@ stex_queuecommand(struct scsi_cmnd *cmd, void (* done)(struct scsi_cmnd *))
 	hba->send(hba, req, tag);
 	return 0;
 }
+
+static DEF_SCSI_QCMD(stex_queuecommand)
 
 static void stex_scsi_done(struct st_ccb *ccb)
 {
@@ -1020,7 +1024,7 @@ static int stex_common_handshake(struct st_hba *hba)
 	h->partner_type = HMU_PARTNER_TYPE;
 	if (hba->extra_offset) {
 		h->extra_offset = cpu_to_le32(hba->extra_offset);
-		h->extra_size = cpu_to_le32(ST_ADDITIONAL_MEM);
+		h->extra_size = cpu_to_le32(hba->dma_size - hba->extra_offset);
 	} else
 		h->extra_offset = h->extra_size = 0;
 
@@ -1158,9 +1162,7 @@ static int stex_abort(struct scsi_cmnd *cmd)
 	int result = SUCCESS;
 	unsigned long flags;
 
-	printk(KERN_INFO DRV_NAME
-		"(%s): aborting command\n", pci_name(hba->pdev));
-	scsi_print_command(cmd);
+	scmd_printk(KERN_INFO, cmd, "aborting command\n");
 
 	base = hba->mmio_base;
 	spin_lock_irqsave(host->host_lock, flags);
@@ -1348,9 +1350,8 @@ static int stex_reset(struct scsi_cmnd *cmd)
 
 	hba = (struct st_hba *) &cmd->device->host->hostdata[0];
 
-	printk(KERN_INFO DRV_NAME
-		"(%s): resetting host\n", pci_name(hba->pdev));
-	scsi_print_command(cmd);
+	shost_printk(KERN_INFO, cmd->device->host,
+		     "resetting host\n");
 
 	return stex_do_reset(hba) ? FAILED : SUCCESS;
 }
@@ -1492,8 +1493,8 @@ static int stex_set_dma_mask(struct pci_dev * pdev)
 {
 	int ret;
 
-	if (!pci_set_dma_mask(pdev,  DMA_BIT_MASK(64))
-		&& !pci_set_consistent_dma_mask(pdev,  DMA_BIT_MASK(64)))
+	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))
+		&& !pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64)))
 		return 0;
 	ret = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
 	if (!ret)
@@ -1536,8 +1537,7 @@ static void stex_free_irq(struct st_hba *hba)
 		pci_disable_msi(pdev);
 }
 
-static int __devinit
-stex_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+static int stex_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct st_hba *hba;
 	struct Scsi_Host *host;
@@ -1600,10 +1600,24 @@ stex_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	hba->dma_mem = dma_alloc_coherent(&pdev->dev,
 		hba->dma_size, &hba->dma_handle, GFP_KERNEL);
 	if (!hba->dma_mem) {
-		err = -ENOMEM;
-		printk(KERN_ERR DRV_NAME "(%s): dma mem alloc failed\n",
-			pci_name(pdev));
-		goto out_iounmap;
+		/* Retry minimum coherent mapping for st_seq and st_vsc */
+		if (hba->cardtype == st_seq ||
+		    (hba->cardtype == st_vsc && (pdev->subsystem_device & 1))) {
+			printk(KERN_WARNING DRV_NAME
+				"(%s): allocating min buffer for controller\n",
+				pci_name(pdev));
+			hba->dma_size = hba->extra_offset
+				+ ST_ADDITIONAL_MEM_MIN;
+			hba->dma_mem = dma_alloc_coherent(&pdev->dev,
+				hba->dma_size, &hba->dma_handle, GFP_KERNEL);
+		}
+
+		if (!hba->dma_mem) {
+			err = -ENOMEM;
+			printk(KERN_ERR DRV_NAME "(%s): dma mem alloc failed\n",
+				pci_name(pdev));
+			goto out_iounmap;
+		}
 	}
 
 	hba->ccb = kcalloc(ci->rq_count, sizeof(struct st_ccb), GFP_KERNEL);
@@ -1797,7 +1811,7 @@ static struct pci_driver stex_pci_driver = {
 	.name		= DRV_NAME,
 	.id_table	= stex_pci_tbl,
 	.probe		= stex_probe,
-	.remove		= __devexit_p(stex_remove),
+	.remove		= stex_remove,
 	.shutdown	= stex_shutdown,
 };
 

@@ -35,7 +35,7 @@
  *
  * On 32-bit CPUs an optimized representation of the timespec structure
  * is used to avoid expensive conversions from and to timespecs. The
- * endian-aware order of the tv struct members is choosen to allow
+ * endian-aware order of the tv struct members is chosen to allow
  * mathematical operations on the tv64 member of the union too, which
  * for certain operations produces better code.
  *
@@ -160,7 +160,7 @@ static inline ktime_t ktime_set(const long secs, const unsigned long nsecs)
  * @lhs:	minuend
  * @rhs:	subtrahend
  *
- * Returns the remainder of the substraction
+ * Returns the remainder of the subtraction
  */
 static inline ktime_t ktime_sub(const ktime_t lhs, const ktime_t rhs)
 {
@@ -229,12 +229,6 @@ static inline ktime_t timespec_to_ktime(const struct timespec ts)
 			   	   .nsec = (s32)ts.tv_nsec } };
 }
 
-/* convert a timespec64 to ktime_t format: */
-static inline ktime_t timespec64_to_ktime(struct timespec64 ts)
-{
-	return ktime_set(ts.tv_sec, ts.tv_nsec);
-}
-
 /**
  * timeval_to_ktime - convert a timeval to ktime_t format
  * @tv:		the timeval variable to convert
@@ -258,9 +252,6 @@ static inline struct timespec ktime_to_timespec(const ktime_t kt)
 	return (struct timespec) { .tv_sec = (time_t) kt.tv.sec,
 				   .tv_nsec = (long) kt.tv.nsec };
 }
-
-/* Map the ktime_t to timespec conversion to ns_to_timespec function */
-#define ktime_to_timespec64(kt)		ns_to_timespec64((kt).tv64)
 
 /**
  * ktime_to_timeval - convert a ktime_t variable to timeval format
@@ -383,6 +374,24 @@ static inline ktime_t ktime_sub_us(const ktime_t kt, const u64 usec)
 extern ktime_t ktime_add_safe(const ktime_t lhs, const ktime_t rhs);
 
 /**
+ * ktime_to_timespec_cond - convert a ktime_t variable to timespec
+ *			    format only if the variable contains data
+ * @kt:		the ktime_t variable to convert
+ * @ts:		the timespec variable to store the result in
+ *
+ * Returns true if there was a successful conversion, false if kt was 0.
+ */
+static inline bool ktime_to_timespec_cond(const ktime_t kt, struct timespec *ts)
+{
+	if (kt.tv64) {
+		*ts = ktime_to_timespec(kt);
+		return true;
+	} else {
+		return false;
+	}
+}
+
+/**
  * ktime_to_timespec64_cond - convert a ktime_t variable to timespec64
  *			    format only if the variable contains data
  * @kt:		the ktime_t variable to convert
@@ -411,10 +420,10 @@ static inline __must_check bool ktime_to_timespec64_cond(const ktime_t kt,
 #define KTIME_LOW_RES		(ktime_t){ .tv64 = LOW_RES_NSEC }
 
 /* Get the monotonic time in timespec format: */
-extern void ktime_get_ts(struct timespec *ts);
+extern void ktime_get_ts64(struct timespec64 *ts);
 
 /* Get the real (wall-) time in timespec format: */
-#define ktime_get_real_ts(ts)	getnstimeofday(ts)
+#define ktime_get_real_ts64(ts)	getnstimeofday64(ts)
 
 static inline ktime_t ns_to_ktime(u64 ns)
 {
@@ -429,5 +438,7 @@ static inline ktime_t ms_to_ktime(u64 ms)
 
 	return ktime_add_ms(ktime_zero, ms);
 }
+
+# include <linux/timekeeping.h>
 
 #endif

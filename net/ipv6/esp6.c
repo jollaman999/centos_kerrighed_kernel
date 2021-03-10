@@ -24,6 +24,8 @@
  * 	This file is derived from net/ipv4/esp.c
  */
 
+#define pr_fmt(fmt) "IPv6: " fmt
+
 #include <crypto/aead.h>
 #include <crypto/authenc.h>
 #include <linux/err.h>
@@ -37,6 +39,7 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <net/ip6_route.h>
 #include <net/icmp.h>
 #include <net/ipv6.h>
 #include <net/protocol.h>
@@ -49,19 +52,25 @@ struct esp_skb_cb {
 
 #define ESP_SKB_CB(__skb) ((struct esp_skb_cb *)&((__skb)->cb[0]))
 
+static u32 esp6_get_mtu(struct xfrm_state *x, int mtu);
+
 /*
  * Allocate an AEAD request structure with extra space for SG and IV.
  *
- * For alignment considerations the IV is placed at the front, followed
- * by the request and finally the SG list.
+ * For alignment considerations the upper 32 bits of the sequence number are
+ * placed at the front, if present. Followed by the IV, the request and finally
+ * the SG list.
  *
  * TODO: Use spare space in skb for this where possible.
  */
-static void *esp_alloc_tmp(struct crypto_aead *aead, int nfrags)
+static void *esp_alloc_tmp(struct crypto_aead *aead, int nfrags, int seqihlen)
 {
 	unsigned int len;
 
-	len = crypto_aead_ivsize(aead);
+	len = seqihlen;
+
+	len += crypto_aead_ivsize(aead);
+
 	if (len) {
 		len += crypto_aead_alignmask(aead) &
 		       ~(crypto_tfm_ctx_alignment() - 1);
@@ -76,10 +85,16 @@ static void *esp_alloc_tmp(struct crypto_aead *aead, int nfrags)
 	return kmalloc(len, GFP_ATOMIC);
 }
 
-static inline u8 *esp_tmp_iv(struct crypto_aead *aead, void *tmp)
+static inline __be32 *esp_tmp_seqhi(void *tmp)
+{
+	return PTR_ALIGN((__be32 *)tmp, __alignof__(__be32));
+}
+
+static inline u8 *esp_tmp_iv(struct crypto_aead *aead, void *tmp, int seqhilen)
 {
 	return crypto_aead_ivsize(aead) ?
-	       PTR_ALIGN((u8 *)tmp, crypto_aead_alignmask(aead) + 1) : tmp;
+	       PTR_ALIGN((u8 *)tmp + seqhilen,
+			 crypto_aead_alignmask(aead) + 1) : tmp + seqhilen;
 }
 
 static inline struct aead_givcrypt_request *esp_tmp_givreq(
@@ -140,49 +155,76 @@ static int esp6_output(struct xfrm_state *x, struct sk_buff *skb)
 	int blksize;
 	int clen;
 	int alen;
+	int plen;
+	int tfclen;
 	int nfrags;
+	int assoclen;
+	int sglists;
+	int seqhilen;
 	u8 *iv;
 	u8 *tail;
+	__be32 *seqhi;
 	struct esp_data *esp = x->data;
 
 	/* skb is pure payload to encrypt */
-	err = -ENOMEM;
-
-	/* Round to block size */
-	clen = skb->len;
-
 	aead = esp->aead;
 	alen = crypto_aead_authsize(aead);
 
+	tfclen = 0;
+	if (x->tfcpad) {
+		struct xfrm_dst *dst = (struct xfrm_dst *)skb_dst(skb);
+		u32 padto;
+
+		padto = min(x->tfcpad, esp6_get_mtu(x, dst->child_mtu_cached));
+		if (skb->len < padto)
+			tfclen = padto - skb->len;
+	}
 	blksize = ALIGN(crypto_aead_blocksize(aead), 4);
-	clen = ALIGN(clen + 2, blksize);
+	clen = ALIGN(skb->len + 2 + tfclen, blksize);
 	if (esp->padlen)
 		clen = ALIGN(clen, esp->padlen);
+	plen = clen - skb->len - tfclen;
 
-	if ((err = skb_cow_data(skb, clen - skb->len + alen, &trailer)) < 0)
+	err = skb_cow_data(skb, tfclen + plen + alen, &trailer);
+	if (err < 0)
 		goto error;
 	nfrags = err;
 
-	tmp = esp_alloc_tmp(aead, nfrags + 1);
-	if (!tmp)
-		goto error;
+	assoclen = sizeof(*esph);
+	sglists = 1;
+	seqhilen = 0;
 
-	iv = esp_tmp_iv(aead, tmp);
+	if (x->props.flags & XFRM_STATE_ESN) {
+		sglists += 2;
+		seqhilen += sizeof(__be32);
+		assoclen += seqhilen;
+	}
+
+	tmp = esp_alloc_tmp(aead, nfrags + sglists, seqhilen);
+	if (!tmp) {
+		err = -ENOMEM;
+		goto error;
+	}
+
+	seqhi = esp_tmp_seqhi(tmp);
+	iv = esp_tmp_iv(aead, tmp, seqhilen);
 	req = esp_tmp_givreq(aead, iv);
 	asg = esp_givreq_sg(aead, req);
-	sg = asg + 1;
-
-	barrier_nospec();
+	sg = asg + sglists;
 
 	/* Fill padding... */
 	tail = skb_tail_pointer(trailer);
+	if (tfclen) {
+		memset(tail, 0, tfclen);
+		tail += tfclen;
+	}
 	do {
 		int i;
-		for (i=0; i<clen-skb->len - 2; i++)
+		for (i = 0; i < plen - 2; i++)
 			tail[i] = i + 1;
 	} while (0);
-	tail[clen-skb->len - 2] = (clen - skb->len) - 2;
-	tail[clen - skb->len - 1] = *skb_mac_header(skb);
+	tail[plen - 2] = plen - 2;
+	tail[plen - 1] = *skb_mac_header(skb);
 	pskb_put(skb, trailer, clen - skb->len + alen);
 
 	skb_push(skb, -skb_network_offset(skb));
@@ -190,19 +232,28 @@ static int esp6_output(struct xfrm_state *x, struct sk_buff *skb)
 	*skb_mac_header(skb) = IPPROTO_ESP;
 
 	esph->spi = x->id.spi;
-	esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.output);
+	esph->seq_no = htonl(XFRM_SKB_CB(skb)->seq.output.low);
 
 	sg_init_table(sg, nfrags);
 	skb_to_sgvec(skb, sg,
 		     esph->enc_data + crypto_aead_ivsize(aead) - skb->data,
 		     clen + alen);
-	sg_init_one(asg, esph, sizeof(*esph));
+
+	if ((x->props.flags & XFRM_STATE_ESN)) {
+		sg_init_table(asg, 3);
+		sg_set_buf(asg, &esph->spi, sizeof(__be32));
+		*seqhi = htonl(XFRM_SKB_CB(skb)->seq.output.hi);
+		sg_set_buf(asg + 1, seqhi, seqhilen);
+		sg_set_buf(asg + 2, &esph->seq_no, sizeof(__be32));
+	} else
+		sg_init_one(asg, esph, sizeof(*esph));
 
 	aead_givcrypt_set_callback(req, 0, esp_output_done, skb);
 	aead_givcrypt_set_crypt(req, sg, sg, clen, iv);
-	aead_givcrypt_set_assoc(req, asg, sizeof(*esph));
+	aead_givcrypt_set_assoc(req, asg, assoclen);
 	aead_givcrypt_set_giv(req, esph->enc_data,
-			      XFRM_SKB_CB(skb)->seq.output);
+			      XFRM_SKB_CB(skb)->seq.output.low +
+			      ((u64)XFRM_SKB_CB(skb)->seq.output.hi << 32));
 
 	ESP_SKB_CB(skb)->tmp = tmp;
 	err = crypto_aead_givencrypt(req);
@@ -250,7 +301,10 @@ static int esp_input_done2(struct sk_buff *skb, int err)
 
 	pskb_trim(skb, skb->len - alen - padlen - 2);
 	__skb_pull(skb, hlen);
-	skb_set_transport_header(skb, -hdr_len);
+	if (x->props.mode == XFRM_MODE_TUNNEL)
+		skb_reset_transport_header(skb);
+	else
+		skb_set_transport_header(skb, -hdr_len);
 
 	err = nexthdr[1];
 
@@ -278,8 +332,12 @@ static int esp6_input(struct xfrm_state *x, struct sk_buff *skb)
 	struct sk_buff *trailer;
 	int elen = skb->len - sizeof(*esph) - crypto_aead_ivsize(aead);
 	int nfrags;
+	int assoclen;
+	int sglists;
+	int seqhilen;
 	int ret = 0;
 	void *tmp;
+	__be32 *seqhi;
 	u8 *iv;
 	struct scatterlist *sg;
 	struct scatterlist *asg;
@@ -300,15 +358,27 @@ static int esp6_input(struct xfrm_state *x, struct sk_buff *skb)
 	}
 
 	ret = -ENOMEM;
-	tmp = esp_alloc_tmp(aead, nfrags + 1);
+
+	assoclen = sizeof(*esph);
+	sglists = 1;
+	seqhilen = 0;
+
+	if (x->props.flags & XFRM_STATE_ESN) {
+		sglists += 2;
+		seqhilen += sizeof(__be32);
+		assoclen += seqhilen;
+	}
+
+	tmp = esp_alloc_tmp(aead, nfrags + sglists, seqhilen);
 	if (!tmp)
 		goto out;
 
 	ESP_SKB_CB(skb)->tmp = tmp;
-	iv = esp_tmp_iv(aead, tmp);
+	seqhi = esp_tmp_seqhi(tmp);
+	iv = esp_tmp_iv(aead, tmp, seqhilen);
 	req = esp_tmp_req(aead, iv);
 	asg = esp_req_sg(aead, req);
-	sg = asg + 1;
+	sg = asg + sglists;
 
 	skb->ip_summed = CHECKSUM_NONE;
 
@@ -319,11 +389,19 @@ static int esp6_input(struct xfrm_state *x, struct sk_buff *skb)
 
 	sg_init_table(sg, nfrags);
 	skb_to_sgvec(skb, sg, sizeof(*esph) + crypto_aead_ivsize(aead), elen);
-	sg_init_one(asg, esph, sizeof(*esph));
+
+	if ((x->props.flags & XFRM_STATE_ESN)) {
+		sg_init_table(asg, 3);
+		sg_set_buf(asg, &esph->spi, sizeof(__be32));
+		*seqhi = XFRM_SKB_CB(skb)->seq.input.hi;
+		sg_set_buf(asg + 1, seqhi, seqhilen);
+		sg_set_buf(asg + 2, &esph->seq_no, sizeof(__be32));
+	} else
+		sg_init_one(asg, esph, sizeof(*esph));
 
 	aead_request_set_callback(req, 0, esp_input_done, skb);
 	aead_request_set_crypt(req, sg, sg, elen, iv);
-	aead_request_set_assoc(req, asg, sizeof(*esph));
+	aead_request_set_assoc(req, asg, assoclen);
 
 	ret = crypto_aead_decrypt(req);
 	if (ret == -EINPROGRESS)
@@ -351,24 +429,30 @@ static u32 esp6_get_mtu(struct xfrm_state *x, int mtu)
 		 net_adj) & ~(align - 1)) + net_adj - 2;
 }
 
-static void esp6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
-		     u8 type, u8 code, int offset, __be32 info)
+static int esp6_err(struct sk_buff *skb, struct inet6_skb_parm *opt,
+		    u8 type, u8 code, int offset, __be32 info)
 {
 	struct net *net = dev_net(skb->dev);
-	struct ipv6hdr *iph = (struct ipv6hdr*)skb->data;
+	const struct ipv6hdr *iph = (const struct ipv6hdr *)skb->data;
 	struct ip_esp_hdr *esph = (struct ip_esp_hdr *)(skb->data + offset);
 	struct xfrm_state *x;
 
-	if (type != ICMPV6_DEST_UNREACH &&
-	    type != ICMPV6_PKT_TOOBIG)
-		return;
+	if (type != ICMPV6_PKT_TOOBIG &&
+	    type != NDISC_REDIRECT)
+		return 0;
 
-	x = xfrm_state_lookup_with_mark(net, skb->mark, (xfrm_address_t *)&iph->daddr, esph->spi, IPPROTO_ESP, AF_INET6);
+	x = xfrm_state_lookup(net, skb->mark, (const xfrm_address_t *)&iph->daddr,
+			      esph->spi, IPPROTO_ESP, AF_INET6);
 	if (!x)
-		return;
-	printk(KERN_DEBUG "pmtu discovery on SA ESP/%08x/%pI6\n",
-			ntohl(esph->spi), &iph->daddr);
+		return 0;
+
+	if (type == NDISC_REDIRECT)
+		ip6_redirect(skb, net, skb->dev->ifindex, 0);
+	else
+		ip6_update_pmtu(skb, net, info, 0, 0);
 	xfrm_state_put(x);
+
+	return 0;
 }
 
 static void esp6_destroy(struct xfrm_state *x)
@@ -425,10 +509,20 @@ static int esp_init_authenc(struct xfrm_state *x)
 		goto error;
 
 	err = -ENAMETOOLONG;
-	if (snprintf(authenc_name, CRYPTO_MAX_ALG_NAME, "authenc(%s,%s)",
-		     x->aalg ? x->aalg->alg_name : "digest_null",
-		     x->ealg->alg_name) >= CRYPTO_MAX_ALG_NAME)
-		goto error;
+
+	if ((x->props.flags & XFRM_STATE_ESN)) {
+		if (snprintf(authenc_name, CRYPTO_MAX_ALG_NAME,
+			     "authencesn(%s,%s)",
+			     x->aalg ? x->aalg->alg_name : "digest_null",
+			     x->ealg->alg_name) >= CRYPTO_MAX_ALG_NAME)
+			goto error;
+	} else {
+		if (snprintf(authenc_name, CRYPTO_MAX_ALG_NAME,
+			     "authenc(%s,%s)",
+			     x->aalg ? x->aalg->alg_name : "digest_null",
+			     x->ealg->alg_name) >= CRYPTO_MAX_ALG_NAME)
+			goto error;
+	}
 
 	aead = crypto_alloc_aead(authenc_name, 0, 0);
 	err = PTR_ERR(aead);
@@ -524,13 +618,12 @@ static int esp6_init_state(struct xfrm_state *x)
 			x->props.header_len += IPV4_BEET_PHMAXLEN +
 				               (sizeof(struct ipv6hdr) - sizeof(struct iphdr));
 		break;
+	default:
 	case XFRM_MODE_TRANSPORT:
 		break;
 	case XFRM_MODE_TUNNEL:
 		x->props.header_len += sizeof(struct ipv6hdr);
 		break;
-	default:
-		goto error;
 	}
 
 	align = ALIGN(crypto_aead_blocksize(aead), 4);
@@ -540,6 +633,11 @@ static int esp6_init_state(struct xfrm_state *x)
 
 error:
 	return err;
+}
+
+static int esp6_rcv_cb(struct sk_buff *skb, int err)
+{
+	return 0;
 }
 
 static const struct xfrm_type esp6_type =
@@ -556,20 +654,21 @@ static const struct xfrm_type esp6_type =
 	.hdr_offset	= xfrm6_find_1stfragopt,
 };
 
-static const struct inet6_protocol esp6_protocol = {
-	.handler 	=	xfrm6_rcv,
+static struct xfrm6_protocol esp6_protocol = {
+	.handler	=	xfrm6_rcv,
+	.cb_handler	=	esp6_rcv_cb,
 	.err_handler	=	esp6_err,
-	.flags		=	INET6_PROTO_NOPOLICY,
+	.priority	=	0,
 };
 
 static int __init esp6_init(void)
 {
 	if (xfrm_register_type(&esp6_type, AF_INET6) < 0) {
-		printk(KERN_INFO "ipv6 esp init: can't add xfrm type\n");
+		pr_info("%s: can't add xfrm type\n", __func__);
 		return -EAGAIN;
 	}
-	if (inet6_add_protocol(&esp6_protocol, IPPROTO_ESP) < 0) {
-		printk(KERN_INFO "ipv6 esp init: can't add protocol\n");
+	if (xfrm6_protocol_register(&esp6_protocol, IPPROTO_ESP) < 0) {
+		pr_info("%s: can't add protocol\n", __func__);
 		xfrm_unregister_type(&esp6_type, AF_INET6);
 		return -EAGAIN;
 	}
@@ -579,10 +678,10 @@ static int __init esp6_init(void)
 
 static void __exit esp6_fini(void)
 {
-	if (inet6_del_protocol(&esp6_protocol, IPPROTO_ESP) < 0)
-		printk(KERN_INFO "ipv6 esp close: can't remove protocol\n");
+	if (xfrm6_protocol_deregister(&esp6_protocol, IPPROTO_ESP) < 0)
+		pr_info("%s: can't remove protocol\n", __func__);
 	if (xfrm_unregister_type(&esp6_type, AF_INET6) < 0)
-		printk(KERN_INFO "ipv6 esp close: can't remove xfrm type\n");
+		pr_info("%s: can't remove xfrm type\n", __func__);
 }
 
 module_init(esp6_init);

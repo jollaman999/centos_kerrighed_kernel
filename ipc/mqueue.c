@@ -6,7 +6,7 @@
  *
  * Spinlocks:               Mohamed Abbas           (abbas.mohamed@intel.com)
  * Lockless receive & send, fd based notify:
- * 			    Manfred Spraul	    (manfred@colorfullife.com)
+ *			    Manfred Spraul	    (manfred@colorfullife.com)
  *
  * Audit:                   George Wilson           (ltcgcw@us.ibm.com)
  *
@@ -24,6 +24,7 @@
 #include <linux/mqueue.h>
 #include <linux/msg.h>
 #include <linux/skbuff.h>
+#include <linux/vmalloc.h>
 #include <linux/netlink.h>
 #include <linux/syscalls.h>
 #include <linux/audit.h>
@@ -32,7 +33,8 @@
 #include <linux/nsproxy.h>
 #include <linux/pid.h>
 #include <linux/ipc_namespace.h>
-#include <linux/vmalloc.h>
+#include <linux/user_namespace.h>
+#include <linux/slab.h>
 
 #include <net/sock.h>
 #include "util.h"
@@ -71,7 +73,8 @@ struct mqueue_inode_info {
 	struct mq_attr attr;
 
 	struct sigevent notify;
-	struct pid* notify_owner;
+	struct pid *notify_owner;
+	struct user_namespace *notify_user_ns;
 	struct user_struct *user;	/* user who created, for accounting */
 	struct sock *notify_sock;
 	struct sk_buff *notify_cookie;
@@ -89,7 +92,7 @@ static void remove_notification(struct mqueue_inode_info *info);
 
 static struct kmem_cache *mqueue_inode_cachep;
 
-static struct ctl_table_header * mq_sysctl_table;
+static struct ctl_table_header *mq_sysctl_table;
 
 static inline struct mqueue_inode_info *MQUEUE_I(struct inode *inode)
 {
@@ -139,7 +142,6 @@ static int msg_insert(struct msg_msg *msg, struct mqueue_inode_info *info)
 		leaf = kmalloc(sizeof(*leaf), GFP_ATOMIC);
 		if (!leaf)
 			return -ENOMEM;
-		rb_init_node(&leaf->rb_node);
 		INIT_LIST_HEAD(&leaf->msg_list);
 		info->qsize += sizeof(*leaf);
 	}
@@ -172,19 +174,18 @@ try_again:
 	}
 	if (!parent) {
 		if (info->attr.mq_curmsgs) {
-			pr_warn_ratelimited("Inconsistency in POSIX message "
-					    "queue, no tree element, but "
-					    "supposedly messages should "
-					    "exist!\n");
+			pr_warn_once("Inconsistency in POSIX message queue, "
+				     "no tree element, but supposedly messages "
+				     "should exist!\n");
 			info->attr.mq_curmsgs = 0;
 		}
 		return NULL;
 	}
 	leaf = rb_entry(parent, struct posix_msg_tree_node, rb_node);
 	if (unlikely(list_empty(&leaf->msg_list))) {
-		pr_warn_ratelimited("Inconsistency in POSIX message queue, "
-				    "empty leaf node but we haven't "
-				    "implemented lazy leaf delete!\n");
+		pr_warn_once("Inconsistency in POSIX message queue, "
+			     "empty leaf node but we haven't implemented "
+			     "lazy leaf delete!\n");
 		rb_erase(&leaf->rb_node, &info->msg_tree);
 		if (info->node_cache) {
 			info->qsize -= sizeof(*leaf);
@@ -213,133 +214,131 @@ try_again:
 }
 
 static struct inode *mqueue_get_inode(struct super_block *sb,
-		struct ipc_namespace *ipc_ns, int mode,
+		struct ipc_namespace *ipc_ns, umode_t mode,
 		struct mq_attr *attr)
 {
 	struct user_struct *u = current_user();
 	struct inode *inode;
+	int ret = -ENOMEM;
 
 	inode = new_inode(sb);
-	if (inode) {
-		inode->i_mode = mode;
-		inode->i_uid = current_fsuid();
-		inode->i_gid = current_fsgid();
-		inode->i_mtime = inode->i_ctime = inode->i_atime =
-				CURRENT_TIME;
+	if (!inode)
+		goto err;
 
-		if (S_ISREG(mode)) {
-			struct mqueue_inode_info *info;
-			struct task_struct *p = current;
-			unsigned long mq_bytes, mq_treesize;
+	inode->i_ino = get_next_ino();
+	inode->i_mode = mode;
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
+	inode->i_mtime = inode->i_ctime = inode->i_atime = CURRENT_TIME;
 
-			inode->i_fop = &mqueue_file_operations;
-			inode->i_size = FILENT_SIZE;
-			/* mqueue specific info */
-			info = MQUEUE_I(inode);
-			spin_lock_init(&info->lock);
-			init_waitqueue_head(&info->wait_q);
-			INIT_LIST_HEAD(&info->e_wait_q[0].list);
-			INIT_LIST_HEAD(&info->e_wait_q[1].list);
-			info->notify_owner = NULL;
-			info->qsize = 0;
-			info->user = NULL;	/* set when all is ok */
-			info->msg_tree = RB_ROOT;
-			info->node_cache = NULL;
-			memset(&info->attr, 0, sizeof(info->attr));
-			info->attr.mq_maxmsg = min(ipc_ns->mq_msg_max,
-						   ipc_ns->mq_msg_default);
-			info->attr.mq_msgsize = min(ipc_ns->mq_msgsize_max,
-						    ipc_ns->mq_msgsize_default);
-			if (attr) {
-				info->attr.mq_maxmsg = attr->mq_maxmsg;
-				info->attr.mq_msgsize = attr->mq_msgsize;
-			}
-			/*
-			 * We used to allocate a static array of pointers and
-			 * account the size of that array as well as one
-			 * msg_msg struct per possible message into the queue
-			 * size.  That's no longer accurate as the queue is
-			 * now an rbtree and will grow and shrink depending
-			 * on usage patterns.  We can, however, still account
-			 * one msg_msg struct per message, but the nodes are
-			 * allocated depending on priority usage, and most
-			 * programs only use one, or a handful, of priorities.
-			 * However, since this is pinned memory, we need to
-			 * assume worst case, so that means the min(mq_maxmsg,
-			 * max_priorities) * struct posix_msg_tree_node.
-			 */
-			mq_treesize = info->attr.mq_maxmsg *
-				sizeof(struct msg_msg) +
-				min_t(unsigned int, info->attr.mq_maxmsg,
-				      MQ_PRIO_MAX) *
-				sizeof(struct posix_msg_tree_node);
-			mq_bytes = mq_treesize + (info->attr.mq_maxmsg *
-						  info->attr.mq_msgsize);
+	if (S_ISREG(mode)) {
+		struct mqueue_inode_info *info;
+		unsigned long mq_bytes, mq_treesize;
 
-			spin_lock(&mq_lock);
-			if (u->mq_bytes + mq_bytes < u->mq_bytes ||
-		 	    u->mq_bytes + mq_bytes >
-			    p->signal->rlim[RLIMIT_MSGQUEUE].rlim_cur) {
-				spin_unlock(&mq_lock);
-				goto out_inode;
-			}
-			u->mq_bytes += mq_bytes;
-			spin_unlock(&mq_lock);
-
-			/* all is ok */
-			info->user = get_uid(u);
-		} else if (S_ISDIR(mode)) {
-			inc_nlink(inode);
-			/* Some things misbehave if size == 0 on a directory */
-			inode->i_size = 2 * DIRENT_SIZE;
-			inode->i_op = &mqueue_dir_inode_operations;
-			inode->i_fop = &simple_dir_operations;
+		inode->i_fop = &mqueue_file_operations;
+		inode->i_size = FILENT_SIZE;
+		/* mqueue specific info */
+		info = MQUEUE_I(inode);
+		spin_lock_init(&info->lock);
+		init_waitqueue_head(&info->wait_q);
+		INIT_LIST_HEAD(&info->e_wait_q[0].list);
+		INIT_LIST_HEAD(&info->e_wait_q[1].list);
+		info->notify_owner = NULL;
+		info->notify_user_ns = NULL;
+		info->qsize = 0;
+		info->user = NULL;	/* set when all is ok */
+		info->msg_tree = RB_ROOT;
+		info->node_cache = NULL;
+		memset(&info->attr, 0, sizeof(info->attr));
+		info->attr.mq_maxmsg = min(ipc_ns->mq_msg_max,
+					   ipc_ns->mq_msg_default);
+		info->attr.mq_msgsize = min(ipc_ns->mq_msgsize_max,
+					    ipc_ns->mq_msgsize_default);
+		if (attr) {
+			info->attr.mq_maxmsg = attr->mq_maxmsg;
+			info->attr.mq_msgsize = attr->mq_msgsize;
 		}
+		/*
+		 * We used to allocate a static array of pointers and account
+		 * the size of that array as well as one msg_msg struct per
+		 * possible message into the queue size. That's no longer
+		 * accurate as the queue is now an rbtree and will grow and
+		 * shrink depending on usage patterns.  We can, however, still
+		 * account one msg_msg struct per message, but the nodes are
+		 * allocated depending on priority usage, and most programs
+		 * only use one, or a handful, of priorities.  However, since
+		 * this is pinned memory, we need to assume worst case, so
+		 * that means the min(mq_maxmsg, max_priorities) * struct
+		 * posix_msg_tree_node.
+		 */
+		mq_treesize = info->attr.mq_maxmsg * sizeof(struct msg_msg) +
+			min_t(unsigned int, info->attr.mq_maxmsg, MQ_PRIO_MAX) *
+			sizeof(struct posix_msg_tree_node);
+
+		mq_bytes = mq_treesize + (info->attr.mq_maxmsg *
+					  info->attr.mq_msgsize);
+
+		spin_lock(&mq_lock);
+		if (u->mq_bytes + mq_bytes < u->mq_bytes ||
+		    u->mq_bytes + mq_bytes > rlimit(RLIMIT_MSGQUEUE)) {
+			spin_unlock(&mq_lock);
+			/* mqueue_evict_inode() releases info->messages */
+			ret = -EMFILE;
+			goto out_inode;
+		}
+		u->mq_bytes += mq_bytes;
+		spin_unlock(&mq_lock);
+
+		/* all is ok */
+		info->user = get_uid(u);
+	} else if (S_ISDIR(mode)) {
+		inc_nlink(inode);
+		/* Some things misbehave if size == 0 on a directory */
+		inode->i_size = 2 * DIRENT_SIZE;
+		inode->i_op = &mqueue_dir_inode_operations;
+		inode->i_fop = &simple_dir_operations;
 	}
+
 	return inode;
 out_inode:
-	make_bad_inode(inode);
 	iput(inode);
-	return NULL;
+err:
+	return ERR_PTR(ret);
 }
 
 static int mqueue_fill_super(struct super_block *sb, void *data, int silent)
 {
 	struct inode *inode;
-	struct ipc_namespace *ns = data;
-	int error;
+	struct ipc_namespace *ns = sb->s_fs_info;
 
+	sb->s_iflags |= SB_I_NOEXEC | SB_I_NODEV;
 	sb->s_blocksize = PAGE_CACHE_SIZE;
 	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
 	sb->s_magic = MQUEUE_MAGIC;
 	sb->s_op = &mqueue_super_ops;
 
-	inode = mqueue_get_inode(sb, ns, S_IFDIR | S_ISVTX | S_IRWXUGO,
-				NULL);
-	if (!inode) {
-		error = -ENOMEM;
-		goto out;
-	}
+	inode = mqueue_get_inode(sb, ns, S_IFDIR | S_ISVTX | S_IRWXUGO, NULL);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
 
-	sb->s_root = d_alloc_root(inode);
-	if (!sb->s_root) {
-		iput(inode);
-		error = -ENOMEM;
-		goto out;
-	}
-	error = 0;
-
-out:
-	return error;
+	sb->s_root = d_make_root(inode);
+	if (!sb->s_root)
+		return -ENOMEM;
+	return 0;
 }
 
-static int mqueue_get_sb(struct file_system_type *fs_type,
+static struct dentry *mqueue_mount(struct file_system_type *fs_type,
 			 int flags, const char *dev_name,
-			 void *data, struct vfsmount *mnt)
+			 void *data)
 {
-	if (!(flags & MS_KERNMOUNT))
-		data = current->nsproxy->ipc_ns;
-	return get_sb_ns(fs_type, flags, data, mqueue_fill_super, mnt);
+	struct ipc_namespace *ns;
+	if (flags & MS_KERNMOUNT) {
+		ns = data;
+		data = NULL;
+	} else {
+		ns = current->nsproxy->ipc_ns;
+	}
+	return mount_ns(fs_type, flags, data, ns, ns->user_ns, mqueue_fill_super);
 }
 
 static void init_once(void *foo)
@@ -359,12 +358,18 @@ static struct inode *mqueue_alloc_inode(struct super_block *sb)
 	return &ei->vfs_inode;
 }
 
-static void mqueue_destroy_inode(struct inode *inode)
+static void mqueue_i_callback(struct rcu_head *head)
 {
+	struct inode *inode = container_of(head, struct inode, i_rcu);
 	kmem_cache_free(mqueue_inode_cachep, MQUEUE_I(inode));
 }
 
-static void mqueue_delete_inode(struct inode *inode)
+static void mqueue_destroy_inode(struct inode *inode)
+{
+	call_rcu(&inode->i_rcu, mqueue_i_callback);
+}
+
+static void mqueue_evict_inode(struct inode *inode)
 {
 	struct mqueue_inode_info *info;
 	struct user_struct *user;
@@ -372,10 +377,11 @@ static void mqueue_delete_inode(struct inode *inode)
 	struct ipc_namespace *ipc_ns;
 	struct msg_msg *msg;
 
-	if (S_ISDIR(inode->i_mode)) {
-		clear_inode(inode);
+	clear_inode(inode);
+
+	if (S_ISDIR(inode->i_mode))
 		return;
-	}
+
 	ipc_ns = get_ns_from_inode(inode);
 	info = MQUEUE_I(inode);
 	spin_lock(&info->lock);
@@ -384,13 +390,14 @@ static void mqueue_delete_inode(struct inode *inode)
 	kfree(info->node_cache);
 	spin_unlock(&info->lock);
 
-	clear_inode(inode);
-
+	/* Total amount of bytes accounted for the mqueue */
 	mq_treesize = info->attr.mq_maxmsg * sizeof(struct msg_msg) +
 		min_t(unsigned int, info->attr.mq_maxmsg, MQ_PRIO_MAX) *
 		sizeof(struct posix_msg_tree_node);
+
 	mq_bytes = mq_treesize + (info->attr.mq_maxmsg *
 				  info->attr.mq_msgsize);
+
 	user = info->user;
 	if (user) {
 		spin_lock(&mq_lock);
@@ -411,7 +418,7 @@ static void mqueue_delete_inode(struct inode *inode)
 }
 
 static int mqueue_create(struct inode *dir, struct dentry *dentry,
-				int mode, struct nameidata *nd)
+				umode_t mode, bool excl)
 {
 	struct inode *inode;
 	struct mq_attr *attr = dentry->d_fsdata;
@@ -424,9 +431,9 @@ static int mqueue_create(struct inode *dir, struct dentry *dentry,
 		error = -EACCES;
 		goto out_unlock;
 	}
-	if (ipc_ns->mq_queues_count >= HARD_QUEUESMAX ||
-	    (ipc_ns->mq_queues_count >= ipc_ns->mq_queues_max &&
-	     !capable(CAP_SYS_RESOURCE))) {
+
+	if (ipc_ns->mq_queues_count >= ipc_ns->mq_queues_max &&
+	    !capable(CAP_SYS_RESOURCE)) {
 		error = -ENOSPC;
 		goto out_unlock;
 	}
@@ -434,8 +441,8 @@ static int mqueue_create(struct inode *dir, struct dentry *dentry,
 	spin_unlock(&mq_lock);
 
 	inode = mqueue_get_inode(dir->i_sb, ipc_ns, mode, attr);
-	if (!inode) {
-		error = -ENOMEM;
+	if (IS_ERR(inode)) {
+		error = PTR_ERR(inode);
 		spin_lock(&mq_lock);
 		ipc_ns->mq_queues_count--;
 		goto out_unlock;
@@ -457,13 +464,13 @@ out_unlock:
 
 static int mqueue_unlink(struct inode *dir, struct dentry *dentry)
 {
-  	struct inode *inode = dentry->d_inode;
+	struct inode *inode = dentry->d_inode;
 
 	dir->i_ctime = dir->i_mtime = dir->i_atime = CURRENT_TIME;
 	dir->i_size -= DIRENT_SIZE;
-  	drop_nlink(inode);
-  	dput(dentry);
-  	return 0;
+	drop_nlink(inode);
+	dput(dentry);
+	return 0;
 }
 
 /*
@@ -476,7 +483,7 @@ static int mqueue_unlink(struct inode *dir, struct dentry *dentry)
 static ssize_t mqueue_read_file(struct file *filp, char __user *u_data,
 				size_t count, loff_t *off)
 {
-	struct mqueue_inode_info *info = MQUEUE_I(filp->f_path.dentry->d_inode);
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
 	char buffer[FILENT_SIZE];
 	ssize_t ret;
 
@@ -497,13 +504,13 @@ static ssize_t mqueue_read_file(struct file *filp, char __user *u_data,
 	if (ret <= 0)
 		return ret;
 
-	filp->f_path.dentry->d_inode->i_atime = filp->f_path.dentry->d_inode->i_ctime = CURRENT_TIME;
+	file_inode(filp)->i_atime = file_inode(filp)->i_ctime = CURRENT_TIME;
 	return ret;
 }
 
 static int mqueue_flush_file(struct file *filp, fl_owner_t id)
 {
-	struct mqueue_inode_info *info = MQUEUE_I(filp->f_path.dentry->d_inode);
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
 
 	spin_lock(&info->lock);
 	if (task_tgid(current) == info->notify_owner)
@@ -515,7 +522,7 @@ static int mqueue_flush_file(struct file *filp, fl_owner_t id)
 
 static unsigned int mqueue_poll_file(struct file *filp, struct poll_table_struct *poll_tab)
 {
-	struct mqueue_inode_info *info = MQUEUE_I(filp->f_path.dentry->d_inode);
+	struct mqueue_inode_info *info = MQUEUE_I(file_inode(filp));
 	int retval = 0;
 
 	poll_wait(filp, &info->wait_q, poll_tab);
@@ -554,7 +561,7 @@ static void wq_add(struct mqueue_inode_info *info, int sr,
  * sr: SEND or RECV
  */
 static int wq_sleep(struct mqueue_inode_info *info, int sr,
-			long timeout, struct ext_wait_queue *ewp)
+		    ktime_t *timeout, struct ext_wait_queue *ewp)
 {
 	int retval;
 	signed long time;
@@ -565,7 +572,8 @@ static int wq_sleep(struct mqueue_inode_info *info, int sr,
 		set_current_state(TASK_INTERRUPTIBLE);
 
 		spin_unlock(&info->lock);
-		time = schedule_timeout(timeout);
+		time = schedule_hrtimeout_range_clock(timeout, 0,
+			HRTIMER_MODE_ABS, CLOCK_REALTIME);
 
 		while (ewp->state == STATE_PENDING)
 			cpu_relax();
@@ -609,9 +617,10 @@ static struct ext_wait_queue *wq_get_first_waiter(
 	return list_entry(ptr, struct ext_wait_queue, list);
 }
 
+
 static inline void set_cookie(struct sk_buff *skb, char code)
 {
-	((char*)skb->data)[NOTIFY_COOKIE_LEN-1] = code;
+	((char *)skb->data)[NOTIFY_COOKIE_LEN-1] = code;
 }
 
 /*
@@ -637,9 +646,12 @@ static void __do_notify(struct mqueue_inode_info *info)
 			sig_i.si_errno = 0;
 			sig_i.si_code = SI_MESGQ;
 			sig_i.si_value = info->notify.sigev_value;
+			/* map current pid/uid into info->owner's namespaces */
+			rcu_read_lock();
 			sig_i.si_pid = task_tgid_nr_ns(current,
 						ns_of_pid(info->notify_owner));
-			sig_i.si_uid = current_uid();
+			sig_i.si_uid = from_kuid_munged(info->notify_user_ns, current_uid());
+			rcu_read_unlock();
 
 			kill_pid_info(info->notify.sigev_signo,
 				      &sig_i, info->notify_owner);
@@ -651,36 +663,23 @@ static void __do_notify(struct mqueue_inode_info *info)
 		}
 		/* after notification unregisters process */
 		put_pid(info->notify_owner);
+		put_user_ns(info->notify_user_ns);
 		info->notify_owner = NULL;
+		info->notify_user_ns = NULL;
 	}
 	wake_up(&info->wait_q);
 }
 
-static long prepare_timeout(struct timespec *p)
+static int prepare_timeout(const struct timespec __user *u_abs_timeout,
+			   ktime_t *expires, struct timespec *ts)
 {
-	struct timespec nowts;
-	long timeout;
+	if (copy_from_user(ts, u_abs_timeout, sizeof(struct timespec)))
+		return -EFAULT;
+	if (!timespec_valid(ts))
+		return -EINVAL;
 
-	if (p) {
-		if (unlikely(p->tv_nsec < 0 || p->tv_sec < 0
-			|| p->tv_nsec >= NSEC_PER_SEC))
-			return -EINVAL;
-		nowts = CURRENT_TIME;
-		/* first subtract as jiffies can't be too big */
-		p->tv_sec -= nowts.tv_sec;
-		if (p->tv_nsec < nowts.tv_nsec) {
-			p->tv_nsec += NSEC_PER_SEC;
-			p->tv_sec--;
-		}
-		p->tv_nsec -= nowts.tv_nsec;
-		if (p->tv_sec < 0)
-			return 0;
-
-		timeout = timespec_to_jiffies(p) + 1;
-	} else
-		return MAX_SCHEDULE_TIMEOUT;
-
-	return timeout;
+	*expires = timespec_to_ktime(*ts);
+	return 0;
 }
 
 static void remove_notification(struct mqueue_inode_info *info)
@@ -691,7 +690,9 @@ static void remove_notification(struct mqueue_inode_info *info)
 		netlink_sendskb(info->notify_sock, info->notify_cookie);
 	}
 	put_pid(info->notify_owner);
+	put_user_ns(info->notify_user_ns);
 	info->notify_owner = NULL;
+	info->notify_user_ns = NULL;
 }
 
 static int mq_attr_ok(struct ipc_namespace *ipc_ns, struct mq_attr *attr)
@@ -725,20 +726,19 @@ static int mq_attr_ok(struct ipc_namespace *ipc_ns, struct mq_attr *attr)
 /*
  * Invoked when creating a new queue via sys_mq_open
  */
-static struct file *do_create(struct ipc_namespace *ipc_ns, struct dentry *dir,
-			struct dentry *dentry, int oflag, mode_t mode,
+static struct file *do_create(struct ipc_namespace *ipc_ns, struct inode *dir,
+			struct path *path, int oflag, umode_t mode,
 			struct mq_attr *attr)
 {
 	const struct cred *cred = current_cred();
-	struct file *result;
 	int ret;
 
 	if (attr) {
 		ret = mq_attr_ok(ipc_ns, attr);
 		if (ret)
-			goto out;
+			return ERR_PTR(ret);
 		/* store for use during create */
-		dentry->d_fsdata = attr;
+		path->dentry->d_fsdata = attr;
 	} else {
 		struct mq_attr def_attr;
 
@@ -748,67 +748,43 @@ static struct file *do_create(struct ipc_namespace *ipc_ns, struct dentry *dir,
 					  ipc_ns->mq_msgsize_default);
 		ret = mq_attr_ok(ipc_ns, &def_attr);
 		if (ret)
-			goto out;
+			return ERR_PTR(ret);
 	}
 
 	mode &= ~current_umask();
-	ret = mnt_want_write(ipc_ns->mq_mnt);
+	ret = vfs_create(dir, path->dentry, mode, true);
+	path->dentry->d_fsdata = NULL;
 	if (ret)
-		goto out;
-	ret = vfs_create(dir->d_inode, dentry, mode, NULL);
-	dentry->d_fsdata = NULL;
-	if (ret)
-		goto out_drop_write;
-
-	result = dentry_open(dentry, ipc_ns->mq_mnt, oflag, cred);
-	/*
-	 * dentry_open() took a persistent mnt_want_write(),
-	 * so we can now drop this one.
-	 */
-	mnt_drop_write(ipc_ns->mq_mnt);
-	return result;
-
-out_drop_write:
-	mnt_drop_write(ipc_ns->mq_mnt);
-out:
-	dput(dentry);
-	mntput(ipc_ns->mq_mnt);
-	return ERR_PTR(ret);
+		return ERR_PTR(ret);
+	return dentry_open(path, oflag, cred);
 }
 
 /* Opens existing queue */
-static struct file *do_open(struct ipc_namespace *ipc_ns,
-				struct dentry *dentry, int oflag)
+static struct file *do_open(struct path *path, int oflag)
 {
-	const struct cred *cred = current_cred();
-
 	static const int oflag2acc[O_ACCMODE] = { MAY_READ, MAY_WRITE,
 						  MAY_READ | MAY_WRITE };
-
-	if ((oflag & O_ACCMODE) == (O_RDWR | O_WRONLY)) {
-		dput(dentry);
-		mntput(ipc_ns->mq_mnt);
+	int acc;
+	if ((oflag & O_ACCMODE) == (O_RDWR | O_WRONLY))
 		return ERR_PTR(-EINVAL);
-	}
-
-	if (inode_permission(dentry->d_inode, oflag2acc[oflag & O_ACCMODE])) {
-		dput(dentry);
-		mntput(ipc_ns->mq_mnt);
+	acc = oflag2acc[oflag & O_ACCMODE];
+	if (inode_permission(path->dentry->d_inode, acc))
 		return ERR_PTR(-EACCES);
-	}
-
-	return dentry_open(dentry, ipc_ns->mq_mnt, oflag, cred);
+	return dentry_open(path, oflag, current_cred());
 }
 
-SYSCALL_DEFINE4(mq_open, const char __user *, u_name, int, oflag, mode_t, mode,
+SYSCALL_DEFINE4(mq_open, const char __user *, u_name, int, oflag, umode_t, mode,
 		struct mq_attr __user *, u_attr)
 {
-	struct dentry *dentry;
+	struct path path;
 	struct file *filp;
 	struct filename *name;
 	struct mq_attr attr;
 	int fd, error;
 	struct ipc_namespace *ipc_ns = current->nsproxy->ipc_ns;
+	struct vfsmount *mnt = ipc_ns->mq_mnt;
+	struct dentry *root = mnt->mnt_root;
+	int ro;
 
 	if (u_attr && copy_from_user(&attr, u_attr, sizeof(struct mq_attr)))
 		return -EFAULT;
@@ -822,54 +798,57 @@ SYSCALL_DEFINE4(mq_open, const char __user *, u_name, int, oflag, mode_t, mode,
 	if (fd < 0)
 		goto out_putname;
 
-	mutex_lock(&ipc_ns->mq_mnt->mnt_root->d_inode->i_mutex);
-	dentry = lookup_one_len(name->name, ipc_ns->mq_mnt->mnt_root,
-				strlen(name->name));
-	if (IS_ERR(dentry)) {
-		error = PTR_ERR(dentry);
+	ro = mnt_want_write(mnt);	/* we'll drop it in any case */
+	error = 0;
+	mutex_lock(&root->d_inode->i_mutex);
+	path.dentry = lookup_one_len(name->name, root, strlen(name->name));
+	if (IS_ERR(path.dentry)) {
+		error = PTR_ERR(path.dentry);
 		goto out_putfd;
 	}
-	mntget(ipc_ns->mq_mnt);
+	path.mnt = mntget(mnt);
 
 	if (oflag & O_CREAT) {
-		if (dentry->d_inode) {	/* entry already exists */
-			audit_inode(name, dentry, 0);
+		if (path.dentry->d_inode) {	/* entry already exists */
+			audit_inode(name, path.dentry, 0);
 			if (oflag & O_EXCL) {
 				error = -EEXIST;
 				goto out;
 			}
-			filp = do_open(ipc_ns, dentry, oflag);
+			filp = do_open(&path, oflag);
 		} else {
-			audit_inode_parent_hidden(name, ipc_ns->mq_mnt->mnt_root);
-			filp = do_create(ipc_ns, ipc_ns->mq_mnt->mnt_root,
-						dentry, oflag, mode,
+			if (ro) {
+				error = ro;
+				goto out;
+			}
+			audit_inode_parent_hidden(name, root);
+			filp = do_create(ipc_ns, root->d_inode,
+						&path, oflag, mode,
 						u_attr ? &attr : NULL);
 		}
 	} else {
-		if (!dentry->d_inode) {
+		if (!path.dentry->d_inode) {
 			error = -ENOENT;
 			goto out;
 		}
-		audit_inode(name, dentry, 0);
-		filp = do_open(ipc_ns, dentry, oflag);
+		audit_inode(name, path.dentry, 0);
+		filp = do_open(&path, oflag);
 	}
 
-	if (IS_ERR(filp)) {
+	if (!IS_ERR(filp))
+		fd_install(fd, filp);
+	else
 		error = PTR_ERR(filp);
-		goto out_putfd;
-	}
-
-	fd_install(fd, filp);
-	goto out_upsem;
-
 out:
-	dput(dentry);
-	mntput(ipc_ns->mq_mnt);
+	path_put(&path);
 out_putfd:
-	put_unused_fd(fd);
-	fd = error;
-out_upsem:
-	mutex_unlock(&ipc_ns->mq_mnt->mnt_root->d_inode->i_mutex);
+	if (error) {
+		put_unused_fd(fd);
+		fd = error;
+	}
+	mutex_unlock(&root->d_inode->i_mutex);
+	if (!ro)
+		mnt_drop_write(mnt);
 out_putname:
 	putname(name);
 	return fd;
@@ -882,42 +861,40 @@ SYSCALL_DEFINE1(mq_unlink, const char __user *, u_name)
 	struct dentry *dentry;
 	struct inode *inode = NULL;
 	struct ipc_namespace *ipc_ns = current->nsproxy->ipc_ns;
+	struct vfsmount *mnt = ipc_ns->mq_mnt;
 
 	name = getname(u_name);
 	if (IS_ERR(name))
 		return PTR_ERR(name);
 
-	audit_inode_parent_hidden(name, ipc_ns->mq_mnt->mnt_root);
-	mutex_lock_nested(&ipc_ns->mq_mnt->mnt_root->d_inode->i_mutex,
-			I_MUTEX_PARENT);
-	dentry = lookup_one_len(name->name, ipc_ns->mq_mnt->mnt_root,
+	audit_inode_parent_hidden(name, mnt->mnt_root);
+	err = mnt_want_write(mnt);
+	if (err)
+		goto out_name;
+	mutex_lock_nested(&mnt->mnt_root->d_inode->i_mutex, I_MUTEX_PARENT);
+	dentry = lookup_one_len(name->name, mnt->mnt_root,
 				strlen(name->name));
 	if (IS_ERR(dentry)) {
 		err = PTR_ERR(dentry);
 		goto out_unlock;
 	}
 
-	if (!dentry->d_inode) {
-		err = -ENOENT;
-		goto out_err;
-	}
-
 	inode = dentry->d_inode;
-	if (inode)
-		atomic_inc(&inode->i_count);
-	err = mnt_want_write(ipc_ns->mq_mnt);
-	if (err)
-		goto out_err;
-	err = vfs_unlink(dentry->d_parent->d_inode, dentry);
-	mnt_drop_write(ipc_ns->mq_mnt);
-out_err:
+	if (!inode) {
+		err = -ENOENT;
+	} else {
+		ihold(inode);
+		err = vfs_unlink(dentry->d_parent->d_inode, dentry, NULL);
+	}
 	dput(dentry);
 
 out_unlock:
-	mutex_unlock(&ipc_ns->mq_mnt->mnt_root->d_inode->i_mutex);
-	putname(name);
+	mutex_unlock(&mnt->mnt_root->d_inode->i_mutex);
 	if (inode)
 		iput(inode);
+	mnt_drop_write(mnt);
+out_name:
+	putname(name);
 
 	return err;
 }
@@ -976,45 +953,44 @@ SYSCALL_DEFINE5(mq_timedsend, mqd_t, mqdes, const char __user *, u_msg_ptr,
 		size_t, msg_len, unsigned int, msg_prio,
 		const struct timespec __user *, u_abs_timeout)
 {
-	struct file *filp;
+	struct fd f;
 	struct inode *inode;
 	struct ext_wait_queue wait;
 	struct ext_wait_queue *receiver;
 	struct msg_msg *msg_ptr;
 	struct mqueue_inode_info *info;
-	struct timespec ts, *p = NULL;
-	long timeout;
+	ktime_t expires, *timeout = NULL;
+	struct timespec ts;
 	struct posix_msg_tree_node *new_leaf = NULL;
 	int ret = 0;
 
 	if (u_abs_timeout) {
-		if (copy_from_user(&ts, u_abs_timeout, 
-					sizeof(struct timespec)))
-			return -EFAULT;
-		p = &ts;
+		int res = prepare_timeout(u_abs_timeout, &expires, &ts);
+		if (res)
+			return res;
+		timeout = &expires;
 	}
 
 	if (unlikely(msg_prio >= (unsigned long) MQ_PRIO_MAX))
 		return -EINVAL;
 
-	audit_mq_sendrecv(mqdes, msg_len, msg_prio, p);
-	timeout = prepare_timeout(p);
+	audit_mq_sendrecv(mqdes, msg_len, msg_prio, timeout ? &ts : NULL);
 
-	filp = fget(mqdes);
-	if (unlikely(!filp)) {
+	f = fdget(mqdes);
+	if (unlikely(!f.file)) {
 		ret = -EBADF;
 		goto out;
 	}
 
-	inode = filp->f_path.dentry->d_inode;
-	if (unlikely(filp->f_op != &mqueue_file_operations)) {
+	inode = file_inode(f.file);
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
 		ret = -EBADF;
 		goto out_fput;
 	}
 	info = MQUEUE_I(inode);
-	audit_inode(NULL, filp->f_path.dentry, 0);
+	audit_inode(NULL, f.file->f_path.dentry, 0);
 
-	if (unlikely(!(filp->f_mode & FMODE_WRITE))) {
+	if (unlikely(!(f.file->f_mode & FMODE_WRITE))) {
 		ret = -EBADF;
 		goto out_fput;
 	}
@@ -1046,7 +1022,6 @@ SYSCALL_DEFINE5(mq_timedsend, mqd_t, mqdes, const char __user *, u_msg_ptr,
 
 	if (!info->node_cache && new_leaf) {
 		/* Save our speculative allocation into the cache */
-		rb_init_node(&new_leaf->rb_node);
 		INIT_LIST_HEAD(&new_leaf->msg_list);
 		info->node_cache = new_leaf;
 		info->qsize += sizeof(*new_leaf);
@@ -1056,10 +1031,8 @@ SYSCALL_DEFINE5(mq_timedsend, mqd_t, mqdes, const char __user *, u_msg_ptr,
 	}
 
 	if (info->attr.mq_curmsgs == info->attr.mq_maxmsg) {
-		if (filp->f_flags & O_NONBLOCK) {
+		if (f.file->f_flags & O_NONBLOCK) {
 			ret = -EAGAIN;
-		} else if (unlikely(timeout < 0)) {
-			ret = timeout;
 		} else {
 			wait.task = current;
 			wait.msg = (void *) msg_ptr;
@@ -1091,7 +1064,7 @@ out_free:
 	if (ret)
 		free_msg(msg_ptr);
 out_fput:
-	fput(filp);
+	fdput(f);
 out:
 	return ret;
 }
@@ -1100,41 +1073,40 @@ SYSCALL_DEFINE5(mq_timedreceive, mqd_t, mqdes, char __user *, u_msg_ptr,
 		size_t, msg_len, unsigned int __user *, u_msg_prio,
 		const struct timespec __user *, u_abs_timeout)
 {
-	long timeout;
 	ssize_t ret;
 	struct msg_msg *msg_ptr;
-	struct file *filp;
+	struct fd f;
 	struct inode *inode;
 	struct mqueue_inode_info *info;
 	struct ext_wait_queue wait;
-	struct timespec ts, *p = NULL;
+	ktime_t expires, *timeout = NULL;
+	struct timespec ts;
 	struct posix_msg_tree_node *new_leaf = NULL;
 
 	if (u_abs_timeout) {
-		if (copy_from_user(&ts, u_abs_timeout, 
-					sizeof(struct timespec)))
-			return -EFAULT;
-		p = &ts;
+		int res = prepare_timeout(u_abs_timeout, &expires, &ts);
+		if (res)
+			return res;
+		timeout = &expires;
 	}
 
-	audit_mq_sendrecv(mqdes, msg_len, 0, p);
-	timeout = prepare_timeout(p);
+	audit_mq_sendrecv(mqdes, msg_len, 0, timeout ? &ts : NULL);
 
-	filp = fget(mqdes);
-	if (unlikely(!filp)) {
+	f = fdget(mqdes);
+	if (unlikely(!f.file)) {
 		ret = -EBADF;
 		goto out;
 	}
 
-	inode = filp->f_path.dentry->d_inode;
-	if (unlikely(filp->f_op != &mqueue_file_operations)) {
+	inode = file_inode(f.file);
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
 		ret = -EBADF;
 		goto out_fput;
 	}
 	info = MQUEUE_I(inode);
-	audit_inode(NULL, filp->f_path.dentry, 0);
+	audit_inode(NULL, f.file->f_path.dentry, 0);
 
-	if (unlikely(!(filp->f_mode & FMODE_READ))) {
+	if (unlikely(!(f.file->f_mode & FMODE_READ))) {
 		ret = -EBADF;
 		goto out_fput;
 	}
@@ -1157,7 +1129,6 @@ SYSCALL_DEFINE5(mq_timedreceive, mqd_t, mqdes, char __user *, u_msg_ptr,
 
 	if (!info->node_cache && new_leaf) {
 		/* Save our speculative allocation into the cache */
-		rb_init_node(&new_leaf->rb_node);
 		INIT_LIST_HEAD(&new_leaf->msg_list);
 		info->node_cache = new_leaf;
 		info->qsize += sizeof(*new_leaf);
@@ -1166,14 +1137,9 @@ SYSCALL_DEFINE5(mq_timedreceive, mqd_t, mqdes, char __user *, u_msg_ptr,
 	}
 
 	if (info->attr.mq_curmsgs == 0) {
-		if (filp->f_flags & O_NONBLOCK) {
+		if (f.file->f_flags & O_NONBLOCK) {
 			spin_unlock(&info->lock);
 			ret = -EAGAIN;
-			msg_ptr = NULL;
-		} else if (unlikely(timeout < 0)) {
-			spin_unlock(&info->lock);
-			ret = timeout;
-			msg_ptr = NULL;
 		} else {
 			wait.task = current;
 			wait.state = STATE_NONE;
@@ -1201,7 +1167,7 @@ SYSCALL_DEFINE5(mq_timedreceive, mqd_t, mqdes, char __user *, u_msg_ptr,
 		free_msg(msg_ptr);
 	}
 out_fput:
-	fput(filp);
+	fdput(f);
 out:
 	return ret;
 }
@@ -1215,7 +1181,7 @@ SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
 		const struct sigevent __user *, u_notification)
 {
 	int ret;
-	struct file *filp;
+	struct fd f;
 	struct sock *sock;
 	struct inode *inode;
 	struct sigevent notification;
@@ -1261,13 +1227,13 @@ SYSCALL_DEFINE2(mq_notify, mqd_t, mqdes,
 			skb_put(nc, NOTIFY_COOKIE_LEN);
 			/* and attach it to the socket */
 retry:
-			filp = fget(notification.sigev_signo);
-			if (!filp) {
+			f = fdget(notification.sigev_signo);
+			if (!f.file) {
 				ret = -EBADF;
 				goto out;
 			}
-			sock = netlink_getsockbyfilp(filp);
-			fput(filp);
+			sock = netlink_getsockbyfilp(f.file);
+			fdput(f);
 			if (IS_ERR(sock)) {
 				ret = PTR_ERR(sock);
 				sock = NULL;
@@ -1288,14 +1254,14 @@ retry:
 		}
 	}
 
-	filp = fget(mqdes);
-	if (!filp) {
+	f = fdget(mqdes);
+	if (!f.file) {
 		ret = -EBADF;
 		goto out;
 	}
 
-	inode = filp->f_path.dentry->d_inode;
-	if (unlikely(filp->f_op != &mqueue_file_operations)) {
+	inode = file_inode(f.file);
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
 		ret = -EBADF;
 		goto out_fput;
 	}
@@ -1330,11 +1296,12 @@ retry:
 		}
 
 		info->notify_owner = get_pid(task_tgid(current));
+		info->notify_user_ns = get_user_ns(current_user_ns());
 		inode->i_atime = inode->i_ctime = CURRENT_TIME;
 	}
 	spin_unlock(&info->lock);
 out_fput:
-	fput(filp);
+	fdput(f);
 out:
 	if (sock) {
 		netlink_detachskb(sock, nc);
@@ -1350,7 +1317,7 @@ SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
 {
 	int ret;
 	struct mq_attr mqstat, omqstat;
-	struct file *filp;
+	struct fd f;
 	struct inode *inode;
 	struct mqueue_inode_info *info;
 
@@ -1361,14 +1328,14 @@ SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
 			return -EINVAL;
 	}
 
-	filp = fget(mqdes);
-	if (!filp) {
+	f = fdget(mqdes);
+	if (!f.file) {
 		ret = -EBADF;
 		goto out;
 	}
 
-	inode = filp->f_path.dentry->d_inode;
-	if (unlikely(filp->f_op != &mqueue_file_operations)) {
+	inode = file_inode(f.file);
+	if (unlikely(f.file->f_op != &mqueue_file_operations)) {
 		ret = -EBADF;
 		goto out_fput;
 	}
@@ -1377,15 +1344,15 @@ SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
 	spin_lock(&info->lock);
 
 	omqstat = info->attr;
-	omqstat.mq_flags = filp->f_flags & O_NONBLOCK;
+	omqstat.mq_flags = f.file->f_flags & O_NONBLOCK;
 	if (u_mqstat) {
 		audit_mq_getsetattr(mqdes, &mqstat);
-		spin_lock(&filp->f_lock);
+		spin_lock(&f.file->f_lock);
 		if (mqstat.mq_flags & O_NONBLOCK)
-			filp->f_flags |= O_NONBLOCK;
+			f.file->f_flags |= O_NONBLOCK;
 		else
-			filp->f_flags &= ~O_NONBLOCK;
-		spin_unlock(&filp->f_lock);
+			f.file->f_flags &= ~O_NONBLOCK;
+		spin_unlock(&f.file->f_lock);
 
 		inode->i_atime = inode->i_ctime = CURRENT_TIME;
 	}
@@ -1398,7 +1365,7 @@ SYSCALL_DEFINE3(mq_getsetattr, mqd_t, mqdes,
 		ret = -EFAULT;
 
 out_fput:
-	fput(filp);
+	fdput(f);
 out:
 	return ret;
 }
@@ -1413,20 +1380,21 @@ static const struct file_operations mqueue_file_operations = {
 	.flush = mqueue_flush_file,
 	.poll = mqueue_poll_file,
 	.read = mqueue_read_file,
+	.llseek = default_llseek,
 };
 
 static const struct super_operations mqueue_super_ops = {
 	.alloc_inode = mqueue_alloc_inode,
 	.destroy_inode = mqueue_destroy_inode,
+	.evict_inode = mqueue_evict_inode,
 	.statfs = simple_statfs,
-	.delete_inode = mqueue_delete_inode,
-	.drop_inode = generic_delete_inode,
 };
 
 static struct file_system_type mqueue_fs_type = {
 	.name = "mqueue",
-	.get_sb = mqueue_get_sb,
+	.mount = mqueue_mount,
 	.kill_sb = kill_litter_super,
+	.fs_flags = FS_USERNS_MOUNT,
 };
 
 int mq_init_ns(struct ipc_namespace *ns)
@@ -1454,7 +1422,7 @@ void mq_clear_sbinfo(struct ipc_namespace *ns)
 
 void mq_put_mnt(struct ipc_namespace *ns)
 {
-	mntput(ns->mq_mnt);
+	kern_unmount(ns->mq_mnt);
 }
 
 static int __init init_mqueue_fs(void)
@@ -1463,11 +1431,11 @@ static int __init init_mqueue_fs(void)
 
 	mqueue_inode_cachep = kmem_cache_create("mqueue_inode_cache",
 				sizeof(struct mqueue_inode_info), 0,
-				SLAB_HWCACHE_ALIGN, init_once);
+				SLAB_HWCACHE_ALIGN|SLAB_ACCOUNT, init_once);
 	if (mqueue_inode_cachep == NULL)
 		return -ENOMEM;
 
-	/* ignore failues - they are not fatal */
+	/* ignore failures - they are not fatal */
 	mq_sysctl_table = mq_register_sysctl_table();
 
 	error = register_filesystem(&mqueue_fs_type);
@@ -1476,11 +1444,9 @@ static int __init init_mqueue_fs(void)
 
 	spin_lock_init(&mq_lock);
 
-	init_ipc_ns.mq_mnt = kern_mount_data(&mqueue_fs_type, &init_ipc_ns);
-	if (IS_ERR(init_ipc_ns.mq_mnt)) {
-		error = PTR_ERR(init_ipc_ns.mq_mnt);
+	error = mq_init_ns(&init_ipc_ns);
+	if (error)
 		goto out_filesystem;
-	}
 
 	return 0;
 
@@ -1493,4 +1459,4 @@ out_sysctl:
 	return error;
 }
 
-__initcall(init_mqueue_fs);
+device_initcall(init_mqueue_fs);

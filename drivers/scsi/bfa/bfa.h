@@ -112,7 +112,7 @@ bfa_reqq_winit(struct bfa_reqq_wait_s *wqe, void (*qresume) (void *cbarg),
 									\
 		struct list_head *waitq = bfa_reqq(__bfa, __reqq);      \
 									\
-		WARN_ON(((__reqq) >= BFI_IOC_MAX_CQS));     		\
+		WARN_ON(((__reqq) >= BFI_IOC_MAX_CQS));			\
 		WARN_ON(!((__wqe)->qresume && (__wqe)->cbarg));		\
 									\
 		list_add_tail(&(__wqe)->qe, waitq);      \
@@ -382,6 +382,22 @@ int bfa_iocfc_get_pbc_vports(struct bfa_s *bfa,
 	bfa_ioc_get_mfg_mac(&(__bfa)->ioc)
 #define bfa_get_fw_clock_res(__bfa)		\
 	((__bfa)->iocfc.cfgrsp->fwcfg.fw_tick_res)
+
+/*
+ * lun mask macros return NULL when min cfg is enabled and there is
+ * no memory allocated for lunmask.
+ */
+#define bfa_get_lun_mask(__bfa)					\
+	((&(__bfa)->modules.dconf_mod)->min_cfg) ? NULL :	\
+	 (&(BFA_DCONF_MOD(__bfa)->dconf->lun_mask))
+
+#define bfa_get_lun_mask_list(_bfa)				\
+	((&(_bfa)->modules.dconf_mod)->min_cfg) ? NULL :	\
+	 (bfa_get_lun_mask(_bfa)->lun_list)
+
+#define bfa_get_lun_mask_status(_bfa)				\
+	(((&(_bfa)->modules.dconf_mod)->min_cfg)		\
+	 ? BFA_LUNMASK_MINCFG : ((bfa_get_lun_mask(_bfa))->status))
 
 void bfa_get_pciids(struct bfa_pciid_s **pciids, int *npciids);
 void bfa_cfg_get_default(struct bfa_iocfc_cfg_s *cfg);

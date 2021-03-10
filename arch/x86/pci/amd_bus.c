@@ -145,7 +145,7 @@ static int __init early_root_info_init(void)
 	def_link = (reg >> 8) & 0x03;
 
 	memset(range, 0, sizeof(range));
-	range[0].end = 0xffff;
+	add_range(range, RANGE_NUM, 0, 0, 0xffff + 1);
 	/* io port resource */
 	for (i = 0; i < 4; i++) {
 		reg = read_pci_config(bus, slot, 1, 0xc0 + (i << 3));
@@ -169,7 +169,7 @@ static int __init early_root_info_init(void)
 		if (end > 0xffff)
 			end = 0xffff;
 		update_res(info, start, end, IORESOURCE_IO, 1);
-		subtract_range(range, RANGE_NUM, start, end);
+		subtract_range(range, RANGE_NUM, start, end + 1);
 	}
 	/* add left over io port range to def node/link, [0, 0xffff] */
 	/* find the position */
@@ -179,14 +179,16 @@ static int __init early_root_info_init(void)
 			if (!range[i].end)
 				continue;
 
-			update_res(info, range[i].start, range[i].end,
+			update_res(info, range[i].start, range[i].end - 1,
 				   IORESOURCE_IO, 1);
 		}
 	}
 
 	memset(range, 0, sizeof(range));
 	/* 0xfd00000000-0xffffffffff for HT */
-	range[0].end = cap_resource((0xfdULL<<32) - 1);
+	end = cap_resource((0xfdULL<<32) - 1);
+	end++;
+	add_range(range, RANGE_NUM, 0, 0, end);
 
 	/* need to take out [0, TOM) for RAM*/
 	address = MSR_K8_TOP_MEM1;
@@ -194,7 +196,7 @@ static int __init early_root_info_init(void)
 	end = (val & 0xffffff800000ULL);
 	printk(KERN_INFO "TOM: %016llx aka %lldM\n", end, end>>20);
 	if (end < (1ULL<<32))
-		subtract_range(range, RANGE_NUM, 0, end - 1);
+		subtract_range(range, RANGE_NUM, 0, end);
 
 	/* get mmconfig */
 	fam10h_mmconf = amd_get_mmconfig_range(&fam10h_mmconf_res);
@@ -203,7 +205,8 @@ static int __init early_root_info_init(void)
 		printk(KERN_DEBUG "Fam 10h mmconf %pR\n", fam10h_mmconf);
 		fam10h_mmconf_start = fam10h_mmconf->start;
 		fam10h_mmconf_end = fam10h_mmconf->end;
-		subtract_range(range, RANGE_NUM, fam10h_mmconf_start, fam10h_mmconf_end);
+		subtract_range(range, RANGE_NUM, fam10h_mmconf_start,
+				 fam10h_mmconf_end + 1);
 	} else {
 		fam10h_mmconf_start = 0;
 		fam10h_mmconf_end = 0;
@@ -255,7 +258,8 @@ static int __init early_root_info_init(void)
 				/* we got a hole */
 				endx = fam10h_mmconf_start - 1;
 				update_res(info, start, endx, IORESOURCE_MEM, 0);
-				subtract_range(range, RANGE_NUM, start, endx);
+				subtract_range(range, RANGE_NUM, start,
+						 endx + 1);
 				printk(KERN_CONT " ==> [%llx, %llx]", start, endx);
 				start = fam10h_mmconf_end + 1;
 				changed = 1;
@@ -272,7 +276,7 @@ static int __init early_root_info_init(void)
 
 		update_res(info, cap_resource(start), cap_resource(end),
 				 IORESOURCE_MEM, 1);
-		subtract_range(range, RANGE_NUM, start, end);
+		subtract_range(range, RANGE_NUM, start, end + 1);
 		printk(KERN_CONT "\n");
 	}
 
@@ -287,7 +291,7 @@ static int __init early_root_info_init(void)
 		rdmsrl(address, val);
 		end = (val & 0xffffff800000ULL);
 		printk(KERN_INFO "TOM2: %016llx aka %lldM\n", end, end>>20);
-		subtract_range(range, RANGE_NUM, 1ULL<<32, end - 1);
+		subtract_range(range, RANGE_NUM, 1ULL<<32, end);
 	}
 
 	/*
@@ -301,7 +305,7 @@ static int __init early_root_info_init(void)
 				continue;
 
 			update_res(info, cap_resource(range[i].start),
-				   cap_resource(range[i].end),
+				   cap_resource(range[i].end - 1),
 				   IORESOURCE_MEM, 1);
 		}
 	}
@@ -323,7 +327,7 @@ static int __init early_root_info_init(void)
 
 #define ENABLE_CF8_EXT_CFG      (1ULL << 46)
 
-static void __cpuinit enable_pci_io_ecs(void *unused)
+static void enable_pci_io_ecs(void *unused)
 {
 	u64 reg;
 	rdmsrl(MSR_AMD64_NB_CFG, reg);
@@ -333,8 +337,8 @@ static void __cpuinit enable_pci_io_ecs(void *unused)
 	}
 }
 
-static int __cpuinit amd_cpu_notify(struct notifier_block *self,
-				    unsigned long action, void *hcpu)
+static int amd_cpu_notify(struct notifier_block *self, unsigned long action,
+			  void *hcpu)
 {
 	int cpu = (long)hcpu;
 	switch (action) {
@@ -348,7 +352,7 @@ static int __cpuinit amd_cpu_notify(struct notifier_block *self,
 	return NOTIFY_OK;
 }
 
-static struct notifier_block __cpuinitdata amd_cpu_notifier = {
+static struct notifier_block amd_cpu_notifier = {
 	.notifier_call	= amd_cpu_notify,
 };
 
@@ -391,10 +395,13 @@ static int __init pci_io_ecs_init(void)
 	if (early_pci_allowed())
 		pci_enable_pci_io_ecs();
 
-	register_cpu_notifier(&amd_cpu_notifier);
+	cpu_notifier_register_begin();
 	for_each_online_cpu(cpu)
 		amd_cpu_notify(&amd_cpu_notifier, (unsigned long)CPU_ONLINE,
 			       (void *)(long)cpu);
+	__register_cpu_notifier(&amd_cpu_notifier);
+	cpu_notifier_register_done();
+
 	pci_probe |= PCI_HAS_IO_ECS;
 
 	return 0;
@@ -406,9 +413,7 @@ static int __init amd_postcore_init(void)
 		return 0;
 
 	early_root_info_init();
-
-	if (boot_cpu_data.x86 <= 0x16)
-		pci_io_ecs_init();
+	pci_io_ecs_init();
 
 	return 0;
 }

@@ -1,19 +1,19 @@
 /*
- *  linux/arch/cris/mm/fault.c
+ *  arch/cris/mm/fault.c
  *
- *  Copyright (C) 2000-2006  Axis Communications AB
- *
- *  Authors:  Bjorn Wesen
- *
+ *  Copyright (C) 2000-2010  Axis Communications AB
  */
 
 #include <linux/mm.h>
 #include <linux/interrupt.h>
 #include <linux/module.h>
-#include <asm/uaccess.h>
+#include <linux/wait.h>
+#include <linux/uaccess.h>
+#include <arch/system.h>
 
 extern int find_fixup_code(struct pt_regs *);
 extern void die_if_kernel(const char *, struct pt_regs *, long);
+extern void show_registers(struct pt_regs *regs);
 
 /* debug of low-level TLB reload */
 #undef DEBUG
@@ -58,6 +58,8 @@ do_page_fault(unsigned long address, struct pt_regs *regs,
 	struct vm_area_struct * vma;
 	siginfo_t info;
 	int fault;
+	unsigned int flags = FAULT_FLAG_ALLOW_RETRY | FAULT_FLAG_KILLABLE |
+				((writeaccess & 1) ? FAULT_FLAG_WRITE : 0);
 
 	D(printk(KERN_DEBUG
 		 "Page fault for %lX on %X at %lX, prot %d write %d\n",
@@ -108,13 +110,14 @@ do_page_fault(unsigned long address, struct pt_regs *regs,
 	info.si_code = SEGV_MAPERR;
 
 	/*
-	 * If we're in an interrupt or have no user
-	 * context, we must not take the fault..
+	 * If we're in an interrupt, have pagefaults disabled or have no
+	 * user context, we must not take the fault.
 	 */
 
-	if (in_interrupt() || !mm)
+	if (faulthandler_disabled() || !mm)
 		goto no_context;
 
+retry:
 	down_read(&mm->mmap_sem);
 	vma = find_vma(mm, address);
 	if (!vma)
@@ -163,7 +166,11 @@ do_page_fault(unsigned long address, struct pt_regs *regs,
 	 * the fault.
 	 */
 
-	fault = handle_mm_fault(mm, vma, address, (writeaccess & 1) ? FAULT_FLAG_WRITE : 0);
+	fault = handle_mm_fault(vma, address, flags);
+
+	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current))
+		return;
+
 	if (unlikely(fault & VM_FAULT_ERROR)) {
 		if (fault & VM_FAULT_OOM)
 			goto out_of_memory;
@@ -171,10 +178,25 @@ do_page_fault(unsigned long address, struct pt_regs *regs,
 			goto do_sigbus;
 		BUG();
 	}
-	if (fault & VM_FAULT_MAJOR)
-		tsk->maj_flt++;
-	else
-		tsk->min_flt++;
+
+	if (flags & FAULT_FLAG_ALLOW_RETRY) {
+		if (fault & VM_FAULT_MAJOR)
+			tsk->maj_flt++;
+		else
+			tsk->min_flt++;
+		if (fault & VM_FAULT_RETRY) {
+			flags &= ~FAULT_FLAG_ALLOW_RETRY;
+			flags |= FAULT_FLAG_TRIED;
+
+			/*
+			 * No need to up_read(&mm->mmap_sem) as we would
+			 * have already released it in __lock_page_or_retry
+			 * in mm/filemap.c.
+			 */
+
+			goto retry;
+		}
+	}
 
 	up_read(&mm->mmap_sem);
 	return;
@@ -193,14 +215,25 @@ do_page_fault(unsigned long address, struct pt_regs *regs,
 	/* User mode accesses just cause a SIGSEGV */
 
 	if (user_mode(regs)) {
+		printk(KERN_NOTICE "%s (pid %d) segfaults for page "
+			"address %08lx at pc %08lx\n",
+			tsk->comm, tsk->pid,
+			address, instruction_pointer(regs));
+
+		/* With DPG on, we've already dumped registers above.  */
+		DPG(if (0))
+			show_registers(regs);
+
+#ifdef CONFIG_NO_SEGFAULT_TERMINATION
+		DECLARE_WAIT_QUEUE_HEAD(wq);
+		wait_event_interruptible(wq, 0 == 1);
+#else
 		info.si_signo = SIGSEGV;
 		info.si_errno = 0;
 		/* info.si_code has been set above */
 		info.si_addr = (void *)address;
 		force_sig_info(SIGSEGV, &info, tsk);
-		printk(KERN_NOTICE "%s (pid %d) segfaults for page "
-		       "address %08lx at pc %08lx\n",
-		       tsk->comm, tsk->pid, address, instruction_pointer(regs));
+#endif
 		return;
 	}
 
@@ -209,7 +242,7 @@ do_page_fault(unsigned long address, struct pt_regs *regs,
 	/* Are we prepared to handle this kernel fault?
 	 *
 	 * (The kernel has valid exception-points in the source
-	 *  when it acesses user-memory. When it fails in one
+	 *  when it accesses user-memory. When it fails in one
 	 *  of those points, we find it in a table and do a jump
 	 *  to some fixup code that loads an appropriate error
 	 *  code)
@@ -245,10 +278,10 @@ do_page_fault(unsigned long address, struct pt_regs *regs,
 
  out_of_memory:
 	up_read(&mm->mmap_sem);
-	printk("VM: killing process %s\n", tsk->comm);
-	if (user_mode(regs))
-		do_exit(SIGKILL);
-	goto no_context;
+	if (!user_mode(regs))
+		goto no_context;
+	pagefault_out_of_memory();
+	return;
 
  do_sigbus:
 	up_read(&mm->mmap_sem);
@@ -334,8 +367,11 @@ int
 find_fixup_code(struct pt_regs *regs)
 {
 	const struct exception_table_entry *fixup;
+	/* in case of delay slot fault (v32) */
+	unsigned long ip = (instruction_pointer(regs) & ~0x1);
 
-	if ((fixup = search_exception_tables(instruction_pointer(regs))) != 0) {
+	fixup = search_exception_tables(ip);
+	if (fixup != 0) {
 		/* Adjust the instruction pointer in the stackframe. */
 		instruction_pointer(regs) = fixup->fixup;
 		arch_fixup(regs);

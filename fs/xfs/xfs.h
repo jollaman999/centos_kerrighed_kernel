@@ -19,11 +19,19 @@
 #define __XFS_H__
 
 #ifdef CONFIG_XFS_DEBUG
-#define STATIC
 #define DEBUG 1
 #define XFS_BUF_LOCK_TRACKING 1
-/* #define QUOTADEBUG 1 */
 #endif
 
-#include <linux-2.6/xfs_linux.h>
+#ifdef CONFIG_XFS_ASSERT_FATAL
+#define XFS_ASSERT_FATAL 1
+#endif
+
+#ifdef CONFIG_XFS_WARN
+#define XFS_WARN 1
+#endif
+
+
+#include "xfs_linux.h"
+
 #endif	/* __XFS_H__ */

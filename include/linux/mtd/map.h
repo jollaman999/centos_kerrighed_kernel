@@ -1,3 +1,21 @@
+/*
+ * Copyright © 2000-2010 David Woodhouse <dwmw2@infradead.org> et al.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+ *
+ */
 
 /* Overhauled routines for dealing with different mmap regions of flash */
 
@@ -7,13 +25,12 @@
 #include <linux/types.h>
 #include <linux/list.h>
 #include <linux/string.h>
-#include <linux/nospec.h>
-
-#include <linux/mtd/compatmac.h>
+#include <linux/bug.h>
+#include <linux/kernel.h>
 
 #include <asm/unaligned.h>
-#include <asm/system.h>
 #include <asm/io.h>
+#include <asm/barrier.h>
 
 #ifdef CONFIG_MTD_MAP_BANK_WIDTH_1
 #define map_bankwidth(map) 1
@@ -197,6 +214,7 @@ struct map_info {
 	void __iomem *virt;
 	void *cached;
 
+	int swap; /* this mapping's byte-swapping requirement */
 	int bankwidth; /* in octets. This isn't necessarily the width
 		       of actual bus cycles -- it's the repeat interval
 		      in bytes, before you are talking to the first chip again.
@@ -227,6 +245,7 @@ struct map_info {
 	unsigned long pfow_base;
 	unsigned long map_priv_1;
 	unsigned long map_priv_2;
+	struct device_node *device_node;
 	void *fldrv_priv;
 	struct mtd_chip_driver *fldrv;
 };
@@ -324,6 +343,8 @@ static inline map_word map_word_load(struct map_info *map, const void *ptr)
 #endif
 	else if (map_bankwidth_is_large(map))
 		memcpy(r.x, ptr, map->bankwidth);
+	else
+		BUG();
 
 	return r;
 }
@@ -336,7 +357,6 @@ static inline map_word map_word_load_partial(struct map_info *map, map_word orig
 		char *dest = (char *)&orig;
 		memcpy(dest+start, buf, len);
 	} else {
-		barrier_nospec();
 		for (i=start; i < start+len; i++) {
 			int bitpos;
 #ifdef __LITTLE_ENDIAN
@@ -345,7 +365,7 @@ static inline map_word map_word_load_partial(struct map_info *map, map_word orig
 			bitpos = (map_bankwidth(map)-1-i)*8;
 #endif
 			orig.x[0] &= ~(0xff << bitpos);
-			orig.x[0] |= buf[i-start] << bitpos;
+			orig.x[0] |= (unsigned long)buf[i-start] << bitpos;
 		}
 	}
 	return orig;
@@ -364,7 +384,7 @@ static inline map_word map_word_ff(struct map_info *map)
 
 	if (map_bankwidth(map) < MAP_FF_LIMIT) {
 		int bw = 8 * map_bankwidth(map);
-		r.x[0] = (1 << bw) - 1;
+		r.x[0] = (1UL << bw) - 1;
 	} else {
 		for (i=0; i<map_words(map); i++)
 			r.x[i] = ~0UL;
@@ -388,6 +408,8 @@ static inline map_word inline_map_read(struct map_info *map, unsigned long ofs)
 #endif
 	else if (map_bankwidth_is_large(map))
 		memcpy_fromio(r.x, map->virt+ofs, map->bankwidth);
+	else
+		BUG();
 
 	return r;
 }
@@ -406,6 +428,8 @@ static inline void inline_map_write(struct map_info *map, const map_word datum, 
 #endif
 	else if (map_bankwidth_is_large(map))
 		memcpy_toio(map->virt+ofs, datum.x, map->bankwidth);
+	else
+		BUG();
 	mb();
 }
 

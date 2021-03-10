@@ -11,6 +11,7 @@
  */
 
 #include <media/rc-map.h>
+#include <linux/module.h>
 
 /*
  * Igor Kuznetsov <igk72@ya.ru>
@@ -97,7 +98,7 @@ static struct rc_map_table behold[] = {
 	{ 0x6b861a, KEY_STOP },
 	{ 0x6b860e, KEY_TEXT },
 	{ 0x6b861f, KEY_RED },	/*XXX KEY_AUDIO	*/
-	{ 0x6b861e, KEY_YELLOW },	/*XXX KEY_SOURCE	*/
+	{ 0x6b861e, KEY_VIDEO },
 
 	/*  0x1d   0x13     0x19  *
 	 * SLEEP  PREVIEW   DVB   *

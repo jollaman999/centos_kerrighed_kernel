@@ -22,11 +22,9 @@
 #include <linux/err.h>
 #include <linux/vmalloc.h>
 #include <linux/security.h>
-#include <linux/nospec.h>
+#include <linux/uio.h>
 #include <asm/uaccess.h>
 #include "internal.h"
-
-#define KEY_MAX_DESC_SIZE 4096
 
 static int key_get_type_from_user(char *type,
 				  const char __user *_type,
@@ -49,6 +47,9 @@ static int key_get_type_from_user(char *type,
  * Extract the description of a new key from userspace and either add it as a
  * new key to the specified keyring or update a matching key in that keyring.
  *
+ * If the description is NULL or an empty string, the key type is asked to
+ * generate one from the payload.
+ *
  * The keyring must be writable so that we can attach the key to it.
  *
  * If successful, the new key's serial number is returned, otherwise an error
@@ -64,47 +65,41 @@ SYSCALL_DEFINE5(add_key, const char __user *, _type,
 	char type[32], *description;
 	void *payload;
 	long ret;
-	bool vm;
 
 	ret = -EINVAL;
-	if (plen > 1024 * 1024 - 1 || !_description)
+	if (plen > 1024 * 1024 - 1)
 		goto error;
-	plen = array_index_nospec(plen, 1024 * 1024);
 
 	/* draw all the data into kernel space */
 	ret = key_get_type_from_user(type, _type, sizeof(type));
 	if (ret < 0)
 		goto error;
 
-	description = strndup_user(_description, KEY_MAX_DESC_SIZE);
-	if (IS_ERR(description)) {
-		ret = PTR_ERR(description);
-		goto error;
-	}
-	if (!*description) {
-		ret = -EINVAL;
-		goto error2;
-	} else if ((description[0] == '.') &&
-		   (strncmp(type, "keyring", 7) == 0)) {
-		ret = -EPERM;
-		goto error2;
+	description = NULL;
+	if (_description) {
+		description = strndup_user(_description, PAGE_SIZE);
+		if (IS_ERR(description)) {
+			ret = PTR_ERR(description);
+			goto error;
+		}
+		if (!*description) {
+			kfree(description);
+			description = NULL;
+		} else if ((description[0] == '.') &&
+			   (strncmp(type, "keyring", 7) == 0)) {
+			ret = -EPERM;
+			goto error2;
+		}
 	}
 
 	/* pull the payload in if one was supplied */
 	payload = NULL;
 
-	vm = false;
-	if (_payload) {
+	if (plen) {
 		ret = -ENOMEM;
-		payload = kmalloc(plen, GFP_KERNEL | __GFP_NOWARN);
-		if (!payload) {
-			if (plen <= PAGE_SIZE)
-				goto error2;
-			vm = true;
-			payload = vmalloc(plen);
-			if (!payload)
-				goto error2;
-		}
+		payload = kvmalloc(plen, GFP_KERNEL);
+		if (!payload)
+			goto error2;
 
 		ret = -EFAULT;
 		if (copy_from_user(payload, _payload, plen) != 0)
@@ -133,10 +128,10 @@ SYSCALL_DEFINE5(add_key, const char __user *, _type,
 
 	key_ref_put(keyring_ref);
  error3:
-	if (!vm)
-		kfree(payload);
-	else
-		vfree(payload);
+	if (payload) {
+		memzero_explicit(payload, plen);
+		kvfree(payload);
+	}
  error2:
 	kfree(description);
  error:
@@ -174,7 +169,7 @@ SYSCALL_DEFINE4(request_key, const char __user *, _type,
 		goto error;
 
 	/* pull the description into kernel space */
-	description = strndup_user(_description, KEY_MAX_DESC_SIZE);
+	description = strndup_user(_description, PAGE_SIZE);
 	if (IS_ERR(description)) {
 		ret = PTR_ERR(description);
 		goto error;
@@ -272,7 +267,8 @@ error:
  * Create and join an anonymous session keyring or join a named session
  * keyring, creating it if necessary.  A named session keyring must have Search
  * permission for it to be joined.  Session keyrings without this permit will
- * be skipped over.
+ * be skipped over.  It is not permitted for userspace to create or join
+ * keyrings whose name begin with a dot.
  *
  * If successful, the ID of the joined session keyring will be returned.
  */
@@ -284,17 +280,21 @@ long keyctl_join_session_keyring(const char __user *_name)
 	/* fetch the name from userspace */
 	name = NULL;
 	if (_name) {
-		name = strndup_user(_name, KEY_MAX_DESC_SIZE);
+		name = strndup_user(_name, PAGE_SIZE);
 		if (IS_ERR(name)) {
 			ret = PTR_ERR(name);
 			goto error;
 		}
+
+		ret = -EPERM;
+		if (name[0] == '.')
+			goto error_name;
 	}
 
 	/* join the session */
 	ret = join_session_keyring(name);
+error_name:
 	kfree(name);
-
 error:
 	return ret;
 }
@@ -323,7 +323,7 @@ long keyctl_update_key(key_serial_t id,
 
 	/* pull the payload in if one was supplied */
 	payload = NULL;
-	if (_payload) {
+	if (plen) {
 		ret = -ENOMEM;
 		payload = kmalloc(plen, GFP_KERNEL);
 		if (!payload)
@@ -346,7 +346,7 @@ long keyctl_update_key(key_serial_t id,
 
 	key_ref_put(key_ref);
 error2:
-	kfree(payload);
+	kzfree(payload);
 error:
 	return ret;
 }
@@ -559,9 +559,8 @@ long keyctl_describe_key(key_serial_t keyid,
 {
 	struct key *key, *instkey;
 	key_ref_t key_ref;
-	char *infobuf;
+	char *tmpbuf;
 	long ret;
-	int desclen, infolen;
 
 	key_ref = lookup_user_key(keyid, KEY_LOOKUP_PARTIAL, KEY_VIEW);
 	if (IS_ERR(key_ref)) {
@@ -584,31 +583,38 @@ long keyctl_describe_key(key_serial_t keyid,
 	}
 
 okay:
-	key = key_ref_to_ptr(key_ref);
-	desclen = strlen(key->description);
-
-	/* calculate how much information we're going to return */
+	/* calculate how much description we're going to return */
 	ret = -ENOMEM;
-	infobuf = kasprintf(GFP_KERNEL,
-			    "%s;%d;%d;%08x;",
-			    key->type->name,
-			    key->uid,
-			    key->gid,
-			    key->perm);
-	if (!infobuf)
+	tmpbuf = kmalloc(PAGE_SIZE, GFP_KERNEL);
+	if (!tmpbuf)
 		goto error2;
-	infolen = strlen(infobuf);
-	ret = infolen + desclen + 1;
+
+	key = key_ref_to_ptr(key_ref);
+
+	ret = snprintf(tmpbuf, PAGE_SIZE - 1,
+		       "%s;%d;%d;%08x;%s",
+		       key->type->name,
+		       from_kuid_munged(current_user_ns(), key->uid),
+		       from_kgid_munged(current_user_ns(), key->gid),
+		       key->perm,
+		       key->description ?: "");
+
+	/* include a NUL char at the end of the data */
+	if (ret > PAGE_SIZE - 1)
+		ret = PAGE_SIZE - 1;
+	tmpbuf[ret] = 0;
+	ret++;
 
 	/* consider returning the data */
-	if (buffer && buflen >= ret) {
-		if (copy_to_user(buffer, infobuf, infolen) != 0 ||
-		    copy_to_user(buffer + infolen, key->description,
-				 desclen + 1) != 0)
+	if (buffer && buflen > 0) {
+		if (buflen > ret)
+			buflen = ret;
+
+		if (copy_to_user(buffer, tmpbuf, buflen) != 0)
 			ret = -EFAULT;
 	}
 
-	kfree(infobuf);
+	kfree(tmpbuf);
 error2:
 	key_ref_put(key_ref);
 error:
@@ -640,7 +646,7 @@ long keyctl_keyring_search(key_serial_t ringid,
 	if (ret < 0)
 		goto error;
 
-	description = strndup_user(_description, KEY_MAX_DESC_SIZE);
+	description = strndup_user(_description, PAGE_SIZE);
 	if (IS_ERR(description)) {
 		ret = PTR_ERR(description);
 		goto error;
@@ -734,17 +740,16 @@ long keyctl_read_key(key_serial_t keyid, char __user *buffer, size_t buflen)
 
 	key = key_ref_to_ptr(key_ref);
 
-	if (test_bit(KEY_FLAG_NEGATIVE, &key->flags)) {
-		ret = -ENOKEY;
-		goto error2;
-	}
+	ret = key_read_state(key);
+	if (ret < 0)
+		goto error2; /* Negatively instantiated */
 
 	/* see if we can read it directly */
 	ret = key_permission(key_ref, KEY_READ);
 	if (ret == 0)
 		goto can_read_key;
 	if (ret != -EACCES)
-		goto error;
+		goto error2;
 
 	/* we can't; see if it's searchable from this process's keyrings
 	 * - we automatically take account of the fact that it may be
@@ -790,15 +795,25 @@ error:
  *
  * If successful, 0 will be returned.
  */
-long keyctl_chown_key(key_serial_t id, uid_t uid, gid_t gid)
+long keyctl_chown_key(key_serial_t id, uid_t user, gid_t group)
 {
 	struct key_user *newowner, *zapowner = NULL;
 	struct key *key;
 	key_ref_t key_ref;
 	long ret;
+	kuid_t uid;
+	kgid_t gid;
+
+	uid = make_kuid(current_user_ns(), user);
+	gid = make_kgid(current_user_ns(), group);
+	ret = -EINVAL;
+	if ((user != (uid_t) -1) && !uid_valid(uid))
+		goto error;
+	if ((group != (gid_t) -1) && !gid_valid(gid))
+		goto error;
 
 	ret = 0;
-	if (uid == (uid_t) -1 && gid == (gid_t) -1)
+	if (user == (uid_t) -1 && group == (gid_t) -1)
 		goto error;
 
 	key_ref = lookup_user_key(id, KEY_LOOKUP_CREATE | KEY_LOOKUP_PARTIAL,
@@ -816,27 +831,27 @@ long keyctl_chown_key(key_serial_t id, uid_t uid, gid_t gid)
 
 	if (!capable(CAP_SYS_ADMIN)) {
 		/* only the sysadmin can chown a key to some other UID */
-		if (uid != (uid_t) -1 && key->uid != uid)
+		if (user != (uid_t) -1 && !uid_eq(key->uid, uid))
 			goto error_put;
 
 		/* only the sysadmin can set the key's GID to a group other
 		 * than one of those that the current process subscribes to */
-		if (gid != (gid_t) -1 && gid != key->gid && !in_group_p(gid))
+		if (group != (gid_t) -1 && !gid_eq(gid, key->gid) && !in_group_p(gid))
 			goto error_put;
 	}
 
 	/* change the UID */
-	if (uid != (uid_t) -1 && uid != key->uid) {
+	if (user != (uid_t) -1 && !uid_eq(uid, key->uid)) {
 		ret = -ENOMEM;
-		newowner = key_user_lookup(uid, current_user_ns());
+		newowner = key_user_lookup(uid);
 		if (!newowner)
 			goto error_put;
 
 		/* transfer the quota burden to the new user */
 		if (test_bit(KEY_FLAG_IN_QUOTA, &key->flags)) {
-			unsigned maxkeys = (uid == 0) ?
+			unsigned maxkeys = uid_eq(uid, GLOBAL_ROOT_UID) ?
 				key_quota_root_maxkeys : key_quota_maxkeys;
-			unsigned maxbytes = (uid == 0) ?
+			unsigned maxbytes = uid_eq(uid, GLOBAL_ROOT_UID) ?
 				key_quota_root_maxbytes : key_quota_maxbytes;
 
 			spin_lock(&newowner->lock);
@@ -859,7 +874,7 @@ long keyctl_chown_key(key_serial_t id, uid_t uid, gid_t gid)
 		atomic_dec(&key->user->nkeys);
 		atomic_inc(&newowner->nkeys);
 
-		if (test_bit(KEY_FLAG_INSTANTIATED, &key->flags)) {
+		if (key->state != KEY_IS_UNINSTANTIATED) {
 			atomic_dec(&key->user->nikeys);
 			atomic_inc(&newowner->nikeys);
 		}
@@ -870,7 +885,7 @@ long keyctl_chown_key(key_serial_t id, uid_t uid, gid_t gid)
 	}
 
 	/* change the GID */
-	if (gid != (gid_t) -1)
+	if (group != (gid_t) -1)
 		key->gid = gid;
 
 	ret = 0;
@@ -921,7 +936,7 @@ long keyctl_setperm_key(key_serial_t id, key_perm_t perm)
 	down_write(&key->sem);
 
 	/* if we're not the sysadmin, we can only change a key that we own */
-	if (capable(CAP_SYS_ADMIN) || key->uid == current_fsuid()) {
+	if (capable(CAP_SYS_ADMIN) || uid_eq(key->uid, current_fsuid())) {
 		key->perm = perm;
 		ret = 0;
 	}
@@ -1022,7 +1037,6 @@ long keyctl_instantiate_key_common(key_serial_t id,
 	struct key *instkey, *dest_keyring;
 	void *payload;
 	long ret;
-	bool vm = false;
 
 	kenter("%d,,%zu,%d", id, plen, ringid);
 
@@ -1046,15 +1060,9 @@ long keyctl_instantiate_key_common(key_serial_t id,
 
 	if (payload_iov) {
 		ret = -ENOMEM;
-		payload = kmalloc(plen, GFP_KERNEL);
-		if (!payload) {
-			if (plen <= PAGE_SIZE)
-				goto error;
-			vm = true;
-			payload = vmalloc(plen);
-			if (!payload)
-				goto error;
-		}
+		payload = kvmalloc(plen, GFP_KERNEL);
+		if (!payload)
+			goto error;
 
 		ret = copy_from_user_iovec(payload, payload_iov, ioc);
 		if (ret < 0)
@@ -1079,10 +1087,9 @@ long keyctl_instantiate_key_common(key_serial_t id,
 		keyctl_change_reqkey_auth(NULL);
 
 error2:
-	if (!vm)
-		kfree(payload);
-	else
-		vfree(payload);
+	if (payload) {
+		kvfree(payload);
+	}
 error:
 	return ret;
 }
@@ -1134,7 +1141,7 @@ long keyctl_instantiate_key_iov(key_serial_t id,
 		goto no_payload;
 
 	ret = rw_copy_check_uvector(WRITE, _payload_iov, ioc,
-				    ARRAY_SIZE(iovstack), iovstack, &iov, 1);
+				    ARRAY_SIZE(iovstack), iovstack, &iov);
 	if (ret < 0)
 		goto err;
 	if (ret == 0)
@@ -1243,8 +1250,8 @@ error:
  * Read or set the default keyring in which request_key() will cache keys and
  * return the old setting.
  *
- * If a process keyring is specified then this will be created if it doesn't
- * yet exist.  The old setting will be returned if successful.
+ * If a thread or process keyring is specified then it will be created if it
+ * doesn't yet exist.  The old setting will be returned if successful.
  */
 long keyctl_set_reqkey_keyring(int reqkey_defl)
 {
@@ -1269,11 +1276,8 @@ long keyctl_set_reqkey_keyring(int reqkey_defl)
 
 	case KEY_REQKEY_DEFL_PROCESS_KEYRING:
 		ret = install_process_keyring_to_cred(new);
-		if (ret < 0) {
-			if (ret != -EEXIST)
-				goto error;
-			ret = 0;
-		}
+		if (ret < 0)
+			goto error;
 		goto set;
 
 	case KEY_REQKEY_DEFL_DEFAULT:
@@ -1393,11 +1397,9 @@ long keyctl_assume_authority(key_serial_t id)
 	}
 
 	ret = keyctl_change_reqkey_auth(authkey);
-	if (ret < 0)
-		goto error;
+	if (ret == 0)
+		ret = authkey->serial;
 	key_put(authkey);
-
-	ret = authkey->serial;
 error:
 	return ret;
 }
@@ -1478,110 +1480,93 @@ long keyctl_get_security(key_serial_t keyid,
  */
 long keyctl_session_to_parent(void)
 {
-#ifdef TIF_NOTIFY_RESUME
 	struct task_struct *me, *parent;
 	const struct cred *mycred, *pcred;
-	struct cred *cred, *oldcred;
+	struct callback_head *newwork, *oldwork;
 	key_ref_t keyring_r;
+	struct cred *cred;
 	int ret;
 
 	keyring_r = lookup_user_key(KEY_SPEC_SESSION_KEYRING, 0, KEY_LINK);
 	if (IS_ERR(keyring_r))
 		return PTR_ERR(keyring_r);
 
+	ret = -ENOMEM;
+
 	/* our parent is going to need a new cred struct, a new tgcred struct
 	 * and new security data, so we allocate them here to prevent ENOMEM in
 	 * our parent */
-	ret = -ENOMEM;
 	cred = cred_alloc_blank();
 	if (!cred)
 		goto error_keyring;
+	newwork = &cred->rcu;
 
-	cred->tgcred->session_keyring = key_ref_to_ptr(keyring_r);
+	cred->session_keyring = key_ref_to_ptr(keyring_r);
 	keyring_r = NULL;
+	init_task_work(newwork, key_change_session_keyring);
 
 	me = current;
 	rcu_read_lock();
 	tasklist_write_lock_irq();
 
-	parent = me->real_parent;
 	ret = -EPERM;
+	oldwork = NULL;
+	parent = me->real_parent;
 
 	/* the parent mustn't be init and mustn't be a kernel thread */
 	if (parent->pid <= 1 || !parent->mm)
-		goto not_permitted;
+		goto unlock;
 
 	/* the parent must be single threaded */
 	if (!thread_group_empty(parent))
-		goto not_permitted;
+		goto unlock;
 
 	/* the parent and the child must have different session keyrings or
 	 * there's no point */
 	mycred = current_cred();
 	pcred = __task_cred(parent);
 	if (mycred == pcred ||
-	    mycred->tgcred->session_keyring == pcred->tgcred->session_keyring)
-		goto already_same;
+	    mycred->session_keyring == pcred->session_keyring) {
+		ret = 0;
+		goto unlock;
+	}
 
 	/* the parent must have the same effective ownership and mustn't be
 	 * SUID/SGID */
-	if (pcred->uid	!= mycred->euid	||
-	    pcred->euid	!= mycred->euid	||
-	    pcred->suid	!= mycred->euid	||
-	    pcred->gid	!= mycred->egid	||
-	    pcred->egid	!= mycred->egid	||
-	    pcred->sgid	!= mycred->egid)
-		goto not_permitted;
+	if (!uid_eq(pcred->uid,	 mycred->euid) ||
+	    !uid_eq(pcred->euid, mycred->euid) ||
+	    !uid_eq(pcred->suid, mycred->euid) ||
+	    !gid_eq(pcred->gid,	 mycred->egid) ||
+	    !gid_eq(pcred->egid, mycred->egid) ||
+	    !gid_eq(pcred->sgid, mycred->egid))
+		goto unlock;
 
 	/* the keyrings must have the same UID */
-	if ((pcred->tgcred->session_keyring &&
-	     pcred->tgcred->session_keyring->uid != mycred->euid) ||
-	    mycred->tgcred->session_keyring->uid != mycred->euid)
-		goto not_permitted;
+	if ((pcred->session_keyring &&
+	     !uid_eq(pcred->session_keyring->uid, mycred->euid)) ||
+	    !uid_eq(mycred->session_keyring->uid, mycred->euid))
+		goto unlock;
 
-	/* the LSM must permit the replacement of the parent's keyring with the
-	 * keyring from this process */
-	ret = security_key_session_to_parent(mycred, pcred,
-					     key_ref_to_ptr(keyring_r));
-	if (ret < 0)
-		goto not_permitted;
-
-	/* if there's an already pending keyring replacement, then we replace
-	 * that */
-	oldcred = parent->replacement_session_keyring;
+	/* cancel an already pending keyring replacement */
+	oldwork = task_work_cancel(parent, key_change_session_keyring);
 
 	/* the replacement session keyring is applied just prior to userspace
 	 * restarting */
-	parent->replacement_session_keyring = cred;
-	cred = NULL;
-	set_ti_thread_flag(task_thread_info(parent), TIF_NOTIFY_RESUME);
-
-	write_unlock_irq(&tasklist_lock);
+	ret = task_work_add(parent, newwork, true);
+	if (!ret)
+		newwork = NULL;
+unlock:
+	qwrite_unlock_irq(&tasklist_lock);
 	rcu_read_unlock();
-	if (oldcred)
-		put_cred(oldcred);
-	return 0;
-
-already_same:
-	ret = 0;
-not_permitted:
-	write_unlock_irq(&tasklist_lock);
-	rcu_read_unlock();
-	put_cred(cred);
+	if (oldwork)
+		put_cred(container_of(oldwork, struct cred, rcu));
+	if (newwork)
+		put_cred(cred);
 	return ret;
 
 error_keyring:
 	key_ref_put(keyring_r);
 	return ret;
-
-#else /* !TIF_NOTIFY_RESUME */
-	/*
-	 * To be removed when TIF_NOTIFY_RESUME has been implemented on
-	 * m68k/xtensa
-	 */
-#warning TIF_NOTIFY_RESUME not implemented
-	return -EOPNOTSUPP;
-#endif /* !TIF_NOTIFY_RESUME */
 }
 
 /*
@@ -1686,6 +1671,9 @@ SYSCALL_DEFINE5(keyctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	case KEYCTL_INVALIDATE:
 		return keyctl_invalidate_key((key_serial_t) arg2);
+
+	case KEYCTL_GET_PERSISTENT:
+		return keyctl_get_persistent((uid_t)arg2, (key_serial_t)arg3);
 
 	default:
 		return -EOPNOTSUPP;

@@ -128,8 +128,6 @@ static int cachefiles_daemon_add_cache(struct cachefiles_cache *cache)
 	    !root->d_inode->i_op->mkdir ||
 	    !root->d_inode->i_op->setxattr ||
 	    !root->d_inode->i_op->getxattr ||
-	    !root->d_sb ||
-	    !root->d_sb->s_op ||
 	    !root->d_sb->s_op->statfs ||
 	    !root->d_sb->s_op->sync_fs)
 		goto error_unsupported;
@@ -220,7 +218,8 @@ static int cachefiles_daemon_add_cache(struct cachefiles_cache *cache)
 			   "%s",
 			   fsdef->dentry->d_sb->s_id);
 
-	fscache_object_init(&fsdef->fscache, NULL, &cache->cache);
+	fscache_object_init(&fsdef->fscache, &fscache_fsdef_index,
+			    &cache->cache);
 
 	ret = fscache_add_cache(&cache->cache, &fsdef->fscache, cache->tag);
 	if (ret < 0)

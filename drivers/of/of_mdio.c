@@ -15,6 +15,7 @@
 #include <linux/err.h>
 #include <linux/phy.h>
 #include <linux/of.h>
+#include <linux/of_irq.h>
 #include <linux/of_mdio.h>
 #include <linux/module.h>
 
@@ -33,7 +34,10 @@ int of_mdiobus_register(struct mii_bus *mdio, struct device_node *np)
 {
 	struct phy_device *phy;
 	struct device_node *child;
-	int rc, i;
+	const __be32 *paddr;
+	u32 addr;
+	bool is_c45, scanphys = false;
+	int rc, i, len;
 
 	/* Mask out all PHYs from auto probing.  Instead the PHYs listed in
 	 * the device tree are populated after the bus has been registered */
@@ -44,42 +48,52 @@ int of_mdiobus_register(struct mii_bus *mdio, struct device_node *np)
 		for (i=0; i<PHY_MAX_ADDR; i++)
 			mdio->irq[i] = PHY_POLL;
 
+	mdio->dev.of_node = np;
+
 	/* Register the MDIO bus */
 	rc = mdiobus_register(mdio);
 	if (rc)
 		return rc;
 
 	/* Loop over the child nodes and register a phy_device for each one */
-	for_each_child_of_node(np, child) {
-		const u32 *addr;
-		int len;
-
+	for_each_available_child_of_node(np, child) {
 		/* A PHY must have a reg property in the range [0-31] */
-		addr = of_get_property(child, "reg", &len);
-		if (!addr || len < sizeof(*addr) || *addr >= 32 || *addr < 0) {
+		paddr = of_get_property(child, "reg", &len);
+		if (!paddr || len < sizeof(*paddr)) {
+			scanphys = true;
 			dev_err(&mdio->dev, "%s has invalid PHY address\n",
 				child->full_name);
 			continue;
 		}
 
-		if (mdio->irq) {
-			mdio->irq[*addr] = irq_of_parse_and_map(child, 0);
-			if (!mdio->irq[*addr])
-				mdio->irq[*addr] = PHY_POLL;
-		}
-
-		phy = get_phy_device(mdio, *addr);
-		if (!phy) {
-			dev_err(&mdio->dev, "error probing PHY at address %i\n",
-				*addr);
+		addr = be32_to_cpup(paddr);
+		if (addr >= 32) {
+			dev_err(&mdio->dev, "%s PHY address %i is too large\n",
+				child->full_name, addr);
 			continue;
 		}
-		phy_scan_fixups(phy);
+
+		if (mdio->irq) {
+			mdio->irq[addr] = irq_of_parse_and_map(child, 0);
+			if (!mdio->irq[addr])
+				mdio->irq[addr] = PHY_POLL;
+		}
+
+		is_c45 = of_device_is_compatible(child,
+						 "ethernet-phy-ieee802.3-c45");
+		phy = get_phy_device(mdio, addr, is_c45);
+
+		if (!phy || IS_ERR(phy)) {
+			dev_err(&mdio->dev,
+				"cannot get PHY at address %i\n",
+				addr);
+			continue;
+		}
 
 		/* Associate the OF node with the device structure so it
 		 * can be looked up later */
 		of_node_get(child);
-		dev_archdata_set_node(&phy->dev.archdata, child);
+		phy->mdio_dev.of_node = child;
 
 		/* All data is now stored in the phy struct; register it */
 		rc = phy_device_register(phy);
@@ -90,7 +104,60 @@ int of_mdiobus_register(struct mii_bus *mdio, struct device_node *np)
 		}
 
 		dev_dbg(&mdio->dev, "registered phy %s at address %i\n",
-			child->name, *addr);
+			child->name, addr);
+	}
+
+	if (!scanphys)
+		return 0;
+
+	/* auto scan for PHYs with empty reg property */
+	for_each_available_child_of_node(np, child) {
+		/* Skip PHYs with reg property set */
+		paddr = of_get_property(child, "reg", &len);
+		if (paddr)
+			continue;
+
+		is_c45 = of_device_is_compatible(child,
+						 "ethernet-phy-ieee802.3-c45");
+
+		for (addr = 0; addr < PHY_MAX_ADDR; addr++) {
+			/* skip already registered PHYs */
+			if (mdiobus_is_registered_device(mdio, addr))
+				continue;
+
+			/* be noisy to encourage people to set reg property */
+			dev_info(&mdio->dev, "scan phy %s at address %i\n",
+				 child->name, addr);
+
+			phy = get_phy_device(mdio, addr, is_c45);
+			if (!phy || IS_ERR(phy))
+				continue;
+
+			if (mdio->irq) {
+				mdio->irq[addr] =
+					irq_of_parse_and_map(child, 0);
+				if (!mdio->irq[addr])
+					mdio->irq[addr] = PHY_POLL;
+			}
+
+			/* Associate the OF node with the device structure so it
+			 * can be looked up later */
+			of_node_get(child);
+			phy->mdio_dev.of_node = child;
+
+			/* All data is now stored in the phy struct;
+			 * register it */
+			rc = phy_device_register(phy);
+			if (rc) {
+				phy_device_free(phy);
+				of_node_put(child);
+				continue;
+			}
+
+			dev_info(&mdio->dev, "registered phy %s at address %i\n",
+				 child->name, addr);
+			break;
+		}
 	}
 
 	return 0;
@@ -100,14 +167,15 @@ EXPORT_SYMBOL(of_mdiobus_register);
 /* Helper function for of_phy_find_device */
 static int of_phy_match(struct device *dev, void *phy_np)
 {
-	return dev_archdata_get_node(&dev->archdata) == phy_np;
+	return dev->of_node == phy_np;
 }
 
 /**
  * of_phy_find_device - Give a PHY node, find the phy_device
  * @phy_np: Pointer to the phy's device tree node
  *
- * Returns a pointer to the phy_device.
+ * If successful, returns a pointer to the phy_device with the embedded
+ * struct device refcount incremented by one, or NULL on failure.
  */
 struct phy_device *of_phy_find_device(struct device_node *phy_np)
 {
@@ -127,7 +195,9 @@ EXPORT_SYMBOL(of_phy_find_device);
  * @hndlr: Link state callback for the network device
  * @iface: PHY data interface type
  *
- * Returns a pointer to the phy_device if successfull.  NULL otherwise
+ * If successful, returns a pointer to the phy_device with the embedded
+ * struct device refcount incremented by one, or NULL on failure. The
+ * refcount must be dropped by calling phy_disconnect() or phy_detach().
  */
 struct phy_device *of_phy_connect(struct net_device *dev,
 				  struct device_node *phy_np,
@@ -135,11 +205,17 @@ struct phy_device *of_phy_connect(struct net_device *dev,
 				  phy_interface_t iface)
 {
 	struct phy_device *phy = of_phy_find_device(phy_np);
+	int ret;
 
 	if (!phy)
 		return NULL;
 
-	return phy_connect_direct(dev, phy, hndlr, flags, iface) ? NULL : phy;
+	ret = phy_connect_direct(dev, phy, hndlr, iface);
+
+	/* refcount is held by phy_connect_direct() on success */
+	put_device(&phy->mdio_dev);
+
+	return ret ? NULL : phy;
 }
 EXPORT_SYMBOL(of_phy_connect);
 
@@ -160,13 +236,13 @@ struct phy_device *of_phy_connect_fixed_link(struct net_device *dev,
 	struct device_node *net_np;
 	char bus_id[MII_BUS_ID_SIZE + 3];
 	struct phy_device *phy;
-	const u32 *phy_id;
+	const __be32 *phy_id;
 	int sz;
 
 	if (!dev->dev.parent)
 		return NULL;
 
-	net_np = dev_archdata_get_node(&dev->dev.parent->archdata);
+	net_np = dev->dev.parent->of_node;
 	if (!net_np)
 		return NULL;
 
@@ -174,9 +250,9 @@ struct phy_device *of_phy_connect_fixed_link(struct net_device *dev,
 	if (!phy_id || sz < sizeof(*phy_id))
 		return NULL;
 
-	sprintf(bus_id, PHY_ID_FMT, "0", phy_id[0]);
+	sprintf(bus_id, PHY_ID_FMT, "fixed-0", be32_to_cpu(phy_id[0]));
 
-	phy = phy_connect(dev, bus_id, hndlr, 0, iface);
+	phy = phy_connect(dev, bus_id, hndlr, iface);
 	return IS_ERR(phy) ? NULL : phy;
 }
 EXPORT_SYMBOL(of_phy_connect_fixed_link);

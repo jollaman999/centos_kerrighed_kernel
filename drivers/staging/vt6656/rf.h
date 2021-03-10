@@ -30,10 +30,8 @@
 #ifndef __RF_H__
 #define __RF_H__
 
-#include "ttype.h"
 #include "device.h"
 
-/*---------------------  Export Definitions -------------------------*/
 //
 // Baseband RF pair definition in eeprom (Bits 6..0)
 //
@@ -55,46 +53,12 @@
 #define RF_EMU              0x80
 #define RF_MASK             0x7F
 
+extern const u8 RFaby11aChannelIndex[200];
 
+int IFRFbWriteEmbedded(struct vnt_private *, u32 dwData);
+int RFbSetPower(struct vnt_private *, u32 uRATE, u32 uCH);
+int RFbRawSetPower(struct vnt_private *, u8 byPwr, u32 uRATE);
+void RFvRSSITodBm(struct vnt_private *, u8 byCurrRSSI, long *pldBm);
+void RFbRFTableDownload(struct vnt_private *pDevice);
 
-/*---------------------  Export Classes  ----------------------------*/
-
-/*---------------------  Export Variables  --------------------------*/
-extern const BYTE RFaby11aChannelIndex[200];
-/*---------------------  Export Functions  --------------------------*/
-
-BOOL IFRFbWriteEmbeded(PSDevice pDevice, DWORD dwData);
-BOOL RFbSetPower (
-    IN  PSDevice  pDevice,
-    IN  UINT      uRATE,
-    IN  UINT      uCH
-    );
-
-BOOL RFbRawSetPower(
-    IN  PSDevice  pDevice,
-    IN  BYTE      byPwr,
-    IN  UINT      uRATE
-    );
-
-VOID
-RFvRSSITodBm (
-    IN  PSDevice pDevice,
-    IN  BYTE     byCurrRSSI,
-    long *    pldBm
-    );
-
-VOID
-RFbRFTableDownload (
-    IN  PSDevice pDevice
-    );
-
-BOOL s_bVT3226D0_11bLoCurrentAdjust(
-    IN  PSDevice    pDevice,
-    IN  BYTE        byChannel,
-    IN  BOOL        b11bMode
-    );
-
-#endif // __RF_H__
-
-
-
+#endif /* __RF_H__ */

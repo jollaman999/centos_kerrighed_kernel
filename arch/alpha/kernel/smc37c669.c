@@ -3,7 +3,6 @@
  */
 #include <linux/kernel.h>
 
-#include <linux/slab.h>
 #include <linux/mm.h>
 #include <linux/init.h>
 #include <linux/delay.h>
@@ -934,18 +933,6 @@ void SMC37c669_display_device_info(
  *
  *--
  */
-#if 0
-/* $INCLUDE_OPTIONS$ */
-#include    "cp$inc:platform_io.h"
-/* $INCLUDE_OPTIONS_END$ */
-#include    "cp$src:common.h"
-#include    "cp$inc:prototypes.h"
-#include    "cp$src:kernel_def.h"
-#include    "cp$src:msg_def.h"
-#include    "cp$src:smcc669_def.h"
-/* Platform-specific includes */
-#include    "cp$src:platform.h"
-#endif
 
 #ifndef TRUE
 #define TRUE 1

@@ -1,12 +1,13 @@
 #ifndef _LINUX_SIGNAL_H
 #define _LINUX_SIGNAL_H
 
-#include <asm/signal.h>
-#include <asm/siginfo.h>
-
-#ifdef __KERNEL__
 #include <linux/list.h>
+#include <uapi/linux/signal.h>
 
+struct task_struct;
+
+/* for sysctl */
+extern int print_fatal_signals;
 /*
  * Real Time signals may be queued.
  */
@@ -86,6 +87,23 @@ static inline int sigisemptyset(sigset_t *set)
 	}
 }
 
+static inline int sigequalsets(const sigset_t *set1, const sigset_t *set2)
+{
+	switch (_NSIG_WORDS) {
+	case 4:
+		return	(set1->sig[3] == set2->sig[3]) &&
+			(set1->sig[2] == set2->sig[2]) &&
+			(set1->sig[1] == set2->sig[1]) &&
+			(set1->sig[0] == set2->sig[0]);
+	case 2:
+		return	(set1->sig[1] == set2->sig[1]) &&
+			(set1->sig[0] == set2->sig[0]);
+	case 1:
+		return	set1->sig[0] == set2->sig[0];
+	}
+	return 0;
+}
+
 #define sigmask(sig)	(1UL << ((sig) - 1))
 
 #ifndef __HAVE_ARCH_SIG_SETOPS
@@ -121,13 +139,13 @@ _SIG_SET_BINOP(sigorsets, _sig_or)
 #define _sig_and(x,y)	((x) & (y))
 _SIG_SET_BINOP(sigandsets, _sig_and)
 
-#define _sig_nand(x,y)	((x) & ~(y))
-_SIG_SET_BINOP(signandsets, _sig_nand)
+#define _sig_andn(x,y)	((x) & ~(y))
+_SIG_SET_BINOP(sigandnsets, _sig_andn)
 
 #undef _SIG_SET_BINOP
 #undef _sig_or
 #undef _sig_and
-#undef _sig_nand
+#undef _sig_andn
 
 #define _SIG_SET_OP(name, op)						\
 static inline void name(sigset_t *set)					\
@@ -232,20 +250,74 @@ static inline int valid_signal(unsigned long sig)
 	return sig <= _NSIG ? 1 : 0;
 }
 
+struct timespec;
+struct pt_regs;
+
 extern int next_signal(struct sigpending *pending, sigset_t *mask);
 extern int do_send_sig_info(int sig, struct siginfo *info,
 				struct task_struct *p, bool group);
 extern int group_send_sig_info(int sig, struct siginfo *info, struct task_struct *p);
 extern int __group_send_sig_info(int, struct siginfo *, struct task_struct *);
-extern long do_rt_tgsigqueueinfo(pid_t tgid, pid_t pid, int sig,
-				 siginfo_t *info);
-extern long do_sigpending(void __user *, unsigned long);
+extern int do_sigtimedwait(const sigset_t *, siginfo_t *,
+				const struct timespec *);
 extern int sigprocmask(int, sigset_t *, sigset_t *);
+extern void set_current_blocked(sigset_t *);
+extern void __set_current_blocked(const sigset_t *);
 extern int show_unhandled_signals;
+extern int sigsuspend(sigset_t *);
 
-struct pt_regs;
+struct sigaction {
+#ifndef __ARCH_HAS_IRIX_SIGACTION
+	__sighandler_t	sa_handler;
+	unsigned long	sa_flags;
+#else
+	unsigned int	sa_flags;
+	__sighandler_t	sa_handler;
+#endif
+#ifdef __ARCH_HAS_SA_RESTORER
+	__sigrestore_t sa_restorer;
+#endif
+	sigset_t	sa_mask;	/* mask last for extensibility */
+};
+
+struct k_sigaction {
+	struct sigaction sa;
+#ifdef __ARCH_HAS_KA_RESTORER
+	__sigrestore_t ka_restorer;
+#endif
+};
+ 
+#ifdef CONFIG_OLD_SIGACTION
+struct old_sigaction {
+	__sighandler_t sa_handler;
+	old_sigset_t sa_mask;
+	unsigned long sa_flags;
+	__sigrestore_t sa_restorer;
+};
+#endif
+
+struct ksignal {
+	struct k_sigaction ka;
+	siginfo_t info;
+	int sig;
+};
+
 extern int get_signal_to_deliver(siginfo_t *info, struct k_sigaction *return_ka, struct pt_regs *regs, void *cookie);
+extern void signal_setup_done(int failed, struct ksignal *ksig, int stepping);
+extern void signal_delivered(int sig, siginfo_t *info, struct k_sigaction *ka, struct pt_regs *regs, int stepping);
 extern void exit_signals(struct task_struct *tsk);
+
+/*
+ * Eventually that'll replace get_signal_to_deliver(); macro for now,
+ * to avoid nastiness with include order.
+ */
+#define get_signal(ksig)					\
+({								\
+	struct ksignal *p = (ksig);				\
+	p->sig = get_signal_to_deliver(&p->info, &p->ka,	\
+					signal_pt_regs(), NULL);\
+	p->sig > 0;						\
+})
 
 extern struct kmem_cache *sighand_cachep;
 
@@ -370,12 +442,26 @@ int unhandled_signal(struct task_struct *tsk, int sig);
 	(((t)->sighand->action[(signr)-1].sa.sa_handler != SIG_DFL) &&	\
 	 ((t)->sighand->action[(signr)-1].sa.sa_handler != SIG_IGN))
 
-#define sig_fatal_nospec(t, signr, sig_idx) \
+#define sig_fatal(t, signr) \
 	(!siginmask(signr, SIG_KERNEL_IGNORE_MASK|SIG_KERNEL_STOP_MASK) && \
-	 (t)->sighand->action[sig_idx].sa.sa_handler == SIG_DFL)
+	 (t)->sighand->action[(signr)-1].sa.sa_handler == SIG_DFL)
 
 void signals_init(void);
 
-#endif /* __KERNEL__ */
+int restore_altstack(const stack_t __user *);
+int __save_altstack(stack_t __user *, unsigned long);
+
+#define save_altstack_ex(uss, sp) do { \
+	stack_t __user *__uss = uss; \
+	struct task_struct *t = current; \
+	put_user_ex((void __user *)t->sas_ss_sp, &__uss->ss_sp); \
+	put_user_ex(sas_ss_flags(sp), &__uss->ss_flags); \
+	put_user_ex(t->sas_ss_size, &__uss->ss_size); \
+} while (0);
+
+#ifdef CONFIG_PROC_FS
+struct seq_file;
+extern void render_sigset_t(struct seq_file *, const char *, sigset_t *);
+#endif
 
 #endif /* _LINUX_SIGNAL_H */

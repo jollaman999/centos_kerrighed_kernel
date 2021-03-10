@@ -30,80 +30,50 @@
  *      CONTROLnsRequestIn - Read variable length bytes from MEM/BB/MAC/EEPROM
  *      ControlvWriteByte - Write one byte to MEM/BB/MAC/EEPROM
  *      ControlvReadByte - Read one byte from MEM/BB/MAC/EEPROM
- *      ControlvMaskByte - Read one byte from MEM/BB/MAC/EEPROM and clear/set some bits in the same address
+ *      ControlvMaskByte - Read one byte from MEM/BB/MAC/EEPROM and clear/set
+ *				some bits in the same address
  *
  * Revision History:
  *      04-05-2004 Jerry Chen:  Initial release
- *      11-24-2004 Warren Hsu: Add ControlvWriteByte,ControlvReadByte,ControlvMaskByte
+ *      11-24-2004 Warren Hsu: Add ControlvWriteByte, ControlvReadByte,
+ *					ControlvMaskByte
  *
  */
 
 #include "control.h"
 #include "rndis.h"
 
-/*---------------------  Static Definitions -------------------------*/
-//static int          msglevel                =MSG_LEVEL_INFO;
-//static int          msglevel                =MSG_LEVEL_DEBUG;
-/*---------------------  Static Classes  ----------------------------*/
+/* static int          msglevel                =MSG_LEVEL_INFO;  */
+/* static int          msglevel                =MSG_LEVEL_DEBUG; */
 
-/*---------------------  Static Variables  --------------------------*/
-
-/*---------------------  Static Functions  --------------------------*/
-
-/*---------------------  Export Variables  --------------------------*/
-
-/*---------------------  Export Functions  --------------------------*/
-
-
-void ControlvWriteByte(PSDevice pDevice, BYTE byRegType, BYTE byRegOfs, BYTE byData)
+void ControlvWriteByte(struct vnt_private *pDevice, u8 reg, u8 reg_off,
+			u8 data)
 {
-BYTE            byData1;
 
-    byData1 = byData;
+	CONTROLnsRequestOut(pDevice, MESSAGE_TYPE_WRITE, reg_off, reg,
+		sizeof(u8), &data);
 
-    CONTROLnsRequestOut(pDevice,
-                        MESSAGE_TYPE_WRITE,
-                        byRegOfs,
-                        byRegType,
-                        1,
-                        &byData1
-                        );
-
+	return;
 }
 
-
-void ControlvReadByte(PSDevice pDevice, BYTE byRegType, BYTE byRegOfs, PBYTE pbyData)
+void ControlvReadByte(struct vnt_private *pDevice, u8 reg, u8 reg_off,
+			u8 *data)
 {
-NTSTATUS        ntStatus;
-BYTE            byData1;
-
-
-    ntStatus = CONTROLnsRequestIn(pDevice,
-                                    MESSAGE_TYPE_READ,
-                                    byRegOfs,
-                                    byRegType,
-                                    1,
-                                    &byData1);
-
-    *pbyData = byData1;
-
+	CONTROLnsRequestIn(pDevice, MESSAGE_TYPE_READ,
+			reg_off, reg, sizeof(u8), data);
+	return;
 }
 
-
-
-void ControlvMaskByte(PSDevice pDevice, BYTE byRegType, BYTE byRegOfs, BYTE byMask, BYTE byData)
+void ControlvMaskByte(struct vnt_private *pDevice, u8 reg_type, u8 reg_off,
+			u8 reg_mask, u8 data)
 {
-BYTE            pbyData[2];
+	u8 reg_data[2];
 
-    pbyData[0] = byData;
-    pbyData[1] = byMask;
+	reg_data[0] = data;
+	reg_data[1] = reg_mask;
 
-    CONTROLnsRequestOut(pDevice,
-                        MESSAGE_TYPE_WRITE_MASK,
-                        byRegOfs,
-                        byRegType,
-                        2,
-                        pbyData
-                        );
+	CONTROLnsRequestOut(pDevice, MESSAGE_TYPE_WRITE_MASK, reg_off,
+			reg_type, ARRAY_SIZE(reg_data), reg_data);
 
+	return;
 }

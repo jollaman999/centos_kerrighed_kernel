@@ -10,26 +10,32 @@
 #include <linux/vmalloc.h>
 #include <linux/delay.h>
 
+static void qla2xxx_free_fcport_work(struct work_struct *work)
+{
+	struct fc_port *fcport = container_of(work, typeof(*fcport),
+	    free_work);
+
+	qla2x00_free_fcport(fcport);
+}
+
 /* BSG support for ELS/CT pass through */
 void
-qla2x00_bsg_job_done(void *data, void *ptr, int res)
+qla2x00_bsg_job_done(void *ptr, int res)
 {
-	srb_t *sp = (srb_t*)ptr;
-	struct scsi_qla_host *vha = (scsi_qla_host_t *)data;
+	srb_t *sp = ptr;
 	struct fc_bsg_job *bsg_job = sp->u.bsg_job;
 
 	bsg_job->reply->result = res;
 	bsg_job->job_done(bsg_job);
-	sp->free(vha, sp);
+	sp->free(sp);
 }
 
 void
-qla2x00_bsg_sp_free(void *data, void *ptr)
+qla2x00_bsg_sp_free(void *ptr)
 {
-	srb_t *sp = (srb_t *)ptr;
-	struct scsi_qla_host *vha = sp->fcport->vha;
+	srb_t *sp = ptr;
+	struct qla_hw_data *ha = sp->vha->hw;
 	struct fc_bsg_job *bsg_job = sp->u.bsg_job;
-	struct qla_hw_data *ha = vha->hw;
 	struct qla_mt_iocb_rqst_fx00 *piocb_rqst;
 
 	if (sp->type == SRB_FXIOCB_BCMD) {
@@ -55,9 +61,12 @@ qla2x00_bsg_sp_free(void *data, void *ptr)
 
 	if (sp->type == SRB_CT_CMD ||
 	    sp->type == SRB_FXIOCB_BCMD ||
-	    sp->type == SRB_ELS_CMD_HST)
-		kfree(sp->fcport);
-	qla2x00_rel_sp(vha, sp);
+	    sp->type == SRB_ELS_CMD_HST) {
+		INIT_WORK(&sp->fcport->free_work, qla2xxx_free_fcport_work);
+		queue_work(ha->wq, &sp->fcport->free_work);
+	}
+
+	qla2x00_rel_sp(sp);
 }
 
 int
@@ -82,8 +91,7 @@ qla24xx_fcp_prio_cfg_valid(scsi_qla_host_t *vha,
 		return 0;
 	}
 
-	if (bcode[0] != 'H' || bcode[1] != 'Q' || bcode[2] != 'O' ||
-			bcode[3] != 'S') {
+	if (memcmp(bcode, "HQOS", 4)) {
 		/* Invalid FCP priority data header*/
 		ql_dbg(ql_dbg_user, vha, 0x7052,
 		    "Invalid FCP Priority data header. bcode=0x%x.\n",
@@ -125,7 +133,7 @@ qla24xx_proc_fcp_prio_cfg_cmd(struct fc_bsg_job *bsg_job)
 	uint32_t len;
 	uint32_t oper;
 
-	if (!(IS_QLA24XX_TYPE(ha) || IS_QLA25XX(ha) || IS_QLA82XX(ha))) {
+	if (!(IS_QLA24XX_TYPE(ha) || IS_QLA25XX(ha) || IS_P3P_TYPE(ha))) {
 		ret = -EINVAL;
 		goto exit_fcp_prio_cfg;
 	}
@@ -287,7 +295,7 @@ qla2x00_process_els(struct fc_bsg_job *bsg_job)
 	if (bsg_job->request_payload.sg_cnt > 1 ||
 		bsg_job->reply_payload.sg_cnt > 1) {
 		ql_dbg(ql_dbg_user, vha, 0x7002,
-		    "Multiple SG's are not suppored for ELS requests, "
+		    "Multiple SG's are not supported for ELS requests, "
 		    "request_sg_cnt=%x reply_sg_cnt=%x.\n",
 		    bsg_job->request_payload.sg_cnt,
 		    bsg_job->reply_payload.sg_cnt);
@@ -336,19 +344,23 @@ qla2x00_process_els(struct fc_bsg_job *bsg_job)
 		dma_map_sg(&ha->pdev->dev, bsg_job->request_payload.sg_list,
 		bsg_job->request_payload.sg_cnt, DMA_TO_DEVICE);
 	if (!req_sg_cnt) {
+		dma_unmap_sg(&ha->pdev->dev, bsg_job->request_payload.sg_list,
+		    bsg_job->request_payload.sg_cnt, DMA_TO_DEVICE);
 		rval = -ENOMEM;
 		goto done_free_fcport;
 	}
 
 	rsp_sg_cnt = dma_map_sg(&ha->pdev->dev, bsg_job->reply_payload.sg_list,
-	    bsg_job->reply_payload.sg_cnt, DMA_FROM_DEVICE);
-	if (!rsp_sg_cnt) {
+		bsg_job->reply_payload.sg_cnt, DMA_FROM_DEVICE);
+        if (!rsp_sg_cnt) {
+		dma_unmap_sg(&ha->pdev->dev, bsg_job->reply_payload.sg_list,
+		    bsg_job->reply_payload.sg_cnt, DMA_FROM_DEVICE);
 		rval = -ENOMEM;
 		goto done_free_fcport;
 	}
 
 	if ((req_sg_cnt !=  bsg_job->request_payload.sg_cnt) ||
-	    (rsp_sg_cnt != bsg_job->reply_payload.sg_cnt)) {
+		(rsp_sg_cnt != bsg_job->reply_payload.sg_cnt)) {
 		ql_log(ql_log_warn, vha, 0x7008,
 		    "dma mapping resulted in different sg counts, "
 		    "request_sg_cnt: %x dma_request_sg_cnt:%x reply_sg_cnt:%x "
@@ -385,7 +397,7 @@ qla2x00_process_els(struct fc_bsg_job *bsg_job)
 	if (rval != QLA_SUCCESS) {
 		ql_log(ql_log_warn, vha, 0x700e,
 		    "qla2x00_start_sp failed = %d\n", rval);
-		qla2x00_rel_sp(vha, sp);
+		qla2x00_rel_sp(sp);
 		rval = -EIO;
 		goto done_unmap_sg;
 	}
@@ -400,12 +412,12 @@ done_unmap_sg:
 
 done_free_fcport:
 	if (bsg_job->request->msgcode == FC_BSG_RPT_ELS)
-		kfree(fcport);
+		qla2x00_free_fcport(fcport);
 done:
 	return rval;
 }
 
-inline uint16_t
+static inline uint16_t
 qla24xx_calc_ct_iocbs(uint16_t dsds)
 {
 	uint16_t iocbs;
@@ -434,7 +446,7 @@ qla2x00_process_ct(struct fc_bsg_job *bsg_job)
 
 	req_sg_cnt =
 		dma_map_sg(&ha->pdev->dev, bsg_job->request_payload.sg_list,
-		bsg_job->request_payload.sg_cnt, DMA_TO_DEVICE);
+			bsg_job->request_payload.sg_cnt, DMA_TO_DEVICE);
 	if (!req_sg_cnt) {
 		ql_log(ql_log_warn, vha, 0x700f,
 		    "dma_map_sg return %d for request\n", req_sg_cnt);
@@ -532,14 +544,14 @@ qla2x00_process_ct(struct fc_bsg_job *bsg_job)
 	if (rval != QLA_SUCCESS) {
 		ql_log(ql_log_warn, vha, 0x7017,
 		    "qla2x00_start_sp failed=%d.\n", rval);
-		qla2x00_rel_sp(vha, sp);
+		qla2x00_rel_sp(sp);
 		rval = -EIO;
 		goto done_free_fcport;
 	}
 	return rval;
 
 done_free_fcport:
-	kfree(fcport);
+	qla2x00_free_fcport(fcport);
 done_unmap_sg:
 	dma_unmap_sg(&ha->pdev->dev, bsg_job->request_payload.sg_list,
 		bsg_job->request_payload.sg_cnt, DMA_TO_DEVICE);
@@ -559,7 +571,7 @@ qla81xx_reset_loopback_mode(scsi_qla_host_t *vha, uint16_t *config,
 	uint16_t new_config[4];
 	struct qla_hw_data *ha = vha->hw;
 
-	if (!IS_QLA81XX(ha) && !IS_QLA8031(ha))
+	if (!IS_QLA81XX(ha) && !IS_QLA8031(ha) && !IS_QLA8044(ha))
 		goto done_reset_internal;
 
 	memset(new_config, 0 , sizeof(new_config));
@@ -623,14 +635,14 @@ done_reset_internal:
  */
 static inline int
 qla81xx_set_loopback_mode(scsi_qla_host_t *vha, uint16_t *config,
-    uint16_t *new_config, uint16_t mode)
+	uint16_t *new_config, uint16_t mode)
 {
 	int ret = 0;
 	int rval = 0;
 	unsigned long rem_tmo = 0, current_tmo = 0;
 	struct qla_hw_data *ha = vha->hw;
 
-	if (!IS_QLA81XX(ha) && !IS_QLA8031(ha))
+	if (!IS_QLA81XX(ha) && !IS_QLA8031(ha) && !IS_QLA8044(ha))
 		goto done_set_internal;
 
 	if (mode == INTERNAL_LOOPBACK)
@@ -679,7 +691,7 @@ qla81xx_set_loopback_mode(scsi_qla_host_t *vha, uint16_t *config,
 		}
 		rval = -EINVAL;
 	} else {
-                if (ha->flags.idc_compl_status) {
+		if (ha->flags.idc_compl_status) {
 			ql_dbg(ql_dbg_user, vha, 0x70c3,
 			    "Bad status in IDC Completion AEN\n");
 			rval = -EINVAL;
@@ -722,8 +734,8 @@ qla2x00_process_loopback(struct fc_bsg_job *bsg_job)
 	}
 
 	elreq.req_sg_cnt = dma_map_sg(&ha->pdev->dev,
-		bsg_job->request_payload.sg_list,
-		bsg_job->request_payload.sg_cnt, DMA_TO_DEVICE);
+		bsg_job->request_payload.sg_list, bsg_job->request_payload.sg_cnt,
+		DMA_TO_DEVICE);
 
 	if (!elreq.req_sg_cnt) {
 		ql_log(ql_log_warn, vha, 0x701a,
@@ -742,7 +754,7 @@ qla2x00_process_loopback(struct fc_bsg_job *bsg_job)
 		goto done_unmap_req_sg;
 	}
 
-	if ((elreq.req_sg_cnt != bsg_job->request_payload.sg_cnt) ||
+	if ((elreq.req_sg_cnt !=  bsg_job->request_payload.sg_cnt) ||
 		(elreq.rsp_sg_cnt != bsg_job->reply_payload.sg_cnt)) {
 		ql_log(ql_log_warn, vha, 0x701c,
 		    "dma mapping resulted in different sg counts, "
@@ -750,7 +762,6 @@ qla2x00_process_loopback(struct fc_bsg_job *bsg_job)
 		    "reply_sg_cnt: %x dma_reply_sg_cnt: %x.\n",
 		    bsg_job->request_payload.sg_cnt, elreq.req_sg_cnt,
 		    bsg_job->reply_payload.sg_cnt, elreq.rsp_sg_cnt);
-
 		rval = -EAGAIN;
 		goto done_unmap_sg;
 	}
@@ -787,17 +798,17 @@ qla2x00_process_loopback(struct fc_bsg_job *bsg_job)
 
 	if (atomic_read(&vha->loop_state) == LOOP_READY &&
 	    (ha->current_topology == ISP_CFG_F ||
-	    ((IS_QLA81XX(ha) || IS_QLA8031(ha)) &&
+	    ((IS_QLA81XX(ha) || IS_QLA8031(ha) || IS_QLA8044(ha)) &&
 	    le32_to_cpu(*(uint32_t *)req_data) == ELS_OPCODE_BYTE
 	    && req_data_len == MAX_ELS_FRAME_PAYLOAD)) &&
-	    elreq.options == EXTERNAL_LOOPBACK) {
+		elreq.options == EXTERNAL_LOOPBACK) {
 		type = "FC_BSG_HST_VENDOR_ECHO_DIAG";
 		ql_dbg(ql_dbg_user, vha, 0x701e,
 		    "BSG request type: %s.\n", type);
 		command_sent = INT_DEF_LB_ECHO_CMD;
 		rval = qla2x00_echo_test(vha, &elreq, response);
-       } else {
-		if (IS_QLA81XX(ha) || IS_QLA8031(ha)) {
+	} else {
+		if (IS_QLA81XX(ha) || IS_QLA8031(ha) || IS_QLA8044(ha)) {
 			memset(config, 0, sizeof(config));
 			memset(new_config, 0, sizeof(new_config));
 
@@ -820,7 +831,7 @@ qla2x00_process_loopback(struct fc_bsg_job *bsg_job)
 			    "elreq.options=%04x\n", elreq.options);
 
 			if (elreq.options == EXTERNAL_LOOPBACK)
-				if (IS_QLA8031(ha))
+				if (IS_QLA8031(ha) || IS_QLA8044(ha))
 					rval = qla81xx_set_loopback_mode(vha,
 					    config, new_config, elreq.options);
 				else
@@ -1020,7 +1031,7 @@ qla84xx_updatefw(struct fc_bsg_job *bsg_job)
 	sg_copy_to_buffer(bsg_job->request_payload.sg_list,
 		bsg_job->request_payload.sg_cnt, fw_buf, data_len);
 
-	mn = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &mn_dma);
+	mn = dma_pool_zalloc(ha->s_dma_pool, GFP_KERNEL, &mn_dma);
 	if (!mn) {
 		ql_log(ql_log_warn, vha, 0x7036,
 		    "DMA alloc failed for fw buffer.\n");
@@ -1029,9 +1040,8 @@ qla84xx_updatefw(struct fc_bsg_job *bsg_job)
 	}
 
 	flag = bsg_job->request->rqst_data.h_vendor.vendor_cmd[1];
-	fw_ver = le32_to_cpu(*((uint32_t *)((uint32_t *)fw_buf + 2)));
+	fw_ver = get_unaligned_le32((uint32_t *)fw_buf + 2);
 
-	memset(mn, 0, sizeof(struct access_chip_84xx));
 	mn->entry_type = VERIFY_CHIP_IOCB_TYPE;
 	mn->entry_count = 1;
 
@@ -1098,14 +1108,13 @@ qla84xx_mgmt_cmd(struct fc_bsg_job *bsg_job)
 		return -EINVAL;
 	}
 
-	mn = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &mn_dma);
+	mn = dma_pool_zalloc(ha->s_dma_pool, GFP_KERNEL, &mn_dma);
 	if (!mn) {
 		ql_log(ql_log_warn, vha, 0x703c,
 		    "DMA alloc failed for fw buffer.\n");
 		return -ENOMEM;
 	}
 
-	memset(mn, 0, sizeof(struct access_chip_84xx));
 	mn->entry_type = ACCESS_CHIP_IOCB_TYPE;
 	mn->entry_count = 1;
 	ql84_mgmt = (void *)bsg_job->request + sizeof(struct fc_bsg_request);
@@ -1136,7 +1145,7 @@ qla84xx_mgmt_cmd(struct fc_bsg_job *bsg_job)
 		data_len = bsg_job->reply_payload.payload_len;
 
 		mgmt_b = dma_alloc_coherent(&ha->pdev->dev, data_len,
-			&mgmt_dma, GFP_KERNEL);
+		    &mgmt_dma, GFP_KERNEL);
 		if (!mgmt_b) {
 			ql_log(ql_log_warn, vha, 0x703f,
 			    "DMA alloc failed for mgmt_b.\n");
@@ -1335,7 +1344,7 @@ qla24xx_iidma(struct fc_bsg_job *bsg_job)
 
 	if (rval) {
 		ql_log(ql_log_warn, vha, 0x704c,
-		    "iIDMA cmd failed for %8phN -- "
+		    "iiDMA cmd failed for %8phN -- "
 		    "%04x %x %04x %04x.\n", fcport->port_name,
 		    rval, fcport->fp_speed, mb[0], mb[1]);
 		rval = (DID_ERROR << 16);
@@ -1391,7 +1400,8 @@ qla2x00_optrom_setup(struct fc_bsg_job *bsg_job, scsi_qla_host_t *vha,
 		    start == (ha->flt_region_fw * 4))
 			valid = 1;
 		else if (IS_QLA24XX_TYPE(ha) || IS_QLA25XX(ha) ||
-		    IS_CNA_CAPABLE(ha) || IS_QLA2031(ha) || IS_QLA27XX(ha))
+		    IS_CNA_CAPABLE(ha) || IS_QLA2031(ha) || IS_QLA27XX(ha) ||
+		    IS_QLA28XX(ha))
 			valid = 1;
 		if (!valid) {
 			ql_log(ql_log_warn, vha, 0x7058,
@@ -1413,7 +1423,7 @@ qla2x00_optrom_setup(struct fc_bsg_job *bsg_job, scsi_qla_host_t *vha,
 		ha->optrom_state = QLA_SREADING;
 	}
 
-	ha->optrom_buffer = vmalloc(ha->optrom_region_size);
+	ha->optrom_buffer = vzalloc(ha->optrom_region_size);
 	if (!ha->optrom_buffer) {
 		ql_log(ql_log_warn, vha, 0x7059,
 		    "Read: Unable to allocate memory for optrom retrieval "
@@ -1423,7 +1433,6 @@ qla2x00_optrom_setup(struct fc_bsg_job *bsg_job, scsi_qla_host_t *vha,
 		return -ENOMEM;
 	}
 
-	memset(ha->optrom_buffer, 0, ha->optrom_region_size);
 	return 0;
 }
 
@@ -1509,6 +1518,7 @@ qla2x00_update_fru_versions(struct fc_bsg_job *bsg_job)
 	uint32_t count;
 	dma_addr_t sfp_dma;
 	void *sfp = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &sfp_dma);
+
 	if (!sfp) {
 		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
 		    EXT_STATUS_NO_MEMORY;
@@ -1557,6 +1567,7 @@ qla2x00_read_fru_status(struct fc_bsg_job *bsg_job)
 	struct qla_status_reg *sr = (void *)bsg;
 	dma_addr_t sfp_dma;
 	uint8_t *sfp = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &sfp_dma);
+
 	if (!sfp) {
 		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
 		    EXT_STATUS_NO_MEMORY;
@@ -1605,6 +1616,7 @@ qla2x00_write_fru_status(struct fc_bsg_job *bsg_job)
 	struct qla_status_reg *sr = (void *)bsg;
 	dma_addr_t sfp_dma;
 	uint8_t *sfp = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &sfp_dma);
+
 	if (!sfp) {
 		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
 		    EXT_STATUS_NO_MEMORY;
@@ -1649,6 +1661,7 @@ qla2x00_write_i2c(struct fc_bsg_job *bsg_job)
 	struct qla_i2c_access *i2c = (void *)bsg;
 	dma_addr_t sfp_dma;
 	uint8_t *sfp = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &sfp_dma);
+
 	if (!sfp) {
 		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
 		    EXT_STATUS_NO_MEMORY;
@@ -1692,6 +1705,7 @@ qla2x00_read_i2c(struct fc_bsg_job *bsg_job)
 	struct qla_i2c_access *i2c = (void *)bsg;
 	dma_addr_t sfp_dma;
 	uint8_t *sfp = dma_pool_alloc(ha->s_dma_pool, GFP_KERNEL, &sfp_dma);
+
 	if (!sfp) {
 		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
 		    EXT_STATUS_NO_MEMORY;
@@ -1734,7 +1748,6 @@ qla24xx_process_bidir_cmd(struct fc_bsg_job *bsg_job)
 	struct Scsi_Host *host = bsg_job->shost;
 	scsi_qla_host_t *vha = shost_priv(host);
 	struct qla_hw_data *ha = vha->hw;
-	uint16_t thread_id;
 	uint32_t rval = EXT_STATUS_OK;
 	uint16_t req_sg_cnt = 0;
 	uint16_t rsp_sg_cnt = 0;
@@ -1786,12 +1799,10 @@ qla24xx_process_bidir_cmd(struct fc_bsg_job *bsg_job)
 	/* Check if operating mode is P2P */
 	if (ha->operating_mode != P2P) {
 		ql_log(ql_log_warn, vha, 0x70a4,
-		    "Host is operating mode is not P2p\n");
+		    "Host operating mode is not P2p\n");
 		rval = EXT_STATUS_INVALID_CFG;
 		goto done;
 	}
-
-	thread_id = bsg_job->request->rqst_data.h_vendor.vendor_cmd[1];
 
 	mutex_lock(&ha->selflogin_lock);
 	if (vha->self_login_loop_id == 0) {
@@ -1904,7 +1915,7 @@ done:
 	bsg_job->reply->reply_payload_rcv_len = 0;
 	bsg_job->reply->result = (DID_OK) << 16;
 	bsg_job->job_done(bsg_job);
-	/* Always retrun success, vendor rsp carries correct status */
+	/* Always return success, vendor rsp carries correct status */
 	return 0;
 }
 
@@ -1927,7 +1938,7 @@ qlafx00_mgmt_cmd(struct fc_bsg_job *bsg_job)
 
 	/* Dump the vendor information */
 	ql_dump_buffer(ql_dbg_user + ql_dbg_verbose , vha, 0x70cf,
-	    (uint8_t *)piocb_rqst, sizeof(struct qla_mt_iocb_rqst_fx00));
+	    piocb_rqst, sizeof(*piocb_rqst));
 
 	if (!vha->flags.online) {
 		ql_log(ql_log_warn, vha, 0x70d0,
@@ -2013,7 +2024,7 @@ qlafx00_mgmt_cmd(struct fc_bsg_job *bsg_job)
 	return rval;
 
 done_free_fcport:
-	kfree(fcport);
+	qla2x00_free_fcport(fcport);
 
 done_unmap_rsp_sg:
 	if (piocb_rqst->flags & SRB_FXDISC_RESP_DMA_VALID)
@@ -2055,9 +2066,9 @@ qla26xx_serdes_op(struct fc_bsg_job *bsg_job)
 		bsg_job->reply->reply_payload_rcv_len = sizeof(sr);
 		break;
 	default:
-		ql_log(ql_log_warn, vha, 0x708c,
+		ql_dbg(ql_dbg_user, vha, 0x708c,
 		    "Unknown serdes cmd %x.\n", sr.cmd);
-		rval = -EDOM;
+		rval = -EINVAL;
 		break;
 	}
 
@@ -2067,6 +2078,314 @@ qla26xx_serdes_op(struct fc_bsg_job *bsg_job)
 	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
 	bsg_job->reply->result = DID_OK << 16;
 	bsg_job->job_done(bsg_job);
+	return 0;
+}
+
+static int
+qla8044_serdes_op(struct fc_bsg_job *bsg_job)
+{
+	struct Scsi_Host *host = bsg_job->shost;
+	scsi_qla_host_t *vha = shost_priv(host);
+	int rval = 0;
+	struct qla_serdes_reg_ex sr;
+
+	memset(&sr, 0, sizeof(sr));
+
+	sg_copy_to_buffer(bsg_job->request_payload.sg_list,
+	    bsg_job->request_payload.sg_cnt, &sr, sizeof(sr));
+
+	switch (sr.cmd) {
+	case INT_SC_SERDES_WRITE_REG:
+		rval = qla8044_write_serdes_word(vha, sr.addr, sr.val);
+		bsg_job->reply->reply_payload_rcv_len = 0;
+		break;
+	case INT_SC_SERDES_READ_REG:
+		rval = qla8044_read_serdes_word(vha, sr.addr, &sr.val);
+		sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
+		    bsg_job->reply_payload.sg_cnt, &sr, sizeof(sr));
+		bsg_job->reply->reply_payload_rcv_len = sizeof(sr);
+		break;
+	default:
+		ql_dbg(ql_dbg_user, vha, 0x7020,
+		    "Unknown serdes cmd %x.\n", sr.cmd);
+		rval = -EINVAL;
+		break;
+	}
+
+	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
+	    rval ? EXT_STATUS_MAILBOX : 0;
+
+	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
+	bsg_job->reply->result = DID_OK << 16;
+	bsg_job->job_done(bsg_job);
+	return 0;
+}
+
+static int
+qla27xx_get_flash_upd_cap(struct fc_bsg_job *bsg_job)
+{
+	struct Scsi_Host *host = bsg_job->shost;
+	scsi_qla_host_t *vha = shost_priv(host);
+	struct qla_hw_data *ha = vha->hw;
+	struct qla_flash_update_caps cap;
+
+	if (!(IS_QLA27XX(ha)) && !IS_QLA28XX(ha))
+		return -EPERM;
+
+	memset(&cap, 0, sizeof(cap));
+	cap.capabilities = (uint64_t)ha->fw_attributes_ext[1] << 48 |
+			   (uint64_t)ha->fw_attributes_ext[0] << 32 |
+			   (uint64_t)ha->fw_attributes_h << 16 |
+			   (uint64_t)ha->fw_attributes;
+
+	sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
+	    bsg_job->reply_payload.sg_cnt, &cap, sizeof(cap));
+	bsg_job->reply->reply_payload_rcv_len = sizeof(cap);
+
+	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
+	    EXT_STATUS_OK;
+
+	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
+	bsg_job->reply->result = DID_OK << 16;
+	bsg_job->job_done(bsg_job);
+	return 0;
+}
+
+static int
+qla27xx_set_flash_upd_cap(struct fc_bsg_job *bsg_job)
+{
+	struct Scsi_Host *host = bsg_job->shost;
+	scsi_qla_host_t *vha = shost_priv(host);
+	struct qla_hw_data *ha = vha->hw;
+	uint64_t online_fw_attr = 0;
+	struct qla_flash_update_caps cap;
+
+	if (!IS_QLA27XX(ha) && !IS_QLA28XX(ha))
+		return -EPERM;
+
+	memset(&cap, 0, sizeof(cap));
+	sg_copy_to_buffer(bsg_job->request_payload.sg_list,
+	    bsg_job->request_payload.sg_cnt, &cap, sizeof(cap));
+
+	online_fw_attr = (uint64_t)ha->fw_attributes_ext[1] << 48 |
+			 (uint64_t)ha->fw_attributes_ext[0] << 32 |
+			 (uint64_t)ha->fw_attributes_h << 16 |
+			 (uint64_t)ha->fw_attributes;
+
+	if (online_fw_attr != cap.capabilities) {
+		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
+		    EXT_STATUS_INVALID_PARAM;
+		return -EINVAL;
+	}
+
+	if (cap.outage_duration < MAX_LOOP_TIMEOUT)  {
+		bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
+		    EXT_STATUS_INVALID_PARAM;
+		return -EINVAL;
+	}
+
+	bsg_job->reply->reply_payload_rcv_len = 0;
+
+	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
+	    EXT_STATUS_OK;
+
+	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
+	bsg_job->reply->result = DID_OK << 16;
+	bsg_job->job_done(bsg_job);
+	return 0;
+}
+
+static int
+qla27xx_get_bbcr_data(struct fc_bsg_job *bsg_job)
+{
+	struct Scsi_Host *host = bsg_job->shost;
+	scsi_qla_host_t *vha = shost_priv(host);
+	struct qla_hw_data *ha = vha->hw;
+	struct qla_bbcr_data bbcr;
+	uint16_t loop_id, topo, sw_cap;
+	uint8_t domain, area, al_pa, state;
+	int rval;
+
+	if (!IS_QLA27XX(ha) && !IS_QLA28XX(ha))
+		return -EPERM;
+
+	memset(&bbcr, 0, sizeof(bbcr));
+
+	if (vha->flags.bbcr_enable)
+		bbcr.status = QLA_BBCR_STATUS_ENABLED;
+	else
+		bbcr.status = QLA_BBCR_STATUS_DISABLED;
+
+	if (bbcr.status == QLA_BBCR_STATUS_ENABLED) {
+		rval = qla2x00_get_adapter_id(vha, &loop_id, &al_pa,
+			&area, &domain, &topo, &sw_cap);
+		if (rval != QLA_SUCCESS) {
+			bbcr.status = QLA_BBCR_STATUS_UNKNOWN;
+			bbcr.state = QLA_BBCR_STATE_OFFLINE;
+			bbcr.mbx1 = loop_id;
+			goto done;
+		}
+
+		state = (vha->bbcr >> 12) & 0x1;
+
+		if (state) {
+			bbcr.state = QLA_BBCR_STATE_OFFLINE;
+			bbcr.offline_reason_code = QLA_BBCR_REASON_LOGIN_REJECT;
+		} else {
+			bbcr.state = QLA_BBCR_STATE_ONLINE;
+			bbcr.negotiated_bbscn = (vha->bbcr >> 8) & 0xf;
+		}
+
+		bbcr.configured_bbscn = vha->bbcr & 0xf;
+	}
+
+done:
+	sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
+		bsg_job->reply_payload.sg_cnt, &bbcr, sizeof(bbcr));
+	bsg_job->reply->reply_payload_rcv_len = sizeof(bbcr);
+
+	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] = EXT_STATUS_OK;
+
+	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
+	bsg_job->reply->result = DID_OK << 16;
+	bsg_job->job_done(bsg_job);
+	return 0;
+}
+
+static int
+qla2x00_get_priv_stats(struct fc_bsg_job *bsg_job)
+{
+	struct Scsi_Host *host = bsg_job->shost;
+	scsi_qla_host_t *vha = shost_priv(host);
+	struct qla_hw_data *ha = vha->hw;
+	struct scsi_qla_host *base_vha = pci_get_drvdata(ha->pdev);
+	struct link_statistics *stats = NULL;
+	dma_addr_t stats_dma;
+	int rval;
+	uint32_t *cmd = bsg_job->request->rqst_data.h_vendor.vendor_cmd;
+	uint options = cmd[0] == QL_VND_GET_PRIV_STATS_EX ? cmd[1] : 0;
+
+	if (test_bit(UNLOADING, &vha->dpc_flags))
+		return -ENODEV;
+
+	if (unlikely(pci_channel_offline(ha->pdev)))
+		return -ENODEV;
+
+	if (qla2x00_reset_active(vha))
+		return -EBUSY;
+
+	if (!IS_FWI2_CAPABLE(ha))
+		return -EPERM;
+
+	stats = dma_zalloc_coherent(&ha->pdev->dev, sizeof(*stats),
+				    &stats_dma, GFP_KERNEL);
+	if (!stats) {
+		ql_log(ql_log_warn, vha, 0x70e2,
+		    "Failed to allocate memory for stats.\n");
+		return -ENOMEM;
+	}
+
+	rval = qla24xx_get_isp_stats(base_vha, stats, stats_dma, options);
+
+	if (rval == QLA_SUCCESS) {
+		ql_dump_buffer(ql_dbg_user + ql_dbg_verbose, vha, 0x70e5,
+			stats, sizeof(*stats));
+		sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
+			bsg_job->reply_payload.sg_cnt, stats, sizeof(*stats));
+	}
+
+	bsg_job->reply->reply_payload_rcv_len = sizeof(*stats);
+	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
+	    rval ? EXT_STATUS_MAILBOX : EXT_STATUS_OK;
+
+	bsg_job->reply_len = sizeof(*bsg_job->reply);
+	bsg_job->reply->result = DID_OK << 16;
+	bsg_job->job_done(bsg_job);
+
+	dma_free_coherent(&ha->pdev->dev, sizeof(*stats),
+		stats, stats_dma);
+
+	return 0;
+}
+
+static int
+qla2x00_do_dport_diagnostics(struct fc_bsg_job *bsg_job)
+{
+	struct Scsi_Host *host = bsg_job->shost;
+	scsi_qla_host_t *vha = shost_priv(host);
+	int rval;
+	struct qla_dport_diag *dd;
+
+	if (!IS_QLA83XX(vha->hw) && !IS_QLA27XX(vha->hw) &&
+	    !IS_QLA28XX(vha->hw))
+		return -EPERM;
+
+	dd = kmalloc(sizeof(*dd), GFP_KERNEL);
+	if (!dd) {
+		ql_log(ql_log_warn, vha, 0x70db,
+		    "Failed to allocate memory for dport.\n");
+		return -ENOMEM;
+	}
+
+	sg_copy_to_buffer(bsg_job->request_payload.sg_list,
+	    bsg_job->request_payload.sg_cnt, dd, sizeof(*dd));
+
+	rval = qla26xx_dport_diagnostics(
+	    vha, dd->buf, sizeof(dd->buf), dd->options);
+	if (rval == QLA_SUCCESS) {
+		sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
+		    bsg_job->reply_payload.sg_cnt, dd, sizeof(*dd));
+	}
+
+	bsg_job->reply->reply_payload_rcv_len = sizeof(*dd);
+	bsg_job->reply->reply_data.vendor_reply.vendor_rsp[0] =
+	    rval ? EXT_STATUS_MAILBOX : EXT_STATUS_OK;
+
+	bsg_job->reply_len = sizeof(*bsg_job->reply);
+	bsg_job->reply->result = DID_OK << 16;
+	bsg_job->job_done(bsg_job);
+
+	kfree(dd);
+
+	return 0;
+}
+
+static int
+qla2x00_get_flash_image_status(struct fc_bsg_job *bsg_job)
+{
+	struct Scsi_Host *host = bsg_job->shost;
+	struct fc_bsg_reply *bsg_reply = bsg_job->reply;
+	scsi_qla_host_t *vha = shost_priv(host);
+	struct qla_hw_data *ha = vha->hw;
+	struct qla_active_regions regions = { };
+	struct active_regions active_regions = { };
+
+	qla27xx_get_active_image(vha, &active_regions);
+	regions.global_image = active_regions.global;
+
+	if (IS_QLA28XX(ha)) {
+		qla27xx_get_active_image(vha, &active_regions);
+		regions.board_config = active_regions.aux.board_config;
+		regions.vpd_nvram = active_regions.aux.vpd_nvram;
+		regions.npiv_config_0_1 = active_regions.aux.npiv_config_0_1;
+		regions.npiv_config_2_3 = active_regions.aux.npiv_config_2_3;
+	}
+
+	ql_dbg(ql_dbg_user, vha, 0x70e1,
+	    "%s(%lu): FW=%u BCFG=%u VPDNVR=%u NPIV01=%u NPIV02=%u\n",
+	    __func__, vha->host_no, regions.global_image,
+	    regions.board_config, regions.vpd_nvram,
+	    regions.npiv_config_0_1, regions.npiv_config_2_3);
+
+	sg_copy_from_buffer(bsg_job->reply_payload.sg_list,
+	    bsg_job->reply_payload.sg_cnt, &regions, sizeof(regions));
+
+	bsg_reply->reply_data.vendor_reply.vendor_rsp[0] = EXT_STATUS_OK;
+	bsg_reply->reply_payload_rcv_len = sizeof(regions);
+	bsg_reply->result = DID_OK << 16;
+	bsg_job->reply_len = sizeof(struct fc_bsg_reply);
+	bsg_job->job_done(bsg_job);
+
 	return 0;
 }
 
@@ -2122,6 +2441,28 @@ qla2x00_process_vendor_specific(struct fc_bsg_job *bsg_job)
 	case QL_VND_SERDES_OP:
 		return qla26xx_serdes_op(bsg_job);
 
+	case QL_VND_SERDES_OP_EX:
+		return qla8044_serdes_op(bsg_job);
+
+	case QL_VND_GET_FLASH_UPDATE_CAPS:
+		return qla27xx_get_flash_upd_cap(bsg_job);
+
+	case QL_VND_SET_FLASH_UPDATE_CAPS:
+		return qla27xx_set_flash_upd_cap(bsg_job);
+
+	case QL_VND_GET_BBCR_DATA:
+		return qla27xx_get_bbcr_data(bsg_job);
+
+	case QL_VND_GET_PRIV_STATS:
+	case QL_VND_GET_PRIV_STATS_EX:
+		return qla2x00_get_priv_stats(bsg_job);
+
+	case QL_VND_DPORT_DIAGNOSTICS:
+		return qla2x00_do_dport_diagnostics(bsg_job);
+
+	case QL_VND_SS_GET_FLASH_IMAGE_STATUS:
+		return qla2x00_get_flash_image_status(bsg_job);
+
 	default:
 		return -ENOSYS;
 	}
@@ -2132,7 +2473,6 @@ qla24xx_bsg_request(struct fc_bsg_job *bsg_job)
 {
 	int ret = -EINVAL;
 	struct fc_rport *rport;
-	fc_port_t *fcport = NULL;
 	struct Scsi_Host *host;
 	scsi_qla_host_t *vha;
 
@@ -2141,7 +2481,6 @@ qla24xx_bsg_request(struct fc_bsg_job *bsg_job)
 
 	if (bsg_job->request->msgcode == FC_BSG_RPT_ELS) {
 		rport = bsg_job->rport;
-		fcport = *(fc_port_t **) rport->dd_data;
 		host = rport_to_shost(rport);
 		vha = shost_priv(host);
 	} else {
@@ -2149,7 +2488,7 @@ qla24xx_bsg_request(struct fc_bsg_job *bsg_job)
 		vha = shost_priv(host);
 	}
 
-	if (qla2x00_reset_active(vha)) {
+	if (qla2x00_chip_is_down(vha)) {
 		ql_dbg(ql_dbg_user, vha, 0x709f,
 		    "BSG: ISP abort active/needed -- cmd=%d.\n",
 		    bsg_job->request->msgcode);
@@ -2232,6 +2571,6 @@ qla24xx_bsg_timeout(struct fc_bsg_job *bsg_job)
 
 done:
 	spin_unlock_irqrestore(&ha->hardware_lock, flags);
-	sp->free(vha, sp);
+	sp->free(sp);
 	return 0;
 }

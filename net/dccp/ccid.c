@@ -11,6 +11,8 @@
  *	published by the Free Software Foundation.
  */
 
+#include <linux/slab.h>
+
 #include "ccid.h"
 #include "ccids/lib/tfrc.h"
 
@@ -44,6 +46,7 @@ bool ccid_support_check(u8 const *ccid_array, u8 array_len)
  * ccid_get_builtin_ccids  -  Populate a list of built-in CCIDs
  * @ccid_array: pointer to copy into
  * @array_len: value to return length into
+ *
  * This function allocates memory - caller must see that it is freed after use.
  */
 int ccid_get_builtin_ccids(u8 **ccid_array, u8 *array_len)
@@ -63,14 +66,13 @@ int ccid_getsockopt_builtin_ccids(struct sock *sk, int len,
 	u8 *ccid_array, array_len;
 	int err = 0;
 
-	if (len < ARRAY_SIZE(ccids))
-		return -EINVAL;
-
 	if (ccid_get_builtin_ccids(&ccid_array, &array_len))
 		return -ENOBUFS;
 
-	if (put_user(array_len, optlen) ||
-	    copy_to_user(optval, ccid_array, array_len))
+	if (put_user(array_len, optlen))
+		err = -EFAULT;
+	else if (len > 0 && copy_to_user(optval, ccid_array,
+					 len > array_len ? array_len : len))
 		err = -EFAULT;
 
 	kfree(ccid_array);
@@ -117,7 +119,7 @@ static int ccid_activate(struct ccid_operations *ccid_ops)
 	if (ccid_ops->ccid_hc_tx_slab == NULL)
 		goto out_free_rx_slab;
 
-	pr_info("CCID: Activated CCID %d (%s)\n",
+	pr_info("DCCP: Activated CCID %d (%s)\n",
 		ccid_ops->ccid_id, ccid_ops->ccid_name);
 	err = 0;
 out:
@@ -135,7 +137,7 @@ static void ccid_deactivate(struct ccid_operations *ccid_ops)
 	ccid_kmem_cache_destroy(ccid_ops->ccid_hc_rx_slab);
 	ccid_ops->ccid_hc_rx_slab = NULL;
 
-	pr_info("CCID: Deactivated CCID %d (%s)\n",
+	pr_info("DCCP: Deactivated CCID %d (%s)\n",
 		ccid_ops->ccid_id, ccid_ops->ccid_name);
 }
 

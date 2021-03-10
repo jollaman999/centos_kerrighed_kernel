@@ -113,14 +113,12 @@
 #define DTD_HANGOVER			600	/* 600 samples, or 75ms     */
 #define DC_LOG2BETA			3	/* log2() of DC filter Beta */
 
-
 /* adapting coeffs using the traditional stochastic descent (N)LMS algorithm */
 
 #ifdef __bfin__
-static inline void lms_adapt_bg(struct oslec_state *ec, int clean,
-				    int shift)
+static inline void lms_adapt_bg(struct oslec_state *ec, int clean, int shift)
 {
-	int i, j;
+	int i;
 	int offset1;
 	int offset2;
 	int factor;
@@ -143,7 +141,7 @@ static inline void lms_adapt_bg(struct oslec_state *ec, int clean,
 
 	/* asm("st:"); */
 	n = ec->taps;
-	for (i = 0, j = offset2; i < n; i++, j++) {
+	for (i = 0; i < n; i++) {
 		exp = *phist++ * factor;
 		ec->fir_taps16[1][i] += (int16_t) ((exp + (1 << 14)) >> 15);
 	}
@@ -189,8 +187,7 @@ static inline void lms_adapt_bg(struct oslec_state *ec, int clean,
 */
 
 #else
-static inline void lms_adapt_bg(struct oslec_state *ec, int clean,
-				    int shift)
+static inline void lms_adapt_bg(struct oslec_state *ec, int clean, int shift)
 {
 	int i;
 
@@ -225,13 +222,14 @@ static inline int top_bit(unsigned int bits)
 	if (bits == 0)
 		return -1;
 	else
-		return (int)fls((int32_t)bits)-1;
+		return (int)fls((int32_t) bits) - 1;
 }
 
 struct oslec_state *oslec_create(int len, int adaption_mode)
 {
 	struct oslec_state *ec;
 	int i;
+	const int16_t *history;
 
 	ec = kzalloc(sizeof(*ec), GFP_KERNEL);
 	if (!ec)
@@ -241,15 +239,22 @@ struct oslec_state *oslec_create(int len, int adaption_mode)
 	ec->log2taps = top_bit(len);
 	ec->curr_pos = ec->taps - 1;
 
-	for (i = 0; i < 2; i++) {
-		ec->fir_taps16[i] =
-		    kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
-		if (!ec->fir_taps16[i])
-			goto error_oom;
-	}
+	ec->fir_taps16[0] =
+	    kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
+	if (!ec->fir_taps16[0])
+		goto error_oom_0;
 
-	fir16_create(&ec->fir_state, ec->fir_taps16[0], ec->taps);
-	fir16_create(&ec->fir_state_bg, ec->fir_taps16[1], ec->taps);
+	ec->fir_taps16[1] =
+	    kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
+	if (!ec->fir_taps16[1])
+		goto error_oom_1;
+
+	history = fir16_create(&ec->fir_state, ec->fir_taps16[0], ec->taps);
+	if (!history)
+		goto error_state;
+	history = fir16_create(&ec->fir_state_bg, ec->fir_taps16[1], ec->taps);
+	if (!history)
+		goto error_state_bg;
 
 	for (i = 0; i < 5; i++)
 		ec->xvtx[i] = ec->yvtx[i] = ec->xvrx[i] = ec->yvrx[i] = 0;
@@ -259,7 +264,7 @@ struct oslec_state *oslec_create(int len, int adaption_mode)
 
 	ec->snapshot = kcalloc(ec->taps, sizeof(int16_t), GFP_KERNEL);
 	if (!ec->snapshot)
-		goto error_oom;
+		goto error_snap;
 
 	ec->cond_met = 0;
 	ec->Pstates = 0;
@@ -272,10 +277,15 @@ struct oslec_state *oslec_create(int len, int adaption_mode)
 
 	return ec;
 
-error_oom:
-	for (i = 0; i < 2; i++)
-		kfree(ec->fir_taps16[i]);
-
+error_snap:
+	fir16_free(&ec->fir_state_bg);
+error_state_bg:
+	fir16_free(&ec->fir_state);
+error_state:
+	kfree(ec->fir_taps16[1]);
+error_oom_1:
+	kfree(ec->fir_taps16[0]);
+error_oom_0:
 	kfree(ec);
 	return NULL;
 }
@@ -338,7 +348,8 @@ int16_t oslec_update(struct oslec_state *ec, int16_t tx, int16_t rx)
 {
 	int32_t echo_value;
 	int clean_bg;
-	int tmp, tmp1;
+	int tmp;
+	int tmp1;
 
 	/*
 	 * Input scaling was found be required to prevent problems when tx
@@ -408,7 +419,7 @@ int16_t oslec_update(struct oslec_state *ec, int16_t tx, int16_t rx)
 		old = (int)ec->fir_state.history[ec->fir_state.curr_pos] *
 		    (int)ec->fir_state.history[ec->fir_state.curr_pos];
 		ec->Pstates +=
-		    ((new - old) + (1 << (ec->log2taps-1))) >> ec->log2taps;
+		    ((new - old) + (1 << (ec->log2taps - 1))) >> ec->log2taps;
 		if (ec->Pstates < 0)
 			ec->Pstates = 0;
 	}
@@ -466,7 +477,7 @@ int16_t oslec_update(struct oslec_state *ec, int16_t tx, int16_t rx)
 
 		   factor      = (2^30) * (2^-2) * clean_bg_rx/P
 
-						(30 - 2 - log2(P))
+		   (30 - 2 - log2(P))
 		   factor      = clean_bg_rx 2                     ----- (3)
 
 		   To avoid a divide we approximate log2(P) as top_bit(P),
@@ -514,7 +525,7 @@ int16_t oslec_update(struct oslec_state *ec, int16_t tx, int16_t rx)
 			 */
 			ec->adapt = 1;
 			memcpy(ec->fir_taps16[0], ec->fir_taps16[1],
-				ec->taps * sizeof(int16_t));
+			       ec->taps * sizeof(int16_t));
 		} else
 			ec->cond_met++;
 	} else
@@ -544,7 +555,7 @@ int16_t oslec_update(struct oslec_state *ec, int16_t tx, int16_t rx)
 				 * Just random numbers rolled off very vaguely
 				 * Hoth-like.  DR: This noise doesn't sound
 				 * quite right to me - I suspect there are some
-				 * overlfow issues in the filtering as it's too
+				 * overflow issues in the filtering as it's too
 				 * "crackly".
 				 * TODO: debug this, maybe just play noise at
 				 * high level or look at spectrum.
@@ -603,7 +614,7 @@ int16_t oslec_update(struct oslec_state *ec, int16_t tx, int16_t rx)
 }
 EXPORT_SYMBOL_GPL(oslec_update);
 
-/* This function is seperated from the echo canceller is it is usually called
+/* This function is separated from the echo canceller is it is usually called
    as part of the tx process.  See rx HP (DC blocking) filter above, it's
    the same design.
 
@@ -627,7 +638,8 @@ EXPORT_SYMBOL_GPL(oslec_update);
 
 int16_t oslec_hpf_tx(struct oslec_state *ec, int16_t tx)
 {
-	int tmp, tmp1;
+	int tmp;
+	int tmp1;
 
 	if (ec->adaption_mode & ECHO_CAN_USE_TX_HPF) {
 		tmp = tx << 15;

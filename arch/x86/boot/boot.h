@@ -23,11 +23,10 @@
 #include <stdarg.h>
 #include <linux/types.h>
 #include <linux/edd.h>
-#include <asm/boot.h>
 #include <asm/setup.h>
 #include "bitops.h"
-#include <asm/cpufeature.h>
-#include <asm/processor-flags.h>
+#include "ctype.h"
+#include "cpuflags.h"
 
 /* Useful macros */
 #define BUILD_BUG_ON(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
@@ -36,6 +35,8 @@
 
 extern struct setup_header hdr;
 extern struct boot_params boot_params;
+
+#define cpu_relax()	asm volatile("rep; nop")
 
 /* Basic port I/O */
 static inline void outb(u8 v, u16 port)
@@ -64,7 +65,7 @@ static inline void outl(u32 v, u16 port)
 {
 	asm volatile("outl %0,%1" : : "a" (v), "dN" (port));
 }
-static inline u32 inl(u32 port)
+static inline u32 inl(u16 port)
 {
 	u32 v;
 	asm volatile("inl %1,%0" : "=a" (v) : "dN" (port));
@@ -175,14 +176,6 @@ static inline void wrgs32(u32 v, addr_t addr)
 }
 
 /* Note: these only return true/false, not a signed return value! */
-static inline int memcmp(const void *s1, const void *s2, size_t len)
-{
-	u8 diff;
-	asm("repe; cmpsb; setnz %0"
-	    : "=qm" (diff), "+D" (s1), "+S" (s2), "+c" (len));
-	return diff;
-}
-
 static inline int memcmp_fs(const void *s1, addr_t s2, size_t len)
 {
 	u8 diff;
@@ -196,11 +189,6 @@ static inline int memcmp_gs(const void *s1, addr_t s2, size_t len)
 	asm volatile("gs; repe; cmpsb; setnz %0"
 		     : "=qm" (diff), "+D" (s1), "+S" (s2), "+c" (len));
 	return diff;
-}
-
-static inline int isdigit(int ch)
-{
-	return (ch >= '0') && (ch <= '9');
 }
 
 /* Heap -- available for dynamic lists. */
@@ -231,11 +219,6 @@ void copy_to_fs(addr_t dst, void *src, size_t len);
 void *copy_from_fs(void *dst, addr_t src, size_t len);
 void copy_to_gs(addr_t dst, void *src, size_t len);
 void *copy_from_gs(void *dst, addr_t src, size_t len);
-void *memcpy(void *dst, void *src, size_t len);
-void *memset(void *dst, int c, size_t len);
-
-#define memcpy(d,s,l) __builtin_memcpy(d,s,l)
-#define memset(d,c,l) __builtin_memset(d,c,l)
 
 /* a20.c */
 int enable_a20(void);
@@ -287,18 +270,36 @@ struct biosregs {
 void intcall(u8 int_no, const struct biosregs *ireg, struct biosregs *oreg);
 
 /* cmdline.c */
-int cmdline_find_option(const char *option, char *buffer, int bufsize);
-int cmdline_find_option_bool(const char *option);
+int __cmdline_find_option(unsigned long cmdline_ptr, const char *option, char *buffer, int bufsize);
+int __cmdline_find_option_bool(unsigned long cmdline_ptr, const char *option);
+static inline int cmdline_find_option(const char *option, char *buffer, int bufsize)
+{
+	unsigned long cmd_line_ptr = boot_params.hdr.cmd_line_ptr;
+
+	if (cmd_line_ptr >= 0x100000)
+		return -1;      /* inaccessible */
+
+	return __cmdline_find_option(cmd_line_ptr, option, buffer, bufsize);
+}
+
+static inline int cmdline_find_option_bool(const char *option)
+{
+	unsigned long cmd_line_ptr = boot_params.hdr.cmd_line_ptr;
+
+	if (cmd_line_ptr >= 0x100000)
+		return -1;      /* inaccessible */
+
+	return __cmdline_find_option_bool(cmd_line_ptr, option);
+}
 
 /* cpu.c, cpucheck.c */
-struct cpu_features {
-	int level;		/* Family, or 64 for x86-64 */
-	int model;
-	u32 flags[RHNCAPINTS];
-};
-extern struct cpu_features cpu;
 int check_cpu(int *cpu_level_ptr, int *req_level_ptr, u32 **err_flags_ptr);
+int check_knl_erratum(void);
 int validate_cpu(void);
+
+/* early_serial_console.c */
+extern int early_serial_base;
+void console_init(void);
 
 /* edd.c */
 void query_edd(void);
@@ -329,8 +330,12 @@ void initregs(struct biosregs *regs);
 
 /* string.c */
 int strcmp(const char *str1, const char *str2);
+int strncmp(const char *cs, const char *ct, size_t count);
 size_t strnlen(const char *s, size_t maxlen);
 unsigned int atou(const char *s);
+unsigned long long simple_strtoull(const char *cp, char **endp, unsigned int base);
+size_t strlen(const char *s);
+char *strchr(const char *s, int c);
 
 /* tty.c */
 void puts(const char *);

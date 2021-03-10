@@ -4,6 +4,7 @@ block storage on the LAN.
   http://support.coraid.com/documents/AoEr11.txt
 
 The EtherDrive (R) HOWTO for 2.6 and 3.x kernels is found at ...
+
   http://support.coraid.com/support/linux/EtherDrive-2.6-HOWTO.html
 
 It has many tips and hints!  Please see, especially, recommended
@@ -36,7 +37,6 @@ CREATING DEVICE NODES
   however, because AoE discovery takes a few seconds.  It can be
   confusing when an AoE device is not present the first time the a
   command is run but appears a second later.
-
 
 USING DEVICE NODES
 

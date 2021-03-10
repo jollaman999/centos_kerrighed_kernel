@@ -3,7 +3,6 @@
  *
  * Copyright (C) 2007 Sven Schnelle <svens@bitebene.org>
  * Copyright © CC Computer Consultants GmbH, 2007
- * Contact: Jan Engelhardt <jengelh@computergmbh.de>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -31,10 +30,10 @@ static inline unsigned int optlen(const u_int8_t *opt, unsigned int offset)
 
 static unsigned int
 tcpoptstrip_mangle_packet(struct sk_buff *skb,
-			  const struct xt_tcpoptstrip_target_info *info,
-			  unsigned int tcphoff, unsigned int minlen,
-			  int fragoff)
+			  const struct xt_action_param *par,
+			  unsigned int tcphoff, unsigned int minlen)
 {
+	const struct xt_tcpoptstrip_target_info *info = par->targinfo;
 	unsigned int optl, i, j;
 	struct tcphdr *tcph;
 	u_int16_t n, o;
@@ -42,7 +41,7 @@ tcpoptstrip_mangle_packet(struct sk_buff *skb,
 	int len, tcp_hdrlen;
 
 	/* This is a fragment, no TCP header is available */
-	if (fragoff)
+	if (par->fragoff != 0)
 		return XT_CONTINUE;
 
 	if (!skb_make_writable(skb, skb->len))
@@ -90,30 +89,28 @@ tcpoptstrip_mangle_packet(struct sk_buff *skb,
 }
 
 static unsigned int
-tcpoptstrip_tg4(struct sk_buff *skb, const struct xt_target_param *par)
+tcpoptstrip_tg4(struct sk_buff *skb, const struct xt_action_param *par)
 {
-	return tcpoptstrip_mangle_packet(skb, par->targinfo, ip_hdrlen(skb),
-	       sizeof(struct iphdr) + sizeof(struct tcphdr),
-	       ntohs(ip_hdr(skb)->frag_off) & IP_OFFSET);
+	return tcpoptstrip_mangle_packet(skb, par, ip_hdrlen(skb),
+	       sizeof(struct iphdr) + sizeof(struct tcphdr));
 }
 
-#if defined(CONFIG_IP6_NF_MANGLE) || defined(CONFIG_IP6_NF_MANGLE_MODULE)
+#if IS_ENABLED(CONFIG_IP6_NF_MANGLE)
 static unsigned int
-tcpoptstrip_tg6(struct sk_buff *skb, const struct xt_target_param *par)
+tcpoptstrip_tg6(struct sk_buff *skb, const struct xt_action_param *par)
 {
 	struct ipv6hdr *ipv6h = ipv6_hdr(skb);
 	int tcphoff;
 	u_int8_t nexthdr;
-	__be16 fragoff;
+	__be16 frag_off;
 
 	nexthdr = ipv6h->nexthdr;
-	tcphoff = ipv6_skip_exthdr_fragoff(skb, sizeof(*ipv6h), &nexthdr,
-					   &fragoff);
+	tcphoff = ipv6_skip_exthdr(skb, sizeof(*ipv6h), &nexthdr, &frag_off);
 	if (tcphoff < 0)
 		return NF_DROP;
 
-	return tcpoptstrip_mangle_packet(skb, par->targinfo, tcphoff,
-	       sizeof(*ipv6h) + sizeof(struct tcphdr), ntohs(fragoff));
+	return tcpoptstrip_mangle_packet(skb, par, tcphoff,
+	       sizeof(*ipv6h) + sizeof(struct tcphdr));
 }
 #endif
 
@@ -127,7 +124,7 @@ static struct xt_target tcpoptstrip_tg_reg[] __read_mostly = {
 		.targetsize = sizeof(struct xt_tcpoptstrip_target_info),
 		.me         = THIS_MODULE,
 	},
-#if defined(CONFIG_IP6_NF_MANGLE) || defined(CONFIG_IP6_NF_MANGLE_MODULE)
+#if IS_ENABLED(CONFIG_IP6_NF_MANGLE)
 	{
 		.name       = "TCPOPTSTRIP",
 		.family     = NFPROTO_IPV6,
@@ -154,7 +151,7 @@ static void __exit tcpoptstrip_tg_exit(void)
 
 module_init(tcpoptstrip_tg_init);
 module_exit(tcpoptstrip_tg_exit);
-MODULE_AUTHOR("Sven Schnelle <svens@bitebene.org>, Jan Engelhardt <jengelh@computergmbh.de>");
+MODULE_AUTHOR("Sven Schnelle <svens@bitebene.org>, Jan Engelhardt <jengelh@medozas.de>");
 MODULE_DESCRIPTION("Xtables: TCP option stripping");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS("ipt_TCPOPTSTRIP");

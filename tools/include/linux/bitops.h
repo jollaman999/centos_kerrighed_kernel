@@ -1,15 +1,17 @@
 #ifndef _TOOLS_LINUX_BITOPS_H_
 #define _TOOLS_LINUX_BITOPS_H_
 
+#include <asm/types.h>
 #include <linux/kernel.h>
 #include <linux/compiler.h>
-#include <asm/hweight.h>
 
 #ifndef __WORDSIZE
 #define __WORDSIZE (__SIZEOF_LONG__ * 8)
 #endif
 
-#define BITS_PER_LONG __WORDSIZE
+#ifndef BITS_PER_LONG
+# define BITS_PER_LONG __WORDSIZE
+#endif
 
 #define BIT_MASK(nr)		(1UL << ((nr) % BITS_PER_LONG))
 #define BIT_WORD(nr)		((nr) / BITS_PER_LONG)
@@ -18,6 +20,11 @@
 #define BITS_TO_U64(nr)		DIV_ROUND_UP(nr, BITS_PER_BYTE * sizeof(u64))
 #define BITS_TO_U32(nr)		DIV_ROUND_UP(nr, BITS_PER_BYTE * sizeof(u32))
 #define BITS_TO_BYTES(nr)	DIV_ROUND_UP(nr, BITS_PER_BYTE)
+
+extern unsigned int __sw_hweight8(unsigned int w);
+extern unsigned int __sw_hweight16(unsigned int w);
+extern unsigned int __sw_hweight32(unsigned int w);
+extern unsigned long __sw_hweight64(__u64 w);
 
 /*
  * Include this here because some architectures need generic_ffs/fls in
@@ -32,8 +39,13 @@
 	     (bit) < (size);					\
 	     (bit) = find_next_bit((addr), (size), (bit) + 1))
 
+#define for_each_clear_bit(bit, addr, size) \
+	for ((bit) = find_first_zero_bit((addr), (size));       \
+	     (bit) < (size);                                    \
+	     (bit) = find_next_zero_bit((addr), (size), (bit) + 1))
+
 /* same as for_each_set_bit() but use bit as value to start with */
-#define for_each_set_bit_cont(bit, addr, size) \
+#define for_each_set_bit_from(bit, addr, size) \
 	for ((bit) = find_next_bit((addr), (size), (bit));	\
 	     (bit) < (size);					\
 	     (bit) = find_next_bit((addr), (size), (bit) + 1))

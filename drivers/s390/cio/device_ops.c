@@ -198,7 +198,7 @@ int ccw_device_start_key(struct ccw_device *cdev, struct ccw1 *cpa,
 	if (cdev->private->state == DEV_STATE_VERIFY) {
 		/* Remember to fake irb when finished. */
 		if (!cdev->private->flags.fake_irb) {
-			cdev->private->flags.fake_irb = 1;
+			cdev->private->flags.fake_irb = FAKE_CMD_IRB;
 			cdev->private->intparm = intparm;
 			return 0;
 		} else
@@ -418,11 +418,8 @@ int ccw_device_resume(struct ccw_device *cdev)
 int
 ccw_device_call_handler(struct ccw_device *cdev)
 {
-	struct subchannel *sch;
 	unsigned int stctl;
 	int ending_status;
-
-	sch = to_subchannel(cdev->dev.parent);
 
 	/*
 	 * we allow for the device action handler if .
@@ -432,7 +429,7 @@ ccw_device_call_handler(struct ccw_device *cdev)
 	 *  - fast notification was requested (primary status)
 	 *  - unsolicited interrupts
 	 */
-	stctl = scsw_stctl(&cdev->private->irb.scsw);
+	stctl = scsw_stctl(&cdev->private->dma_area->irb.scsw);
 	ending_status = (stctl & SCSW_STCTL_SEC_STATUS) ||
 		(stctl == (SCSW_STCTL_ALERT_STATUS | SCSW_STCTL_STATUS_PEND)) ||
 		(stctl == SCSW_STCTL_STATUS_PEND);
@@ -451,12 +448,12 @@ ccw_device_call_handler(struct ccw_device *cdev)
 	 */
 	if (cdev->handler)
 		cdev->handler(cdev, cdev->private->intparm,
-			      &cdev->private->irb);
+			      &cdev->private->dma_area->irb);
 
 	/*
 	 * Clear the old and now useless interrupt response block.
 	 */
-	memset(&cdev->private->irb, 0, sizeof(struct irb));
+	memset(&cdev->private->dma_area->irb, 0, sizeof(struct irb));
 
 	return 1;
 }
@@ -482,8 +479,8 @@ struct ciw *ccw_device_get_ciw(struct ccw_device *cdev, __u32 ct)
 	if (cdev->private->flags.esid == 0)
 		return NULL;
 	for (ciw_cnt = 0; ciw_cnt < MAX_CIWS; ciw_cnt++)
-		if (cdev->private->senseid.ciw[ciw_cnt].ct == ct)
-			return cdev->private->senseid.ciw + ciw_cnt;
+		if (cdev->private->dma_area->senseid.ciw[ciw_cnt].ct == ct)
+			return cdev->private->dma_area->senseid.ciw + ciw_cnt;
 	return NULL;
 }
 
@@ -617,6 +614,16 @@ int ccw_device_tm_start_key(struct ccw_device *cdev, struct tcw *tcw,
 	sch = to_subchannel(cdev->dev.parent);
 	if (!sch->schib.pmcw.ena)
 		return -EINVAL;
+	if (cdev->private->state == DEV_STATE_VERIFY) {
+		/* Remember to fake irb when finished. */
+		if (!cdev->private->flags.fake_irb) {
+			cdev->private->flags.fake_irb = FAKE_TM_IRB;
+			cdev->private->intparm = intparm;
+			return 0;
+		} else
+			/* There's already a fake I/O around. */
+			return -EBUSY;
+	}
 	if (cdev->private->state != DEV_STATE_ONLINE)
 		return -EIO;
 	/* Adjust requested path mask to exclude unusable paths. */
@@ -763,14 +770,6 @@ int ccw_device_tm_intrg(struct ccw_device *cdev)
 }
 EXPORT_SYMBOL(ccw_device_tm_intrg);
 
-// FIXME: these have to go:
-
-int
-_ccw_device_get_subchannel_number(struct ccw_device *cdev)
-{
-	return cdev->private->schid.sch_no;
-}
-
 /**
  * ccw_device_get_schid - obtain a subchannel id
  * @cdev: device to obtain the id for
@@ -783,6 +782,23 @@ void ccw_device_get_schid(struct ccw_device *cdev, struct subchannel_id *schid)
 	*schid = sch->schid;
 }
 EXPORT_SYMBOL_GPL(ccw_device_get_schid);
+
+/*
+ * Allocate zeroed dma coherent 31 bit addressable memory using
+ * the subchannels dma pool. Maximal size of allocation supported
+ * is PAGE_SIZE.
+ */
+void *ccw_device_dma_zalloc(struct ccw_device *cdev, size_t size)
+{
+	return cio_gp_dma_zalloc(cdev->private->dma_pool, &cdev->dev, size);
+}
+EXPORT_SYMBOL(ccw_device_dma_zalloc);
+
+void ccw_device_dma_free(struct ccw_device *cdev, void *cpu_addr, size_t size)
+{
+	cio_gp_dma_free(cdev->private->dma_pool, cpu_addr, size);
+}
+EXPORT_SYMBOL(ccw_device_dma_free);
 
 MODULE_LICENSE("GPL");
 EXPORT_SYMBOL(ccw_device_set_options_mask);
@@ -797,5 +813,4 @@ EXPORT_SYMBOL(ccw_device_start_timeout_key);
 EXPORT_SYMBOL(ccw_device_start_key);
 EXPORT_SYMBOL(ccw_device_get_ciw);
 EXPORT_SYMBOL(ccw_device_get_path_mask);
-EXPORT_SYMBOL(_ccw_device_get_subchannel_number);
 EXPORT_SYMBOL_GPL(ccw_device_get_chp_desc);

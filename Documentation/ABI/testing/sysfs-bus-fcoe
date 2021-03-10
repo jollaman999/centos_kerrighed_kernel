@@ -50,22 +50,22 @@ Attributes:
 
 	lesb/link_fail:   Link Error Status Block (LESB) link failure count.
 
-	lesb_vlink_fail:  Link Error Status Block (LESB) virtual link
+	lesb/vlink_fail:  Link Error Status Block (LESB) virtual link
 			  failure count.
 
-	lesb_miss_fka:    Link Error Status Block (LESB) missed FCoE
+	lesb/miss_fka:    Link Error Status Block (LESB) missed FCoE
 			  Initialization Protocol (FIP) Keep-Alives (FKA).
 
-	lesb_symb_err:    Link Error Status Block (LESB) symbolic error count.
+	lesb/symb_err:    Link Error Status Block (LESB) symbolic error count.
 
-	lesb_err_block:   Link Error Status Block (LESB) block error count.
+	lesb/err_block:   Link Error Status Block (LESB) block error count.
 
-	lesb_fcs_error:   Link Error Status Block (LESB) Fibre Channel
+	lesb/fcs_error:   Link Error Status Block (LESB) Fibre Channel
 			  Serivces error count.
 
 Notes: ctlr_X (global increment starting at 0)
 
-What:		/sys/bus/fcoe/fcf_X
+What:		/sys/bus/fcoe/devices/fcf_X
 Date:		March 2012
 KernelVersion:	TBD
 Contact:	Robert Love <robert.w.love@intel.com>, devel@open-fcoe.org

@@ -24,16 +24,6 @@
 #include <asm/delay.h>
 #include <asm/irq.h>
 
-extern int dump_fpu(struct pt_regs *, elf_fpregset_t *);
-
-/* platform dependent support */
-EXPORT_SYMBOL(dump_fpu);
-EXPORT_SYMBOL(kernel_thread);
-
-#ifdef CONFIG_VT
-EXPORT_SYMBOL(screen_info);
-#endif
-
 EXPORT_SYMBOL(__put_user_asm_b);
 EXPORT_SYMBOL(__put_user_asm_w);
 EXPORT_SYMBOL(__put_user_asm_l);
@@ -42,8 +32,6 @@ EXPORT_SYMBOL(__get_user_asm_b);
 EXPORT_SYMBOL(__get_user_asm_w);
 EXPORT_SYMBOL(__get_user_asm_l);
 EXPORT_SYMBOL(__get_user_asm_q);
-EXPORT_SYMBOL(__strnlen_user);
-EXPORT_SYMBOL(__strncpy_from_user);
 EXPORT_SYMBOL(__clear_user);
 EXPORT_SYMBOL(copy_page);
 EXPORT_SYMBOL(__copy_user);

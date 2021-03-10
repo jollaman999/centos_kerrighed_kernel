@@ -1,8 +1,7 @@
 /*
- *  arch/s390/hypfs/hypfs.h
  *    Hypervisor filesystem for Linux on s390.
  *
- *    Copyright (C) IBM Corp. 2006
+ *    Copyright IBM Corp. 2006
  *    Author(s): Michael Holzheu <holzheu@de.ibm.com>
  */
 
@@ -40,6 +39,10 @@ extern int hypfs_vm_init(void);
 extern void hypfs_vm_exit(void);
 extern int hypfs_vm_create_files(struct super_block *sb, struct dentry *root);
 
+/* VM diagnose 0c */
+int hypfs_diag0c_init(void);
+void hypfs_diag0c_exit(void);
+
 /* debugfs interface */
 struct hypfs_dbfs_file;
 
@@ -47,8 +50,7 @@ struct hypfs_dbfs_data {
 	void			*buf;
 	void			*buf_free_ptr;
 	size_t			size;
-	struct hypfs_dbfs_file	*dbfs_file;;
-	struct kref		kref;
+	struct hypfs_dbfs_file	*dbfs_file;
 };
 
 struct hypfs_dbfs_file {
@@ -58,8 +60,6 @@ struct hypfs_dbfs_file {
 	void		(*data_free)(const void *buf_free_ptr);
 
 	/* Private data for hypfs_dbfs.c */
-	struct hypfs_dbfs_data	*data;
-	struct delayed_work	data_free_work;
 	struct mutex		lock;
 	struct dentry		*dentry;
 };

@@ -113,7 +113,7 @@ ssize_t pm80xx_get_fatal_dump(struct device *cdev,
 		pm8001_ha->forensic_info.data_buf.read_len = 0;
 
 		pm8001_ha->forensic_info.data_buf.direct_data = direct_data;
-		
+
 		/* start to get data */
 		/* Program the MEMBASE II Shifting Register with 0x00.*/
 		pm8001_cw32(pm8001_ha, 0, MEMBASE_II_SHIFT_REGISTER,
@@ -2953,7 +2953,7 @@ hw_event_sata_phy_up(struct pm8001_hba_info *pm8001_ha, void *piomb)
 		sizeof(struct dev_to_host_fis));
 	phy->frame_rcvd_size = sizeof(struct dev_to_host_fis);
 	phy->identify.target_port_protocols = SAS_PROTOCOL_SATA;
-	phy->identify.device_type = SATA_DEV;
+	phy->identify.device_type = SAS_SATA_DEV;
 	pm8001_get_attached_sas_addr(phy, phy->sas_phy.attached_sas_addr);
 	spin_unlock_irqrestore(&phy->sas_phy.frame_rcvd_lock, flags);
 	pm8001_bytes_dmaed(pm8001_ha, phy_id);
@@ -3986,7 +3986,7 @@ static int pm80xx_chip_ssp_io_req(struct pm8001_hba_info *pm8001_ha,
 	} else {
 		PM8001_IO_DBG(pm8001_ha, pm8001_printk(
 			"Sending Normal SAS command 0x%x inb q %x\n",
-			task->ssp_task.cdb[0], q_index));
+			task->ssp_task.cdb[0], q_index))
 		/* fill in PRD (scatter/gather) table, if any */
 		if (task->num_scatter > 1) {
 			pm8001_chip_make_sg(task->scatter, ccb->n_elem,
@@ -4076,7 +4076,7 @@ static int pm80xx_chip_sata_req(struct pm8001_hba_info *pm8001_ha,
 			PM8001_IO_DBG(pm8001_ha, pm8001_printk("PIO\n"));
 		}
 		if (task->ata_task.use_ncq &&
-			dev->sata_dev.command_set != ATAPI_COMMAND_SET) {
+		    dev->sata_dev.class != ATA_DEV_ATAPI) {
 			ATAP = 0x07; /* FPDMA */
 			PM8001_IO_DBG(pm8001_ha, pm8001_printk("FPDMA\n"));
 		}
@@ -4392,7 +4392,7 @@ static int pm80xx_chip_reg_dev_req(struct pm8001_hba_info *pm8001_ha,
 	if (flag == 1) {
 		stp_sspsmp_sata = 0x02; /*direct attached sata */
 	} else {
-		if (pm8001_dev->dev_type == SATA_DEV)
+		if (pm8001_dev->dev_type == SAS_SATA_DEV)
 			stp_sspsmp_sata = 0x00; /* stp*/
 		else if (pm8001_dev->dev_type == SAS_END_DEVICE ||
 			pm8001_dev->dev_type == SAS_EDGE_EXPANDER_DEVICE ||

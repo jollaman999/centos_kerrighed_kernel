@@ -46,9 +46,9 @@
 #include <linux/pci.h>
 #include <linux/poll.h>
 #include <linux/vmalloc.h>
+#include <linux/export.h>
 #include <linux/fs.h>
 #include <linux/uaccess.h>
-#include <linux/nospec.h>
 
 #include "qib.h"
 #include "qib_common.h"
@@ -140,7 +140,8 @@ static const struct file_operations diag_file_ops = {
 	.write = qib_diag_write,
 	.read = qib_diag_read,
 	.open = qib_diag_open,
-	.release = qib_diag_release
+	.release = qib_diag_release,
+	.llseek = default_llseek,
 };
 
 static atomic_t diagpkt_count = ATOMIC_INIT(0);
@@ -153,6 +154,7 @@ static ssize_t qib_diagpkt_write(struct file *fp, const char __user *data,
 static const struct file_operations diagpkt_file_ops = {
 	.owner = THIS_MODULE,
 	.write = qib_diagpkt_write,
+	.llseek = noop_llseek,
 };
 
 int qib_diag_add(struct qib_devdata *dd)
@@ -553,7 +555,6 @@ static ssize_t qib_diagpkt_write(struct file *fp,
 	struct qib_devdata *dd;
 	struct qib_pportdata *ppd;
 	ssize_t ret = 0;
-	u16 idx;
 
 	if (count != sizeof(dp)) {
 		ret = -EINVAL;
@@ -590,8 +591,7 @@ static ssize_t qib_diagpkt_write(struct file *fp,
 		ret = -EINVAL;
 		goto bail;
 	}
-	idx = array_index_nospec(dp.port - 1, dd->num_pports);
-	ppd = &dd->pport[idx];
+	ppd = &dd->pport[dp.port - 1];
 
 	/*
 	 * need total length before first word written, plus 2 Dwords. One Dword
@@ -609,14 +609,12 @@ static ssize_t qib_diagpkt_write(struct file *fp,
 
 	tmpbuf = vmalloc(plen);
 	if (!tmpbuf) {
-		qib_devinfo(dd->pcidev,
-			"Unable to allocate tmp buffer, failing\n");
 		ret = -ENOMEM;
 		goto bail;
 	}
 
 	if (copy_from_user(tmpbuf,
-			   (const void __user *) (unsigned long) dp.data,
+			   u64_to_user_ptr(dp.data),
 			   dp.len)) {
 		ret = -EFAULT;
 		goto bail;
@@ -702,10 +700,8 @@ int qib_register_observer(struct qib_devdata *dd,
 	if (!dd || !op)
 		return -EINVAL;
 	olp = vmalloc(sizeof(*olp));
-	if (!olp) {
-		pr_err("vmalloc for observer failed\n");
+	if (!olp)
 		return -ENOMEM;
-	}
 
 	spin_lock_irqsave(&dd->qib_diag_trans_lock, flags);
 	olp->op = op;

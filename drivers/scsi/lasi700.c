@@ -40,6 +40,7 @@
 #include <linux/blkdev.h>
 #include <linux/ioport.h>
 #include <linux/dma-mapping.h>
+#include <linux/slab.h>
 
 #include <asm/page.h>
 #include <asm/pgtable.h>
@@ -167,7 +168,7 @@ static struct parisc_driver lasi700_driver = {
 	.name =		"lasi_scsi",
 	.id_table =	lasi700_ids,
 	.probe =	lasi700_probe,
-	.remove =	__devexit_p(lasi700_driver_remove),
+	.remove =	lasi700_driver_remove,
 };
 
 static int __init

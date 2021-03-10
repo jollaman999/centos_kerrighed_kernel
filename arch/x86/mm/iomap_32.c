@@ -18,7 +18,7 @@
 
 #include <asm/iomap.h>
 #include <asm/pat.h>
-#include <linux/module.h>
+#include <linux/export.h>
 #include <linux/highmem.h>
 
 static int is_io_mapping_possible(resource_size_t base, unsigned long size)
@@ -33,36 +33,36 @@ static int is_io_mapping_possible(resource_size_t base, unsigned long size)
 
 int iomap_create_wc(resource_size_t base, unsigned long size, pgprot_t *prot)
 {
-	unsigned long flag = _PAGE_CACHE_WC;
+	enum page_cache_mode pcm = _PAGE_CACHE_MODE_WC;
 	int ret;
 
 	if (!is_io_mapping_possible(base, size))
 		return -EINVAL;
 
-	ret = io_reserve_memtype(base, base + size, &flag);
+	ret = io_reserve_memtype(base, base + size, &pcm);
 	if (ret)
 		return ret;
 
-	*prot = __pgprot(__PAGE_KERNEL | flag);
+	*prot = __pgprot(__PAGE_KERNEL | cachemode2protval(pcm));
 	return 0;
 }
 EXPORT_SYMBOL_GPL(iomap_create_wc);
 
-void
-iomap_free(resource_size_t base, unsigned long size)
+void iomap_free(resource_size_t base, unsigned long size)
 {
 	io_free_memtype(base, base + size);
 }
 EXPORT_SYMBOL_GPL(iomap_free);
 
-void *kmap_atomic_prot_pfn(unsigned long pfn, enum km_type type, pgprot_t prot)
+void *kmap_atomic_prot_pfn(unsigned long pfn, pgprot_t prot)
 {
-	enum fixed_addresses idx;
 	unsigned long vaddr;
+	int idx, type;
 
+	preempt_disable();
 	pagefault_disable();
 
-	debug_kmap_atomic(type);
+	type = kmap_atomic_idx_push();
 	idx = type + KM_TYPE_NR * smp_processor_id();
 	vaddr = __fix_to_virt(FIX_KMAP_BEGIN + idx);
 	set_pte(kmap_pte - idx, pfn_pte(pfn, prot));
@@ -72,10 +72,10 @@ void *kmap_atomic_prot_pfn(unsigned long pfn, enum km_type type, pgprot_t prot)
 }
 
 /*
- * Map 'pfn' using fixed map 'type' and protections 'prot'
+ * Map 'pfn' using protections 'prot'
  */
-void *
-iomap_atomic_prot_pfn(unsigned long pfn, enum km_type type, pgprot_t prot)
+void __iomem *
+iomap_atomic_prot_pfn(unsigned long pfn, pgprot_t prot)
 {
 	/*
 	 * For non-PAT systems, promote PAGE_KERNEL_WC to PAGE_KERNEL_UC_MINUS.
@@ -83,28 +83,41 @@ iomap_atomic_prot_pfn(unsigned long pfn, enum km_type type, pgprot_t prot)
 	 * MTRR is UC or WC.  UC_MINUS gets the real intention, of the
 	 * user, which is "WC if the MTRR is WC, UC if you can't do that."
 	 */
-	if (!pat_enabled && pgprot_val(prot) == pgprot_val(PAGE_KERNEL_WC))
-		prot = PAGE_KERNEL_UC_MINUS;
+	if (!pat_enabled && pgprot_val(prot) ==
+	    (__PAGE_KERNEL | cachemode2protval(_PAGE_CACHE_MODE_WC)))
+		prot = __pgprot(__PAGE_KERNEL |
+				cachemode2protval(_PAGE_CACHE_MODE_UC_MINUS));
 
-	return kmap_atomic_prot_pfn(pfn, type, prot);
+	return (void __force __iomem *) kmap_atomic_prot_pfn(pfn, prot);
 }
 EXPORT_SYMBOL_GPL(iomap_atomic_prot_pfn);
 
 void
-iounmap_atomic(void *kvaddr, enum km_type type)
+iounmap_atomic(void __iomem *kvaddr)
 {
 	unsigned long vaddr = (unsigned long) kvaddr & PAGE_MASK;
-	enum fixed_addresses idx = type + KM_TYPE_NR*smp_processor_id();
 
-	/*
-	 * Force other mappings to Oops if they'll try to access this pte
-	 * without first remap it.  Keeping stale mappings around is a bad idea
-	 * also, in case the page changes cacheability attributes or becomes
-	 * a protected page in a hypervisor.
-	 */
-	if (vaddr == __fix_to_virt(FIX_KMAP_BEGIN+idx))
+	if (vaddr >= __fix_to_virt(FIX_KMAP_END) &&
+	    vaddr <= __fix_to_virt(FIX_KMAP_BEGIN)) {
+		int idx, type;
+
+		type = kmap_atomic_idx();
+		idx = type + KM_TYPE_NR * smp_processor_id();
+
+#ifdef CONFIG_DEBUG_HIGHMEM
+		WARN_ON_ONCE(vaddr != __fix_to_virt(FIX_KMAP_BEGIN + idx));
+#endif
+		/*
+		 * Force other mappings to Oops if they'll try to access this
+		 * pte without first remap it.  Keeping stale mappings around
+		 * is a bad idea also, in case the page changes cacheability
+		 * attributes or becomes a protected page in a hypervisor.
+		 */
 		kpte_clear_flush(kmap_pte-idx, vaddr);
+		kmap_atomic_idx_pop();
+	}
 
 	pagefault_enable();
+	preempt_enable();
 }
 EXPORT_SYMBOL_GPL(iounmap_atomic);

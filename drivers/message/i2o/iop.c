@@ -29,6 +29,7 @@
 #include <linux/i2o.h>
 #include <linux/delay.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 #include "core.h"
 
 #define OSM_NAME	"i2o"
@@ -132,7 +133,7 @@ u32 i2o_cntxt_list_add(struct i2o_controller * c, void *ptr)
  *	Removes a previously added pointer from the context list and returns
  *	the matching context id.
  *
- *	Returns context id on succes or 0 on failure.
+ *	Returns context id on success or 0 on failure.
  */
 u32 i2o_cntxt_list_remove(struct i2o_controller * c, void *ptr)
 {
@@ -198,7 +199,7 @@ void *i2o_cntxt_list_get(struct i2o_controller *c, u32 context)
  *	@c: controller to which the context list belong
  *	@ptr: pointer to which the context id should be fetched
  *
- *	Returns context id which matches to the pointer on succes or 0 on
+ *	Returns context id which matches to the pointer on success or 0 on
  *	failure.
  */
 u32 i2o_cntxt_list_get_ptr(struct i2o_controller * c, void *ptr)
@@ -539,7 +540,7 @@ static int i2o_iop_reset(struct i2o_controller *c)
 		 * which is indeterminate. We need to wait until the IOP has
 		 * rebooted before we can let the system talk to it. We read
 		 * the inbound Free_List until a message is available. If we
-		 * can't read one in the given ammount of time, we assume the
+		 * can't read one in the given amount of time, we assume the
 		 * IOP could not reboot properly.
 		 */
 		osm_debug("%s: Reset in progress, waiting for reboot...\n",
@@ -651,6 +652,44 @@ static int i2o_iop_activate(struct i2o_controller *c)
 	return i2o_hrt_get(c);
 };
 
+static void i2o_res_alloc(struct i2o_controller *c, unsigned long flags)
+{
+	i2o_status_block *sb = c->status_block.virt;
+	struct resource *res = &c->mem_resource;
+	resource_size_t size, align;
+	int err;
+
+	res->name = c->pdev->bus->name;
+	res->flags = flags;
+	res->start = 0;
+	res->end = 0;
+	osm_info("%s: requires private memory resources.\n", c->name);
+
+	if (flags & IORESOURCE_MEM) {
+		size = sb->desired_mem_size;
+		align = 1 << 20;	/* unspecified, use 1Mb and play safe */
+	} else {
+		size = sb->desired_io_size;
+		align = 1 << 12;	/* unspecified, use 4Kb and play safe */
+	}
+
+	err = pci_bus_alloc_resource(c->pdev->bus, res, size, align, 0, 0,
+				     NULL, NULL);
+	if (err < 0)
+		return;
+
+	if (flags & IORESOURCE_MEM) {
+		c->mem_alloc = 1;
+		sb->current_mem_size = resource_size(res);
+		sb->current_mem_base = res->start;
+	} else if (flags & IORESOURCE_IO) {
+		c->io_alloc = 1;
+		sb->current_io_size = resource_size(res);
+		sb->current_io_base = res->start;
+	}
+	osm_info("%s: allocated PCI space %pR\n", c->name, res);
+}
+
 /**
  *	i2o_iop_systab_set - Set the I2O System Table of the specified IOP
  *	@c: I2O controller to which the system table should be send
@@ -664,52 +703,13 @@ static int i2o_iop_systab_set(struct i2o_controller *c)
 	struct i2o_message *msg;
 	i2o_status_block *sb = c->status_block.virt;
 	struct device *dev = &c->pdev->dev;
-	struct resource *root;
 	int rc;
 
-	if (sb->current_mem_size < sb->desired_mem_size) {
-		struct resource *res = &c->mem_resource;
-		res->name = c->pdev->bus->name;
-		res->flags = IORESOURCE_MEM;
-		res->start = 0;
-		res->end = 0;
-		osm_info("%s: requires private memory resources.\n", c->name);
-		root = pci_find_parent_resource(c->pdev, res);
-		if (root == NULL)
-			osm_warn("%s: Can't find parent resource!\n", c->name);
-		if (root && allocate_resource(root, res, sb->desired_mem_size, sb->desired_mem_size, sb->desired_mem_size, 1 << 20,	/* Unspecified, so use 1Mb and play safe */
-					      NULL, NULL) >= 0) {
-			c->mem_alloc = 1;
-			sb->current_mem_size = 1 + res->end - res->start;
-			sb->current_mem_base = res->start;
-			osm_info("%s: allocated %llu bytes of PCI memory at "
-				"0x%016llX.\n", c->name,
-				(unsigned long long)(1 + res->end - res->start),
-				(unsigned long long)res->start);
-		}
-	}
+	if (sb->current_mem_size < sb->desired_mem_size)
+		i2o_res_alloc(c, IORESOURCE_MEM);
 
-	if (sb->current_io_size < sb->desired_io_size) {
-		struct resource *res = &c->io_resource;
-		res->name = c->pdev->bus->name;
-		res->flags = IORESOURCE_IO;
-		res->start = 0;
-		res->end = 0;
-		osm_info("%s: requires private memory resources.\n", c->name);
-		root = pci_find_parent_resource(c->pdev, res);
-		if (root == NULL)
-			osm_warn("%s: Can't find parent resource!\n", c->name);
-		if (root && allocate_resource(root, res, sb->desired_io_size, sb->desired_io_size, sb->desired_io_size, 1 << 20,	/* Unspecified, so use 1Mb and play safe */
-					      NULL, NULL) >= 0) {
-			c->io_alloc = 1;
-			sb->current_io_size = 1 + res->end - res->start;
-			sb->current_mem_base = res->start;
-			osm_info("%s: allocated %llu bytes of PCI I/O at "
-				"0x%016llX.\n", c->name,
-				(unsigned long long)(1 + res->end - res->start),
-				(unsigned long long)res->start);
-		}
-	}
+	if (sb->current_io_size < sb->desired_io_size)
+		i2o_res_alloc(c, IORESOURCE_IO);
 
 	msg = i2o_msg_get_wait(c, I2O_TIMEOUT_MESSAGE_GET);
 	if (IS_ERR(msg))

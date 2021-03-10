@@ -18,7 +18,7 @@
  *
  * File: tcrc.h
  *
- * Purpose: Implement functions to caculate CRC
+ * Purpose: Implement functions to calculate CRC
  *
  * Author: Tevin Chen
  *
@@ -43,11 +43,8 @@
 
 /*---------------------  Export Functions  --------------------------*/
 
-DWORD CRCdwCrc32(PBYTE pbyData, UINT cbByte, DWORD dwCrcSeed);
-DWORD CRCdwGetCrc32(PBYTE pbyData, UINT cbByte);
-DWORD CRCdwGetCrc32Ex(PBYTE pbyData, UINT cbByte, DWORD dwPreCRC);
+unsigned long CRCdwCrc32(unsigned char *pbyData, unsigned int cbByte, unsigned long dwCrcSeed);
+unsigned long CRCdwGetCrc32(unsigned char *pbyData, unsigned int cbByte);
+unsigned long CRCdwGetCrc32Ex(unsigned char *pbyData, unsigned int cbByte, unsigned long dwPreCRC);
 
 #endif // __TCRC_H__
-
-
-

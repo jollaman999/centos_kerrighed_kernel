@@ -5,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2012, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -53,8 +53,8 @@ ACPI_MODULE_NAME("utaddress")
  * FUNCTION:    acpi_ut_add_address_range
  *
  * PARAMETERS:  space_id            - Address space ID
- *              Address             - op_region start address
- *              Length              - op_region length
+ *              address             - op_region start address
+ *              length              - op_region length
  *              region_node         - op_region namespace node
  *
  * RETURN:      Status
@@ -186,9 +186,9 @@ acpi_ut_remove_address_range(acpi_adr_space_type space_id,
  * FUNCTION:    acpi_ut_check_address_range
  *
  * PARAMETERS:  space_id            - Address space ID
- *              Address             - Start address
- *              Length              - Length of address range
- *              Warn                - TRUE if warning on overlap desired
+ *              address             - Start address
+ *              length              - Length of address range
+ *              warn                - TRUE if warning on overlap desired
  *
  * RETURN:      Count of the number of conflicts detected. Zero is always
  *              returned for Space IDs other than Memory or I/O.
@@ -245,12 +245,12 @@ acpi_ut_check_address_range(acpi_adr_space_type space_id,
 								  region_node);
 
 				ACPI_WARNING((AE_INFO,
-					      "%s range 0x%p-0x%p conflicts with OpRegion 0x%p-0x%p (%s)",
+					     "%s range 0x%p-0x%p conflicts with OpRegion 0x%p-0x%p (%s)",
 					      acpi_ut_get_region_name (space_id),
 					      ACPI_CAST_PTR(void, address),
 					      ACPI_CAST_PTR(void, end_address),
-					      ACPI_CAST_PTR(void, range_info->start_address),
-					      ACPI_CAST_PTR(void, range_info->end_address),
+					      ACPI_CAST_PTR (void, range_info->start_address),
+					      ACPI_CAST_PTR (void, range_info->end_address),
 					      pathname));
 				ACPI_FREE(pathname);
 			}

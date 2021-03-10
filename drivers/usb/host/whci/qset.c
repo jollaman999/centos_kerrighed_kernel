@@ -1,22 +1,12 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Wireless Host Controller (WHC) qset management.
  *
  * Copyright (C) 2007 Cambridge Silicon Radio Ltd.
- *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License version
- * 2 as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 #include <linux/kernel.h>
 #include <linux/dma-mapping.h>
+#include <linux/slab.h>
 #include <linux/uwb/umc.h>
 #include <linux/usb.h>
 
@@ -29,10 +19,9 @@ struct whc_qset *qset_alloc(struct whc *whc, gfp_t mem_flags)
 	struct whc_qset *qset;
 	dma_addr_t dma;
 
-	qset = dma_pool_alloc(whc->qset_pool, mem_flags, &dma);
+	qset = dma_pool_zalloc(whc->qset_pool, mem_flags, &dma);
 	if (qset == NULL)
 		return NULL;
-	memset(qset, 0, sizeof(struct whc_qset));
 
 	qset->qset_dma = dma;
 	qset->whc = whc;
@@ -49,11 +38,13 @@ struct whc_qset *qset_alloc(struct whc *whc, gfp_t mem_flags)
  *        state
  * @urb:  an urb for a transfer to this endpoint
  */
-static void qset_fill_qh(struct whc_qset *qset, struct urb *urb)
+static void qset_fill_qh(struct whc *whc, struct whc_qset *qset, struct urb *urb)
 {
 	struct usb_device *usb_dev = urb->dev;
+	struct wusb_dev *wusb_dev = usb_dev->wusb_dev;
 	struct usb_wireless_ep_comp_descriptor *epcd;
 	bool is_out;
+	uint8_t phy_rate;
 
 	is_out = usb_pipeout(urb->pipe);
 
@@ -66,6 +57,22 @@ static void qset_fill_qh(struct whc_qset *qset, struct urb *urb)
 	} else {
 		qset->max_seq = 2;
 		qset->max_burst = 1;
+	}
+
+	/*
+	 * Initial PHY rate is 53.3 Mbit/s for control endpoints or
+	 * the maximum supported by the device for other endpoints
+	 * (unless limited by the user).
+	 */
+	if (usb_pipecontrol(urb->pipe))
+		phy_rate = UWB_PHY_RATE_53;
+	else {
+		uint16_t phy_rates;
+
+		phy_rates = le16_to_cpu(wusb_dev->wusb_cap_descr->wPHYRates);
+		phy_rate = fls(phy_rates) - 1;
+		if (phy_rate > whc->wusbhc.phy_rate)
+			phy_rate = whc->wusbhc.phy_rate;
 	}
 
 	qset->qh.info1 = cpu_to_le32(
@@ -87,7 +94,7 @@ static void qset_fill_qh(struct whc_qset *qset, struct urb *urb)
 	 * strength and can presumably guess the Tx power required
 	 * from that? */
 	qset->qh.info3 = cpu_to_le32(
-		QH_INFO3_TX_RATE_53_3
+		QH_INFO3_TX_RATE(phy_rate)
 		| QH_INFO3_TX_PWR(0) /* 0 == max power */
 		);
 
@@ -105,7 +112,7 @@ void qset_clear(struct whc *whc, struct whc_qset *qset)
 {
 	qset->td_start = qset->td_end = qset->ntds = 0;
 
-	qset->qh.link = cpu_to_le32(QH_LINK_NTDS(8) | QH_LINK_T);
+	qset->qh.link = cpu_to_le64(QH_LINK_NTDS(8) | QH_LINK_T);
 	qset->qh.status = qset->qh.status & QH_STATUS_SEQ_MASK;
 	qset->qh.err_count = 0;
 	qset->qh.scratch[0] = 0;
@@ -149,7 +156,7 @@ struct whc_qset *get_qset(struct whc *whc, struct urb *urb,
 
 		qset->ep = urb->ep;
 		urb->ep->hcpriv = qset;
-		qset_fill_qh(qset, urb);
+		qset_fill_qh(whc, qset, urb);
 	}
 	return qset;
 }
@@ -296,7 +303,7 @@ void qset_free_std(struct whc *whc, struct whc_std *std)
 		kfree(std->bounce_buf);
 	}
 	if (std->pl_virt) {
-		if (std->dma_addr)
+		if (!dma_mapping_error(whc->wusbhc.dev, std->dma_addr))
 			dma_unmap_single(whc->wusbhc.dev, std->dma_addr,
 					 std->num_pointers * sizeof(struct whc_page_list_entry),
 					 DMA_TO_DEVICE);
@@ -358,6 +365,10 @@ static int qset_fill_page_list(struct whc *whc, struct whc_std *std, gfp_t mem_f
 	if (std->pl_virt == NULL)
 		return -ENOMEM;
 	std->dma_addr = dma_map_single(whc->wusbhc.dev, std->pl_virt, pl_len, DMA_TO_DEVICE);
+	if (dma_mapping_error(whc->wusbhc.dev, std->dma_addr)) {
+		kfree(std->pl_virt);
+		return -EFAULT;
+	}
 
 	for (p = 0; p < std->num_pointers; p++) {
 		std->pl_virt[p].buf_ptr = cpu_to_le64(dma_addr);
@@ -377,7 +388,7 @@ static void urb_dequeue_work(struct work_struct *work)
 	struct whc *whc = qset->whc;
 	unsigned long flags;
 
-	if (wurb->is_async == true)
+	if (wurb->is_async)
 		asl_update(whc, WUSBCMD_ASYNC_UPDATED
 			   | WUSBCMD_ASYNC_SYNCED_DB
 			   | WUSBCMD_ASYNC_QSET_RM);
@@ -417,14 +428,14 @@ static int qset_add_urb_sg(struct whc *whc, struct whc_qset *qset, struct urb *u
 	int i;
 	int ntds = 0;
 	struct whc_std *std = NULL;
-	struct whc_page_list_entry *entry;
+	struct whc_page_list_entry *new_pl_virt;
 	dma_addr_t prev_end = 0;
 	size_t pl_len;
 	int p = 0;
 
 	remaining = urb->transfer_buffer_length;
 
-	for_each_sg(urb->sg->sg, sg, urb->num_sgs, i) {
+	for_each_sg(urb->sg, sg, urb->num_mapped_sgs, i) {
 		dma_addr_t dma_addr;
 		size_t dma_remaining;
 		dma_addr_t sp, ep;
@@ -456,7 +467,7 @@ static int qset_add_urb_sg(struct whc *whc, struct whc_qset *qset, struct urb *u
 			    || (prev_end & (WHCI_PAGE_SIZE-1))
 			    || (dma_addr & (WHCI_PAGE_SIZE-1))
 			    || std->len + WHCI_PAGE_SIZE > QTD_MAX_XFER_SIZE) {
-				if (std->len % qset->max_packet != 0)
+				if (std && std->len % qset->max_packet != 0)
 					return -EINVAL;
 				std = qset_new_std(whc, qset, urb, mem_flags);
 				if (std == NULL) {
@@ -489,12 +500,15 @@ static int qset_add_urb_sg(struct whc *whc, struct whc_qset *qset, struct urb *u
 
 			pl_len = std->num_pointers * sizeof(struct whc_page_list_entry);
 
-			std->pl_virt = krealloc(std->pl_virt, pl_len, mem_flags);
-			if (std->pl_virt == NULL) {
+			new_pl_virt = krealloc(std->pl_virt, pl_len, mem_flags);
+			if (new_pl_virt == NULL) {
+				kfree(std->pl_virt);
+				std->pl_virt = NULL;
 				return -ENOMEM;
 			}
+			std->pl_virt = new_pl_virt;
 
-			for (;p < std->num_pointers; p++, entry++) {
+			for (;p < std->num_pointers; p++) {
 				std->pl_virt[p].buf_ptr = cpu_to_le64(dma_addr);
 				dma_addr = (dma_addr + WHCI_PAGE_SIZE) & ~(WHCI_PAGE_SIZE-1);
 			}
@@ -510,9 +524,11 @@ static int qset_add_urb_sg(struct whc *whc, struct whc_qset *qset, struct urb *u
 	list_for_each_entry(std, &qset->stds, list_node) {
 		if (std->ntds_remaining == -1) {
 			pl_len = std->num_pointers * sizeof(struct whc_page_list_entry);
-			std->ntds_remaining = ntds--;
 			std->dma_addr = dma_map_single(whc->wusbhc.dev, std->pl_virt,
 						       pl_len, DMA_TO_DEVICE);
+			if (dma_mapping_error(whc->wusbhc.dev, std->dma_addr))
+				return -EFAULT;
+			std->ntds_remaining = ntds--;
 		}
 	}
 	return 0;
@@ -542,7 +558,7 @@ static int qset_add_urb_sg_linearize(struct whc *whc, struct whc_qset *qset,
 
 	remaining = urb->transfer_buffer_length;
 
-	for_each_sg(urb->sg->sg, sg, urb->sg->nents, i) {
+	for_each_sg(urb->sg, sg, urb->num_mapped_sgs, i) {
 		size_t len;
 		size_t sg_remaining;
 		void *orig;
@@ -593,6 +609,8 @@ static int qset_add_urb_sg_linearize(struct whc *whc, struct whc_qset *qset,
 
 		std->dma_addr = dma_map_single(&whc->umc->dev, std->bounce_buf, std->len,
 					       is_out ? DMA_TO_DEVICE : DMA_FROM_DEVICE);
+		if (dma_mapping_error(&whc->umc->dev, std->dma_addr))
+			return -EFAULT;
 
 		if (qset_fill_page_list(whc, std, mem_flags) < 0)
 			return -ENOMEM;
@@ -627,7 +645,7 @@ int qset_add_urb(struct whc *whc, struct whc_qset *qset, struct urb *urb,
 	wurb->urb = urb;
 	INIT_WORK(&wurb->dequeue_work, urb_dequeue_work);
 
-	if (urb->sg) {
+	if (urb->num_sgs) {
 		ret = qset_add_urb_sg(whc, qset, urb, mem_flags);
 		if (ret == -EINVAL) {
 			qset_free_stds(qset, urb);
@@ -720,7 +738,7 @@ static int get_urb_status_from_qtd(struct urb *urb, u32 status)
  * process_inactive_qtd - process an inactive (but not halted) qTD.
  *
  * Update the urb with the transfer bytes from the qTD, if the urb is
- * completely transfered or (in the case of an IN only) the LPF is
+ * completely transferred or (in the case of an IN only) the LPF is
  * set, then the transfer is complete and the urb should be returned
  * to the system.
  */

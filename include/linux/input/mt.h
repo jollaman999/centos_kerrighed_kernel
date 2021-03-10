@@ -12,7 +12,6 @@
  */
 
 #include <linux/input.h>
-#include <linux/nospec.h>
 
 #define TRKID_MAX	0xffff
 
@@ -63,9 +62,7 @@ static inline void input_mt_set_value(struct input_mt_slot *slot,
 static inline int input_mt_get_value(const struct input_mt_slot *slot,
 				     unsigned code)
 {
-	unsigned idx = array_index_nospec(code - ABS_MT_FIRST,
-					  ABS_MT_LAST - ABS_MT_FIRST + 1);
-	return slot->abs[idx];
+	return slot->abs[code - ABS_MT_FIRST];
 }
 
 static inline bool input_mt_is_active(const struct input_mt_slot *slot)
@@ -121,7 +118,8 @@ struct input_mt_pos {
 };
 
 int input_mt_assign_slots(struct input_dev *dev, int *slots,
-			  const struct input_mt_pos *pos, int num_pos);
+			  const struct input_mt_pos *pos, int num_pos,
+			  int dmax);
 
 int input_mt_get_slot_by_key(struct input_dev *dev, int key);
 

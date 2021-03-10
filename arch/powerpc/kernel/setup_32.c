@@ -16,7 +16,7 @@
 #include <linux/root_dev.h>
 #include <linux/cpu.h>
 #include <linux/console.h>
-#include <linux/lmb.h>
+#include <linux/memblock.h>
 
 #include <asm/io.h>
 #include <asm/prom.h>
@@ -30,7 +30,6 @@
 #include <asm/btext.h>
 #include <asm/machdep.h>
 #include <asm/uaccess.h>
-#include <asm/system.h>
 #include <asm/pmac_feature.h>
 #include <asm/sections.h>
 #include <asm/nvram.h>
@@ -39,15 +38,13 @@
 #include <asm/serial.h>
 #include <asm/udbg.h>
 #include <asm/mmu_context.h>
-#include <asm/swiotlb.h>
 
 #define DBG(fmt...)
 
 extern void bootx_init(unsigned long r4, unsigned long phys);
 
-int boot_cpuid;
-EXPORT_SYMBOL_GPL(boot_cpuid);
 int boot_cpuid_phys;
+EXPORT_SYMBOL_GPL(boot_cpuid_phys);
 
 int smp_hw_index[NR_CPUS];
 
@@ -105,6 +102,8 @@ notrace unsigned long __init early_init(unsigned long dt_ptr)
 			 PTRRELOC(&__start___lwsync_fixup),
 			 PTRRELOC(&__stop___lwsync_fixup));
 
+	do_final_fixups();
+
 	return KERNELBASE + offset;
 }
 
@@ -115,7 +114,7 @@ notrace unsigned long __init early_init(unsigned long dt_ptr)
  * This is called very early on the boot process, after a minimal
  * MMU environment has been set up but before MMU_init is called.
  */
-notrace void __init machine_init(unsigned long dt_ptr)
+notrace void __init machine_init(u64 dt_ptr)
 {
 	lockdep_init();
 
@@ -124,6 +123,8 @@ notrace void __init machine_init(unsigned long dt_ptr)
 
 	/* Do some early initialization based on the flat device tree */
 	early_init_devtree(__va(dt_ptr));
+
+	early_init_mmu();
 
 	probe_machine();
 
@@ -143,27 +144,6 @@ notrace void __init machine_init(unsigned long dt_ptr)
 	if (ppc_md.progress)
 		ppc_md.progress("id mach(): done", 0x200);
 }
-
-#ifdef CONFIG_BOOKE_WDT
-/* Checks wdt=x and wdt_period=xx command-line option */
-notrace int __init early_parse_wdt(char *p)
-{
-	if (p && strncmp(p, "0", 1) != 0)
-	       booke_wdt_enabled = 1;
-
-	return 0;
-}
-early_param("wdt", early_parse_wdt);
-
-int __init early_parse_wdt_period (char *p)
-{
-	if (p)
-		booke_wdt_period = simple_strtoul(p, NULL, 0);
-
-	return 0;
-}
-early_param("wdt_period", early_parse_wdt_period);
-#endif	/* CONFIG_BOOKE_WDT */
 
 /* Checks "l2cr=xxxx" command-line option */
 int __init ppc_setup_l2cr(char *str)
@@ -240,39 +220,36 @@ int __init ppc_init(void)
 
 arch_initcall(ppc_init);
 
-#ifdef CONFIG_IRQSTACKS
 static void __init irqstack_early_init(void)
 {
 	unsigned int i;
 
 	/* interrupt stacks must be in lowmem, we get that for free on ppc32
-	 * as the lmb is limited to lowmem by LMB_REAL_LIMIT */
+	 * as the memblock is limited to lowmem by default */
 	for_each_possible_cpu(i) {
 		softirq_ctx[i] = (struct thread_info *)
-			__va(lmb_alloc(THREAD_SIZE, THREAD_SIZE));
+			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
 		hardirq_ctx[i] = (struct thread_info *)
-			__va(lmb_alloc(THREAD_SIZE, THREAD_SIZE));
+			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
 	}
 }
-#else
-#define irqstack_early_init()
-#endif
 
 #if defined(CONFIG_BOOKE) || defined(CONFIG_40x)
 static void __init exc_lvl_early_init(void)
 {
-	unsigned int i;
+	unsigned int i, hw_cpu;
 
 	/* interrupt stacks must be in lowmem, we get that for free on ppc32
-	 * as the lmb is limited to lowmem by LMB_REAL_LIMIT */
+	 * as the memblock is limited to lowmem by MEMBLOCK_REAL_LIMIT */
 	for_each_possible_cpu(i) {
-		critirq_ctx[i] = (struct thread_info *)
-			__va(lmb_alloc(THREAD_SIZE, THREAD_SIZE));
+		hw_cpu = get_hard_smp_processor_id(i);
+		critirq_ctx[hw_cpu] = (struct thread_info *)
+			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
 #ifdef CONFIG_BOOKE
-		dbgirq_ctx[i] = (struct thread_info *)
-			__va(lmb_alloc(THREAD_SIZE, THREAD_SIZE));
-		mcheckirq_ctx[i] = (struct thread_info *)
-			__va(lmb_alloc(THREAD_SIZE, THREAD_SIZE));
+		dbgirq_ctx[hw_cpu] = (struct thread_info *)
+			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
+		mcheckirq_ctx[hw_cpu] = (struct thread_info *)
+			__va(memblock_alloc(THREAD_SIZE, THREAD_SIZE));
 #endif
 	}
 }
@@ -314,9 +291,6 @@ void __init setup_arch(char **cmdline_p)
 	if (cpu_has_feature(CPU_FTR_UNIFIED_ID_CACHE))
 		ucache_bsize = icache_bsize = dcache_bsize;
 
-	/* reboot on panic */
-	panic_timeout = 180;
-
 	if (ppc_md.panic)
 		setup_panic();
 
@@ -340,11 +314,6 @@ void __init setup_arch(char **cmdline_p)
 	if (ppc_md.setup_arch)
 		ppc_md.setup_arch();
 	if ( ppc_md.progress ) ppc_md.progress("arch: exit", 0x3eab);
-
-#ifdef CONFIG_SWIOTLB
-	if (ppc_swiotlb_enable)
-		swiotlb_init(1);
-#endif
 
 	paging_init();
 

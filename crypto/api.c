@@ -10,7 +10,7 @@
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
- * Software Foundation; either version 2 of the License, or (at your option) 
+ * Software Foundation; either version 2 of the License, or (at your option)
  * any later version.
  *
  */
@@ -195,9 +195,21 @@ static struct crypto_alg *crypto_larval_wait(struct crypto_alg *alg)
 struct crypto_alg *crypto_alg_lookup(const char *name, u32 type, u32 mask)
 {
 	struct crypto_alg *alg;
+	u32 test = 0;
+
+	if (!((type | mask) & CRYPTO_ALG_TESTED))
+		test |= CRYPTO_ALG_TESTED;
 
 	down_read(&crypto_alg_sem);
-	alg = __crypto_alg_lookup(name, type, mask);
+	alg = __crypto_alg_lookup(name, type | test, mask | test);
+	if (!alg && test) {
+		alg = __crypto_alg_lookup(name, type, mask);
+		if (alg && !crypto_is_larval(alg)) {
+			/* Test failed */
+			crypto_mod_put(alg);
+			alg = ERR_PTR(-ELIBBAD);
+		}
+	}
 	up_read(&crypto_alg_sem);
 
 	return alg;
@@ -216,19 +228,21 @@ struct crypto_alg *crypto_larval_lookup(const char *name, u32 type, u32 mask)
 
 	alg = crypto_alg_lookup(name, type, mask);
 	if (!alg) {
-		request_module("%s", name);
+		request_module("crypto-%s", name);
 
 		if (!((type ^ CRYPTO_ALG_NEED_FALLBACK) & mask &
 		      CRYPTO_ALG_NEED_FALLBACK))
-			request_module("%s-all", name);
+			request_module("crypto-%s-all", name);
 
 		alg = crypto_alg_lookup(name, type, mask);
 	}
 
-	if (alg)
-		return crypto_is_larval(alg) ? crypto_larval_wait(alg) : alg;
+	if (!IS_ERR_OR_NULL(alg) && crypto_is_larval(alg))
+		alg = crypto_larval_wait(alg);
+	else if (!alg)
+		alg = crypto_larval_add(name, type, mask);
 
-	return crypto_larval_add(name, type, mask);
+	return alg;
 }
 EXPORT_SYMBOL_GPL(crypto_larval_lookup);
 
@@ -252,10 +266,15 @@ struct crypto_alg *crypto_alg_mod_lookup(const char *name, u32 type, u32 mask)
 	struct crypto_alg *larval;
 	int ok;
 
-	if (!((type | mask) & CRYPTO_ALG_TESTED)) {
-		type |= CRYPTO_ALG_TESTED;
-		mask |= CRYPTO_ALG_TESTED;
-	}
+	/*
+	 * If the internal flag is set for a cipher, require a caller to
+	 * to invoke the cipher with the internal flag to use that cipher.
+	 * Also, if a caller wants to allocate a cipher that may or may
+	 * not be an internal cipher, use type | CRYPTO_ALG_INTERNAL and
+	 * !(mask & CRYPTO_ALG_INTERNAL).
+	 */
+	if (!((type | mask) & CRYPTO_ALG_INTERNAL))
+		mask |= CRYPTO_ALG_INTERNAL;
 
 	larval = crypto_larval_lookup(name, type, mask);
 	if (IS_ERR(larval) || !crypto_is_larval(larval))
@@ -287,11 +306,11 @@ static int crypto_init_ops(struct crypto_tfm *tfm, u32 type, u32 mask)
 
 	case CRYPTO_ALG_TYPE_COMPRESS:
 		return crypto_init_compress_ops(tfm);
-	
+
 	default:
 		break;
 	}
-	
+
 	BUG();
 	return -EINVAL;
 }
@@ -314,10 +333,9 @@ static void crypto_exit_ops(struct crypto_tfm *tfm)
 	case CRYPTO_ALG_TYPE_COMPRESS:
 		crypto_exit_compress_ops(tfm);
 		break;
-	
+
 	default:
 		BUG();
-		
 	}
 }
 
@@ -592,12 +610,12 @@ int crypto_has_alg(const char *name, u32 type, u32 mask)
 {
 	int ret = 0;
 	struct crypto_alg *alg = crypto_alg_mod_lookup(name, type, mask);
-	
+
 	if (!IS_ERR(alg)) {
 		crypto_mod_put(alg);
 		ret = 1;
 	}
-	
+
 	return ret;
 }
 EXPORT_SYMBOL_GPL(crypto_has_alg);

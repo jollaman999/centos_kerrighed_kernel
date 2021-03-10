@@ -19,10 +19,7 @@
  *
  */
 
-#include <linux/nospec.h>
 #include "opl3_voice.h"
-
-extern char snd_opl3_regmap[MAX_OPL2_VOICES][4];
 
 static char snd_opl3_drum_table[47] =
 {
@@ -188,16 +185,13 @@ void snd_opl3_drum_switch(struct snd_opl3 *opl3, int note, int vel, int on_off,
 {
 	unsigned char drum_mask;
 	struct snd_opl3_drum_voice *drum_voice;
-	int idx;
 
 	if (!(opl3->drum_reg & OPL3_PERCUSSION_ENABLE))
 		return;
 
 	if ((note < 35) || (note > 81))
 		return;
-
-	idx = array_index_nospec(note - 35, 82 - 35);
-	drum_mask = snd_opl3_drum_table[idx];
+	drum_mask = snd_opl3_drum_table[note - 35];
 
 	if (on_off) {
 		switch (drum_mask) {

@@ -16,16 +16,18 @@ asmlinkage long sys_ni_syscall(void)
 	return -ENOSYS;
 }
 
-cond_syscall(sys_nfsservctl);
 cond_syscall(sys_quotactl);
 cond_syscall(sys32_quotactl);
 cond_syscall(sys_acct);
 cond_syscall(sys_lookup_dcookie);
+cond_syscall(compat_sys_lookup_dcookie);
 cond_syscall(sys_swapon);
 cond_syscall(sys_swapoff);
 cond_syscall(sys_kexec_load);
 cond_syscall(compat_sys_kexec_load);
+cond_syscall(sys_kexec_file_load);
 cond_syscall(sys_init_module);
+cond_syscall(sys_finit_module);
 cond_syscall(sys_delete_module);
 cond_syscall(sys_socketpair);
 cond_syscall(sys_bind);
@@ -52,6 +54,7 @@ cond_syscall(compat_sys_sendmmsg);
 cond_syscall(sys_recvmsg);
 cond_syscall(sys_recvmmsg);
 cond_syscall(compat_sys_recvmsg);
+cond_syscall(compat_sys_recv);
 cond_syscall(compat_sys_recvfrom);
 cond_syscall(compat_sys_recvmmsg);
 cond_syscall(sys_socketcall);
@@ -70,15 +73,22 @@ cond_syscall(compat_sys_epoll_pwait);
 cond_syscall(sys_semget);
 cond_syscall(sys_semop);
 cond_syscall(sys_semtimedop);
+cond_syscall(compat_sys_semtimedop);
 cond_syscall(sys_semctl);
+cond_syscall(compat_sys_semctl);
 cond_syscall(sys_msgget);
 cond_syscall(sys_msgsnd);
+cond_syscall(compat_sys_msgsnd);
 cond_syscall(sys_msgrcv);
+cond_syscall(compat_sys_msgrcv);
 cond_syscall(sys_msgctl);
+cond_syscall(compat_sys_msgctl);
 cond_syscall(sys_shmget);
 cond_syscall(sys_shmat);
+cond_syscall(compat_sys_shmat);
 cond_syscall(sys_shmdt);
 cond_syscall(sys_shmctl);
+cond_syscall(compat_sys_shmctl);
 cond_syscall(sys_mq_open);
 cond_syscall(sys_mq_unlink);
 cond_syscall(sys_mq_timedsend);
@@ -128,6 +138,7 @@ cond_syscall(sys_setreuid16);
 cond_syscall(sys_setuid16);
 cond_syscall(sys_vm86old);
 cond_syscall(sys_vm86);
+cond_syscall(sys_ipc);
 cond_syscall(compat_sys_ipc);
 cond_syscall(compat_sys_sysctl);
 cond_syscall(sys_flock);
@@ -141,17 +152,19 @@ cond_syscall(sys_process_vm_readv);
 cond_syscall(sys_process_vm_writev);
 cond_syscall(compat_sys_process_vm_readv);
 cond_syscall(compat_sys_process_vm_writev);
+cond_syscall(sys_copy_file_range);
 
 /* arch-specific weak syscall entries */
 cond_syscall(sys_pciconfig_read);
 cond_syscall(sys_pciconfig_write);
 cond_syscall(sys_pciconfig_iobase);
-cond_syscall(sys32_ipc);
-cond_syscall(sys32_sysctl);
+cond_syscall(compat_sys_s390_ipc);
 cond_syscall(ppc_rtas);
 cond_syscall(sys_spu_run);
 cond_syscall(sys_spu_create);
 cond_syscall(sys_subpage_prot);
+cond_syscall(sys_s390_pci_mmio_read);
+cond_syscall(sys_s390_pci_mmio_write);
 
 /* mmu depending weak syscall entries */
 cond_syscall(sys_mprotect);
@@ -160,6 +173,7 @@ cond_syscall(sys_mlock);
 cond_syscall(sys_munlock);
 cond_syscall(sys_mlockall);
 cond_syscall(sys_munlockall);
+cond_syscall(sys_mlock2);
 cond_syscall(sys_mincore);
 cond_syscall(sys_madvise);
 cond_syscall(sys_mremap);
@@ -184,6 +198,35 @@ cond_syscall(compat_sys_timerfd_settime);
 cond_syscall(compat_sys_timerfd_gettime);
 cond_syscall(sys_eventfd);
 cond_syscall(sys_eventfd2);
+cond_syscall(sys_memfd_create);
+cond_syscall(sys_userfaultfd);
 
 /* performance counters: */
 cond_syscall(sys_perf_event_open);
+
+/* fanotify! */
+cond_syscall(sys_fanotify_init);
+cond_syscall(sys_fanotify_mark);
+cond_syscall(compat_sys_fanotify_mark);
+
+/* open by handle */
+cond_syscall(sys_name_to_handle_at);
+cond_syscall(sys_open_by_handle_at);
+cond_syscall(compat_sys_open_by_handle_at);
+
+/* compare kernel pointers */
+cond_syscall(sys_kcmp);
+
+/* operate on Secure Computing state */
+cond_syscall(sys_seccomp);
+
+/* memory protection keys */
+cond_syscall(sys_pkey_mprotect);
+cond_syscall(sys_pkey_alloc);
+cond_syscall(sys_pkey_free);
+
+/* membarrier */
+cond_syscall(sys_membarrier);
+
+/* access BPF programs and maps */
+cond_syscall(sys_bpf);

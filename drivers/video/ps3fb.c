@@ -31,7 +31,6 @@
 #include <linux/fb.h>
 #include <linux/init.h>
 
-#include <asm/abs_addr.h>
 #include <asm/cell-regs.h>
 #include <asm/lv1call.h>
 #include <asm/ps3av.h>
@@ -260,7 +259,7 @@ static const struct fb_videomode ps3fb_modedb[] = {
 static int ps3fb_mode;
 module_param(ps3fb_mode, int, 0);
 
-static char *mode_option __devinitdata;
+static char *mode_option;
 
 static int ps3fb_cmp_mode(const struct fb_videomode *vmode,
 			  const struct fb_var_screeninfo *var)
@@ -513,9 +512,9 @@ static int ps3fb_release(struct fb_info *info, int user)
 	if (atomic_dec_and_test(&ps3fb.f_count)) {
 		if (atomic_read(&ps3fb.ext_flip)) {
 			atomic_set(&ps3fb.ext_flip, 0);
-			if (!try_acquire_console_sem()) {
+			if (console_trylock()) {
 				ps3fb_sync(info, 0);	/* single buffer */
-				release_console_sem();
+				console_unlock();
 			}
 		}
 	}
@@ -706,21 +705,15 @@ static int ps3fb_pan_display(struct fb_var_screeninfo *var,
 
 static int ps3fb_mmap(struct fb_info *info, struct vm_area_struct *vma)
 {
-	unsigned long size, offset;
+	int r;
 
-	size = vma->vm_end - vma->vm_start;
-	offset = vma->vm_pgoff << PAGE_SHIFT;
-	if (offset + size > info->fix.smem_len)
-		return -EINVAL;
-
-	offset += info->fix.smem_start;
-	if (remap_pfn_range(vma, vma->vm_start, offset >> PAGE_SHIFT,
-			    size, vma->vm_page_prot))
-		return -EAGAIN;
+	r = vm_iomap_memory(vma, info->fix.smem_start, info->fix.smem_len);
 
 	dev_dbg(info->device, "ps3fb: mmap framebuffer P(%lx)->V(%lx)\n",
-		offset, vma->vm_start);
-	return 0;
+		info->fix.smem_start + (vma->vm_pgoff << PAGE_SHIFT),
+		vma->vm_start);
+
+	return r;
 }
 
     /*
@@ -830,14 +823,14 @@ static int ps3fb_ioctl(struct fb_info *info, unsigned int cmd,
 			if (vmode) {
 				var = info->var;
 				fb_videomode_to_var(&var, vmode);
-				acquire_console_sem();
+				console_lock();
 				info->flags |= FBINFO_MISC_USEREVENT;
 				/* Force, in case only special bits changed */
 				var.activate |= FB_ACTIVATE_FORCE;
 				par->new_mode_id = val;
 				retval = fb_set_var(info, &var);
 				info->flags &= ~FBINFO_MISC_USEREVENT;
-				release_console_sem();
+				console_unlock();
 			}
 			break;
 		}
@@ -881,9 +874,9 @@ static int ps3fb_ioctl(struct fb_info *info, unsigned int cmd,
 			break;
 
 		dev_dbg(info->device, "PS3FB_IOCTL_FSEL:%d\n", val);
-		acquire_console_sem();
+		console_lock();
 		retval = ps3fb_sync(info, val);
-		release_console_sem();
+		console_unlock();
 		break;
 
 	default:
@@ -903,9 +896,9 @@ static int ps3fbd(void *arg)
 		set_current_state(TASK_INTERRUPTIBLE);
 		if (ps3fb.is_kicked) {
 			ps3fb.is_kicked = 0;
-			acquire_console_sem();
+			console_lock();
 			ps3fb_sync(info, 0);	/* single buffer */
-			release_console_sem();
+			console_unlock();
 		}
 		schedule();
 	}
@@ -966,7 +959,7 @@ static struct fb_fix_screeninfo ps3fb_fix __initdata = {
 	.accel =	FB_ACCEL_NONE,
 };
 
-static int __devinit ps3fb_probe(struct ps3_system_bus_device *dev)
+static int ps3fb_probe(struct ps3_system_bus_device *dev)
 {
 	struct fb_info *info;
 	struct ps3fb_par *par;
@@ -1035,6 +1028,7 @@ static int __devinit ps3fb_probe(struct ps3_system_bus_device *dev)
 	if (status) {
 		dev_err(&dev->core, "%s: lv1_gpu_memory_allocate failed: %d\n",
 			__func__, status);
+		retval = -ENOMEM;
 		goto err_close_device;
 	}
 	dev_dbg(&dev->core, "ddr:lpar:0x%llx\n", ddr_lpar);
@@ -1047,6 +1041,7 @@ static int __devinit ps3fb_probe(struct ps3_system_bus_device *dev)
 		dev_err(&dev->core,
 			"%s: lv1_gpu_context_allocate failed: %d\n", __func__,
 			status);
+		retval = -ENOMEM;
 		goto err_gpu_memory_free;
 	}
 
@@ -1054,6 +1049,7 @@ static int __devinit ps3fb_probe(struct ps3_system_bus_device *dev)
 	dinfo = (void __force *)ioremap(lpar_driver_info, 128 * 1024);
 	if (!dinfo) {
 		dev_err(&dev->core, "%s: ioremap failed\n", __func__);
+		retval = -ENOMEM;
 		goto err_gpu_context_free;
 	}
 
@@ -1082,7 +1078,7 @@ static int __devinit ps3fb_probe(struct ps3_system_bus_device *dev)
 	}
 
 	retval = request_irq(ps3fb.irq_no, ps3fb_vsync_interrupt,
-			     IRQF_DISABLED, DEVICE_NAME, &dev->core);
+			     0, DEVICE_NAME, &dev->core);
 	if (retval) {
 		dev_err(&dev->core, "%s: request_irq failed %d\n", __func__,
 			retval);
@@ -1122,8 +1118,10 @@ static int __devinit ps3fb_probe(struct ps3_system_bus_device *dev)
 	}
 
 	info = framebuffer_alloc(sizeof(struct ps3fb_par), &dev->core);
-	if (!info)
+	if (!info) {
+		retval = -ENOMEM;
 		goto err_context_fb_close;
+	}
 
 	par = info->par;
 	par->mode_id = ~ps3fb_mode;	/* != ps3fb_mode, to trigger change */
@@ -1141,7 +1139,7 @@ static int __devinit ps3fb_probe(struct ps3_system_bus_device *dev)
 	 */
 	fb_start = ps3fb_videomemory.address + GPU_FB_START;
 	info->screen_base = (char __force __iomem *)fb_start;
-	info->fix.smem_start = virt_to_abs(fb_start);
+	info->fix.smem_start = __pa(fb_start);
 	info->fix.smem_len = ps3fb_videomemory.size - GPU_FB_START;
 
 	info->pseudo_palette = par->pseudo_palette;

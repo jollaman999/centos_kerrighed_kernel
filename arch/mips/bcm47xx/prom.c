@@ -1,6 +1,7 @@
 /*
  *  Copyright (C) 2004 Florian Schirmer <jolt@tuxbox.org>
  *  Copyright (C) 2007 Aurelien Jarno <aurelien@aurel32.net>
+ *  Copyright (C) 2010-2012 Hauke Mehrtens <hauke@hauke-m.de>
  *
  *  This program is free software; you can redistribute  it and/or modify it
  *  under  the terms of  the GNU General  Public License as published by the
@@ -27,6 +28,7 @@
 #include <linux/types.h>
 #include <linux/kernel.h>
 #include <linux/spinlock.h>
+#include <linux/smp.h>
 #include <asm/bootinfo.h>
 #include <asm/fw/cfe/cfe_api.h>
 #include <asm/fw/cfe/cfe_error.h>
@@ -100,11 +102,11 @@ static __init void prom_init_console(void)
 
 static __init void prom_init_cmdline(void)
 {
-	static char buf[CL_SIZE] __initdata;
+	static char buf[COMMAND_LINE_SIZE] __initdata;
 
 	/* Get the kernel command line from CFE */
-	if (cfe_getenv("LINUX_CMDLINE", buf, CL_SIZE) >= 0) {
-		buf[CL_SIZE-1] = 0;
+	if (cfe_getenv("LINUX_CMDLINE", buf, COMMAND_LINE_SIZE) >= 0) {
+		buf[COMMAND_LINE_SIZE - 1] = 0;
 		strcpy(arcs_cmdline, buf);
 	}
 
@@ -112,13 +114,13 @@ static __init void prom_init_cmdline(void)
 	 * as CFE is not available anymore later in the boot process. */
 	if ((strstr(arcs_cmdline, "console=")) == NULL) {
 		/* Try to read the default serial port used by CFE */
-		if ((cfe_getenv("BOOT_CONSOLE", buf, CL_SIZE) < 0)
+		if ((cfe_getenv("BOOT_CONSOLE", buf, COMMAND_LINE_SIZE) < 0)
 		    || (strncmp("uart", buf, 4)))
 			/* Default to uart0 */
 			strcpy(buf, "uart0");
 
 		/* Compute the new command line */
-		snprintf(arcs_cmdline, CL_SIZE, "%s console=ttyS%c,115200",
+		snprintf(arcs_cmdline, COMMAND_LINE_SIZE, "%s console=ttyS%c,115200",
 			 arcs_cmdline, buf[4]);
 	}
 }
@@ -126,6 +128,9 @@ static __init void prom_init_cmdline(void)
 static __init void prom_init_mem(void)
 {
 	unsigned long mem;
+	unsigned long max;
+	unsigned long off;
+	struct cpuinfo_mips *c = &current_cpu_data;
 
 	/* Figure out memory size by finding aliases.
 	 *
@@ -134,12 +139,33 @@ static __init void prom_init_mem(void)
 	 * want to reuse the memory used by CFE (around 4MB). That means cfe_*
 	 * functions stop to work at some point during the boot, we should only
 	 * call them at the beginning of the boot.
+	 *
+	 * BCM47XX uses 128MB for addressing the ram, if the system contains
+	 * less that that amount of ram it remaps the ram more often into the
+	 * available space.
+	 * Accessing memory after 128MB will cause an exception.
+	 * max contains the biggest possible address supported by the platform.
+	 * If the method wants to try something above we assume 128MB ram.
 	 */
+	off = (unsigned long)prom_init;
+	max = off | ((128 << 20) - 1);
 	for (mem = (1 << 20); mem < (128 << 20); mem += (1 << 20)) {
-		if (*(unsigned long *)((unsigned long)(prom_init) + mem) ==
-		    *(unsigned long *)(prom_init))
+		if ((off + mem) > max) {
+			mem = (128 << 20);
+			printk(KERN_DEBUG "assume 128MB RAM\n");
+			break;
+		}
+		if (!memcmp(prom_init, prom_init + mem, 32))
 			break;
 	}
+
+	/* Ignoring the last page when ddr size is 128M. Cached
+	 * accesses to last page is causing the processor to prefetch
+	 * using address above 128M stepping out of the ddr address
+	 * space.
+	 */
+	if (c->cputype == CPU_74K && (mem == (128  << 20)))
+		mem -= 0x1000;
 
 	add_memory_region(0, mem, BOOT_MEM_RAM);
 }
@@ -155,4 +181,3 @@ void __init prom_init(void)
 void __init prom_free_prom_memory(void)
 {
 }
-

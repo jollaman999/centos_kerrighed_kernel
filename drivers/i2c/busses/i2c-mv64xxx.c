@@ -10,14 +10,18 @@
  * or implied.
  */
 #include <linux/kernel.h>
+#include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/spinlock.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
 #include <linux/mv643xx_i2c.h>
 #include <linux/platform_device.h>
-
-#include <asm/io.h>
+#include <linux/io.h>
+#include <linux/of.h>
+#include <linux/of_irq.h>
+#include <linux/clk.h>
+#include <linux/err.h>
 
 /* Register defines */
 #define	MV64XXX_I2C_REG_SLAVE_ADDR			0x00
@@ -59,6 +63,7 @@ enum {
 	MV64XXX_I2C_STATE_INVALID,
 	MV64XXX_I2C_STATE_IDLE,
 	MV64XXX_I2C_STATE_WAITING_FOR_START_COND,
+	MV64XXX_I2C_STATE_WAITING_FOR_RESTART,
 	MV64XXX_I2C_STATE_WAITING_FOR_ADDR_1_ACK,
 	MV64XXX_I2C_STATE_WAITING_FOR_ADDR_2_ACK,
 	MV64XXX_I2C_STATE_WAITING_FOR_SLAVE_ACK,
@@ -70,6 +75,7 @@ enum {
 	MV64XXX_I2C_ACTION_INVALID,
 	MV64XXX_I2C_ACTION_CONTINUE,
 	MV64XXX_I2C_ACTION_SEND_START,
+	MV64XXX_I2C_ACTION_SEND_RESTART,
 	MV64XXX_I2C_ACTION_SEND_ADDR_1,
 	MV64XXX_I2C_ACTION_SEND_ADDR_2,
 	MV64XXX_I2C_ACTION_SEND_DATA,
@@ -91,10 +97,14 @@ struct mv64xxx_i2c_data {
 	u32			addr2;
 	u32			bytes_left;
 	u32			byte_posn;
+	u32			send_stop;
 	u32			block;
 	int			rc;
 	u32			freq_m;
 	u32			freq_n;
+#if defined(CONFIG_HAVE_CLK)
+	struct clk              *clk;
+#endif
 	wait_queue_head_t	waitq;
 	spinlock_t		lock;
 	struct i2c_msg		*msg;
@@ -159,8 +169,15 @@ mv64xxx_i2c_fsm(struct mv64xxx_i2c_data *drv_data, u32 status)
 		if ((drv_data->bytes_left == 0)
 				|| (drv_data->aborting
 					&& (drv_data->byte_posn != 0))) {
-			drv_data->action = MV64XXX_I2C_ACTION_SEND_STOP;
-			drv_data->state = MV64XXX_I2C_STATE_IDLE;
+			if (drv_data->send_stop) {
+				drv_data->action = MV64XXX_I2C_ACTION_SEND_STOP;
+				drv_data->state = MV64XXX_I2C_STATE_IDLE;
+			} else {
+				drv_data->action =
+					MV64XXX_I2C_ACTION_SEND_RESTART;
+				drv_data->state =
+					MV64XXX_I2C_STATE_WAITING_FOR_RESTART;
+			}
 		} else {
 			drv_data->action = MV64XXX_I2C_ACTION_SEND_DATA;
 			drv_data->state =
@@ -228,6 +245,15 @@ static void
 mv64xxx_i2c_do_action(struct mv64xxx_i2c_data *drv_data)
 {
 	switch(drv_data->action) {
+	case MV64XXX_I2C_ACTION_SEND_RESTART:
+		drv_data->cntl_bits |= MV64XXX_I2C_REG_CONTROL_START;
+		drv_data->cntl_bits &= ~MV64XXX_I2C_REG_CONTROL_INTEN;
+		writel(drv_data->cntl_bits,
+			drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
+		drv_data->block = 0;
+		wake_up(&drv_data->waitq);
+		break;
+
 	case MV64XXX_I2C_ACTION_CONTINUE:
 		writel(drv_data->cntl_bits,
 			drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
@@ -273,7 +299,7 @@ mv64xxx_i2c_do_action(struct mv64xxx_i2c_data *drv_data)
 		writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_STOP,
 			drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
 		drv_data->block = 0;
-		wake_up_interruptible(&drv_data->waitq);
+		wake_up(&drv_data->waitq);
 		break;
 
 	case MV64XXX_I2C_ACTION_INVALID:
@@ -288,7 +314,7 @@ mv64xxx_i2c_do_action(struct mv64xxx_i2c_data *drv_data)
 		writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_STOP,
 			drv_data->reg_base + MV64XXX_I2C_REG_CONTROL);
 		drv_data->block = 0;
-		wake_up_interruptible(&drv_data->waitq);
+		wake_up(&drv_data->waitq);
 		break;
 	}
 }
@@ -338,9 +364,6 @@ mv64xxx_i2c_prepare_for_io(struct mv64xxx_i2c_data *drv_data,
 	if (msg->flags & I2C_M_RD)
 		dir = 1;
 
-	if (msg->flags & I2C_M_REV_DIR_ADDR)
-		dir ^= 1;
-
 	if (msg->flags & I2C_M_TEN) {
 		drv_data->addr1 = 0xf0 | (((u32)msg->addr & 0x300) >> 7) | dir;
 		drv_data->addr2 = (u32)msg->addr & 0xff;
@@ -357,7 +380,7 @@ mv64xxx_i2c_wait_for_completion(struct mv64xxx_i2c_data *drv_data)
 	unsigned long	flags;
 	char		abort = 0;
 
-	time_left = wait_event_interruptible_timeout(drv_data->waitq,
+	time_left = wait_event_timeout(drv_data->waitq,
 		!drv_data->block, drv_data->adapter.timeout);
 
 	spin_lock_irqsave(&drv_data->lock, flags);
@@ -389,7 +412,8 @@ mv64xxx_i2c_wait_for_completion(struct mv64xxx_i2c_data *drv_data)
 }
 
 static int
-mv64xxx_i2c_execute_msg(struct mv64xxx_i2c_data *drv_data, struct i2c_msg *msg)
+mv64xxx_i2c_execute_msg(struct mv64xxx_i2c_data *drv_data, struct i2c_msg *msg,
+				int is_first, int is_last)
 {
 	unsigned long	flags;
 
@@ -409,10 +433,18 @@ mv64xxx_i2c_execute_msg(struct mv64xxx_i2c_data *drv_data, struct i2c_msg *msg)
 			drv_data->bytes_left--;
 		}
 	} else {
-		drv_data->action = MV64XXX_I2C_ACTION_SEND_START;
-		drv_data->state = MV64XXX_I2C_STATE_WAITING_FOR_START_COND;
+		if (is_first) {
+			drv_data->action = MV64XXX_I2C_ACTION_SEND_START;
+			drv_data->state =
+				MV64XXX_I2C_STATE_WAITING_FOR_START_COND;
+		} else {
+			drv_data->action = MV64XXX_I2C_ACTION_SEND_ADDR_1;
+			drv_data->state =
+				MV64XXX_I2C_STATE_WAITING_FOR_ADDR_1_ACK;
+		}
 	}
 
+	drv_data->send_stop = is_last;
 	drv_data->block = 1;
 	mv64xxx_i2c_do_action(drv_data);
 	spin_unlock_irqrestore(&drv_data->lock, flags);
@@ -440,9 +472,12 @@ mv64xxx_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 	struct mv64xxx_i2c_data *drv_data = i2c_get_adapdata(adap);
 	int	i, rc;
 
-	for (i=0; i<num; i++)
-		if ((rc = mv64xxx_i2c_execute_msg(drv_data, &msgs[i])) < 0)
+	for (i = 0; i < num; i++) {
+		rc = mv64xxx_i2c_execute_msg(drv_data, &msgs[i],
+						i == 0, i + 1 == num);
+		if (rc < 0)
 			return rc;
+	}
 
 	return num;
 }
@@ -459,7 +494,7 @@ static const struct i2c_algorithm mv64xxx_i2c_algo = {
  *
  *****************************************************************************
  */
-static int __devinit
+static int
 mv64xxx_i2c_map_regs(struct platform_device *pd,
 	struct mv64xxx_i2c_data *drv_data)
 {
@@ -493,14 +528,90 @@ mv64xxx_i2c_unmap_regs(struct mv64xxx_i2c_data *drv_data)
 	drv_data->reg_base_p = 0;
 }
 
-static int __devinit
+#ifdef CONFIG_OF
+static int
+mv64xxx_calc_freq(const int tclk, const int n, const int m)
+{
+	return tclk / (10 * (m + 1) * (2 << n));
+}
+
+static bool
+mv64xxx_find_baud_factors(const u32 req_freq, const u32 tclk, u32 *best_n,
+			  u32 *best_m)
+{
+	int freq, delta, best_delta = INT_MAX;
+	int m, n;
+
+	for (n = 0; n <= 7; n++)
+		for (m = 0; m <= 15; m++) {
+			freq = mv64xxx_calc_freq(tclk, n, m);
+			delta = req_freq - freq;
+			if (delta >= 0 && delta < best_delta) {
+				*best_m = m;
+				*best_n = n;
+				best_delta = delta;
+			}
+			if (best_delta == 0)
+				return true;
+		}
+	if (best_delta == INT_MAX)
+		return false;
+	return true;
+}
+
+static int
+mv64xxx_of_config(struct mv64xxx_i2c_data *drv_data,
+		  struct device_node *np)
+{
+	u32 bus_freq, tclk;
+	int rc = 0;
+
+	/* CLK is mandatory when using DT to describe the i2c bus. We
+	 * need to know tclk in order to calculate bus clock
+	 * factors.
+	 */
+#if !defined(CONFIG_HAVE_CLK)
+	/* Have OF but no CLK */
+	return -ENODEV;
+#else
+	if (IS_ERR(drv_data->clk)) {
+		rc = -ENODEV;
+		goto out;
+	}
+	tclk = clk_get_rate(drv_data->clk);
+	of_property_read_u32(np, "clock-frequency", &bus_freq);
+	if (!mv64xxx_find_baud_factors(bus_freq, tclk,
+				       &drv_data->freq_n, &drv_data->freq_m)) {
+		rc = -EINVAL;
+		goto out;
+	}
+	drv_data->irq = irq_of_parse_and_map(np, 0);
+
+	/* Its not yet defined how timeouts will be specified in device tree.
+	 * So hard code the value to 1 second.
+	 */
+	drv_data->adapter.timeout = HZ;
+out:
+	return rc;
+#endif
+}
+#else /* CONFIG_OF */
+static int
+mv64xxx_of_config(struct mv64xxx_i2c_data *drv_data,
+		  struct device_node *np)
+{
+	return -ENODEV;
+}
+#endif /* CONFIG_OF */
+
+static int
 mv64xxx_i2c_probe(struct platform_device *pd)
 {
 	struct mv64xxx_i2c_data		*drv_data;
 	struct mv64xxx_i2c_pdata	*pdata = pd->dev.platform_data;
 	int	rc;
 
-	if ((pd->id != 0) || !pdata)
+	if ((!pdata && !pd->dev.of_node))
 		return -ENODEV;
 
 	drv_data = kzalloc(sizeof(struct mv64xxx_i2c_data), GFP_KERNEL);
@@ -518,19 +629,35 @@ mv64xxx_i2c_probe(struct platform_device *pd)
 	init_waitqueue_head(&drv_data->waitq);
 	spin_lock_init(&drv_data->lock);
 
-	drv_data->freq_m = pdata->freq_m;
-	drv_data->freq_n = pdata->freq_n;
-	drv_data->irq = platform_get_irq(pd, 0);
+#if defined(CONFIG_HAVE_CLK)
+	/* Not all platforms have a clk */
+	drv_data->clk = clk_get(&pd->dev, NULL);
+	if (!IS_ERR(drv_data->clk)) {
+		clk_prepare(drv_data->clk);
+		clk_enable(drv_data->clk);
+	}
+#endif
+	if (pdata) {
+		drv_data->freq_m = pdata->freq_m;
+		drv_data->freq_n = pdata->freq_n;
+		drv_data->irq = platform_get_irq(pd, 0);
+		drv_data->adapter.timeout = msecs_to_jiffies(pdata->timeout);
+	} else if (pd->dev.of_node) {
+		rc = mv64xxx_of_config(drv_data, pd->dev.of_node);
+		if (rc)
+			goto exit_unmap_regs;
+	}
 	if (drv_data->irq < 0) {
 		rc = -ENXIO;
 		goto exit_unmap_regs;
 	}
+
 	drv_data->adapter.dev.parent = &pd->dev;
 	drv_data->adapter.algo = &mv64xxx_i2c_algo;
 	drv_data->adapter.owner = THIS_MODULE;
 	drv_data->adapter.class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
-	drv_data->adapter.timeout = msecs_to_jiffies(pdata->timeout);
 	drv_data->adapter.nr = pd->id;
+	drv_data->adapter.dev.of_node = pd->dev.of_node;
 	platform_set_drvdata(pd, drv_data);
 	i2c_set_adapdata(&drv_data->adapter, drv_data);
 
@@ -554,49 +681,56 @@ mv64xxx_i2c_probe(struct platform_device *pd)
 	exit_free_irq:
 		free_irq(drv_data->irq, drv_data);
 	exit_unmap_regs:
+#if defined(CONFIG_HAVE_CLK)
+	/* Not all platforms have a clk */
+	if (!IS_ERR(drv_data->clk)) {
+		clk_disable(drv_data->clk);
+		clk_unprepare(drv_data->clk);
+	}
+#endif
 		mv64xxx_i2c_unmap_regs(drv_data);
 	exit_kfree:
 		kfree(drv_data);
 	return rc;
 }
 
-static int __devexit
+static int
 mv64xxx_i2c_remove(struct platform_device *dev)
 {
 	struct mv64xxx_i2c_data		*drv_data = platform_get_drvdata(dev);
-	int	rc;
 
-	rc = i2c_del_adapter(&drv_data->adapter);
+	i2c_del_adapter(&drv_data->adapter);
 	free_irq(drv_data->irq, drv_data);
 	mv64xxx_i2c_unmap_regs(drv_data);
+#if defined(CONFIG_HAVE_CLK)
+	/* Not all platforms have a clk */
+	if (!IS_ERR(drv_data->clk)) {
+		clk_disable(drv_data->clk);
+		clk_unprepare(drv_data->clk);
+	}
+#endif
 	kfree(drv_data);
 
-	return rc;
+	return 0;
 }
+
+static const struct of_device_id mv64xxx_i2c_of_match_table[] = {
+	{ .compatible = "marvell,mv64xxx-i2c", },
+	{}
+};
+MODULE_DEVICE_TABLE(of, mv64xxx_i2c_of_match_table);
 
 static struct platform_driver mv64xxx_i2c_driver = {
 	.probe	= mv64xxx_i2c_probe,
-	.remove	= __devexit_p(mv64xxx_i2c_remove),
+	.remove	= mv64xxx_i2c_remove,
 	.driver	= {
 		.owner	= THIS_MODULE,
 		.name	= MV64XXX_I2C_CTLR_NAME,
+		.of_match_table = of_match_ptr(mv64xxx_i2c_of_match_table),
 	},
 };
 
-static int __init
-mv64xxx_i2c_init(void)
-{
-	return platform_driver_register(&mv64xxx_i2c_driver);
-}
-
-static void __exit
-mv64xxx_i2c_exit(void)
-{
-	platform_driver_unregister(&mv64xxx_i2c_driver);
-}
-
-module_init(mv64xxx_i2c_init);
-module_exit(mv64xxx_i2c_exit);
+module_platform_driver(mv64xxx_i2c_driver);
 
 MODULE_AUTHOR("Mark A. Greer <mgreer@mvista.com>");
 MODULE_DESCRIPTION("Marvell mv64xxx host bridge i2c ctlr driver");

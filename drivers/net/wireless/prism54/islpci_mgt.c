@@ -21,9 +21,9 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/sched.h>
+#include <linux/slab.h>
 
 #include <asm/io.h>
-#include <asm/system.h>
 #include <linux/if_arp.h>
 
 #include "prismcompat.h"
@@ -113,7 +113,7 @@ islpci_mgmt_rx_fill(struct net_device *ndev)
 	u32 curr = le32_to_cpu(cb->driver_curr_frag[ISL38XX_CB_RX_MGMTQ]);
 
 #if VERBOSE > SHOW_ERROR_MESSAGES
-	DEBUG(SHOW_FUNCTION_CALLS, "islpci_mgmt_rx_fill \n");
+	DEBUG(SHOW_FUNCTION_CALLS, "islpci_mgmt_rx_fill\n");
 #endif
 
 	while (curr - priv->index_mgmt_rx < ISL38XX_CB_MGMT_QSIZE) {
@@ -123,11 +123,8 @@ islpci_mgmt_rx_fill(struct net_device *ndev)
 
 		if (buf->mem == NULL) {
 			buf->mem = kmalloc(MGMT_FRAME_SIZE, GFP_ATOMIC);
-			if (!buf->mem) {
-				printk(KERN_WARNING
-				       "Error allocating management frame.\n");
+			if (!buf->mem)
 				return -ENOMEM;
-			}
 			buf->size = MGMT_FRAME_SIZE;
 		}
 		if (buf->pci_addr == 0) {
@@ -191,11 +188,9 @@ islpci_mgt_transmit(struct net_device *ndev, int operation, unsigned long oid,
 
 	err = -ENOMEM;
 	p = buf.mem = kmalloc(frag_len, GFP_KERNEL);
-	if (!buf.mem) {
-		printk(KERN_DEBUG "%s: cannot allocate mgmt frame\n",
-		       ndev->name);
+	if (!buf.mem)
 		goto error;
-	}
+
 	buf.size = frag_len;
 
 	/* create the header directly in the fragment data area */
@@ -211,7 +206,7 @@ islpci_mgt_transmit(struct net_device *ndev, int operation, unsigned long oid,
 	{
 		pimfor_header_t *h = buf.mem;
 		DEBUG(SHOW_PIMFOR_FRAMES,
-		      "PIMFOR: op %i, oid 0x%08lx, device %i, flags 0x%x length 0x%x \n",
+		      "PIMFOR: op %i, oid 0x%08lx, device %i, flags 0x%x length 0x%x\n",
 		      h->operation, oid, h->device_id, h->flags, length);
 
 		/* display the buffer contents for debugging */
@@ -279,7 +274,7 @@ islpci_mgt_receive(struct net_device *ndev)
 	u32 curr_frag;
 
 #if VERBOSE > SHOW_ERROR_MESSAGES
-	DEBUG(SHOW_FUNCTION_CALLS, "islpci_mgt_receive \n");
+	DEBUG(SHOW_FUNCTION_CALLS, "islpci_mgt_receive\n");
 #endif
 
 	/* Only once per interrupt, determine fragment range to
@@ -338,7 +333,7 @@ islpci_mgt_receive(struct net_device *ndev)
 
 #if VERBOSE > SHOW_ERROR_MESSAGES
 		DEBUG(SHOW_PIMFOR_FRAMES,
-		      "PIMFOR: op %i, oid 0x%08x, device %i, flags 0x%x length 0x%x \n",
+		      "PIMFOR: op %i, oid 0x%08x, device %i, flags 0x%x length 0x%x\n",
 		      header->operation, header->oid, header->device_id,
 		      header->flags, header->length);
 
@@ -358,14 +353,11 @@ islpci_mgt_receive(struct net_device *ndev)
 
 		/* Determine frame size, skipping OID_INL_TUNNEL headers. */
 		size = PIMFOR_HEADER_SIZE + header->length;
-		frame = kmalloc(sizeof (struct islpci_mgmtframe) + size,
+		frame = kmalloc(sizeof(struct islpci_mgmtframe) + size,
 				GFP_ATOMIC);
-		if (!frame) {
-			printk(KERN_WARNING
-			       "%s: Out of memory, cannot handle oid 0x%08x\n",
-			       ndev->name, header->oid);
+		if (!frame)
 			continue;
-		}
+
 		frame->ndev = ndev;
 		memcpy(&frame->buf, header, size);
 		frame->header = (pimfor_header_t *) frame->buf;

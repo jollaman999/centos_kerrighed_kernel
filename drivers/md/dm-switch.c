@@ -251,7 +251,7 @@ static void switch_dtr(struct dm_target *ti)
  */
 static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv)
 {
-	static struct dm_arg _args[] = {
+	static const struct dm_arg _args[] = {
 		{1, (KMALLOC_MAX_SIZE - sizeof(struct switch_ctx)) / sizeof(struct switch_path), "Invalid number of paths"},
 		{1, UINT_MAX, "Invalid region size"},
 		{0, 0, "Invalid number of optional args"},
@@ -306,7 +306,7 @@ static int switch_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	initialise_region_table(sctx);
 
 	/* For UNMAP, sending the request down any path is sufficient */
-	ti->num_discard_requests = 1;
+	ti->num_discard_bios = 1;
 
 	return 0;
 
@@ -316,7 +316,7 @@ error:
 	return r;
 }
 
-static int switch_map(struct dm_target *ti, struct bio *bio, union map_info *map_context)
+static int switch_map(struct dm_target *ti, struct bio *bio)
 {
 	struct switch_ctx *sctx = ti->private;
 	sector_t offset = dm_target_offset(ti, bio->bi_sector);
@@ -485,8 +485,8 @@ static int switch_message(struct dm_target *ti, unsigned argc, char **argv)
 	return r;
 }
 
-static int switch_status(struct dm_target *ti, status_type_t type,
-			 char *result, unsigned maxlen)
+static void switch_status(struct dm_target *ti, status_type_t type,
+			  unsigned status_flags, char *result, unsigned maxlen)
 {
 	struct switch_ctx *sctx = ti->private;
 	unsigned sz = 0;
@@ -504,8 +504,6 @@ static int switch_status(struct dm_target *ti, status_type_t type,
 			       (unsigned long long)sctx->path_list[path_nr].start);
 		break;
 	}
-
-	return 0;
 }
 
 /*
@@ -513,27 +511,22 @@ static int switch_status(struct dm_target *ti, status_type_t type,
  *
  * Passthrough all ioctls to the path for sector 0
  */
-static int switch_ioctl(struct dm_target *ti, unsigned cmd,
-			unsigned long arg)
+static int switch_prepare_ioctl(struct dm_target *ti, struct block_device **bdev)
 {
 	struct switch_ctx *sctx = ti->private;
-	struct block_device *bdev;
-	fmode_t mode;
 	unsigned path_nr;
-	int r = 0;
 
 	path_nr = switch_get_path_nr(sctx, 0);
 
-	bdev = sctx->path_list[path_nr].dmdev->bdev;
-	mode = sctx->path_list[path_nr].dmdev->mode;
+	*bdev = sctx->path_list[path_nr].dmdev->bdev;
 
 	/*
 	 * Only pass ioctls through if the device sizes match exactly.
 	 */
-	if (ti->len + sctx->path_list[path_nr].start != i_size_read(bdev->bd_inode) >> SECTOR_SHIFT)
-		r = scsi_verify_blk_ioctl(NULL, cmd);
-
-	return r ? : __blkdev_driver_ioctl(bdev, mode, cmd, arg);
+	if (ti->len + sctx->path_list[path_nr].start !=
+	    i_size_read((*bdev)->bd_inode) >> SECTOR_SHIFT)
+		return 1;
+	return 0;
 }
 
 static int switch_iterate_devices(struct dm_target *ti,
@@ -562,7 +555,7 @@ static struct target_type switch_target = {
 	.map = switch_map,
 	.message = switch_message,
 	.status = switch_status,
-	.ioctl = switch_ioctl,
+	.prepare_ioctl = switch_prepare_ioctl,
 	.iterate_devices = switch_iterate_devices,
 };
 

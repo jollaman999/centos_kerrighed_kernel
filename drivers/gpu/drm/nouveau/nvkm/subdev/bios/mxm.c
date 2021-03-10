@@ -81,9 +81,8 @@ mxm_sor_map(struct nvkm_bios *bios, u8 conn)
 		u16 map = nvbios_rd16(bios, mxm + 4);
 		if (map) {
 			ver = nvbios_rd08(bios, map);
-			if (ver == 0x10) {
+			if (ver == 0x10 || ver == 0x11) {
 				if (conn < nvbios_rd08(bios, map + 3)) {
-					gmb();
 					map += nvbios_rd08(bios, map + 1);
 					map += conn;
 					return nvbios_rd08(bios, map);
@@ -121,7 +120,6 @@ mxm_ddc_map(struct nvkm_bios *bios, u8 port)
 			ver = nvbios_rd08(bios, map);
 			if (ver == 0x10) {
 				if (port < nvbios_rd08(bios, map + 3)) {
-					gmb();
 					map += nvbios_rd08(bios, map + 1);
 					map += port;
 					return nvbios_rd08(bios, map);

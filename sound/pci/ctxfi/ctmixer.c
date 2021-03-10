@@ -86,9 +86,7 @@ enum CTALSA_MIXER_CTL {
 	MIXER_LINEIN_C_S,
 	MIXER_MIC_C_S,
 	MIXER_SPDIFI_C_S,
-	MIXER_LINEIN_P_S,
 	MIXER_SPDIFO_P_S,
-	MIXER_SPDIFI_P_S,
 	MIXER_WAVEF_P_S,
 	MIXER_WAVER_P_S,
 	MIXER_WAVEC_P_S,
@@ -137,11 +135,11 @@ ct_kcontrol_init_table[NUM_CTALSA_MIXERS] = {
 	},
 	[MIXER_LINEIN_P] = {
 		.ctl = 1,
-		.name = "Line-in Playback Volume",
+		.name = "Line Playback Volume",
 	},
 	[MIXER_LINEIN_C] = {
 		.ctl = 1,
-		.name = "Line-in Capture Volume",
+		.name = "Line Capture Volume",
 	},
 	[MIXER_MIC_P] = {
 		.ctl = 1,
@@ -153,15 +151,15 @@ ct_kcontrol_init_table[NUM_CTALSA_MIXERS] = {
 	},
 	[MIXER_SPDIFI_P] = {
 		.ctl = 1,
-		.name = "S/PDIF-in Playback Volume",
+		.name = "IEC958 Playback Volume",
 	},
 	[MIXER_SPDIFI_C] = {
 		.ctl = 1,
-		.name = "S/PDIF-in Capture Volume",
+		.name = "IEC958 Capture Volume",
 	},
 	[MIXER_SPDIFO_P] = {
 		.ctl = 1,
-		.name = "S/PDIF-out Playback Volume",
+		.name = "Digital Playback Volume",
 	},
 	[MIXER_WAVEF_P] = {
 		.ctl = 1,
@@ -179,14 +177,13 @@ ct_kcontrol_init_table[NUM_CTALSA_MIXERS] = {
 		.ctl = 1,
 		.name = "Surround Playback Volume",
 	},
-
 	[MIXER_PCM_C_S] = {
 		.ctl = 1,
 		.name = "PCM Capture Switch",
 	},
 	[MIXER_LINEIN_C_S] = {
 		.ctl = 1,
-		.name = "Line-in Capture Switch",
+		.name = "Line Capture Switch",
 	},
 	[MIXER_MIC_C_S] = {
 		.ctl = 1,
@@ -194,19 +191,11 @@ ct_kcontrol_init_table[NUM_CTALSA_MIXERS] = {
 	},
 	[MIXER_SPDIFI_C_S] = {
 		.ctl = 1,
-		.name = "S/PDIF-in Capture Switch",
-	},
-	[MIXER_LINEIN_P_S] = {
-		.ctl = 1,
-		.name = "Line-in Playback Switch",
+		.name = "IEC958 Capture Switch",
 	},
 	[MIXER_SPDIFO_P_S] = {
 		.ctl = 1,
-		.name = "S/PDIF-out Playback Switch",
-	},
-	[MIXER_SPDIFI_P_S] = {
-		.ctl = 1,
-		.name = "S/PDIF-in Playback Switch",
+		.name = "Digital Playback Switch",
 	},
 	[MIXER_WAVEF_P_S] = {
 		.ctl = 1,
@@ -236,6 +225,8 @@ ct_mixer_recording_select(struct ct_mixer *mixer, enum CT_AMIXER_CTL type);
 static void
 ct_mixer_recording_unselect(struct ct_mixer *mixer, enum CT_AMIXER_CTL type);
 
+/* FIXME: this static looks like it would fail if more than one card was */
+/* installed. */
 static struct snd_kcontrol *kctls[2] = {NULL};
 
 static enum CT_AMIXER_CTL get_amixer_index(enum CTALSA_MIXER_CTL alsa_index)
@@ -420,6 +411,77 @@ static struct snd_kcontrol_new vol_ctl = {
 	.tlv		= { .p =  ct_vol_db_scale },
 };
 
+static int output_switch_info(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_info *info)
+{
+	static const char *const names[3] = {
+	  "FP Headphones", "Headphones", "Speakers"
+	};
+
+	return snd_ctl_enum_info(info, 1, 3, names);
+}
+
+static int output_switch_get(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct ct_atc *atc = snd_kcontrol_chip(kcontrol);
+	ucontrol->value.enumerated.item[0] = atc->output_switch_get(atc);
+	return 0;
+}
+
+static int output_switch_put(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct ct_atc *atc = snd_kcontrol_chip(kcontrol);
+	if (ucontrol->value.enumerated.item[0] > 2)
+		return -EINVAL;
+	return atc->output_switch_put(atc, ucontrol->value.enumerated.item[0]);
+}
+
+static struct snd_kcontrol_new output_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Analog Output Playback Enum",
+	.info = output_switch_info,
+	.get = output_switch_get,
+	.put = output_switch_put,
+};
+
+static int mic_source_switch_info(struct snd_kcontrol *kcontrol,
+			      struct snd_ctl_elem_info *info)
+{
+	static const char *const names[3] = {
+	  "Mic", "FP Mic", "Aux"
+	};
+
+	return snd_ctl_enum_info(info, 1, 3, names);
+}
+
+static int mic_source_switch_get(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct ct_atc *atc = snd_kcontrol_chip(kcontrol);
+	ucontrol->value.enumerated.item[0] = atc->mic_source_switch_get(atc);
+	return 0;
+}
+
+static int mic_source_switch_put(struct snd_kcontrol *kcontrol,
+			     struct snd_ctl_elem_value *ucontrol)
+{
+	struct ct_atc *atc = snd_kcontrol_chip(kcontrol);
+	if (ucontrol->value.enumerated.item[0] > 2)
+		return -EINVAL;
+	return atc->mic_source_switch_put(atc,
+					ucontrol->value.enumerated.item[0]);
+}
+
+static struct snd_kcontrol_new mic_source_ctl = {
+	.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+	.name = "Mic Source Capture Enum",
+	.info = mic_source_switch_info,
+	.get = mic_source_switch_get,
+	.put = mic_source_switch_put,
+};
+
 static void
 do_line_mic_switch(struct ct_atc *atc, enum CTALSA_MIXER_CTL type)
 {
@@ -465,6 +527,7 @@ do_digit_io_switch(struct ct_atc *atc, int state)
 static void do_switch(struct ct_atc *atc, enum CTALSA_MIXER_CTL type, int state)
 {
 	struct ct_mixer *mixer = atc->mixer;
+	struct capabilities cap = atc->capabilities(atc);
 
 	/* Do changes in mixer. */
 	if ((SWH_CAPTURE_START <= type) && (SWH_CAPTURE_END >= type)) {
@@ -477,8 +540,17 @@ static void do_switch(struct ct_atc *atc, enum CTALSA_MIXER_CTL type, int state)
 		}
 	}
 	/* Do changes out of mixer. */
-	if (state && (MIXER_LINEIN_C_S == type || MIXER_MIC_C_S == type))
-		do_line_mic_switch(atc, type);
+	if (!cap.dedicated_mic &&
+	    (MIXER_LINEIN_C_S == type || MIXER_MIC_C_S == type)) {
+		if (state)
+			do_line_mic_switch(atc, type);
+		atc->line_in_unmute(atc, state);
+	} else if (cap.dedicated_mic && (MIXER_LINEIN_C_S == type))
+		atc->line_in_unmute(atc, state);
+	else if (cap.dedicated_mic && (MIXER_MIC_C_S == type))
+		atc->mic_unmute(atc, state);
+	else if (MIXER_SPDIFI_C_S == type)
+		atc->spdif_in_unmute(atc, state);
 	else if (MIXER_WAVEF_P_S == type)
 		atc->line_front_unmute(atc, state);
 	else if (MIXER_WAVES_P_S == type)
@@ -487,12 +559,8 @@ static void do_switch(struct ct_atc *atc, enum CTALSA_MIXER_CTL type, int state)
 		atc->line_clfe_unmute(atc, state);
 	else if (MIXER_WAVER_P_S == type)
 		atc->line_rear_unmute(atc, state);
-	else if (MIXER_LINEIN_P_S == type)
-		atc->line_in_unmute(atc, state);
 	else if (MIXER_SPDIFO_P_S == type)
 		atc->spdif_out_unmute(atc, state);
-	else if (MIXER_SPDIFI_P_S == type)
-		atc->spdif_in_unmute(atc, state);
 	else if (MIXER_DIGITAL_IO_S == type)
 		do_digit_io_switch(atc, state);
 
@@ -566,19 +634,6 @@ static int ct_spdif_get_mask(struct snd_kcontrol *kcontrol,
 	return 0;
 }
 
-static int ct_spdif_default_get(struct snd_kcontrol *kcontrol,
-				struct snd_ctl_elem_value *ucontrol)
-{
-	unsigned int status = SNDRV_PCM_DEFAULT_CON_SPDIF;
-
-	ucontrol->value.iec958.status[0] = (status >> 0) & 0xff;
-	ucontrol->value.iec958.status[1] = (status >> 8) & 0xff;
-	ucontrol->value.iec958.status[2] = (status >> 16) & 0xff;
-	ucontrol->value.iec958.status[3] = (status >> 24) & 0xff;
-
-	return 0;
-}
-
 static int ct_spdif_get(struct snd_kcontrol *kcontrol,
 			struct snd_ctl_elem_value *ucontrol)
 {
@@ -586,6 +641,10 @@ static int ct_spdif_get(struct snd_kcontrol *kcontrol,
 	unsigned int status;
 
 	atc->spdif_out_get_status(atc, &status);
+
+	if (status == 0)
+		status = SNDRV_PCM_DEFAULT_CON_SPDIF;
+
 	ucontrol->value.iec958.status[0] = (status >> 0) & 0xff;
 	ucontrol->value.iec958.status[1] = (status >> 8) & 0xff;
 	ucontrol->value.iec958.status[2] = (status >> 16) & 0xff;
@@ -629,7 +688,7 @@ static struct snd_kcontrol_new iec958_default_ctl = {
 	.name		= SNDRV_CTL_NAME_IEC958("", PLAYBACK, DEFAULT),
 	.count		= 1,
 	.info		= ct_spdif_info,
-	.get		= ct_spdif_default_get,
+	.get		= ct_spdif_get,
 	.put		= ct_spdif_put,
 	.private_value	= MIXER_IEC958_DEFAULT
 };
@@ -680,6 +739,7 @@ static int ct_mixer_kcontrols_create(struct ct_mixer *mixer)
 {
 	enum CTALSA_MIXER_CTL type;
 	struct ct_atc *atc = mixer->atc;
+	struct capabilities cap = atc->capabilities(atc);
 	int err;
 
 	/* Create snd kcontrol instances on demand */
@@ -693,8 +753,8 @@ static int ct_mixer_kcontrols_create(struct ct_mixer *mixer)
 		}
 	}
 
-	ct_kcontrol_init_table[MIXER_DIGITAL_IO_S].ctl =
-					atc->have_digit_io_switch(atc);
+	ct_kcontrol_init_table[MIXER_DIGITAL_IO_S].ctl = cap.digit_io_switch;
+
 	for (type = SWH_MIXER_START; type <= SWH_MIXER_END; type++) {
 		if (ct_kcontrol_init_table[type].ctl) {
 			swh_ctl.name = ct_kcontrol_init_table[type].name;
@@ -717,6 +777,17 @@ static int ct_mixer_kcontrols_create(struct ct_mixer *mixer)
 	if (err)
 		return err;
 
+	if (cap.output_switch) {
+		err = ct_mixer_kcontrol_new(mixer, &output_ctl);
+		if (err)
+			return err;
+	}
+
+	if (cap.mic_source_switch) {
+		err = ct_mixer_kcontrol_new(mixer, &mic_source_ctl);
+		if (err)
+			return err;
+	}
 	atc->line_front_unmute(atc, 1);
 	set_switch_state(mixer, MIXER_WAVEF_P_S, 1);
 	atc->line_surround_unmute(atc, 0);
@@ -728,13 +799,12 @@ static int ct_mixer_kcontrols_create(struct ct_mixer *mixer)
 	atc->spdif_out_unmute(atc, 0);
 	set_switch_state(mixer, MIXER_SPDIFO_P_S, 0);
 	atc->line_in_unmute(atc, 0);
-	set_switch_state(mixer, MIXER_LINEIN_P_S, 0);
+	if (cap.dedicated_mic)
+		atc->mic_unmute(atc, 0);
 	atc->spdif_in_unmute(atc, 0);
-	set_switch_state(mixer, MIXER_SPDIFI_P_S, 0);
-
-	set_switch_state(mixer, MIXER_PCM_C_S, 1);
-	set_switch_state(mixer, MIXER_LINEIN_C_S, 1);
-	set_switch_state(mixer, MIXER_SPDIFI_C_S, 1);
+	set_switch_state(mixer, MIXER_PCM_C_S, 0);
+	set_switch_state(mixer, MIXER_LINEIN_C_S, 0);
+	set_switch_state(mixer, MIXER_SPDIFI_C_S, 0);
 
 	return 0;
 }
@@ -784,8 +854,8 @@ static int ct_mixer_get_resources(struct ct_mixer *mixer)
 	for (i = 0; i < (NUM_CT_SUMS * CHN_NUM); i++) {
 		err = sum_mgr->get_sum(sum_mgr, &sum_desc, &sum);
 		if (err) {
-			printk(KERN_ERR "ctxfi:Failed to get sum resources for "
-					  "front output!\n");
+			dev_err(mixer->atc->card->dev,
+				"Failed to get sum resources for front output!\n");
 			break;
 		}
 		mixer->sums[i] = sum;
@@ -799,8 +869,8 @@ static int ct_mixer_get_resources(struct ct_mixer *mixer)
 	for (i = 0; i < (NUM_CT_AMIXERS * CHN_NUM); i++) {
 		err = amixer_mgr->get_amixer(amixer_mgr, &am_desc, &amixer);
 		if (err) {
-			printk(KERN_ERR "ctxfi:Failed to get amixer resources "
-			       "for mixer obj!\n");
+			dev_err(mixer->atc->card->dev,
+				"Failed to get amixer resources for mixer obj!\n");
 			break;
 		}
 		mixer->amixers[i] = amixer;
@@ -840,13 +910,14 @@ static int ct_mixer_get_mem(struct ct_mixer **rmixer)
 	if (!mixer)
 		return -ENOMEM;
 
-	mixer->amixers = kzalloc(sizeof(void *)*(NUM_CT_AMIXERS*CHN_NUM),
+	mixer->amixers = kcalloc(NUM_CT_AMIXERS * CHN_NUM, sizeof(void *),
 				 GFP_KERNEL);
 	if (!mixer->amixers) {
 		err = -ENOMEM;
 		goto error1;
 	}
-	mixer->sums = kzalloc(sizeof(void *)*(NUM_CT_SUMS*CHN_NUM), GFP_KERNEL);
+	mixer->sums = kcalloc(NUM_CT_SUMS * CHN_NUM, sizeof(void *),
+			      GFP_KERNEL);
 	if (!mixer->sums) {
 		err = -ENOMEM;
 		goto error2;
@@ -867,17 +938,18 @@ static int ct_mixer_topology_build(struct ct_mixer *mixer)
 	struct sum *sum;
 	struct amixer *amix_d, *amix_s;
 	enum CT_AMIXER_CTL i, j;
+	enum CT_SUM_CTL k;
 
 	/* Build topology from destination to source */
 
 	/* Set up Master mixer */
-	for (i = AMIXER_MASTER_F, j = SUM_IN_F;
-					i <= AMIXER_MASTER_S; i++, j++) {
+	for (i = AMIXER_MASTER_F, k = SUM_IN_F;
+					i <= AMIXER_MASTER_S; i++, k++) {
 		amix_d = mixer->amixers[i*CHN_NUM];
-		sum = mixer->sums[j*CHN_NUM];
+		sum = mixer->sums[k*CHN_NUM];
 		amix_d->ops->setup(amix_d, &sum->rsc, INIT_VOL, NULL);
 		amix_d = mixer->amixers[i*CHN_NUM+1];
-		sum = mixer->sums[j*CHN_NUM+1];
+		sum = mixer->sums[k*CHN_NUM+1];
 		amix_d->ops->setup(amix_d, &sum->rsc, INIT_VOL, NULL);
 	}
 
@@ -901,12 +973,12 @@ static int ct_mixer_topology_build(struct ct_mixer *mixer)
 	amix_d->ops->setup(amix_d, &amix_s->rsc, INIT_VOL, NULL);
 
 	/* Set up PCM-in mixer */
-	for (i = AMIXER_PCM_F, j = SUM_IN_F; i <= AMIXER_PCM_S; i++, j++) {
+	for (i = AMIXER_PCM_F, k = SUM_IN_F; i <= AMIXER_PCM_S; i++, k++) {
 		amix_d = mixer->amixers[i*CHN_NUM];
-		sum = mixer->sums[j*CHN_NUM];
+		sum = mixer->sums[k*CHN_NUM];
 		amix_d->ops->setup(amix_d, NULL, INIT_VOL, sum);
 		amix_d = mixer->amixers[i*CHN_NUM+1];
-		sum = mixer->sums[j*CHN_NUM+1];
+		sum = mixer->sums[k*CHN_NUM+1];
 		amix_d->ops->setup(amix_d, NULL, INIT_VOL, sum);
 	}
 
@@ -1048,7 +1120,7 @@ mixer_set_input_right(struct ct_mixer *mixer,
 	return 0;
 }
 
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 static int mixer_resume(struct ct_mixer *mixer)
 {
 	int i, state;
@@ -1118,7 +1190,7 @@ int ct_mixer_create(struct ct_atc *atc, struct ct_mixer **rmixer)
 	mixer->get_output_ports = mixer_get_output_ports;
 	mixer->set_input_left = mixer_set_input_left;
 	mixer->set_input_right = mixer_set_input_right;
-#ifdef CONFIG_PM
+#ifdef CONFIG_PM_SLEEP
 	mixer->resume = mixer_resume;
 #endif
 

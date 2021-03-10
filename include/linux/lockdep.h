@@ -12,6 +12,10 @@
 struct task_struct;
 struct lockdep_map;
 
+/* for sysctl */
+extern int prove_locking;
+extern int lock_stat;
+
 #ifdef CONFIG_LOCKDEP
 
 #include <linux/linkage.h>
@@ -28,6 +32,17 @@ struct lockdep_map;
 #define MAX_LOCKDEP_SUBCLASSES		8UL
 
 /*
+ * NR_LOCKDEP_CACHING_CLASSES ... Number of classes
+ * cached in the instance of lockdep_map
+ *
+ * Currently main class (subclass == 0) and signle depth subclass
+ * are cached in lockdep_map. This optimization is mainly targeting
+ * on rq->lock. double_rq_lock() acquires this highly competitive with
+ * single depth.
+ */
+#define NR_LOCKDEP_CACHING_CLASSES	2
+
+/*
  * Lock-classes are keyed via unique addresses, by embedding the
  * lockclass-key into the kernel (or module) .data section. (For
  * static locks we use the lock address itself as the key.)
@@ -39,6 +54,8 @@ struct lockdep_subclass_key {
 struct lock_class_key {
 	struct lockdep_subclass_key	subkeys[MAX_LOCKDEP_SUBCLASSES];
 };
+
+extern struct lock_class_key __lockdep_no_validate__;
 
 #define LOCKSTAT_POINTS		4
 
@@ -79,13 +96,8 @@ struct lock_class {
 	 */
 	unsigned int			version;
 
-	/*
-	 * Statistics counter:
-	 */
-	unsigned long			ops;
-
-	const char			*name;
 	int				name_version;
+	const char			*name;
 
 #ifdef CONFIG_LOCK_STAT
 	unsigned long			contention_point[LOCKSTAT_POINTS];
@@ -132,13 +144,31 @@ void clear_lock_stats(struct lock_class *class);
  */
 struct lockdep_map {
 	struct lock_class_key		*key;
-	struct lock_class		*class_cache;
+	struct lock_class		*class_cache[NR_LOCKDEP_CACHING_CLASSES];
 	const char			*name;
 #ifdef CONFIG_LOCK_STAT
 	int				cpu;
 	unsigned long			ip;
 #endif
 };
+
+static inline void lockdep_copy_map(struct lockdep_map *to,
+				    struct lockdep_map *from)
+{
+	int i;
+
+	*to = *from;
+	/*
+	 * Since the class cache can be modified concurrently we could observe
+	 * half pointers (64bit arch using 32bit copy insns). Therefore clear
+	 * the caches and take the performance hit.
+	 *
+	 * XXX it doesn't work well with lockdep_set_class_and_subclass(), since
+	 *     that relies on cache abuse.
+	 */
+	for (i = 0; i < NR_LOCKDEP_CACHING_CLASSES; i++)
+		to->class_cache[i] = NULL;
+}
 
 /*
  * Every lock has a list of other locks that were taken after it.
@@ -266,6 +296,9 @@ extern void lockdep_init_map(struct lockdep_map *lock, const char *name,
 #define lockdep_set_subclass(lock, sub)	\
 		lockdep_init_map(&(lock)->dep_map, #lock, \
 				 (lock)->dep_map.key, sub)
+
+#define lockdep_set_novalidate_class(lock) \
+	lockdep_set_class(lock, &__lockdep_no_validate__)
 /*
  * Compare locking classes
  */
@@ -299,9 +332,18 @@ extern void lock_acquire(struct lockdep_map *lock, unsigned int subclass,
 extern void lock_release(struct lockdep_map *lock, int nested,
 			 unsigned long ip);
 
-#define lockdep_is_held(lock)	lock_is_held(&(lock)->dep_map)
+/*
+ * Same "read" as for lock_acquire(), except -1 means any.
+ */
+extern int lock_is_held_type(struct lockdep_map *lock, int read);
 
-extern int lock_is_held(struct lockdep_map *lock);
+static inline int lock_is_held(struct lockdep_map *lock)
+{
+	return lock_is_held_type(lock, -1);
+}
+
+#define lockdep_is_held(lock)		lock_is_held(&(lock)->dep_map)
+#define lockdep_is_held_type(lock, r)	lock_is_held_type(&(lock)->dep_map, (r))
 
 extern void lock_set_class(struct lockdep_map *lock, const char *name,
 			   struct lock_class_key *key, unsigned int subclass,
@@ -321,9 +363,25 @@ extern void lockdep_trace_alloc(gfp_t mask);
 
 #define lockdep_depth(tsk)	(debug_locks ? (tsk)->lockdep_depth : 0)
 
-#define lockdep_assert_held(l)	WARN_ON(debug_locks && !lockdep_is_held(l))
+#define lockdep_assert_held(l)	do {				\
+		WARN_ON(debug_locks && !lockdep_is_held(l));	\
+	} while (0)
 
-#else /* !LOCKDEP */
+#define lockdep_assert_held_exclusive(l)	do {			\
+		WARN_ON(debug_locks && !lockdep_is_held_type(l, 0));	\
+	} while (0)
+
+#define lockdep_assert_held_read(l)	do {				\
+		WARN_ON(debug_locks && !lockdep_is_held_type(l, 1));	\
+	} while (0)
+
+#define lockdep_assert_held_once(l)	do {				\
+		WARN_ON_ONCE(debug_locks && !lockdep_is_held(l));	\
+	} while (0)
+
+#define lockdep_recursing(tsk)	((tsk)->lockdep_recursion)
+
+#else /* !CONFIG_LOCKDEP */
 
 static inline void lockdep_off(void)
 {
@@ -350,6 +408,9 @@ static inline void lockdep_on(void)
 #define lockdep_set_class_and_subclass(lock, key, sub) \
 		do { (void)(key); } while (0)
 #define lockdep_set_subclass(lock, sub)		do { } while (0)
+
+#define lockdep_set_novalidate_class(lock) do { } while (0)
+
 /*
  * We don't define lockdep_match_class() and lockdep_match_key() for !LOCKDEP
  * case since the result is not well defined and the caller should rather
@@ -367,7 +428,14 @@ struct lock_class_key { };
 
 #define lockdep_depth(tsk)	(0)
 
+#define lockdep_is_held_type(l, r)		(1)
+
 #define lockdep_assert_held(l)			do { (void)(l); } while (0)
+#define lockdep_assert_held_exclusive(l)	do { (void)(l); } while (0)
+#define lockdep_assert_held_read(l)		do { (void)(l); } while (0)
+#define lockdep_assert_held_once(l)		do { (void)(l); } while (0)
+
+#define lockdep_recursing(tsk)			(0)
 
 #endif /* !LOCKDEP */
 
@@ -412,25 +480,9 @@ do {								\
 
 #endif /* CONFIG_LOCKDEP */
 
-#ifdef CONFIG_GENERIC_HARDIRQS
-extern void early_init_irq_lock_class(void);
-#else
-static inline void early_init_irq_lock_class(void)
-{
-}
-#endif
-
 #ifdef CONFIG_TRACE_IRQFLAGS
-extern void early_boot_irqs_off(void);
-extern void early_boot_irqs_on(void);
 extern void print_irqtrace_events(struct task_struct *curr);
 #else
-static inline void early_boot_irqs_off(void)
-{
-}
-static inline void early_boot_irqs_on(void)
-{
-}
 static inline void print_irqtrace_events(struct task_struct *curr)
 {
 }
@@ -448,76 +500,41 @@ static inline void print_irqtrace_events(struct task_struct *curr)
  * on the per lock-class debug mode:
  */
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-# ifdef CONFIG_PROVE_LOCKING
-#  define spin_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
-#  define spin_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 2, n, i)
-# else
-#  define spin_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
-#  define spin_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 1, NULL, i)
-# endif
-# define spin_release(l, n, i)			lock_release(l, n, i)
+#ifdef CONFIG_PROVE_LOCKING
+ #define lock_acquire_exclusive(l, s, t, n, i)		lock_acquire(l, s, t, 0, 2, n, i)
+ #define lock_acquire_shared(l, s, t, n, i)		lock_acquire(l, s, t, 1, 2, n, i)
+ #define lock_acquire_shared_recursive(l, s, t, n, i)	lock_acquire(l, s, t, 2, 2, n, i)
 #else
-# define spin_acquire(l, s, t, i)		do { } while (0)
-# define spin_release(l, n, i)			do { } while (0)
+ #define lock_acquire_exclusive(l, s, t, n, i)		lock_acquire(l, s, t, 0, 1, n, i)
+ #define lock_acquire_shared(l, s, t, n, i)		lock_acquire(l, s, t, 1, 1, n, i)
+ #define lock_acquire_shared_recursive(l, s, t, n, i)	lock_acquire(l, s, t, 2, 1, n, i)
 #endif
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-# ifdef CONFIG_PROVE_LOCKING
-#  define rwlock_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
-#  define rwlock_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 2, 2, NULL, i)
-# else
-#  define rwlock_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
-#  define rwlock_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 2, 1, NULL, i)
-# endif
-# define rwlock_release(l, n, i)		lock_release(l, n, i)
-#else
-# define rwlock_acquire(l, s, t, i)		do { } while (0)
-# define rwlock_acquire_read(l, s, t, i)	do { } while (0)
-# define rwlock_release(l, n, i)		do { } while (0)
-#endif
+#define spin_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+#define spin_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
+#define spin_release(l, n, i)			lock_release(l, n, i)
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-# ifdef CONFIG_PROVE_LOCKING
-#  define mutex_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
-#  define mutex_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 2, n, i)
-# else
-#  define mutex_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
-#  define mutex_acquire_nest(l, s, t, n, i)	lock_acquire(l, s, t, 0, 1, n, i)
-# endif
-# define mutex_release(l, n, i)			lock_release(l, n, i)
-#else
-# define mutex_acquire(l, s, t, i)		do { } while (0)
-# define mutex_acquire_nest(l, s, t, n, i)	do { } while (0)
-# define mutex_release(l, n, i)			do { } while (0)
-#endif
+#define rwlock_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+#define rwlock_acquire_read(l, s, t, i)		lock_acquire_shared_recursive(l, s, t, NULL, i)
+#define rwlock_release(l, n, i)			lock_release(l, n, i)
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-# ifdef CONFIG_PROVE_LOCKING
-#  define rwsem_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 2, NULL, i)
-#  define rwsem_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 1, 2, NULL, i)
-# else
-#  define rwsem_acquire(l, s, t, i)		lock_acquire(l, s, t, 0, 1, NULL, i)
-#  define rwsem_acquire_read(l, s, t, i)	lock_acquire(l, s, t, 1, 1, NULL, i)
-# endif
-# define rwsem_release(l, n, i)			lock_release(l, n, i)
-#else
-# define rwsem_acquire(l, s, t, i)		do { } while (0)
-# define rwsem_acquire_read(l, s, t, i)		do { } while (0)
-# define rwsem_release(l, n, i)			do { } while (0)
-#endif
+#define seqcount_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+#define seqcount_acquire_read(l, s, t, i)	lock_acquire_shared_recursive(l, s, t, NULL, i)
+#define seqcount_release(l, n, i)		lock_release(l, n, i)
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-# ifdef CONFIG_PROVE_LOCKING
-#  define lock_map_acquire(l)		lock_acquire(l, 0, 0, 0, 2, NULL, _THIS_IP_)
-# else
-#  define lock_map_acquire(l)		lock_acquire(l, 0, 0, 0, 1, NULL, _THIS_IP_)
-# endif
-# define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
-#else
-# define lock_map_acquire(l)			do { } while (0)
-# define lock_map_release(l)			do { } while (0)
-#endif
+#define mutex_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+#define mutex_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
+#define mutex_release(l, n, i)			lock_release(l, n, i)
+
+#define rwsem_acquire(l, s, t, i)		lock_acquire_exclusive(l, s, t, NULL, i)
+#define rwsem_acquire_nest(l, s, t, n, i)	lock_acquire_exclusive(l, s, t, n, i)
+#define rwsem_acquire_read(l, s, t, i)		lock_acquire_shared(l, s, t, NULL, i)
+#define rwsem_release(l, n, i)			lock_release(l, n, i)
+
+#define lock_map_acquire(l)			lock_acquire_exclusive(l, 0, 0, NULL, _THIS_IP_)
+#define lock_map_acquire_read(l)		lock_acquire_shared_recursive(l, 0, 0, NULL, _THIS_IP_)
+#define lock_map_acquire_tryread(l)		lock_acquire_shared_recursive(l, 0, 1, NULL, _THIS_IP_)
+#define lock_map_release(l)			lock_release(l, 1, _THIS_IP_)
 
 #ifdef CONFIG_PROVE_LOCKING
 # define might_lock(lock) 						\
@@ -535,6 +552,10 @@ do {									\
 #else
 # define might_lock(lock) do { } while (0)
 # define might_lock_read(lock) do { } while (0)
+#endif
+
+#ifdef CONFIG_PROVE_RCU
+void lockdep_rcu_suspicious(const char *file, const int line, const char *s);
 #endif
 
 #endif /* __LINUX_LOCKDEP_H */

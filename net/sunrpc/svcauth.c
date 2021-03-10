@@ -46,13 +46,16 @@ svc_authenticate(struct svc_rqst *rqstp, __be32 *authp)
 	dprintk("svc: svc_authenticate (%d)\n", flavor);
 
 	spin_lock(&authtab_lock);
-	if (flavor >= RPC_AUTH_MAXFLAVOR || !(aops = authtab[flavor])
-			|| !try_module_get(aops->owner)) {
+	if (flavor >= RPC_AUTH_MAXFLAVOR || !(aops = authtab[flavor]) ||
+	    !try_module_get(aops->owner)) {
 		spin_unlock(&authtab_lock);
 		*authp = rpc_autherr_badcred;
 		return SVC_DENIED;
 	}
 	spin_unlock(&authtab_lock);
+
+	rqstp->rq_auth_slack = 0;
+	init_svc_cred(&rqstp->rq_cred);
 
 	rqstp->rq_authop = aops;
 	return aops->accept(rqstp, authp);
@@ -61,6 +64,7 @@ EXPORT_SYMBOL_GPL(svc_authenticate);
 
 int svc_set_client(struct svc_rqst *rqstp)
 {
+	rqstp->rq_client = NULL;
 	return rqstp->rq_authop->set_client(rqstp);
 }
 EXPORT_SYMBOL_GPL(svc_set_client);
@@ -118,7 +122,6 @@ EXPORT_SYMBOL_GPL(svc_auth_unregister);
 
 #define	DN_HASHBITS	6
 #define	DN_HASHMAX	(1<<DN_HASHBITS)
-#define	DN_HASHMASK	(DN_HASHMAX-1)
 
 static struct hlist_head	auth_domain_table[DN_HASHMAX];
 static spinlock_t	auth_domain_lock =
@@ -139,13 +142,12 @@ auth_domain_lookup(char *name, struct auth_domain *new)
 {
 	struct auth_domain *hp;
 	struct hlist_head *head;
-	struct hlist_node *np;
 
 	head = &auth_domain_table[hash_str(name, DN_HASHBITS)];
 
 	spin_lock(&auth_domain_lock);
 
-	hlist_for_each_entry(hp, np, head, hash) {
+	hlist_for_each_entry(hp, head, hash) {
 		if (strcmp(hp->name, name)==0) {
 			kref_get(&hp->ref);
 			spin_unlock(&auth_domain_lock);

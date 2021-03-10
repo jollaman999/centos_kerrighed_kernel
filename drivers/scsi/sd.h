@@ -1,18 +1,14 @@
 #ifndef _SCSI_DISK_H
 #define _SCSI_DISK_H
 
+#include <linux/rh_kabi.h>
+
 /*
  * More than enough for everybody ;)  The huge number of majors
  * is a leftover from 16bit dev_t days, we don't really need that
  * much numberspace.
  */
 #define SD_MAJORS	16
-
-/*
- * This is limited by the naming scheme enforced in sd_probe,
- * add another character to it if you really need more disks.
- */
-#define SD_MAX_DISKS	(((26 * 26) + 26 + 1) * 26)
 
 /*
  * Time out in seconds for disks and Magneto-opticals (which are slower).
@@ -24,6 +20,7 @@
  * user modifiable via sysfs but initially set to SD_TIMEOUT
  */
 #define SD_FLUSH_TIMEOUT_MULTIPLIER	2
+#define SD_WRITE_SAME_TIMEOUT	(120 * HZ)
 
 /*
  * Number of allowed retries
@@ -49,6 +46,13 @@ enum {
 };
 
 enum {
+	SD_DEF_XFER_BLOCKS = 0xffff,
+	SD_MAX_XFER_BLOCKS = 0xffffffff,
+	SD_MAX_WS10_BLOCKS = 0xffff,
+	SD_MAX_WS16_BLOCKS = 0x7fffff,
+};
+
+enum {
 	SD_LBP_FULL = 0,	/* Full logical block provisioning */
 	SD_LBP_UNMAP,		/* Use UNMAP command */
 	SD_LBP_WS16,		/* Use WRITE SAME(16) with UNMAP bit */
@@ -62,8 +66,8 @@ struct scsi_disk {
 	struct scsi_device *device;
 	struct device	dev;
 	struct gendisk	*disk;
-	unsigned int	openers;	/* protected by BKL for now, yuck */
-	sector_t	capacity;	/* size in 512-byte sectors */
+	atomic_t	openers;
+	sector_t	capacity;	/* size in logical blocks */
 	u32		max_ws_blocks;
 	u32		max_unmap_blocks;
 	u32		unmap_granularity;
@@ -76,8 +80,8 @@ struct scsi_disk {
 	u8		write_prot;
 	u8		protection_type;/* Data Integrity Field */
 	u8		provisioning_mode;
-	unsigned	previous_state : 1;
 	unsigned	ATO : 1;	/* state of disk ATO bit */
+	unsigned	cache_override : 1; /* temp override of WCE,RCD */
 	unsigned	WCE : 1;	/* state of disk WCE bit */
 	unsigned	RCD : 1;	/* state of disk RCD bit, unused */
 	unsigned	DPOFUA : 1;	/* state of disk DPOFUA bit */
@@ -88,9 +92,18 @@ struct scsi_disk {
 	unsigned	lbpws : 1;
 	unsigned	lbpws10 : 1;
 	unsigned	lbpvpd : 1;
-#ifndef __GENKSYMS__
-	unsigned	cache_override : 1; /* temp override of WCE,RCD */
-#endif
+	unsigned	ws10 : 1;
+	unsigned	ws16 : 1;
+
+	/* FOR RH USE ONLY
+	 *
+	 * The following padding has been inserted before ABI freeze to
+	 * allow extending the structure while preserving ABI.
+	 */
+	u32		xcopy_reserved;
+
+	RH_KABI_USE(1, u32 max_xfer_blocks)
+	RH_KABI_USE(2, u32 opt_xfer_blocks)
 };
 #define to_scsi_disk(obj) container_of(obj,struct scsi_disk,dev)
 
@@ -101,9 +114,15 @@ static inline struct scsi_disk *scsi_disk(struct gendisk *disk)
 
 #define sd_printk(prefix, sdsk, fmt, a...)				\
         (sdsk)->disk ?							\
-	sdev_printk(prefix, (sdsk)->device, "[%s] " fmt,		\
-		    (sdsk)->disk->disk_name, ##a) :			\
-	sdev_printk(prefix, (sdsk)->device, fmt, ##a)
+	      sdev_prefix_printk(prefix, (sdsk)->device,		\
+				 (sdsk)->disk->disk_name, fmt, ##a) :	\
+	      sdev_printk(prefix, (sdsk)->device, fmt, ##a)
+
+#define sd_first_printk(prefix, sdsk, fmt, a...)			\
+	do {								\
+		if ((sdsk)->first_scan)					\
+			sd_printk(prefix, sdsk, fmt, ##a);		\
+	} while (0)
 
 static inline int scsi_medium_access_command(struct scsi_cmnd *scmd)
 {
@@ -135,6 +154,16 @@ static inline int scsi_medium_access_command(struct scsi_cmnd *scmd)
 	}
 
 	return 0;
+}
+
+static inline sector_t logical_to_sectors(struct scsi_device *sdev, sector_t blocks)
+{
+	return blocks << (ilog2(sdev->sector_size) - 9);
+}
+
+static inline unsigned int logical_to_bytes(struct scsi_device *sdev, sector_t blocks)
+{
+	return blocks * sdev->sector_size;
 }
 
 /*

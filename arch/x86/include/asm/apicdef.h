@@ -144,6 +144,7 @@
 
 #define APIC_BASE (fix_to_virt(FIX_APIC_BASE))
 #define APIC_BASE_MSR	0x800
+#define XAPIC_ENABLE	(1UL << 11)
 #define X2APIC_ENABLE	(1UL << 10)
 
 #ifdef CONFIG_X86_32
@@ -429,4 +430,16 @@ struct local_apic {
 #else
  #define BAD_APICID 0xFFFFu
 #endif
+
+enum ioapic_irq_destination_types {
+	dest_Fixed		= 0,
+	dest_LowestPrio		= 1,
+	dest_SMI		= 2,
+	dest__reserved_1	= 3,
+	dest_NMI		= 4,
+	dest_INIT		= 5,
+	dest__reserved_2	= 6,
+	dest_ExtINT		= 7
+};
+
 #endif /* _ASM_X86_APICDEF_H */

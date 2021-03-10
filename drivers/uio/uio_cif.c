@@ -1,16 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * UIO Hilscher CIF card driver
  *
- * (C) 2007 Hans J. Koch <hjk@linutronix.de>
+ * (C) 2007 Hans J. Koch <hjk@hansjkoch.de>
  * Original code (C) 2005 Benedikt Spranger <b.spranger@linutronix.de>
- *
- * Licensed under GPL version 2 only.
- *
  */
 
 #include <linux/device.h>
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 #include <linux/uio_driver.h>
 
 #include <asm/io.h>
@@ -39,7 +38,7 @@ static irqreturn_t hilscher_handler(int irq, struct uio_info *dev_info)
 	return IRQ_HANDLED;
 }
 
-static int __devinit hilscher_pci_probe(struct pci_dev *dev,
+static int hilscher_pci_probe(struct pci_dev *dev,
 					const struct pci_device_id *id)
 {
 	struct uio_info *info;
@@ -78,7 +77,7 @@ static int __devinit hilscher_pci_probe(struct pci_dev *dev,
 	}
 	info->version = "0.0.1";
 	info->irq = dev->irq;
-	info->irq_flags = IRQF_DISABLED | IRQF_SHARED;
+	info->irq_flags = IRQF_SHARED;
 	info->handler = hilscher_handler;
 
 	if (uio_register_device(&dev->dev, info))
@@ -111,7 +110,7 @@ static void hilscher_pci_remove(struct pci_dev *dev)
 	kfree (info);
 }
 
-static struct pci_device_id hilscher_pci_ids[] __devinitdata = {
+static struct pci_device_id hilscher_pci_ids[] = {
 	{
 		.vendor =	PCI_VENDOR_ID_PLX,
 		.device =	PCI_DEVICE_ID_PLX_9030,

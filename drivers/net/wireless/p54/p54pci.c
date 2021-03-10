@@ -13,6 +13,7 @@
  * published by the Free Software Foundation.
  */
 
+#include <linux/init.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/firmware.h>
@@ -630,6 +631,7 @@ static int p54p_probe(struct pci_dev *pdev,
 	iounmap(priv->map);
 
  err_free_dev:
+	pci_set_drvdata(pdev, NULL);
 	p54_free_common(dev);
 
  err_free_reg:

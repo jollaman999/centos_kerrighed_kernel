@@ -12,10 +12,6 @@
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
- *
- *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
  */
 
 #include <linux/kernel.h>
@@ -30,8 +26,8 @@
 #include <linux/isa.h>
 #include <linux/i2c.h>
 #include <linux/i2c-algo-pca.h>
+#include <linux/io.h>
 
-#include <asm/io.h>
 #include <asm/irq.h>
 
 #define DRIVER "i2c-pca-isa"
@@ -71,8 +67,8 @@ static int pca_isa_readbyte(void *pd, int reg)
 
 static int pca_isa_waitforcompletion(void *pd)
 {
-	long ret = ~0;
 	unsigned long timeout;
+	long ret;
 
 	if (irq > -1) {
 		ret = wait_event_timeout(pca_wait,
@@ -81,11 +77,15 @@ static int pca_isa_waitforcompletion(void *pd)
 	} else {
 		/* Do polling */
 		timeout = jiffies + pca_isa_ops.timeout;
-		while (((pca_isa_readbyte(pd, I2C_PCA_CON)
-				& I2C_PCA_CON_SI) == 0)
-				&& (ret = time_before(jiffies, timeout)))
+		do {
+			ret = time_before(jiffies, timeout);
+			if (pca_isa_readbyte(pd, I2C_PCA_CON)
+					& I2C_PCA_CON_SI)
+				break;
 			udelay(100);
+		} while (ret);
 	}
+
 	return ret > 0;
 }
 
@@ -115,7 +115,7 @@ static struct i2c_adapter pca_isa_ops = {
 	.timeout	= HZ,
 };
 
-static int __devinit pca_isa_match(struct device *dev, unsigned int id)
+static int pca_isa_match(struct device *dev, unsigned int id)
 {
 	int match = base != 0;
 
@@ -128,7 +128,7 @@ static int __devinit pca_isa_match(struct device *dev, unsigned int id)
 	return match;
 }
 
-static int __devinit pca_isa_probe(struct device *dev, unsigned int id)
+static int pca_isa_probe(struct device *dev, unsigned int id)
 {
 	init_waitqueue_head(&pca_wait);
 
@@ -170,7 +170,7 @@ static int __devinit pca_isa_probe(struct device *dev, unsigned int id)
 	return -ENODEV;
 }
 
-static int __devexit pca_isa_remove(struct device *dev, unsigned int id)
+static int pca_isa_remove(struct device *dev, unsigned int id)
 {
 	i2c_del_adapter(&pca_isa_ops);
 
@@ -186,7 +186,7 @@ static int __devexit pca_isa_remove(struct device *dev, unsigned int id)
 static struct isa_driver pca_isa_driver = {
 	.match		= pca_isa_match,
 	.probe		= pca_isa_probe,
-	.remove		= __devexit_p(pca_isa_remove),
+	.remove		= pca_isa_remove,
 	.driver = {
 		.owner	= THIS_MODULE,
 		.name	= DRIVER,

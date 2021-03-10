@@ -1,4 +1,3 @@
-
 /******************************************************************************
  *
  * Module Name: exoparg1 - AML execution - opcodes with 1 argument
@@ -6,7 +5,7 @@
  *****************************************************************************/
 
 /*
- * Copyright (C) 2000 - 2008, Intel Corp.
+ * Copyright (C) 2000 - 2013, Intel Corp.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -100,12 +99,12 @@ acpi_status acpi_ex_opcode_0A_0T_1R(struct acpi_walk_state *walk_state)
 
 		/* Create a return object of type Integer */
 
-		return_desc = acpi_ut_create_internal_object(ACPI_TYPE_INTEGER);
+		return_desc =
+		    acpi_ut_create_integer_object(acpi_os_get_timer());
 		if (!return_desc) {
 			status = AE_NO_MEMORY;
 			goto cleanup;
 		}
-		return_desc->integer.value = acpi_os_get_timer();
 		break;
 
 	default:		/*  Unknown opcode  */
@@ -173,7 +172,7 @@ acpi_status acpi_ex_opcode_1A_0T_0R(struct acpi_walk_state *walk_state)
 
 	case AML_SLEEP_OP:	/*  Sleep (msec_time) */
 
-		status = acpi_ex_system_do_suspend(operand[0]->integer.value);
+		status = acpi_ex_system_do_sleep(operand[0]->integer.value);
 		break;
 
 	case AML_STALL_OP:	/*  Stall (usec_time) */
@@ -261,8 +260,8 @@ acpi_status acpi_ex_opcode_1A_1T_1R(struct acpi_walk_state *walk_state)
 	union acpi_operand_object *return_desc2 = NULL;
 	u32 temp32;
 	u32 i;
-	acpi_integer power_of_ten;
-	acpi_integer digit;
+	u64 power_of_ten;
+	u64 digit;
 
 	ACPI_FUNCTION_TRACE_STR(ex_opcode_1A_1T_1R,
 				acpi_ps_get_opcode_name(walk_state->opcode));
@@ -328,7 +327,6 @@ acpi_status acpi_ex_opcode_1A_1T_1R(struct acpi_walk_state *walk_state)
 			break;
 
 		case AML_FROM_BCD_OP:	/* from_bcd (BCDValue, Result) */
-
 			/*
 			 * The 64-bit ACPI integer can hold 16 4-bit BCD characters
 			 * (if table is 32-bit, integer can hold 8 BCD characters)
@@ -362,7 +360,7 @@ acpi_status acpi_ex_opcode_1A_1T_1R(struct acpi_walk_state *walk_state)
 				/* Sum the digit into the result with the current power of 10 */
 
 				return_desc->integer.value +=
-				    (((acpi_integer) temp32) * power_of_ten);
+				    (((u64) temp32) * power_of_ten);
 
 				/* Shift to next BCD digit */
 
@@ -392,7 +390,7 @@ acpi_status acpi_ex_opcode_1A_1T_1R(struct acpi_walk_state *walk_state)
 				 * remainder from above
 				 */
 				return_desc->integer.value |=
-				    (((acpi_integer) temp32) << ACPI_MUL_4(i));
+				    (((u64) temp32) << ACPI_MUL_4(i));
 			}
 
 			/* Overflow if there is any data left in Digit */
@@ -408,7 +406,6 @@ acpi_status acpi_ex_opcode_1A_1T_1R(struct acpi_walk_state *walk_state)
 			break;
 
 		case AML_COND_REF_OF_OP:	/* cond_ref_of (source_object, Result) */
-
 			/*
 			 * This op is a little strange because the internal return value is
 			 * different than the return value stored in the result descriptor
@@ -439,17 +436,18 @@ acpi_status acpi_ex_opcode_1A_1T_1R(struct acpi_walk_state *walk_state)
 
 			/* The object exists in the namespace, return TRUE */
 
-			return_desc->integer.value = ACPI_INTEGER_MAX;
+			return_desc->integer.value = ACPI_UINT64_MAX;
 			goto cleanup;
 
 		default:
+
 			/* No other opcodes get here */
+
 			break;
 		}
 		break;
 
 	case AML_STORE_OP:	/* Store (Source, Target) */
-
 		/*
 		 * A store operand is typically a number, string, buffer or lvalue
 		 * Be careful about deleting the source object,
@@ -518,8 +516,10 @@ acpi_status acpi_ex_opcode_1A_1T_1R(struct acpi_walk_state *walk_state)
 
 	case AML_TO_INTEGER_OP:	/* to_integer (Data, Result) */
 
-		status = acpi_ex_convert_to_integer(operand[0], &return_desc,
-						    ACPI_ANY_BASE);
+		/* Perform "explicit" conversion */
+
+		status =
+		    acpi_ex_convert_to_integer(operand[0], &return_desc, 0);
 		if (return_desc == operand[0]) {
 
 			/* No conversion performed, add ref to handle return value */
@@ -589,7 +589,7 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 	union acpi_operand_object *return_desc = NULL;
 	acpi_status status = AE_OK;
 	u32 type;
-	acpi_integer value;
+	u64 value;
 
 	ACPI_FUNCTION_TRACE_STR(ex_opcode_1A_0T_1R,
 				acpi_ps_get_opcode_name(walk_state->opcode));
@@ -599,26 +599,25 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 	switch (walk_state->opcode) {
 	case AML_LNOT_OP:	/* LNot (Operand) */
 
-		return_desc = acpi_ut_create_internal_object(ACPI_TYPE_INTEGER);
+		return_desc = acpi_ut_create_integer_object((u64) 0);
 		if (!return_desc) {
 			status = AE_NO_MEMORY;
 			goto cleanup;
 		}
 
 		/*
-		 * Set result to ONES (TRUE) if Value == 0.  Note:
+		 * Set result to ONES (TRUE) if Value == 0. Note:
 		 * return_desc->Integer.Value is initially == 0 (FALSE) from above.
 		 */
 		if (!operand[0]->integer.value) {
-			return_desc->integer.value = ACPI_INTEGER_MAX;
+			return_desc->integer.value = ACPI_UINT64_MAX;
 		}
 		break;
 
 	case AML_DECREMENT_OP:	/* Decrement (Operand)  */
 	case AML_INCREMENT_OP:	/* Increment (Operand)  */
-
 		/*
-		 * Create a new integer.  Can't just get the base integer and
+		 * Create a new integer. Can't just get the base integer and
 		 * increment it because it may be an Arg or Field.
 		 */
 		return_desc = acpi_ut_create_internal_object(ACPI_TYPE_INTEGER);
@@ -683,10 +682,9 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 		break;
 
 	case AML_TYPE_OP:	/* object_type (source_object) */
-
 		/*
 		 * Note: The operand is not resolved at this point because we want to
-		 * get the associated object, not its value.  For example, we don't
+		 * get the associated object, not its value. For example, we don't
 		 * want to resolve a field_unit to its value, we want the actual
 		 * field_unit object.
 		 */
@@ -702,17 +700,14 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 
 		/* Allocate a descriptor to hold the type. */
 
-		return_desc = acpi_ut_create_internal_object(ACPI_TYPE_INTEGER);
+		return_desc = acpi_ut_create_integer_object((u64) type);
 		if (!return_desc) {
 			status = AE_NO_MEMORY;
 			goto cleanup;
 		}
-
-		return_desc->integer.value = type;
 		break;
 
 	case AML_SIZE_OF_OP:	/* size_of (source_object) */
-
 		/*
 		 * Note: The operand is not resolved at this point because we want to
 		 * get the associated object, not its value.
@@ -729,7 +724,7 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 
 		/*
 		 * The type of the base object must be integer, buffer, string, or
-		 * package.  All others are not supported.
+		 * package. All others are not supported.
 		 *
 		 * NOTE: Integer is not specifically supported by the ACPI spec,
 		 * but is supported implicitly via implicit operand conversion.
@@ -738,10 +733,12 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 		 */
 		switch (type) {
 		case ACPI_TYPE_INTEGER:
+
 			value = acpi_gbl_integer_byte_width;
 			break;
 
 		case ACPI_TYPE_STRING:
+
 			value = temp_desc->string.length;
 			break;
 
@@ -762,6 +759,7 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 			break;
 
 		default:
+
 			ACPI_ERROR((AE_INFO,
 				    "Operand must be Buffer/Integer/String/Package - found type %s",
 				    acpi_ut_get_type_name(type)));
@@ -777,13 +775,11 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 		 * Now that we have the size of the object, create a result
 		 * object to hold the value
 		 */
-		return_desc = acpi_ut_create_internal_object(ACPI_TYPE_INTEGER);
+		return_desc = acpi_ut_create_integer_object(value);
 		if (!return_desc) {
 			status = AE_NO_MEMORY;
 			goto cleanup;
 		}
-
-		return_desc->integer.value = value;
 		break;
 
 	case AML_REF_OF_OP:	/* ref_of (source_object) */
@@ -865,9 +861,11 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 				break;
 
 			case ACPI_TYPE_STRING:
+
 				break;
 
 			default:
+
 				status = AE_AML_OPERAND_TYPE;
 				goto cleanup;
 			}
@@ -928,7 +926,6 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 			 */
 			switch (operand[0]->reference.class) {
 			case ACPI_REFCLASS_INDEX:
-
 				/*
 				 * The target type for the Index operator must be
 				 * either a Buffer or a Package
@@ -946,30 +943,23 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 					 * NOTE: index into a buffer is NOT a pointer to a
 					 * sub-buffer of the main buffer, it is only a pointer to a
 					 * single element (byte) of the buffer!
-					 */
-					return_desc =
-					    acpi_ut_create_internal_object
-					    (ACPI_TYPE_INTEGER);
-					if (!return_desc) {
-						status = AE_NO_MEMORY;
-						goto cleanup;
-					}
-
-					/*
+					 *
 					 * Since we are returning the value of the buffer at the
 					 * indexed location, we don't need to add an additional
 					 * reference to the buffer itself.
 					 */
-					return_desc->integer.value =
-					    temp_desc->buffer.
-					    pointer[operand[0]->reference.
-						    value];
+					return_desc =
+					    acpi_ut_create_integer_object((u64)
+									  temp_desc->buffer.pointer[operand[0]->reference.value]);
+					if (!return_desc) {
+						status = AE_NO_MEMORY;
+						goto cleanup;
+					}
 					break;
 
 				case ACPI_TYPE_PACKAGE:
-
 					/*
-					 * Return the referenced element of the package.  We must
+					 * Return the referenced element of the package. We must
 					 * add another reference to the referenced object, however.
 					 */
 					return_desc =
@@ -1010,6 +1000,7 @@ acpi_status acpi_ex_opcode_1A_0T_1R(struct acpi_walk_state *walk_state)
 				break;
 
 			default:
+
 				ACPI_ERROR((AE_INFO,
 					    "Unknown class in reference(%p) - 0x%2.2X",
 					    operand[0],

@@ -299,7 +299,7 @@ static int userspace_ctr(struct dm_dirty_log *log, struct dm_target *ti,
 	}
 
 	if (lc->integrated_flush) {
-		lc->dmlog_wq = create_workqueue("dmlogd");
+		lc->dmlog_wq = alloc_workqueue("dmlogd", WQ_MEM_RECLAIM, 0);
 		if (!lc->dmlog_wq) {
 			DMERR("couldn't start dmlogd");
 			r = -ENOMEM;
@@ -313,8 +313,7 @@ static int userspace_ctr(struct dm_dirty_log *log, struct dm_target *ti,
 out:
 	kfree(devices_rdata);
 	if (r) {
-		if (lc->flush_entry_pool)
-			mempool_destroy(lc->flush_entry_pool);
+		mempool_destroy(lc->flush_entry_pool);
 		kfree(lc);
 		kfree(ctr_str);
 	} else {

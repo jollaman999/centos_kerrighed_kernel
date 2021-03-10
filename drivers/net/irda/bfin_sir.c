@@ -22,7 +22,7 @@ static int max_rate = 57600;
 static int max_rate = 115200;
 #endif
 
-static void turnaround_delay(unsigned long last_jif, int mtt)
+static void turnaround_delay(int mtt)
 {
 	long ticks;
 
@@ -31,7 +31,7 @@ static void turnaround_delay(unsigned long last_jif, int mtt)
 	schedule_timeout_uninterruptible(ticks);
 }
 
-static void __devinit bfin_sir_init_ports(struct bfin_sir_port *sp, struct platform_device *pdev)
+static void bfin_sir_init_ports(struct bfin_sir_port *sp, struct platform_device *pdev)
 {
 	int i;
 	struct resource *res;
@@ -67,27 +67,27 @@ static void bfin_sir_stop_tx(struct bfin_sir_port *port)
 	disable_dma(port->tx_dma_channel);
 #endif
 
-	while (!(SIR_UART_GET_LSR(port) & THRE)) {
+	while (!(UART_GET_LSR(port) & THRE)) {
 		cpu_relax();
 		continue;
 	}
 
-	SIR_UART_STOP_TX(port);
+	UART_CLEAR_IER(port, ETBEI);
 }
 
 static void bfin_sir_enable_tx(struct bfin_sir_port *port)
 {
-	SIR_UART_ENABLE_TX(port);
+	UART_SET_IER(port, ETBEI);
 }
 
 static void bfin_sir_stop_rx(struct bfin_sir_port *port)
 {
-	SIR_UART_STOP_RX(port);
+	UART_CLEAR_IER(port, ERBFI);
 }
 
 static void bfin_sir_enable_rx(struct bfin_sir_port *port)
 {
-	SIR_UART_ENABLE_RX(port);
+	UART_SET_IER(port, ERBFI);
 }
 
 static int bfin_sir_set_speed(struct bfin_sir_port *port, int speed)
@@ -107,12 +107,16 @@ static int bfin_sir_set_speed(struct bfin_sir_port *port, int speed)
 	case 57600:
 	case 115200:
 
-		quot = (port->clk + (8 * speed)) / (16 * speed)\
-						- ANOMALY_05000230;
+		/*
+		 * IRDA is not affected by anomaly 05000230, so there is no
+		 * need to tweak the divisor like he UART driver (which will
+		 * slightly speed up the baud rate on us).
+		 */
+		quot = (port->clk + (8 * speed)) / (16 * speed);
 
 		do {
 			udelay(utime);
-			lsr = SIR_UART_GET_LSR(port);
+			lsr = UART_GET_LSR(port);
 		} while (!(lsr & TEMT) && count--);
 
 		/* The useconds for 1 bits to transmit */
@@ -121,27 +125,27 @@ static int bfin_sir_set_speed(struct bfin_sir_port *port, int speed)
 		/* Clear UCEN bit to reset the UART state machine
 		 * and control registers
 		 */
-		val = SIR_UART_GET_GCTL(port);
+		val = UART_GET_GCTL(port);
 		val &= ~UCEN;
-		SIR_UART_PUT_GCTL(port, val);
+		UART_PUT_GCTL(port, val);
 
 		/* Set DLAB in LCR to Access THR RBR IER */
-		SIR_UART_SET_DLAB(port);
+		UART_SET_DLAB(port);
 		SSYNC();
 
-		SIR_UART_PUT_DLL(port, quot & 0xFF);
-		SIR_UART_PUT_DLH(port, (quot >> 8) & 0xFF);
+		UART_PUT_DLL(port, quot & 0xFF);
+		UART_PUT_DLH(port, (quot >> 8) & 0xFF);
 		SSYNC();
 
 		/* Clear DLAB in LCR */
-		SIR_UART_CLEAR_DLAB(port);
+		UART_CLEAR_DLAB(port);
 		SSYNC();
 
-		SIR_UART_PUT_LCR(port, lcr);
+		UART_PUT_LCR(port, lcr);
 
-		val = SIR_UART_GET_GCTL(port);
+		val = UART_GET_GCTL(port);
 		val |= UCEN;
-		SIR_UART_PUT_GCTL(port, val);
+		UART_PUT_GCTL(port, val);
 
 		ret = 0;
 		break;
@@ -150,12 +154,12 @@ static int bfin_sir_set_speed(struct bfin_sir_port *port, int speed)
 		break;
 	}
 
-	val = SIR_UART_GET_GCTL(port);
+	val = UART_GET_GCTL(port);
 	/* If not add the 'RPOLC', we can't catch the receive interrupt.
 	 * It's related with the HW layout and the IR transiver.
 	 */
-	val |= IREN | RPOLC;
-	SIR_UART_PUT_GCTL(port, val);
+	val |= UMOD_IRDA | RPOLC;
+	UART_PUT_GCTL(port, val);
 	return ret;
 }
 
@@ -164,7 +168,7 @@ static int bfin_sir_is_receiving(struct net_device *dev)
 	struct bfin_sir_self *self = netdev_priv(dev);
 	struct bfin_sir_port *port = self->sir_port;
 
-	if (!(SIR_UART_GET_IER(port) & ERBFI))
+	if (!(UART_GET_IER(port) & ERBFI))
 		return 0;
 	return self->rx_buff.state != OUTSIDE_FRAME;
 }
@@ -178,7 +182,7 @@ static void bfin_sir_tx_chars(struct net_device *dev)
 
 	if (self->tx_buff.len != 0) {
 		chr = *(self->tx_buff.data);
-		SIR_UART_PUT_CHAR(port, chr);
+		UART_PUT_CHAR(port, chr);
 		self->tx_buff.data++;
 		self->tx_buff.len--;
 	} else {
@@ -202,10 +206,9 @@ static void bfin_sir_rx_chars(struct net_device *dev)
 	struct bfin_sir_port *port = self->sir_port;
 	unsigned char ch;
 
-	SIR_UART_CLEAR_LSR(port);
-	ch = SIR_UART_GET_CHAR(port);
+	UART_CLEAR_LSR(port);
+	ch = UART_GET_CHAR(port);
 	async_unwrap_char(dev, &self->stats, &self->rx_buff, ch);
-	dev->last_rx = jiffies;
 }
 
 static irqreturn_t bfin_sir_rx_int(int irq, void *dev_id)
@@ -215,7 +218,7 @@ static irqreturn_t bfin_sir_rx_int(int irq, void *dev_id)
 	struct bfin_sir_port *port = self->sir_port;
 
 	spin_lock(&self->lock);
-	while ((SIR_UART_GET_LSR(port) & DR))
+	while ((UART_GET_LSR(port) & DR))
 		bfin_sir_rx_chars(dev);
 	spin_unlock(&self->lock);
 
@@ -229,7 +232,7 @@ static irqreturn_t bfin_sir_tx_int(int irq, void *dev_id)
 	struct bfin_sir_port *port = self->sir_port;
 
 	spin_lock(&self->lock);
-	if (SIR_UART_GET_LSR(port) & THRE)
+	if (UART_GET_LSR(port) & THRE)
 		bfin_sir_tx_chars(dev);
 	spin_unlock(&self->lock);
 
@@ -308,7 +311,7 @@ static void bfin_sir_dma_rx_chars(struct net_device *dev)
 	struct bfin_sir_port *port = self->sir_port;
 	int i;
 
-	SIR_UART_CLEAR_LSR(port);
+	UART_CLEAR_LSR(port);
 
 	for (i = port->rx_dma_buf.head; i < port->rx_dma_buf.tail; i++)
 		async_unwrap_char(dev, &self->stats, &self->rx_buff, port->rx_dma_buf.buf[i]);
@@ -385,7 +388,8 @@ static int bfin_sir_startup(struct bfin_sir_port *port, struct net_device *dev)
 	set_dma_callback(port->rx_dma_channel, bfin_sir_dma_rx_int, dev);
 	set_dma_callback(port->tx_dma_channel, bfin_sir_dma_tx_int, dev);
 
-	port->rx_dma_buf.buf = (unsigned char *)dma_alloc_coherent(NULL, PAGE_SIZE, &dma_handle, GFP_DMA);
+	port->rx_dma_buf.buf = dma_alloc_coherent(NULL, PAGE_SIZE,
+						  &dma_handle, GFP_DMA);
 	port->rx_dma_buf.head = 0;
 	port->rx_dma_buf.tail = 0;
 	port->rx_dma_nrows = 0;
@@ -426,11 +430,10 @@ static void bfin_sir_shutdown(struct bfin_sir_port *port, struct net_device *dev
 	unsigned short val;
 
 	bfin_sir_stop_rx(port);
-	SIR_UART_DISABLE_INTS(port);
 
-	val = SIR_UART_GET_GCTL(port);
-	val &= ~(UCEN | IREN | RPOLC);
-	SIR_UART_PUT_GCTL(port, val);
+	val = UART_GET_GCTL(port);
+	val &= ~(UCEN | UMOD_MASK | RPOLC);
+	UART_PUT_GCTL(port, val);
 
 #ifdef CONFIG_SIR_BFIN_DMA
 	disable_dma(port->tx_dma_channel);
@@ -506,7 +509,7 @@ static void bfin_sir_send_work(struct work_struct *work)
 	int tx_cnt = 10;
 
 	while (bfin_sir_is_receiving(dev) && --tx_cnt)
-		turnaround_delay(dev->last_rx, self->mtt);
+		turnaround_delay(self->mtt);
 
 	bfin_sir_stop_rx(port);
 
@@ -514,12 +517,12 @@ static void bfin_sir_send_work(struct work_struct *work)
 	 * sending data. We also can set the speed, which will
 	 * reset all the UART.
 	 */
-	val = SIR_UART_GET_GCTL(port);
-	val &= ~(IREN | RPOLC);
-	SIR_UART_PUT_GCTL(port, val);
+	val = UART_GET_GCTL(port);
+	val &= ~(UMOD_MASK | RPOLC);
+	UART_PUT_GCTL(port, val);
 	SSYNC();
-	val |= IREN | RPOLC;
-	SIR_UART_PUT_GCTL(port, val);
+	val |= UMOD_IRDA | RPOLC;
+	UART_PUT_GCTL(port, val);
 	SSYNC();
 	/* bfin_sir_set_speed(port, self->speed); */
 
@@ -527,7 +530,7 @@ static void bfin_sir_send_work(struct work_struct *work)
 	bfin_sir_dma_tx_chars(dev);
 #endif
 	bfin_sir_enable_tx(port);
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);
 }
 
 static int bfin_sir_hard_xmit(struct sk_buff *skb, struct net_device *dev)
@@ -605,7 +608,7 @@ static int bfin_sir_open(struct net_device *dev)
 {
 	struct bfin_sir_self *self = netdev_priv(dev);
 	struct bfin_sir_port *port = self->sir_port;
-	int err = -ENOMEM;
+	int err;
 
 	self->newspeed = 0;
 	self->speed = 9600;
@@ -619,8 +622,10 @@ static int bfin_sir_open(struct net_device *dev)
 	bfin_sir_set_speed(port, 9600);
 
 	self->irlap = irlap_open(dev, &self->qos, DRIVER_NAME);
-	if (!self->irlap)
+	if (!self->irlap) {
+		err = -ENOMEM;
 		goto err_irlap;
+	}
 
 	INIT_WORK(&self->work, bfin_sir_send_work);
 
@@ -685,7 +690,7 @@ static const struct net_device_ops bfin_sir_ndo = {
 	.ndo_get_stats		= bfin_sir_stats,
 };
 
-static int __devinit bfin_sir_probe(struct platform_device *pdev)
+static int bfin_sir_probe(struct platform_device *pdev)
 {
 	struct net_device *dev;
 	struct bfin_sir_self *self;
@@ -772,7 +777,7 @@ err_mem_0:
 	return err;
 }
 
-static int __devexit bfin_sir_remove(struct platform_device *pdev)
+static int bfin_sir_remove(struct platform_device *pdev)
 {
 	struct bfin_sir_port *sir_port;
 	struct net_device *dev = NULL;
@@ -795,7 +800,7 @@ static int __devexit bfin_sir_remove(struct platform_device *pdev)
 
 static struct platform_driver bfin_ir_driver = {
 	.probe   = bfin_sir_probe,
-	.remove  = __devexit_p(bfin_sir_remove),
+	.remove  = bfin_sir_remove,
 	.suspend = bfin_sir_suspend,
 	.resume  = bfin_sir_resume,
 	.driver  = {
@@ -803,18 +808,7 @@ static struct platform_driver bfin_ir_driver = {
 	},
 };
 
-static int __init bfin_sir_init(void)
-{
-	return platform_driver_register(&bfin_ir_driver);
-}
-
-static void __exit bfin_sir_exit(void)
-{
-	platform_driver_unregister(&bfin_ir_driver);
-}
-
-module_init(bfin_sir_init);
-module_exit(bfin_sir_exit);
+module_platform_driver(bfin_ir_driver);
 
 module_param(max_rate, int, 0);
 MODULE_PARM_DESC(max_rate, "Maximum baud rate (115200, 57600, 38400, 19200, 9600)");

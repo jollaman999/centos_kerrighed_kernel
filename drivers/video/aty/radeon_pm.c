@@ -1427,6 +1427,8 @@ static void radeon_pm_full_reset_sdram(struct radeonfb_info *rinfo)
 	mdelay( 15);
 }
 
+#if defined(CONFIG_PM)
+#if defined(CONFIG_X86) || defined(CONFIG_PPC_PMAC)
 static void radeon_pm_reset_pad_ctlr_strength(struct radeonfb_info *rinfo)
 {
 	u32 tmp, tmp2;
@@ -1939,9 +1941,10 @@ static void radeon_reinitialize_M10(struct radeonfb_info *rinfo)
 	 */
 	radeon_pm_m10_enable_lvds_spread_spectrum(rinfo);
 }
+#endif
 
 #ifdef CONFIG_PPC_OF
-
+#ifdef CONFIG_PPC_PMAC
 static void radeon_pm_m9p_reconfigure_mc(struct radeonfb_info *rinfo)
 {
 	OUTREG(MC_CNTL, rinfo->save_regs[46]);
@@ -2202,6 +2205,8 @@ static void radeon_reinitialize_M9P(struct radeonfb_info *rinfo)
 	radeon_pm_restore_pixel_pll(rinfo);
 	radeon_pm_m10_enable_lvds_spread_spectrum(rinfo);
 }
+#endif
+#endif
 
 #if 0 /* Not ready yet */
 static void radeon_reinitialize_QW(struct radeonfb_info *rinfo)
@@ -2626,7 +2631,7 @@ int radeonfb_pci_suspend(struct pci_dev *pdev, pm_message_t mesg)
 		goto done;
 	}
 
-	acquire_console_sem();
+	console_lock();
 
 	fb_set_suspend(info, 1);
 
@@ -2690,7 +2695,7 @@ int radeonfb_pci_suspend(struct pci_dev *pdev, pm_message_t mesg)
 	if (rinfo->pm_mode & radeon_pm_d2)
 		radeon_set_suspend(rinfo, 1);
 
-	release_console_sem();
+	console_unlock();
 
  done:
 	pdev->dev.power.power_state = mesg;
@@ -2715,10 +2720,10 @@ int radeonfb_pci_resume(struct pci_dev *pdev)
 		return 0;
 
 	if (rinfo->no_schedule) {
-		if (try_acquire_console_sem())
+		if (!console_trylock())
 			return 0;
 	} else
-		acquire_console_sem();
+		console_lock();
 
 	printk(KERN_DEBUG "radeonfb (%s): resuming from state: %d...\n",
 	       pci_name(pdev), pdev->dev.power.power_state.event);
@@ -2783,7 +2788,7 @@ int radeonfb_pci_resume(struct pci_dev *pdev)
 	pdev->dev.power.power_state = PMSG_ON;
 
  bail:
-	release_console_sem();
+	console_unlock();
 
 	return rc;
 }
@@ -2872,7 +2877,7 @@ void radeonfb_pm_init(struct radeonfb_info *rinfo, int dynclk, int ignore_devlis
 		}
 
 #if 0
-		/* Power down TV DAC, taht saves a significant amount of power,
+		/* Power down TV DAC, that saves a significant amount of power,
 		 * we'll have something better once we actually have some TVOut
 		 * support
 		 */
