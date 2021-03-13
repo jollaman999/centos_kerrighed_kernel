@@ -339,6 +339,13 @@ extern int arch_setup_additional_pages(struct linux_binprm *bprm,
 extern int syscall32_setup_pages(struct linux_binprm *, int exstack);
 #define compat_arch_setup_additional_pages	syscall32_setup_pages
 
+#ifdef CONFIG_KRG_MM
+struct vm_area_struct;
+
+void import_vdso_context(struct vm_area_struct *vma);
+int import_mm_struct_end(struct mm_struct *mm, struct task_struct *task);
+#endif
+
 /*
  * True on X86_32 or when emulating IA32 on X86_64
  */

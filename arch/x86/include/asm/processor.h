@@ -114,6 +114,11 @@ struct cpuinfo_x86 {
 	/* Index into per_cpu list: */
 	u16			cpu_index;
 #endif
+#ifdef CONFIG_KRG_PROCFS
+	int                     krg_cpu_id;
+	unsigned long           cpu_khz;
+#endif /* CONFIG_KRG_PROCFS */
+
 	/* RHEL6: deprecated and should use x86_hyper instead */
 	unsigned int		x86_hyper_vendor;
 #ifndef __GENKSYMS__

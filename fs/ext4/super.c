@@ -45,6 +45,10 @@
 #include <linux/kthread.h>
 #include <linux/freezer.h>
 
+#ifdef CONFIG_KRG_MM
+#include <kerrighed/krgsyms.h>
+#endif
+
 #include "ext4.h"
 #include "ext4_jbd2.h"
 #include "xattr.h"
@@ -4719,6 +4723,11 @@ static int __init init_ext4_fs(void)
 	err = init_ext4_system_zone();
 	if (err)
 		return err;
+#ifdef CONFIG_KRG_MM
+	err = krgsyms_register(KRGSYMS_VM_OPS_EXT4_FILE, (void *)&ext4_file_vm_ops);
+	if(err)
+		goto out5;
+#endif
 	ext4_kset = kset_create_and_add("ext4", NULL, fs_kobj);
 	if (!ext4_kset)
 		goto out4;
@@ -4752,6 +4761,10 @@ out3:
 	remove_proc_entry("fs/ext4", NULL);
 	kset_unregister(ext4_kset);
 out4:
+#ifdef CONFIG_KRG_MM
+	krgsyms_unregister(KRGSYMS_VM_OPS_EXT4_FILE);
+out5:
+#endif
 	exit_ext4_system_zone();
 	return err;
 }

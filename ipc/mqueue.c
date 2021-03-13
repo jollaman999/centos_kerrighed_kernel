@@ -83,7 +83,10 @@ struct mqueue_inode_info {
 };
 
 static const struct inode_operations mqueue_dir_inode_operations;
-static const struct file_operations mqueue_file_operations;
+#ifndef CONFIG_KRG_EPM
+static
+#endif
+const struct file_operations mqueue_file_operations;
 static const struct super_operations mqueue_super_ops;
 static void remove_notification(struct mqueue_inode_info *info);
 
@@ -1409,7 +1412,10 @@ static const struct inode_operations mqueue_dir_inode_operations = {
 	.unlink = mqueue_unlink,
 };
 
-static const struct file_operations mqueue_file_operations = {
+#ifndef CONFIG_KRG_EPM
+static
+#endif
+const struct file_operations mqueue_file_operations = {
 	.flush = mqueue_flush_file,
 	.poll = mqueue_poll_file,
 	.read = mqueue_read_file,

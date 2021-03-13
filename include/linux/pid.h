@@ -61,6 +61,12 @@ struct pid
 	/* lists of tasks that use this pid */
 	struct hlist_head tasks[PIDTYPE_MAX];
 	struct rcu_head rcu;
+#ifdef CONFIG_KRG_EPM
+	struct pid_kddm_object *kddm_obj;
+#endif
+#ifdef CONFIG_KRG_SCHED
+	struct hlist_head process_sets[PIDTYPE_MAX];
+#endif
 	struct upid numbers[1];
 };
 
@@ -119,8 +125,22 @@ extern struct pid *find_get_pid(int nr);
 extern struct pid *find_ge_pid(int nr, struct pid_namespace *);
 int next_pidmap(struct pid_namespace *pid_ns, unsigned int last);
 
+#ifndef CONFIG_KRG_EPM
 extern struct pid *alloc_pid(struct pid_namespace *ns);
+#endif
 extern void free_pid(struct pid *pid);
+#ifdef CONFIG_KRG_EPM
+extern struct pid *__alloc_pid(struct pid_namespace *ns, const int *req_nr);
+extern int reserve_pidmap(struct pid_namespace *ns, int nr);
+extern void __free_pidmap(struct upid *upid);
+struct pidmap;
+extern int alloc_pidmap_page(struct pidmap *map);
+
+static inline struct pid *alloc_pid(struct pid_namespace *ns)
+{
+	return __alloc_pid(ns, NULL);
+}
+#endif /* CONFIG_KRG_EPM */
 extern void disable_pid_allocation(struct pid_namespace *ns);
 
 /*

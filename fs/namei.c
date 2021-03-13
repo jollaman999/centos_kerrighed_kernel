@@ -35,6 +35,9 @@
 #include <linux/fs_struct.h>
 #include <linux/nospec.h>
 #include <asm/uaccess.h>
+#ifdef CONFIG_KRG_FAF
+#include <kerrighed/faf.h>
+#endif
 
 #include "internal.h"
 
@@ -1269,6 +1272,9 @@ last_component:
 			err = do_follow_link(&next, nd);
 			if (err)
 				goto return_err;
+#ifdef CONFIG_KRG_FAF
+			if (nd->path.dentry)
+#endif
 			inode = nd->path.dentry->d_inode;
 		} else
 			path_to_nameidata(&next, nd);
@@ -1363,6 +1369,20 @@ static int path_init(int dfd, const char *name, unsigned int flags, struct namei
 		if (!file)
 			goto out_fail;
 
+#ifdef CONFIG_KRG_FAF
+		if (file->f_flags & O_FAF_CLT) {
+			faf_client_data_t *data = file->private_data;
+
+			retval = -ENOTDIR;
+			if (!S_ISDIR(data->i_mode))
+				goto fput_fail;
+
+			retval = krg_faf_do_path_lookup(file, name, flags, nd);
+
+			fput_light(file, fput_needed);
+			return retval;
+		}
+#endif
 		dentry = file->f_path.dentry;
 
 		retval = -ENOTDIR;
@@ -2340,6 +2360,13 @@ do_last:
 	if (path.dentry->d_inode && S_ISDIR(path.dentry->d_inode->i_mode))
 		goto exit;
 ok:
+#ifdef CONFIG_KRG_FAF
+	if ((!nd.path.dentry) && (nd.path.mnt)) {
+		struct file *file = (struct file *)nd.path.mnt;
+		get_file(file);
+		return file;
+	}
+#endif
 	/*
 	 * Consider:
 	 * 1. may_open() truncates a file

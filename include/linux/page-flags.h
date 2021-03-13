@@ -97,6 +97,15 @@ enum pageflags {
 	PG_mappedtodisk,	/* Has blocks allocated on-disk */
 	PG_reclaim,		/* To be reclaimed asap */
 	PG_buddy,		/* Page is free, on buddy lists */
+#ifdef CONFIG_KRG_MM
+	PG_to_invalidate,
+	PG_to_set_read_only,
+	PG_locked_kddm,           /* Page is locked in kddm layer */
+	PG_migratable,
+#ifdef CONFIG_DEBUG_PAGEALLOC
+	PG_in_vec,
+#endif
+#endif
 	PG_swapbacked,		/* Page is backed by RAM/swap */
 	PG_unevictable,		/* Page is "unevictable"  */
 #ifdef CONFIG_MMU
@@ -274,6 +283,17 @@ PAGEFLAG_FALSE(Mlocked) SETPAGEFLAG_NOOP(Mlocked)
 PAGEFLAG(Uncached, uncached)
 #else
 PAGEFLAG_FALSE(Uncached)
+#endif
+
+#ifdef CONFIG_KRG_MM
+PAGEFLAG(ToInvalidate, to_invalidate)
+PAGEFLAG(ToSetReadOnly, to_set_read_only)
+PAGEFLAG(LockedKDDM, locked_kddm)
+TESTSCFLAG(LockedKDDM, locked_kddm)
+PAGEFLAG(Migratable, migratable)
+#ifdef CONFIG_DEBUG_PAGEALLOC
+PAGEFLAG(InVec, in_vec)
+#endif
 #endif
 
 #ifdef CONFIG_MEMORY_FAILURE

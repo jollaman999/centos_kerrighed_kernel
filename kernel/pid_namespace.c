@@ -16,6 +16,11 @@
 #include <linux/proc_fs.h>
 #include <linux/reboot.h>
 
+#ifdef CONFIG_KRG_PROC
+#include <linux/module.h>
+#include <kerrighed/namespace.h>
+#endif
+
 #define BITS_PER_PAGE		(PAGE_SIZE*8)
 
 struct pid_cache {
@@ -75,11 +80,23 @@ static void proc_cleanup_work(struct work_struct *work)
 	pid_ns_release_proc(ns);
 }
 
-static struct pid_namespace *create_pid_namespace(struct pid_namespace *parent_pid_ns)
+#ifndef CONFIG_KRG_EPM
+static
+#endif
+struct pid_namespace *create_pid_namespace(struct pid_namespace *parent_pid_ns)
 {
 	struct pid_namespace *ns;
+#ifdef CONFIG_KRG_EPM
+	unsigned int level = 0;
+#else
 	unsigned int level = parent_pid_ns->level + 1;
+#endif
 	int i, err = -ENOMEM;
+
+#ifdef CONFIG_KRG_EPM
+	if (parent_pid_ns)
+		level = parent_pid_ns->level + 1;
+#endif
 
 	ns = kmem_cache_zalloc(pid_ns_cachep, GFP_KERNEL);
 	if (ns == NULL)
@@ -99,7 +116,18 @@ static struct pid_namespace *create_pid_namespace(struct pid_namespace *parent_p
 
 	kref_init(&ns->kref);
 	ns->level = level;
+#ifdef CONFIG_KRG_PROC
+	if (parent_pid_ns) {
+		ns->global = parent_pid_ns->global;
+		ns->global |= current->create_krg_ns;
+		if (parent_pid_ns->krg_ns)
+			get_krg_ns(parent_pid_ns->krg_ns);
+		ns->krg_ns = parent_pid_ns->krg_ns;
+		ns->parent = get_pid_ns(parent_pid_ns);
+	}
+#else
 	ns->parent = get_pid_ns(parent_pid_ns);
+#endif
 	ns->nr_hashed = PIDNS_HASH_ADDING;
 	INIT_WORK(&ns->proc_work, proc_cleanup_work);
 
@@ -123,6 +151,10 @@ static void destroy_pid_namespace(struct pid_namespace *ns)
 {
 	int i;
 
+#ifdef CONFIG_KRG_PROC
+	if (ns->krg_ns && krg_pid_ns_root(ns) != ns)
+		put_krg_ns(ns->krg_ns);
+#endif
 	proc_free_inum(ns->proc_inum);
 	for (i = 0; i < PIDMAP_ENTRIES; i++)
 		kfree(ns->pidmap[i].page);
@@ -150,6 +182,9 @@ void free_pid_ns(struct kref *kref)
 	if (parent != NULL)
 		put_pid_ns(parent);
 }
+#ifdef CONFIG_KRG_PROC
+EXPORT_SYMBOL(free_pid_ns);
+#endif
 
 void zap_pid_ns_processes(struct pid_namespace *pid_ns)
 {
@@ -210,7 +245,7 @@ void zap_pid_ns_processes(struct pid_namespace *pid_ns)
 	 * Make sure they all go away, see free_pid().
 	 */
 	for (;;) {
-		set_current_state(TASK_UNINTERRUPTIBLE);
+		set_current_state(TASK_INTERRUPTIBLE);
 		if (pid_ns->nr_hashed == init_pids)
 			break;
 		schedule();
@@ -223,6 +258,17 @@ void zap_pid_ns_processes(struct pid_namespace *pid_ns)
 	acct_exit_ns(pid_ns);
 	return;
 }
+
+#ifdef CONFIG_KRG_PROC
+struct pid_namespace *find_get_krg_pid_ns(void)
+{
+	struct krg_namespace *krg_ns = find_get_krg_ns();
+	struct pid_namespace *ns = get_pid_ns(krg_ns->root_nsproxy.pid_ns);
+	put_krg_ns(krg_ns);
+	return ns;
+}
+EXPORT_SYMBOL(find_get_krg_pid_ns);
+#endif
 
 int reboot_pid_ns(struct pid_namespace *pid_ns, int cmd)
 {

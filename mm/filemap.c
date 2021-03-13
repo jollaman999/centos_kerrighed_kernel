@@ -44,6 +44,10 @@
 
 #include <asm/mman.h>
 
+#ifdef CONFIG_KRG_FAF
+#include <kerrighed/faf.h>
+#endif
+
 /*
  * Shared mappings implemented 30.11.1994. It's not fully working yet,
  * though.
@@ -1517,11 +1521,20 @@ SYSCALL_DEFINE(readahead)(int fd, loff_t offset, size_t count)
 	file = fget(fd);
 	if (file) {
 		if (file->f_mode & FMODE_READ) {
+#ifdef CONFIG_KRG_FAF
+			if (file->f_flags & O_FAF_CLT) {
+				faf_error(file, "readahead");
+				ret = -ENOSYS;
+			} else {
+#endif
 			struct address_space *mapping = file->f_mapping;
 			pgoff_t start = offset >> PAGE_CACHE_SHIFT;
 			pgoff_t end = (offset + count - 1) >> PAGE_CACHE_SHIFT;
 			unsigned long len = end - start + 1;
 			ret = do_readahead(mapping, file, start, len);
+#ifdef CONFIG_KRG_FAF
+			}
+#endif
 		}
 		fput(file);
 	}

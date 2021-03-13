@@ -87,6 +87,19 @@ extern ssize_t splice_write_to_file(struct pipe_inode_info *, struct file *,
 				    loff_t *, size_t, unsigned int,
 				    splice_write_actor *);
 
+#ifdef CONFIG_KRG_EPM
+extern long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
+			   loff_t *ppos, size_t len, unsigned int flags);
+
+extern long do_splice_to(struct file *in, loff_t *ppos,
+			 struct pipe_inode_info *pipe, size_t len,
+			 unsigned int flags);
+
+extern int link_pipe(struct pipe_inode_info *ipipe,
+		     struct pipe_inode_info *opipe,
+		     size_t len, unsigned int flags);
+#endif
+
 extern void spd_release_page(struct splice_pipe_desc *, unsigned int);
 
 extern const struct pipe_buf_operations page_cache_pipe_buf_ops;

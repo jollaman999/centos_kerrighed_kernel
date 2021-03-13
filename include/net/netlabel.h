@@ -533,14 +533,6 @@ static inline int netlbl_secattr_catmap_setrng(
 {
 	return 0;
 }
-static int netlbl_secattr_catmap_setlong(
-				      struct netlbl_lsm_secattr_catmap **catmap,
-				      u32 offset,
-				      unsigned long bitmap,
-				      gfp_t flags)
-{
-	return 0;
-}
 static inline int netlbl_enabled(void)
 {
 	return 0;

@@ -2,7 +2,13 @@
 #define _LINUX_IPC_H
 
 #include <linux/types.h>
-
+#include <linux/mutex.h>
+// #include <linux/mutex.h>
+/*
+*
+/usr/src/kerrighed-src/kernel/usr/include/linux/ipc.h:5: included file 'linux/mutex.h' is not exported
+*
+*/
 #define IPC_PRIVATE ((__kernel_key_t) 0)  
 
 /* Obsolete, used only for backwards compatibility and libc5 compiles */
@@ -82,6 +88,10 @@ struct ipc_kludge {
 
 #define IPCMNI 32768  /* <= MAX_INT limit for ipc arrays (including sysctl changes) */
 
+#ifdef CONFIG_KRG_IPC
+struct krgipc_ops;
+#endif
+
 /* used by in-kernel data structures */
 struct kern_ipc_perm
 {
@@ -96,7 +106,18 @@ struct kern_ipc_perm
 	mode_t		mode; 
 	unsigned long	seq;
 	void		*security;
+#ifdef CONFIG_KRG_IPC
+	struct krgipc_ops *krgops;
+#endif
 };
+
+#ifdef CONFIG_KRG_IPC
+struct ipc_namespace;
+
+bool ipc_used(struct ipc_namespace *ns);
+#endif
+
+void cleanup_ipc_objects (void);
 
 #endif /* __KERNEL__ */
 

@@ -324,10 +324,18 @@ static void bad_page(struct page *page)
 
 	printk(KERN_ALERT "BUG: Bad page state in process %s  pfn:%05lx\n",
 		current->comm, page_to_pfn(page));
+#ifdef CONFIG_KRG_MM
+	printk(KERN_ALERT
+	        "page:%p flags:%p count:%d mapcount:%d mapping:%p kddm_count:%d obj_entry:%p\n",
+	       page, (void *)page->flags, page_count(page),
+	       page_mapcount(page), page->mapping,
+	       page_kddm_count(page), page->obj_entry);
+#else
 	printk(KERN_ALERT
 		"page:%p flags:%p count:%d mapcount:%d mapping:%p ",
 		page, (void *)page->flags, page_count(page),
 		page_mapcount(page), page->mapping);
+#endif
 	printk(KERN_CONT "index:%lx (%s)\n", page->index, print_tainted());
 	mem_cgroup_print_bad_page(page);
 	dump_stack();
@@ -586,6 +594,10 @@ static inline int free_pages_check(struct page *page)
 	if (unlikely(page_mapcount(page) |
 		(page->mapping != NULL)  |
 		(atomic_read(&page->_count) != 0) |
+#ifdef CONFIG_KRG_MM
+		(page->obj_entry != NULL) |
+		(page_kddm_count(page) != 0) |
+#endif
 		(page->flags & PAGE_FLAGS_CHECK_AT_FREE) |
 		(mem_cgroup_bad_page_check(page)))) {
 		bad_page(page);
@@ -2333,6 +2345,9 @@ __alloc_pages_nodemask(gfp_t gfp_mask, unsigned int order,
 
 	lockdep_trace_alloc(gfp_mask);
 
+#ifdef CONFIG_KRG_MM
+	krg_notify_mem(0);
+#endif
 	might_sleep_if(gfp_mask & __GFP_WAIT);
 
 	if (should_fail_alloc_page(gfp_mask, order))
@@ -2409,6 +2424,9 @@ void __pagevec_free(struct pagevec *pvec)
 
 void __free_pages(struct page *page, unsigned int order)
 {
+#ifdef CONFIG_KRG_MM
+	krg_notify_mem(0);
+#endif
 	if (put_page_testzero(page)) {
 		trace_mm_page_free_direct(page, order);
 		if (order == 0)
@@ -2636,6 +2654,9 @@ void __show_free_areas(unsigned int filter)
 
 	printk("active_anon:%lu inactive_anon:%lu isolated_anon:%lu\n"
 		" active_file:%lu inactive_file:%lu isolated_file:%lu\n"
+#ifdef CONFIG_KRG_MM
+		" active_migr:%lu inactive_migr:%lu isolated_migr:%lu\n"
+#endif
 		" unevictable:%lu"
 		" dirty:%lu writeback:%lu unstable:%lu\n"
 		" free:%lu slab_reclaimable:%lu slab_unreclaimable:%lu\n"
@@ -2646,6 +2667,11 @@ void __show_free_areas(unsigned int filter)
 		global_page_state(NR_ACTIVE_FILE),
 		global_page_state(NR_INACTIVE_FILE),
 		global_page_state(NR_ISOLATED_FILE),
+#ifdef CONFIG_KRG_MM
+		global_page_state(NR_ACTIVE_MIGR),
+		global_page_state(NR_INACTIVE_MIGR),
+		global_page_state(NR_ISOLATED_MIGR),
+#endif
 		global_page_state(NR_UNEVICTABLE),
 		global_page_state(NR_FILE_DIRTY),
 		global_page_state(NR_WRITEBACK),
@@ -2676,6 +2702,9 @@ void __show_free_areas(unsigned int filter)
 			" unevictable:%lukB"
 			" isolated(anon):%lukB"
 			" isolated(file):%lukB"
+#ifdef CONFIG_KRG_MM
+			" isolated(migr):%lukB"
+#endif
 			" present:%lukB"
 			" mlocked:%lukB"
 			" dirty:%lukB"
@@ -2704,6 +2733,9 @@ void __show_free_areas(unsigned int filter)
 			K(zone_page_state(zone, NR_UNEVICTABLE)),
 			K(zone_page_state(zone, NR_ISOLATED_ANON)),
 			K(zone_page_state(zone, NR_ISOLATED_FILE)),
+#ifdef CONFIG_KRG_MM
+			K(zone_page_state(zone, NR_ISOLATED_MIGR)),
+#endif
 			K(zone->present_pages),
 			K(zone_page_state(zone, NR_MLOCK)),
 			K(zone_page_state(zone, NR_FILE_DIRTY)),
@@ -3148,6 +3180,26 @@ static void build_zonelist_cache(pg_data_t *pgdat)
 		zlc->z_to_n[z - zonelist->_zonerefs] = zonelist_node_idx(z);
 }
 
+/*
+ * Boot pageset table. One per cpu which is going to be used for all
+ * zones and all nodes. The parameters will be set in such a way
+ * that an item put on a list will immediately be handed over to
+ * the buddy list. This is safe since pageset manipulation is done
+ * with interrupts disabled.
+ *
+ * Some NUMA counter updates may also be caught by the boot pagesets.
+ *
+ * The boot_pagesets must be kept even after bootup is complete for
+ * unused processors and/or zones. They do play a role for bootstrapping
+ * hotplugged processors.
+ *
+ * zoneinfo_show() and maybe other functions do
+ * not check if the processor is online before following the pageset pointer.
+ * Other parts of the kernel may not check if the zone is available.
+ */
+static struct per_cpu_pageset boot_pageset[NR_CPUS];
+
+static void setup_pageset(struct per_cpu_pageset *p, unsigned long batch);
 
 #else	/* CONFIG_NUMA */
 
@@ -3200,7 +3252,78 @@ static void build_zonelist_cache(pg_data_t *pgdat)
 
 #endif	/* CONFIG_NUMA */
 
-static void setup_zone_pageset(struct zone *zone);
+static int zone_batchsize(struct zone *zone)
+{
+#ifdef CONFIG_MMU
+	int batch;
+
+	/*
+	 * The per-cpu-pages pools are set to around 1000th of the
+	 * size of the zone.  But no more than 1/2 of a meg.
+	 *
+	 * OK, so we don't know how big the cache is.  So guess.
+	 */
+	batch = zone->present_pages / 1024;
+	if (batch * PAGE_SIZE > 512 * 1024)
+		batch = (512 * 1024) / PAGE_SIZE;
+	batch /= 4;		/* We effectively *= 4 below */
+	if (batch < 1)
+		batch = 1;
+
+	/*
+	 * Clamp the batch to a 2^n - 1 value. Having a power
+	 * of 2 value was found to be more likely to have
+	 * suboptimal cache aliasing properties in some cases.
+	 *
+	 * For example if 2 tasks are alternately allocating
+	 * batches of pages, one task can end up with a lot
+	 * of pages of one half of the possible page colors
+	 * and the other with pages of the other colors.
+	 */
+	batch = rounddown_pow_of_two(batch + batch/2) - 1;
+
+	return batch;
+
+#else
+	/* The deferral and batching of frees should be suppressed under NOMMU
+	 * conditions.
+	 *
+	 * The problem is that NOMMU needs to be able to allocate large chunks
+	 * of contiguous memory as there's no hardware page translation to
+	 * assemble apparent contiguous memory from discontiguous pages.
+	 *
+	 * Queueing large contiguous runs of pages for batching, however,
+	 * causes the pages to actually be freed in smaller chunks.  As there
+	 * can be a significant delay between the individual batches being
+	 * recycled, this leads to the once large chunks of space being
+	 * fragmented and becoming unavailable for high-order allocations.
+	 */
+	return 0;
+#endif
+}
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+static __meminit void setup_zone_pageset(struct zone *zone)
+{
+	int cpu;
+
+	for_each_possible_cpu(cpu) {
+		struct per_cpu_pageset *pset;
+		pset = zone_pcp(zone, cpu);
+
+#ifdef CONFIG_NUMA
+		if (unlikely(cpu_online(cpu) && pset == &boot_pageset[cpu])) {
+			pset = kmalloc_node(sizeof(struct per_cpu_pageset),
+					    GFP_NOWAIT, cpu_to_node(cpu));
+			zone_pcp(zone, cpu) = pset;
+		}
+#endif
+		setup_pageset(pset, zone_batchsize(zone));
+	}
+
+	return;
+}
+#endif
 
 /*
  * Global mutex to protect against size modification of zonelists
@@ -3476,6 +3599,9 @@ void __meminit memmap_init_zone(unsigned long size, int nid, unsigned long zone,
 				continue;
 		}
 		page = pfn_to_page(pfn);
+#ifdef CONFIG_KRG_MM
+		atomic_set(&page->_kddm_count, 0);
+#endif
 		set_page_links(page, zone, nid, pfn);
 		mminit_verify_page_links(page, zone, nid, pfn);
 		init_page_count(page);
@@ -3523,56 +3649,6 @@ static void __meminit zone_init_free_lists(struct zone *zone)
 	memmap_init_zone((size), (nid), (zone), (start_pfn), MEMMAP_EARLY)
 #endif
 
-static int zone_batchsize(struct zone *zone)
-{
-#ifdef CONFIG_MMU
-	int batch;
-
-	/*
-	 * The per-cpu-pages pools are set to around 1000th of the
-	 * size of the zone.  But no more than 1/2 of a meg.
-	 *
-	 * OK, so we don't know how big the cache is.  So guess.
-	 */
-	batch = zone->present_pages / 1024;
-	if (batch * PAGE_SIZE > 512 * 1024)
-		batch = (512 * 1024) / PAGE_SIZE;
-	batch /= 4;		/* We effectively *= 4 below */
-	if (batch < 1)
-		batch = 1;
-
-	/*
-	 * Clamp the batch to a 2^n - 1 value. Having a power
-	 * of 2 value was found to be more likely to have
-	 * suboptimal cache aliasing properties in some cases.
-	 *
-	 * For example if 2 tasks are alternately allocating
-	 * batches of pages, one task can end up with a lot
-	 * of pages of one half of the possible page colors
-	 * and the other with pages of the other colors.
-	 */
-	batch = rounddown_pow_of_two(batch + batch/2) - 1;
-
-	return batch;
-
-#else
-	/* The deferral and batching of frees should be suppressed under NOMMU
-	 * conditions.
-	 *
-	 * The problem is that NOMMU needs to be able to allocate large chunks
-	 * of contiguous memory as there's no hardware page translation to
-	 * assemble apparent contiguous memory from discontiguous pages.
-	 *
-	 * Queueing large contiguous runs of pages for batching, however,
-	 * causes the pages to actually be freed in smaller chunks.  As there
-	 * can be a significant delay between the individual batches being
-	 * recycled, this leads to the once large chunks of space being
-	 * fragmented and becoming unavailable for high-order allocations.
-	 */
-	return 0;
-#endif
-}
-
 static void setup_pageset(struct per_cpu_pageset *p, unsigned long batch)
 {
 	struct per_cpu_pages *pcp;
@@ -3607,25 +3683,6 @@ static void setup_pagelist_highmark(struct per_cpu_pageset *p,
 
 
 #ifdef CONFIG_NUMA
-/*
- * Boot pageset table. One per cpu which is going to be used for all
- * zones and all nodes. The parameters will be set in such a way
- * that an item put on a list will immediately be handed over to
- * the buddy list. This is safe since pageset manipulation is done
- * with interrupts disabled.
- *
- * Some NUMA counter updates may also be caught by the boot pagesets.
- *
- * The boot_pagesets must be kept even after bootup is complete for
- * unused processors and/or zones. They do play a role for bootstrapping
- * hotplugged processors.
- *
- * zoneinfo_show() and maybe other functions do
- * not check if the processor is online before following the pageset pointer.
- * Other parts of the kernel may not check if the zone is available.
- */
-static struct per_cpu_pageset boot_pageset[NR_CPUS];
-
 /*
  * Dynamically allocate memory for the
  * per cpu pageset array in struct zone.
@@ -3719,27 +3776,6 @@ void __init setup_per_cpu_pageset(void)
 }
 
 #endif
-
-static __meminit void setup_zone_pageset(struct zone *zone)
-{
-	int cpu;
-
-	for_each_possible_cpu(cpu) {
-		struct per_cpu_pageset *pset;
-		pset = zone_pcp(zone, cpu);
-
-#ifdef CONFIG_NUMA
-		if (unlikely(cpu_online(cpu) && pset == &boot_pageset[cpu])) {
-			pset = kmalloc_node(sizeof(struct per_cpu_pageset),
-					    GFP_NOWAIT, cpu_to_node(cpu));
-			zone_pcp(zone, cpu) = pset;
-		}
-#endif
-		setup_pageset(pset, zone_batchsize(zone));
-	}
-
-	return;
-}
 
 static noinline __init_refok
 int zone_wait_table_init(struct zone *zone, unsigned long zone_size_pages)
@@ -4391,6 +4427,10 @@ static void __paginginit free_area_init_core(struct pglist_data *pgdat,
 		zone->reclaim_stat.recent_rotated[1] = 0;
 		zone->reclaim_stat.recent_scanned[0] = 0;
 		zone->reclaim_stat.recent_scanned[1] = 0;
+#ifdef CONFIG_KRG_MM
+		zone->reclaim_stat.recent_scanned[2] = 0;
+		zone->reclaim_stat.recent_rotated[2] = 0;
+#endif
 		zap_zone_vm_stats(zone);
 		zone->flags = 0;
 		if (!size)

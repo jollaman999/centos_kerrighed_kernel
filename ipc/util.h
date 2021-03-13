@@ -12,8 +12,62 @@
 
 #include <linux/unistd.h>
 #include <linux/err.h>
+#ifdef CONFIG_KRG_IPC
+#include <linux/security.h>
+#include <kerrighed/types.h>
+#include <kddm/kddm_types.h>
+#endif
 
 #define SEQ_MULTIPLIER	(IPCMNI)
+
+/* One semaphore structure for each semaphore in the system. */
+struct sem {
+	int	semval;		/* current value */
+	int	sempid;		/* pid of last operation */
+	spinlock_t	lock;	/* spinlock for fine-grained semtimedop */
+#ifdef CONFIG_KRG_IPC
+	struct list_head remote_sem_pending;
+#endif
+	struct list_head sem_pending; /* pending single-sop operations */
+};
+
+/* One queue for each sleeping process in the system. */
+struct sem_queue {
+	struct list_head	list;	 /* queue of pending operations */
+	struct task_struct	*sleeper; /* this process */
+	struct sem_undo		*undo;	 /* undo structure */
+	int			pid;	 /* process id of requesting process */
+	int			status;	 /* completion status of operation */
+	struct sembuf		*sops;	 /* array of pending operations */
+	int			nsops;	 /* number of operations */
+	int			alter;	 /* does *sops alter the array? */
+#ifdef CONFIG_KRG_IPC
+	int                     semid;
+	kerrighed_node_t        node;
+#endif
+};
+
+/* Each task has a list of undo requests. They are executed automatically
+ * when the process exits.
+ */
+struct sem_undo {
+#ifdef CONFIG_KRG_IPC
+	unique_id_t             proc_list_id;
+	/* list_proc is useless in KRG code */
+#endif
+	struct list_head	list_proc;	/* per-process list: *
+						 * all undos from one process
+						 * rcu protected */
+	struct rcu_head		rcu;		/* rcu struct for sem_undo */
+	struct sem_undo_list	*ulp;		/* back ptr to sem_undo_list */
+	struct list_head	list_id;	/* per semaphore array list:
+						 * all undos for one array */
+	int			semid;		/* semaphore set identifier */
+	short			*semadj;	/* array of adjustments */
+						/* one per semaphore */
+};
+
+#define sem_ids(ns)	((ns)->ids[IPC_SEM_IDS])
 
 void sem_init (void);
 void msg_init (void);
@@ -54,6 +108,12 @@ struct ipc_rcu {
 
 #define ipc_rcu_to_struct(p)  ((void *)(p+1))
 
+#ifdef CONFIG_KRG_IPC
+#define sem_ids(ns)     ((ns)->ids[IPC_SEM_IDS])
+#define msg_ids(ns)     ((ns)->ids[IPC_MSG_IDS])
+#define shm_ids(ns)     ((ns)->ids[IPC_SHM_IDS])
+#endif
+
 /*
  * Structure that holds the parameters needed by the ipc operations
  * (see after)
@@ -65,6 +125,9 @@ struct ipc_params {
 		size_t size;	/* for shared memories */
 		int nsems;	/* for semaphores */
 	} u;			/* holds the getnew() specific param */
+#ifdef CONFIG_KRG_IPC
+	int requested_id;
+#endif
 };
 
 /*
@@ -101,7 +164,11 @@ void __init ipc_init_proc_interface(const char *path, const char *header,
 #define ipcid_to_idx(id) ((id) % SEQ_MULTIPLIER)
 
 /* must be called with ids->rw_mutex acquired for writing */
+#ifdef CONFIG_KRG_IPC
+int ipc_addid(struct ipc_ids *, struct kern_ipc_perm *, int, int);
+#else
 int ipc_addid(struct ipc_ids *, struct kern_ipc_perm *, int);
+#endif
 
 /* must be called with ids->rw_mutex acquired for reading */
 int ipc_get_maxid(struct ipc_ids *);
@@ -130,6 +197,9 @@ void ipc_rcu_putref(void *ptr, void (*func)(struct rcu_head *head));
 void ipc_rcu_free(struct rcu_head *head);
 
 struct kern_ipc_perm *ipc_lock(struct ipc_ids *, int);
+#ifdef CONFIG_KRG_IPC
+struct kern_ipc_perm *local_ipc_lock(struct ipc_ids *ids, int id);
+#endif
 struct kern_ipc_perm *ipc_obtain_object(struct ipc_ids *ids, int id);
 
 void kernel_to_ipc64_perm(struct kern_ipc_perm *in, struct ipc64_perm *out);
@@ -166,15 +236,24 @@ static inline int ipc_checkid(struct kern_ipc_perm *ipcp, int uid)
 
 static inline void ipc_lock_by_ptr(struct kern_ipc_perm *perm)
 {
+#ifdef CONFIG_KRG_IPC
+	BUG_ON(perm->krgops);
+#endif
 	rcu_read_lock();
 	spin_lock(&perm->lock);
 }
 
+#ifdef CONFIG_KRG_IPC
+void ipc_unlock(struct kern_ipc_perm *perm);
+
+void local_ipc_unlock(struct kern_ipc_perm *perm);
+#else
 static inline void ipc_unlock(struct kern_ipc_perm *perm)
 {
 	spin_unlock(&perm->lock);
 	rcu_read_unlock();
 }
+#endif
 
 static inline void ipc_lock_object(struct kern_ipc_perm *perm)
 {
@@ -187,4 +266,35 @@ int ipcget(struct ipc_namespace *ns, struct ipc_ids *ids,
 			struct ipc_ops *ops, struct ipc_params *params);
 void free_ipcs(struct ipc_namespace *ns, struct ipc_ids *ids,
 		void (*free)(struct ipc_namespace *, struct kern_ipc_perm *));
+
+#ifdef CONFIG_KRG_IPC
+void unlink_queue(struct sem_array *sma, struct sem_queue *q);
+
+void msg_rcu_free(struct rcu_head *head);
+void sem_rcu_free(struct rcu_head *head);
+
+struct krgipc_ops {
+	struct kddm_set *map_kddm_set;
+	struct kddm_set *key_kddm_set;
+	struct kddm_set *data_kddm_set;
+
+	struct kern_ipc_perm *(*ipc_lock)(struct ipc_ids *, int);
+	void (*ipc_unlock)(struct kern_ipc_perm *);
+	struct kern_ipc_perm *(*ipc_findkey)(struct ipc_ids *, key_t);
+};
+
+int local_ipc_reserveid(struct ipc_ids* ids, struct kern_ipc_perm* new,
+                        int size);
+
+int is_krg_ipc(struct ipc_ids *ids);
+
+int krg_msg_init_ns(struct ipc_namespace *ns);
+int krg_sem_init_ns(struct ipc_namespace *ns);
+int krg_shm_init_ns(struct ipc_namespace *ns);
+
+void krg_msg_exit_ns(struct ipc_namespace *ns);
+void krg_sem_exit_ns(struct ipc_namespace *ns);
+void krg_shm_exit_ns(struct ipc_namespace *ns);
+#endif
+
 #endif

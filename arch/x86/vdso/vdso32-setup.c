@@ -305,6 +305,39 @@ int __init sysenter_setup(void)
 	return 0;
 }
 
+#ifdef CONFIG_KRG_MM
+void import_vdso_context(struct vm_area_struct *vma)
+{
+	if (vdso_enabled != VDSO_ENABLED) {
+		BUG_ON(!vma->vm_mm->context.vdso
+		       && vma->vm_mm->context.vdso != (void *)VDSO_HIGH_BASE);
+		return;
+	}
+
+	if (compat_uses_vma || !compat) {
+		vma->vm_private_data = vdso_pages;
+
+		BUG_ON(vma->vm_start != vma->vm_mm->context.vdso);
+		BUG_ON(vma->vm_end != vma->vm_start + vdso_size);
+	}
+}
+
+int import_mm_struct_end(struct mm_struct *mm, struct task_struct *task)
+{
+	if (vdso_enabled != VDSO_ENABLED) {
+		BUG_ON(!mm->context.vdso
+		       && mm->context.vdso != (void *)VDSO_HIGH_BASE);
+		return 0;
+	}
+
+	task_thread_info(task)->sysenter_return =
+		VDSO32_SYMBOL(mm->context.vdso, SYSENTER_RETURN);
+
+	return 0;
+}
+
+#endif
+
 /* Setup a VMA at program startup for the vsyscall page */
 int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)
 {

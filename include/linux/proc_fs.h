@@ -108,6 +108,7 @@ struct vmcore {
 
 extern void proc_root_init(void);
 
+void proc_new_task(struct task_struct *task);
 void proc_flush_task(struct task_struct *task);
 
 extern struct proc_dir_entry *create_proc_entry(const char *name, mode_t mode,
@@ -194,6 +195,9 @@ extern void proc_free_inum(unsigned int inum);
 #define proc_net_fops_create(net, name, mode, fops)  ({ (void)(mode), NULL; })
 static inline void proc_net_remove(struct net *net, const char *name) {}
 
+static inline void proc_new_task(struct task_struct *task)
+{
+}
 static inline void proc_flush_task(struct task_struct *task)
 {
 }
@@ -302,6 +306,32 @@ union proc_op {
 		struct task_struct *task);
 };
 
+#if defined(CONFIG_KRG_PROCFS) && defined(CONFIG_KRG_PROC)
+#include <linux/types.h>
+#include <kerrighed/sys/types.h>
+
+struct proc_distant_pid_info;
+
+union proc_distant_op {
+	int (*proc_get_link)(struct inode *, struct path *);
+	int (*proc_read)(struct proc_distant_pid_info *task, char *page);
+	int (*proc_show)(struct file *file, struct proc_distant_pid_info *task,
+			 char *buf, size_t count);
+};
+
+struct task_kddm_object;
+
+struct proc_distant_pid_info {
+	struct task_kddm_object *task_obj;
+	pid_t pid;
+	kerrighed_node_t prob_node;
+	int dumpable;
+	uid_t euid;
+	gid_t egid;
+	union proc_distant_op op;
+};
+#endif
+
 struct ctl_table_header;
 struct ctl_table;
 
@@ -310,6 +340,12 @@ struct proc_inode {
 	int fd;
 	union proc_op op;
 	struct proc_dir_entry *pde;
+#ifdef CONFIG_KRG_PROCFS
+	void *krg_procfs_private;
+#ifdef CONFIG_KRG_PROC
+	struct proc_distant_pid_info distant_proc;
+#endif
+#endif
 	struct ctl_table_header *sysctl;
 	struct ctl_table *sysctl_entry;
 	struct inode vfs_inode;

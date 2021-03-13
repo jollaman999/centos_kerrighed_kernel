@@ -62,6 +62,10 @@
 #include <linux/bootmem.h>
 #include <linux/hugetlb.h>
 
+#ifdef CONFIG_KRG_EPM
+#include <kerrighed/krgsyms.h>
+#endif
+
 #include <asm/futex.h>
 
 #include "rtmutex_common.h"
@@ -2934,6 +2938,18 @@ SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val,
 
 	return do_futex(uaddr, op, val, tp, uaddr2, val2, val3);
 }
+
+#ifdef CONFIG_KRG_EPM
+int futex_krgsyms_register(void)
+{
+	return krgsyms_register(KRGSYMS_FUTEX_WAIT_RESTART, futex_wait_restart);
+}
+
+int futex_krgsyms_unregister(void)
+{
+	return krgsyms_unregister(KRGSYMS_FUTEX_WAIT_RESTART);
+}
+#endif
 
 static int __init futex_init(void)
 {

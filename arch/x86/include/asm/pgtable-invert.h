@@ -4,6 +4,24 @@
 
 #ifndef __ASSEMBLY__
 
+#ifdef CONFIG_KRG_MM
+/* No inverted PFNs for kerrighed */
+
+static inline u64 protnone_mask(u64 val)
+{
+	return 0;
+}
+
+static inline u64 flip_protnone_guard(u64 oldval, u64 val, u64 mask)
+{
+	return val;
+}
+
+static inline bool __pte_needs_invert(u64 val)
+{
+	return false;
+}
+#else
 static inline bool __pte_needs_invert(u64 val)
 {
 	return (val & (_PAGE_PRESENT|_PAGE_PROTNONE)) == _PAGE_PROTNONE;
@@ -26,6 +44,7 @@ static inline u64 flip_protnone_guard(u64 oldval, u64 val, u64 mask)
 		val = (val & ~mask) | (~val & mask);
 	return val;
 }
+#endif
 
 #endif /* __ASSEMBLY__ */
 

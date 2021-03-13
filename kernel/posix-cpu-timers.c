@@ -10,6 +10,10 @@
 #include <linux/kernel_stat.h>
 #include <trace/events/timer.h>
 
+#ifdef CONFIG_KRG_EPM
+#include <kerrighed/krgsyms.h>
+#endif
+
 /*
  * Called after updating RLIMIT_CPU to set timer expiration if necessary.
  */
@@ -1692,6 +1696,19 @@ struct k_clock clock_posix_cpu = {
 	.timer_del	= posix_cpu_timer_del,
 	.timer_get	= posix_cpu_timer_get,
 };
+
+#ifdef CONFIG_KRG_EPM
+int posix_cpu_timers_krgsyms_register(void)
+{
+	return krgsyms_register(KRGSYMS_POSIX_CPU_NSLEEP_RESTART,
+				posix_cpu_nsleep_restart);
+}
+
+int posix_cpu_timers_krgsyms_unregister(void)
+{
+	return krgsyms_unregister(KRGSYMS_POSIX_CPU_NSLEEP_RESTART);
+}
+#endif /* CONFIG_KRG_EPM */
 
 static __init int init_posix_cpu_timers(void)
 {

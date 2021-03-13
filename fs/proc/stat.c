@@ -13,6 +13,10 @@
 #include <asm/cputime.h>
 #include <linux/tick.h>
 
+#ifdef CONFIG_KRG_PROCFS
+#include <linux/export.h>
+#endif
+
 #ifndef arch_irq_stat_cpu
 #define arch_irq_stat_cpu(cpu) 0
 #endif
@@ -22,7 +26,10 @@
 
 #ifdef arch_idle_time
 
-static cputime64_t get_idle_time(int cpu)
+#ifndef CONFIG_KRG_PROCFS
+static
+#endif
+cputime64_t get_idle_time(int cpu)
 {
 	cputime64_t idle;
 
@@ -31,6 +38,9 @@ static cputime64_t get_idle_time(int cpu)
 		idle += arch_idle_time(cpu);
 	return idle;
 }
+#ifdef CONFIG_KRG_PROCFS
+EXPORT_SYMBOL(get_idle_time);
+#endif
 
 static cputime64_t get_iowait_time(int cpu)
 {
@@ -44,7 +54,10 @@ static cputime64_t get_iowait_time(int cpu)
 
 #else
 
-static cputime64_t get_idle_time(int cpu)
+#ifndef CONFIG_KRG_PROCFS
+static
+#endif
+cputime64_t get_idle_time(int cpu)
 {
 	u64 idle_time = get_cpu_idle_time_us(cpu, NULL);
 	cputime64_t idle;
@@ -57,6 +70,9 @@ static cputime64_t get_idle_time(int cpu)
 
 	return idle;
 }
+#ifdef CONFIG_KRG_PROCFS
+EXPORT_SYMBOL(get_idle_time);
+#endif
 
 static cputime64_t get_iowait_time(int cpu)
 {
@@ -74,9 +90,18 @@ static cputime64_t get_iowait_time(int cpu)
 
 #endif
 
-static unsigned int (*kstat_irqs_usr_fn)(unsigned int irq);
+#ifndef CONFIG_KRG_PROCFS
+static
+#endif
+unsigned int (*kstat_irqs_usr_fn)(unsigned int irq);
+#ifdef CONFIG_KRG_PROCFS
+EXPORT_SYMBOL(kstat_irqs_usr_fn);
+#endif
 
-static int show_stat(struct seq_file *p, void *v)
+#ifndef CONFIG_KRG_PROCFS
+static
+#endif
+int show_stat(struct seq_file *p, void *v)
 {
 	int i, j;
 	unsigned long jif;

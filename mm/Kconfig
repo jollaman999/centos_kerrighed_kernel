@@ -313,7 +313,7 @@ config TRANSPARENT_HUGEPAGE
 	bool "Transparent Hugepage support" if EMBEDDED
 	depends on X86_64
 	select COMPACTION
-	default y
+	default n
 	help
 	  Transparent Hugepages allows the kernel to use huge pages and
 	  huge tlb transparently to the applications whenever possible.

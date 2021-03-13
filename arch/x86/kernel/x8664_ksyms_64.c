@@ -24,10 +24,16 @@ EXPORT_SYMBOL(__get_user_1);
 EXPORT_SYMBOL(__get_user_2);
 EXPORT_SYMBOL(__get_user_4);
 EXPORT_SYMBOL(__get_user_8);
+#ifdef CONFIG_KRG_FAF
+EXPORT_SYMBOL(ruaccess_get_user_asm);
+#endif /* CONFIG_KRG_FAF */
 EXPORT_SYMBOL(__put_user_1);
 EXPORT_SYMBOL(__put_user_2);
 EXPORT_SYMBOL(__put_user_4);
 EXPORT_SYMBOL(__put_user_8);
+#ifdef CONFIG_KRG_FAF
+EXPORT_SYMBOL(ruaccess_put_user_asm);
+#endif /* CONFIG_KRG_FAF */
 
 __must_check unsigned long notrace
 copy_user_generic(void *to, const void *from, unsigned len)

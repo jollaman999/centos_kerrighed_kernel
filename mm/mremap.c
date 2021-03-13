@@ -187,7 +187,11 @@ static unsigned long move_vma(struct vm_area_struct *vma,
 {
 	struct mm_struct *mm = vma->vm_mm;
 	struct vm_area_struct *new_vma;
+#ifdef CONFIG_KRG_MM
+	unsigned long long vm_flags = vma->vm_flags;
+#else
 	unsigned long vm_flags = vma->vm_flags;
+#endif
 	unsigned long new_pgoff;
 	unsigned long moved_len;
 	unsigned long excess = 0;
@@ -289,7 +293,12 @@ static unsigned long move_vma(struct vm_area_struct *vma,
 }
 
 static struct vm_area_struct *vma_to_resize(unsigned long addr,
+#ifdef CONFIG_KRG_MM
+	unsigned long old_len, unsigned long new_len, unsigned long *p,
+	unsigned long _lock_limit)
+#else
 	unsigned long old_len, unsigned long new_len, unsigned long *p)
+#endif
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma = find_vma(mm, addr);
@@ -319,7 +328,11 @@ static struct vm_area_struct *vma_to_resize(unsigned long addr,
 	if (vma->vm_flags & VM_LOCKED) {
 		unsigned long locked, lock_limit;
 		locked = mm->locked_vm << PAGE_SHIFT;
+#ifdef CONFIG_KRG_MM
+		lock_limit = _lock_limit;
+#else
 		lock_limit = current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur;
+#endif
 		locked += new_len - old_len;
 		if (locked > lock_limit && !capable(CAP_IPC_LOCK))
 			goto Eagain;
@@ -330,7 +343,11 @@ static struct vm_area_struct *vma_to_resize(unsigned long addr,
 
 	if (vma->vm_flags & VM_ACCOUNT) {
 		unsigned long charged = (new_len - old_len) >> PAGE_SHIFT;
+#ifdef CONFIG_KRG_MM
+		if (security_vm_enough_memory_mm(mm, charged))
+#else
 		if (security_vm_enough_memory(charged))
+#endif
 			goto Efault;
 		*p = charged;
 	}
@@ -349,7 +366,11 @@ Eagain:
 
 static unsigned long mremap_to(unsigned long addr,
 	unsigned long old_len, unsigned long new_addr,
+#ifdef CONFIG_KRG_MM
+	unsigned long new_len, unsigned long _lock_limit)
+#else
 	unsigned long new_len)
+#endif
 {
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma;
@@ -387,7 +408,11 @@ static unsigned long mremap_to(unsigned long addr,
 		old_len = new_len;
 	}
 
+#ifdef CONFIG_KRG_MM
+	vma = vma_to_resize(addr, old_len, new_len, &charged, _lock_limit);
+#else
 	vma = vma_to_resize(addr, old_len, new_len, &charged);
+#endif
 	if (IS_ERR(vma)) {
 		ret = PTR_ERR(vma);
 		goto out;
@@ -433,11 +458,30 @@ static int vma_expandable(struct vm_area_struct *vma, unsigned long delta)
  * MREMAP_FIXED option added 5-Dec-1999 by Benjamin LaHaise
  * This option implies MREMAP_MAYMOVE.
  */
+#ifdef CONFIG_KRG_MM
+unsigned long do_mremap(unsigned long addr,
+			unsigned long old_len, unsigned long new_len,
+			unsigned long flags, unsigned long new_addr)
+{
+	unsigned long dummy = 0;
+
+	return __do_mremap(current->mm, addr, old_len, new_len, flags, new_addr,
+			   &dummy,
+			   current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur);
+}
+
+unsigned long __do_mremap(struct mm_struct *mm, unsigned long addr,
+			  unsigned long old_len, unsigned long new_len,
+			  unsigned long flags, unsigned long new_addr,
+			  unsigned long *_new_addr, unsigned long _lock_limit)
+{
+#else
 unsigned long do_mremap(unsigned long addr,
 	unsigned long old_len, unsigned long new_len,
 	unsigned long flags, unsigned long new_addr)
 {
 	struct mm_struct *mm = current->mm;
+#endif
 	struct vm_area_struct *vma;
 	unsigned long ret = -EINVAL;
 	unsigned long charged = 0;
@@ -461,7 +505,11 @@ unsigned long do_mremap(unsigned long addr,
 
 	if (flags & MREMAP_FIXED) {
 		if (flags & MREMAP_MAYMOVE)
+#ifdef CONFIG_KRG_MM
+			ret = mremap_to(addr, old_len, new_addr, new_len, _lock_limit);
+#else
 			ret = mremap_to(addr, old_len, new_addr, new_len);
+#endif
 		goto out;
 	}
 
@@ -481,7 +529,11 @@ unsigned long do_mremap(unsigned long addr,
 	/*
 	 * Ok, we need to grow..
 	 */
+#ifdef CONFIG_KRG_MM
+	vma = vma_to_resize(addr, old_len, new_len, &charged, _lock_limit);
+#else
 	vma = vma_to_resize(addr, old_len, new_len, &charged);
+#endif
 	if (IS_ERR(vma)) {
 		ret = PTR_ERR(vma);
 		goto out;
@@ -522,10 +574,22 @@ unsigned long do_mremap(unsigned long addr,
 		if (vma->vm_flags & VM_MAYSHARE)
 			map_flags |= MAP_SHARED;
 
+#ifdef CONFIG_KRG_MM
+		if (*_new_addr == 0) {
+			new_addr = get_unmapped_area_prot(vma->vm_file, 0,
+				     new_len, vma->vm_pgoff +
+					((addr - vma->vm_start) >> PAGE_SHIFT),
+					map_flags, vma->vm_flags & VM_EXEC);
+			*_new_addr = new_addr;
+		}
+		else
+			new_addr = *_new_addr;
+#else
 		new_addr = get_unmapped_area_prot(vma->vm_file, 0, new_len,
 					vma->vm_pgoff +
 					((addr - vma->vm_start) >> PAGE_SHIFT),
 					map_flags, vma->vm_flags & VM_EXEC);
+#endif
 		if (new_addr & ~PAGE_MASK) {
 			ret = new_addr;
 			goto out;
@@ -547,9 +611,24 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 		unsigned long, new_addr)
 {
 	unsigned long ret;
+	unsigned long _new_addr = 0;
 
 	down_write(&current->mm->mmap_sem);
+#ifdef CONFIG_KRG_MM
+	ret = __do_mremap(current->mm, addr, old_len, new_len, flags, new_addr,
+			  &_new_addr,
+			  current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur);
+#else
 	ret = do_mremap(addr, old_len, new_len, flags, new_addr);
+#endif
 	up_write(&current->mm->mmap_sem);
+
+#ifdef CONFIG_KRG_MM
+	if (!(ret & ~PAGE_MASK) && current->mm->anon_vma_kddm_set)
+		krg_do_mremap(current->mm, addr, old_len, new_len, flags,
+			      new_addr, _new_addr,
+			      current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur);
+#endif
+
 	return ret;
 }

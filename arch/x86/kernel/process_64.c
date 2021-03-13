@@ -274,25 +274,52 @@ int copy_thread(unsigned long clone_flags, unsigned long sp,
 			(THREAD_SIZE + task_stack_page(p))) - 1;
 	*childregs = *regs;
 
+#ifdef CONFIG_KRG_EPM
+	/* Do not corrupt ax in migration/restart */
+	if (!krg_current || in_krg_do_fork())
+#endif
 	childregs->ax = 0;
 	childregs->sp = sp;
 	if (sp == ~0UL)
 		childregs->sp = (unsigned long)childregs;
 
 	p->thread.sp = (unsigned long) childregs;
+#ifdef CONFIG_KRG_EPM
+	if (krg_current && krg_current->thread.sp) {
+		/* Zombie migration/restart: let get_wchan find do_exit() */
+		p->thread.sp -= 24;
+		*(u64 *)p->thread.sp = p->thread.sp + 8;
+		*(u64 *)(p->thread.sp + 8) = 0;
+		*(u64 *)(p->thread.sp + 16) = (u64)do_exit;
+	}
+#endif
 	p->thread.sp0 = (unsigned long) (childregs+1);
 	p->thread.usersp = me->thread.usersp;
 
 	set_tsk_thread_flag(p, TIF_FORK);
+#ifdef CONFIG_KRG_EPM
+	/*
+	 * Migration/restart could have rcx, r11, and rflags corrupted by
+	 * ret_from_fork.
+	 */
+	if (krg_current && !in_krg_do_fork())
+		set_tsk_thread_flag(p, TIF_MIGRATION);
+#endif
 
 	p->fpu_counter = 0;
 
+#ifdef CONFIG_KRG_EPM
+	if (!krg_current) {
+#endif
 	savesegment(gs, p->thread.gsindex);
-	p->thread.gs = p->thread.gsindex ? 0 : me->thread.gs;
 	savesegment(fs, p->thread.fsindex);
-	p->thread.fs = p->thread.fsindex ? 0 : me->thread.fs;
 	savesegment(es, p->thread.es);
 	savesegment(ds, p->thread.ds);
+#ifdef CONFIG_KRG_EPM
+	}
+#endif
+	p->thread.gs = p->thread.gsindex ? 0 : me->thread.gs;
+	p->thread.fs = p->thread.fsindex ? 0 : me->thread.fs;
 
 	if (unlikely(test_tsk_thread_flag(me, TIF_IO_BITMAP))) {
 		p->thread.io_bitmap_ptr = kmalloc(IO_BITMAP_BYTES, GFP_KERNEL);

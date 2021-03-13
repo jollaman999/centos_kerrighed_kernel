@@ -37,7 +37,10 @@ static void free_ldt(void *ldt, int size)
 		put_page(virt_to_page(ldt));
 }
 
-static int alloc_ldt(mm_context_t *pc, int mincount, int reload)
+#ifndef CONFIG_KRG_MM
+static
+#endif
+int alloc_ldt(mm_context_t *pc, int mincount, int reload)
 {
 	void *oldldt, *newldt;
 	int oldsize;

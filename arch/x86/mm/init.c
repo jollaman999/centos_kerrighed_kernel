@@ -475,6 +475,7 @@ unsigned long max_swapfile_size(void)
 
 	pages = generic_max_swapfile_size();
 
+#ifndef CONFIG_KRG_EPM
 	if (boot_cpu_has_bug(X86_BUG_L1TF)) {
 		/* Limit the swap file size to MAX_PA/2 for L1TF workaround */
 		unsigned long long l1tf_limit = l1tf_pfn_limit() + 1;
@@ -483,9 +484,10 @@ unsigned long max_swapfile_size(void)
 		 * which makes the usable limit higher.
 		 */
 #ifdef CONFIG_X86_64
-		l1tf_limit <<= PAGE_SHIFT - SWP_OFFSET_FIRST_BIT;
+		l1tf_limit <<= PAGE_SHIFT - SWP_OFFSET_SHIFT;
 #endif
 		pages = min_t(unsigned long long, l1tf_limit, pages);
 	}
+#endif
 	return pages;
 }

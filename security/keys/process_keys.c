@@ -858,7 +858,7 @@ void key_replace_session_keyring(void)
 	if (!current->replacement_session_keyring)
 		return;
 
-	tasklist_write_lock_irq();
+	write_lock_irq(&tasklist_lock);
 	new = current->replacement_session_keyring;
 	current->replacement_session_keyring = NULL;
 	write_unlock_irq(&tasklist_lock);

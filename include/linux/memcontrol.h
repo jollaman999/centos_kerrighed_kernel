@@ -161,7 +161,9 @@ unsigned long mem_cgroup_soft_limit_reclaim(struct zone *zone, int order,
 						gfp_t gfp_mask, int nid,
 						int zid);
 
+#ifdef CONFIG_TRANSPARENT_HUGEPAGE
 void mem_cgroup_split_hugepage_commit(struct page *page, struct page *head);
+#endif
 
 u64 mem_cgroup_get_limit(struct mem_cgroup *mem);
 
@@ -376,10 +378,6 @@ unsigned long mem_cgroup_soft_limit_reclaim(struct zone *zone, int order,
 					    gfp_t gfp_mask, int nid, int zid)
 {
 	return 0;
-}
-
-void mem_cgroup_split_hugepage_commit(struct page *page, struct page *head)
-{
 }
 
 static inline

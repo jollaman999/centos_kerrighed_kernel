@@ -107,7 +107,7 @@ SYSCALL_DEFINE3(ioprio_set, int, which, int, who, int, ioprio)
 	 * so we can't use rcu_read_lock(). See re-copy of ->ioprio
 	 * in copy_process().
 	 */
-	tasklist_read_lock();
+	read_lock(&tasklist_lock);
 	switch (which) {
 		case IOPRIO_WHO_PROCESS:
 			if (!who)
@@ -196,7 +196,7 @@ SYSCALL_DEFINE2(ioprio_get, int, which, int, who)
 	int ret = -ESRCH;
 	int tmpio;
 
-	tasklist_read_lock();
+	read_lock(&tasklist_lock);
 	switch (which) {
 		case IOPRIO_WHO_PROCESS:
 			if (!who)

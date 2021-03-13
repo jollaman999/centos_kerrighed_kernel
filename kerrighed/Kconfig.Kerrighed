@@ -1,0 +1,567 @@
+comment "Kerrighed supports x86-64 only"
+depends on !X86_64
+
+menu "Cluster support"
+depends on X86_64
+
+config KERRIGHED
+	bool "Add the Kerrighed support"
+	depends on PREEMPT_NONE && !KEYS && !COMPAT
+	default y
+	select KRG_TOOLS if !KERRIGHED_DEVEL
+	select KRG_COMMUNICATION_FRAMEWORK if !KERRIGHED_DEVEL
+	select KRG_HOTPLUG if !KERRIGHED_DEVEL
+	select KRG_KDDM if !KERRIGHED_DEVEL
+	select KRG_CAP if !KERRIGHED_DEVEL
+	select KRG_PROCFS if !KERRIGHED_DEVEL
+	select KRG_MM if !KERRIGHED_DEVEL
+	select KRG_DVFS if !KERRIGHED_DEVEL
+	select KRG_FAF if !KERRIGHED_DEVEL
+	select KRG_IPC if !KERRIGHED_DEVEL && KRG_IPC_OTHER_DEPS
+	select KRG_PROC if !KERRIGHED_DEVEL && KRG_PROC_OTHER_DEPS
+	select KRG_EPM if !KERRIGHED_DEVEL
+	select KRG_SCHED if !KERRIGHED_DEVEL
+	help
+	  Say Y if you want to use the Kerrighed features.	
+
+comment "Kerrighed requires kernel preemption to be fully disabled (PREEMPT_NONE)"
+	depends on !PREEMPT_NONE
+
+comment "Kerrighed does not support access key retention (KEYS)"
+	depends on KEYS
+
+comment "Kerrighed does not support 32 bits emulation (COMPAT)"
+	depends on COMPAT
+
+config KRG_IPC_OTHER_DEPS
+	def_bool IPC_NS
+
+comment "WARNING: Kerrighed IPC requires IPC namespaces (IPC_NS)"
+	depends on KERRIGHED && !IPC_NS
+
+config KRG_PROC_OTHER_DEPS
+	def_bool PID_NS
+
+comment "WARNING: Kerrighed Process management requires PID namespaces (PID_NS)"
+	depends on KERRIGHED && !PID_NS
+
+config KERRIGHED_DEVEL
+	bool "Allow to build a subset of Kerrighed (!! Kerrighed development only !!)"
+	depends on KERRIGHED
+	default n
+	help
+	  The only reason to enable this, is that you intend to port Kerrighed
+		on a new architecture.
+
+		Just say N, and forget about it.
+
+config KRG_TOOLS
+	bool "Tools"
+	depends on KERRIGHED
+	help
+	  Common library in Kerrighed (without communication)
+
+config KRG_COMMUNICATION_FRAMEWORK
+       bool "Communication layer"
+       depends on KERRIGHED
+       select TIPC
+       select KRGRPC
+       help
+         All-purpose communication layer
+
+config KRG_AUTONODEID
+	bool "Allow node id to bet set automatically"
+	depends on KRG_COMMUNICATION_FRAMEWORK
+	default y
+	help
+	  Compile support to let the kernel automatically set the node id.
+	  The method to compute the node id can be chosen with kernel boot
+	  parameter "autonodeid", which default value can be changed with
+	  the choice menu below. Available methods are described in that
+	  menu.
+
+	  Enabling this option will use 8 bits instead of 7 bits for node ids,
+	  which doubles the size of various node id masks, especially used in
+	  KDDM metadata.
+
+	  If unsure, say Y.
+
+choice
+	prompt "Default value of boot parameter autonodeid"
+	default KRG_AUTONODEID_ON
+	depends on KRG_AUTONODEID
+
+config KRG_AUTONODEID_ON
+	bool "IP address (autonodeid=1)"
+	help
+	  During the boot the kernel must be able to get an IP address
+	  (dhcp, command line, etc.), and will set the node id to the least
+	  significant byte of the IP address.
+
+	  In order to avoid any headache, be sure that all your nodes are
+	  on the same /24 network.
+
+	  This value can be overridden by kernel boot parameter autonodeid.
+
+	  If unsure, say Y.
+
+config KRG_AUTONODEID_OFF
+	bool "off (autonodeid=0)"
+	help
+	  The kernel will not attempt to automatically set the node id. A valid
+	  node id must be provided with kernel boot parameter "node_id".
+
+	  This value can be overridden by kernel boot parameter "autonodeid".
+
+	  If unsure, say N.
+
+endchoice
+
+config KRG_HOTPLUG
+	bool "KerHotplug"
+	depends on KERRIGHED
+	help
+	  Support for nodes management
+
+config KRG_HOTPLUG_DEL
+	bool "KerHotplug: removal support"
+	depends on KRG_HOTPLUG
+	help
+	  Support node removal
+
+config KRG_HOTPLUG_XCH
+	bool "KerHotplug: replacement support"
+	depends on KRG_HOTPLUG
+	help
+	  Support node replacement
+
+config KRG_DISABLE_HEARTBEAT
+       bool "Disable failure detector"
+       depends on KRG_HOTPLUG
+       help
+         If you don't want automatic reconfiguration on a node failure
+         just select this option.
+
+config KRG_KDDM
+	bool "Kernel Distributed Data Management (KDDM)"
+	depends on KRG_COMMUNICATION_FRAMEWORK
+	help
+	  Cluster wide data management. This is the general purpose
+	  mechanism used in Kerrighed to implement distributed
+	  services.
+
+	  If unsure, say Y.
+
+config KRG_KDDM_DEBUG
+	def_bool KRG_KDDM && KRG_DEBUG
+
+config KRG_CAP
+	bool "KerCapabilities"
+	depends on KERRIGHED
+	help
+	  Kerrighed capabilities mechanism.
+
+	  If unsure, say Y.
+
+config KRG_PROCFS
+	bool "ProcFS"
+	depends on KRG_KDDM && KERRIGHED
+	help
+	  Global /proc mechanism.
+
+	  If unsure, say Y.
+
+#config KRG_SYNC
+#	bool "KerSync"
+#	depends on KERRIGHED && KRG_KDDM
+#	help
+#	  Synchronization library
+
+config KRG_MM
+	bool "KerMM"
+	depends on KERRIGHED && KRG_KDDM && !TRACK_DIRTY_PAGES && !COMPACTION && !KSM  && !TRANSPARENT_HUGEPAGE
+	help
+	  Kerrighed's global memory management
+
+config KRG_DVFS
+	bool "Distributed VFS"
+#	depends on KRG_MM && KERRIGHED
+	depends on KERRIGHED
+	help
+	  Kerrighed's distributed VFS. This is the Kerrighed basic
+	  bloc for distributed file management.
+
+	  If unsure, say Y.
+
+config KRG_FAF
+	bool "File access forwarding"
+	depends on KERRIGHED && KRG_DVFS
+	select EPOLL
+	help
+	  Enable migration of open files and streams for those which
+	  cannot be more efficiently managed by other Kerrighed mechanisms.
+
+	  If unsure, say Y.
+
+config KRG_IPC
+	bool "KerIPC"
+	depends on KERRIGHED && KRG_KDDM && KRG_MM && KRG_IPC_OTHER_DEPS
+	help
+	  Kerrighed's global IPC management
+
+config KRG_PROC
+	bool "KerProc"
+	depends on KERRIGHED && KRG_KDDM && KRG_PROC_OTHER_DEPS
+	help
+	  Low-level global process management: global PIDs, syscalls affecting
+	  remote tasks (including signals), global proc PID entries.
+
+	  If unsure, say Y.
+
+config KRG_EPM
+	bool "KerEPM"
+	depends on KERRIGHED && KRG_PROC && KRG_CAP && KRG_MM && (KRG_DVFS || KRG_FAF)
+	help
+	  Enhanced Process Management:
+	    process migration, checkpoint/restart, remote clone.
+
+	  If unsure, say Y.
+
+config KRG_IPC_EPM
+       def_bool KRG_IPC && KRG_EPM
+
+menuconfig KRG_SCHED
+	bool "Kerrighed support for global scheduling"
+	depends on KERRIGHED
+	select CONFIGFS_FS
+	default y
+	help
+	  Compile support for global schedulers.
+
+	  This framework allows, at run-time, to build and configure schedulers
+	  from third parties hot-pluggable components.
+
+	  If you want automagic loading of scheduler modules while configuring
+	  a scheduler, you must select "Automatic module loading" (KMOD) in
+	  section "Loadable module support".
+
+	  If unsure, say Y.
+
+if KRG_SCHED
+
+config KRG_SCHED_COMPAT
+	bool "Compile components needed to emulate Kerrighed 2.3 hard-coded scheduler"
+	depends on KRG_SCHED && KRG_EPM
+	default y
+	help
+	  This option selects the components needed to obtain the same
+	  scheduling policy as in Kerrighed 2.3 hard-coded scheduler.
+	  See the sample script krg_legacy_scheduler located in Kerrighed's
+	  tools to setup this compatible scheduler.
+
+	  If unsure, say Y.
+
+config KRG_SCHED_COMPAT_FORCE
+	def_tristate m if KRG_SCHED_COMPAT
+	select KRG_SCHED_MIGRATION_PROBE
+	select KRG_SCHED_MOSIX_PROBE
+	select KRG_SCHED_THRESHOLD_FILTER
+	select KRG_SCHED_FREQ_LIMIT_FILTER
+	select KRG_SCHED_REMOTE_CACHE_FILTER
+	select KRG_SCHED_MOSIX_LOAD_BALANCER
+	select KRG_SCHED_ROUND_ROBIN_BALANCER
+
+config KRG_SCHED_RBT
+	bool "Compile components needed to implement RBT algorithm."
+	depends on m
+	default y
+	select KRG_SCHED_CPUSPEED_PROBE
+	select KRG_SCHED_LOAD_PROBE
+	select KRG_SCHED_USER_PROBE
+	select KRG_SCHED_PROCESSSIZE_PROBE
+	select KRG_SCHED_MATTLOAD_PROBE
+	select KRG_SCHED_RBT_CACHE_FILTER
+	select KRG_SCHED_RBT_POLICY
+	help
+	  Enabling the RBT load balancer.
+
+	  This option selects the components needed to have the RBT scheduling
+	  algorithm, with a load taking care of modulate ressources usages
+	  regarding the presence of users on the physical machine hosting the
+	  virtual Kerrighed node.
+
+	  The RBT scheduling policy is described in [Perotin, 2008] :
+	  http://portail.scd.univ-tours.fr/search*frf/X?PEROTIN,%20MATTHIEU&m=t&m=u
+
+	  If unsure, say Y.
+
+config KRG_SCHED_CPU_PROBE
+	tristate "Sample CPU probe"
+	depends on m
+	default n
+	help
+	  Sample CPU probe exposing the CPU load of a node
+
+	  If unsure, say N.
+
+config KRG_SCHED_MEM_PROBE
+	tristate "Sample memory probe"
+	depends on m
+	default n
+	help
+	  Sample memory probe exposing the total RAM and free RAM available on
+	  a node
+
+	  If unsure, say N.
+
+config KRG_SCHED_MIGRATION_PROBE
+	tristate "Migration probe"
+	depends on KRG_EPM && m
+	default n
+	help
+	  Probe counting the number of ongoing task migrations out of a node
+	  and registering the last migration event.
+
+	  If unsure, say N.
+
+config KRG_SCHED_MOSIX_PROBE
+	tristate "MOSIX-like CPU probe"
+	depends on m
+	default n
+	help
+	  MOSIX-like CPU probe exposing the CPU load of a node as well as the
+	  CPU load induced by individual tasks
+
+	  If unsure, say N.
+
+config KRG_SCHED_CPUSPEED_PROBE
+	tristate "CPUSPEED probe"
+	depends on m
+	default n
+	help
+	  CPU Speed probe exposes local CPU speed number, and all local
+	  cpu speed (in kHz).
+
+	  If unsure, say N.
+
+config KRG_SCHED_LOAD_PROBE
+	tristate "LOAD probe"
+	depends on m
+	default n
+	help
+	  Load probe exports the number of active tasks in the runqueue of Linux
+	  kernel, and allows to measures the number of jiffies consumed by
+	  each running process.
+
+	  If unsure, say N.
+
+config KRG_SCHED_PROCESSSIZE_PROBE
+	tristate "Process size (numer of pages) probe"
+	depends on m
+	default n
+	help
+	  The process size probe exports process size in term of memory pages.
+	  It is simply the value of total_vm in the task_struct.
+
+	  If unsure, say N.
+
+config KRG_SCHED_LOCAL_USER_PRESENCE
+	tristate "Internal kernel local user counter"
+	depends on m
+	default n
+	help
+	  Local user presence implements a in-kernel counter with full API exported
+	  to manipulate it. It is used by the user probe.
+
+	  If unsure, say N.
+
+config KRG_SCHED_LOCAL_USER_NOTIFIER
+	tristate "Local User userspace notification interface"
+	depends on m && KRG_SCHED_LOCAL_USER_PRESENCE
+	default n
+	help
+	  Local user notifier is a /proc -based userspace notification interface
+	  plugged to the in-kernel user counter implemented by local_user_presence
+	  module. This allows one to be able to retrieve, in-kernel, the presence
+	  of a local user. Useful if Kerrighed node runs on virtual machine,
+	  to notify of host usage.
+
+	  If unsure, say N.
+
+config KRG_SCHED_USER_PROBE
+	tristate "Local user probe"
+	depends on m
+	select KRG_SCHED_LOCAL_USER_PRESENCE
+	default n
+	help
+	  The user probe exports the information of the presence of a local
+	  user on the machine. This is needed by the Mattload load.
+
+	  If unsure, say N.
+
+config KRG_SCHED_MATTLOAD_PROBE
+	tristate "Mattload load probe"
+	depends on m
+	default n
+	help
+	  Mattload probe implements the 'Mattload' load measure defined in
+	  [Perotin, 2008 http://portail.scd.univ-tours.fr/search*frf/X?PEROTIN,%20MATTHIEU&m=t&m=u].
+	  This load allows one to run Kerrighed as virtual node on physical machines
+	  used by regular users, and adapt load according to the presence or
+	  absence of physical user.
+
+	  If unsure, say N.
+
+config KRG_SCHED_THRESHOLD_FILTER
+	tristate "Threshold filter"
+	depends on m
+	default n
+	help
+	  Filter propagating events only if the value exceeds the configured
+	  threshold
+
+	  If unsure, say N.
+
+config KRG_SCHED_FREQ_LIMIT_FILTER
+	tristate "Frequency limit filter"
+	depends on m
+	default n
+	help
+	  Filter propagating events only if, for a configured action monitored,
+	  no action is ongoing and the last one occured more than a configured
+	  delay before
+
+	  If unsure, say N.
+
+config KRG_SCHED_REMOTE_CACHE_FILTER
+	tristate "Remote cache filter"
+	depends on m
+	default n
+	help
+	  Filter caching values from the other nodes, at a configured refresh
+	  rate
+
+	  If unsure, say N.
+
+config KRG_SCHED_RBT_CACHE_FILTER
+	tristate "RBT remote cache filter"
+	depends on m
+	default n
+	help
+	  Filter caching values from the other nodes, for RBT algorithm.
+
+	  If unsure, say N.
+
+config KRG_SCHED_ECHO_POLICY
+	tristate "Sample echo policy"
+	depends on m
+	default n
+	help
+	  Sample policy that logs the values read on its ports when update
+	  notifications are received
+
+	  If unsure, say N.
+
+config KRG_SCHED_MOSIX_LOAD_BALANCER
+	tristate "MOSIX-like load balancing policy"
+	depends on KRG_EPM && m
+	default n
+	help
+	  Migration-based load balancing policy using simplified algorithms
+	  from the CPU load balancing policy found in MOSIX
+
+	  If unsure, say N.
+
+config KRG_SCHED_ROUND_ROBIN_BALANCER
+	tristate "Round robin balancing policy"
+	depends on m
+	default n
+	help
+	  Policy that selects target nodes in a round robin manner when called
+
+	  If unsure, say N.
+
+config KRG_SCHED_RBT_POLICY
+	tristate "RBT load balancing policy"
+	depends on m
+	default n
+	help
+	  RBT Load balancing algorithm
+
+	  If unsure, say N.
+
+endif
+
+config CLUSTER_WIDE_PROC_INFRA
+	bool
+
+config CLUSTER_WIDE_PROC
+	bool "See Cluster wide stats in /proc"
+	depends on KERRIGHED
+	default y
+	select CLUSTER_WIDE_PROC_INFRA
+	help
+	  Say yes if you want to see your cluster as a big SMP through the
+	  /proc files (meminfo, cpuinfo, etc).
+	  
+	  If unsure, say Y.
+
+config CLUSTER_WIDE_PROC_CPUINFO
+	bool
+	depends on KERRIGHED
+	default CLUSTER_WIDE_PROC || KRG_PROC
+	select CLUSTER_WIDE_PROC_INFRA
+
+config CLUSTER_WIDE_PROC_MEMINFO
+	bool
+	depends on KERRIGHED
+	default CLUSTER_WIDE_PROC || KRG_MM
+	select CLUSTER_WIDE_PROC_INFRA
+
+config CLUSTER_WIDE_PROC_LOADAVG
+	bool
+	depends on KERRIGHED
+	default CLUSTER_WIDE_PROC || KRG_PROC
+	select CLUSTER_WIDE_PROC_INFRA
+
+config CLUSTER_WIDE_PROC_STAT
+	bool
+	depends on KERRIGHED
+	default CLUSTER_WIDE_PROC || KRG_PROC
+	select CLUSTER_WIDE_PROC_INFRA
+
+config CLUSTER_WIDE_PROC_UPTIME
+	bool
+	depends on KERRIGHED
+	default CLUSTER_WIDE_PROC || KRG_PROC
+	select CLUSTER_WIDE_PROC_INFRA
+
+config KRG_SYSCALL_EXIT_HOOK
+        bool "Syscall exit hook"
+	depends on KERRIGHED
+	default n
+
+config DEBUG_SEG_FAULT
+	bool "Debug seg faults"
+	depends on KERRIGHED
+	default n
+
+config KRG_DEBUG
+	bool "Debug subsystem"
+	depends on KERRIGHED
+	default n
+	select DEBUG_FS
+	help
+	  Activate Kerrighed's debug subsystem. With this
+          subsystem, most Kerrighed debugs can be activated
+          dynamically at runtime, after having mounted debugfs. To
+          activate debugs for the other subsystems, you will also
+          have to activate them in their respective source
+          directories.
+
+          This option will increase code size and probably slow
+          down the system.
+
+          If unsure, say N.
+
+endmenu

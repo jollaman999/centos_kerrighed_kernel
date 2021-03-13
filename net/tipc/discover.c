@@ -196,7 +196,6 @@ void tipc_disc_recv_msg(struct sk_buff *buf, struct bearer *b_ptr)
 		struct tipc_node *n_ptr = tipc_node_find(orig);
 		int link_fully_up;
 
-		dbg(" in own cluster\n");
 		if (n_ptr == NULL) {
 			n_ptr = tipc_node_create(orig);
 			if (!n_ptr)
@@ -205,7 +204,7 @@ void tipc_disc_recv_msg(struct sk_buff *buf, struct bearer *b_ptr)
 		spin_lock_bh(&n_ptr->lock);
 		link = n_ptr->links[b_ptr->identity];
 		if (!link) {
-			dbg("creating link\n");
+			printk("TIPC: creating link\n");
 			link = tipc_link_create(b_ptr, orig, &media_addr);
 			if (!link) {
 				spin_unlock_bh(&n_ptr->lock);
@@ -219,7 +218,7 @@ void tipc_disc_recv_msg(struct sk_buff *buf, struct bearer *b_ptr)
 				spin_unlock_bh(&n_ptr->lock);
 				return;
 			}
-			warn("Resetting link <%s>, peer interface address changed\n",
+			printk("TIPC: Resetting link <%s>, peer interface address changed\n",
 			     link->name);
 			memcpy(addr, &media_addr, sizeof(*addr));
 			tipc_link_reset(link);

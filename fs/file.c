@@ -22,6 +22,10 @@
 #include <linux/workqueue.h>
 #include <linux/nospec.h>
 
+#ifdef CONFIG_KRG_FAF
+#include <net/krgrpc/rpc.h>
+#endif
+
 struct fdtable_defer {
 	spinlock_t lock;
 	struct work_struct wq;
@@ -138,7 +142,10 @@ static void copy_fdtable(struct fdtable *nfdt, struct fdtable *ofdt)
 	memset((char *)(nfdt->close_on_exec) + cpy, 0, set);
 }
 
-static struct fdtable * alloc_fdtable(unsigned int nr)
+#ifndef CONFIG_KRG_DVFS
+static
+#endif
+struct fdtable * alloc_fdtable(unsigned int nr)
 {
 	struct fdtable *fdt;
 	char *data;
@@ -258,6 +265,9 @@ int expand_files(struct files_struct *files, int nr)
 	 * N.B. For clone tasks sharing a files structure, this test
 	 * will limit the total number of files that can be opened.
 	 */
+#ifdef CONFIG_KRG_FAF
+	if (files != &krgrpc_files)
+#endif
 	if (nr >= current->signal->rlim[RLIMIT_NOFILE].rlim_cur)
 		return -EMFILE;
 
@@ -266,6 +276,9 @@ int expand_files(struct files_struct *files, int nr)
 		return 0;
 
 	/* Can we expand? */
+#ifdef CONFIG_KRG_FAF
+	if (files != &krgrpc_files)
+#endif
 	if (nr >= sysctl_nr_open)
 		return -EMFILE;
 
@@ -273,7 +286,10 @@ int expand_files(struct files_struct *files, int nr)
 	return expand_fdtable(files, nr);
 }
 
-static int count_open_files(struct fdtable *fdt)
+#ifndef CONFIG_KRG_DVFS
+static
+#endif
+int count_open_files(struct fdtable *fdt)
 {
 	int size = fdt->max_fds;
 	int i;
@@ -439,12 +455,25 @@ struct files_struct init_files = {
 /*
  * allocate a file descriptor, mark it busy.
  */
+#ifdef CONFIG_KRG_FAF
+int __alloc_fd(struct task_struct *task,
+	       unsigned start, unsigned flags)
+#else
 int alloc_fd(unsigned start, unsigned flags)
+#endif
 {
+#ifdef CONFIG_KRG_FAF
+	struct files_struct *files = task->files;
+#else
 	struct files_struct *files = current->files;
+#endif
 	unsigned int fd;
 	int error;
 	struct fdtable *fdt;
+
+#ifdef CONFIG_KRG_FAF
+	BUG_ON(task != current && files != &krgrpc_files);
+#endif
 
 	spin_lock(&files->file_lock);
 repeat:
@@ -491,14 +520,29 @@ out:
 	return error;
 }
 
+#ifdef CONFIG_KRG_FAF
+int alloc_fd(unsigned start, unsigned flags)
+{
+	return __alloc_fd(current, start, flags);
+}
+#endif
+
 int get_unused_fd(void)
 {
 	return alloc_fd(0, 0);
 }
 EXPORT_SYMBOL(get_unused_fd);
 
+#ifdef CONFIG_KRG_FAF
+int __get_unused_fd(struct task_struct *task)
+{
+	return __alloc_fd(task, 0, 0);
+}
+#endif
+
 int get_unused_fd_flags(unsigned flags)
 {
 	return alloc_fd(0, flags);
 }
 EXPORT_SYMBOL(get_unused_fd_flags);
+

@@ -29,6 +29,10 @@
 #include <linux/signalfd.h>
 #include <linux/syscalls.h>
 
+#ifdef CONFIG_KRG_FAF
+#include <kerrighed/faf.h>
+#endif
+
 void signalfd_cleanup(struct sighand_struct *sighand)
 {
 	wait_queue_head_t *wqh = &sighand->signalfd_wqh;
@@ -224,7 +228,10 @@ static ssize_t signalfd_read(struct file *file, char __user *buf, size_t count,
 	return total ? total: ret;
 }
 
-static const struct file_operations signalfd_fops = {
+#ifndef CONFIG_KRG_DVFS
+static
+#endif
+const struct file_operations signalfd_fops = {
 	.release	= signalfd_release,
 	.poll		= signalfd_poll,
 	.read		= signalfd_read,
@@ -268,6 +275,14 @@ SYSCALL_DEFINE4(signalfd4, int, ufd, sigset_t __user *, user_mask,
 		struct file *file = fget(ufd);
 		if (!file)
 			return -EBADF;
+
+#ifdef CONFIG_KRG_FAF
+		if (file->f_flags & O_FAF_CLT) {
+			faf_error(file, "signalfd");
+			fput(file);
+			return -EINVAL;
+		}
+#endif
 		ctx = file->private_data;
 		if (file->f_op != &signalfd_fops) {
 			fput(file);

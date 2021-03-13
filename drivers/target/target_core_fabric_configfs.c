@@ -60,7 +60,11 @@ static void target_fabric_setup_##_name##_cit(struct target_fabric_configfs *tf)
 
 static int target_fabric_mappedlun_link(
 	struct config_item *lun_acl_ci,
-	struct config_item *lun_ci)
+	struct config_item *lun_ci
+#ifdef CONFIG_KRG_SCHED
+	, const char *name
+#endif
+	)
 {
 	struct se_dev_entry *deve;
 	struct se_lun *lun = container_of(to_config_group(lun_ci),
@@ -744,7 +748,11 @@ CONFIGFS_EATTR_OPS(target_fabric_port, se_lun, lun_group);
 
 static int target_fabric_port_link(
 	struct config_item *lun_ci,
-	struct config_item *se_dev_ci)
+	struct config_item *se_dev_ci
+#ifdef CONFIG_KRG_SCHED
+	, const char *name
+#endif
+	)
 {
 	struct config_item *tpg_ci;
 	struct se_lun *lun = container_of(to_config_group(lun_ci),

@@ -2245,7 +2245,11 @@ static int ksm_scan_thread(void *nothing)
 }
 
 int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+#ifdef CONFIG_KRG_MM
+		unsigned long end, int advice, unsigned long long *vm_flags)
+#else
 		unsigned long end, int advice, unsigned long *vm_flags)
+#endif
 {
 	struct mm_struct *mm = vma->vm_mm;
 	int err;
@@ -2396,7 +2400,11 @@ struct page *ksm_might_need_to_copy(struct page *page,
 }
 
 int page_referenced_ksm(struct page *page, struct mem_cgroup *memcg,
+#ifdef CONFIG_KRG_MM
+			unsigned long long *vm_flags)
+#else
 			unsigned long *vm_flags)
+#endif
 {
 	struct stable_node *stable_node;
 	struct rmap_item *rmap_item;

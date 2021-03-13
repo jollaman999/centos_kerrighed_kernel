@@ -71,7 +71,6 @@
 unsigned int nfs_idmap_cache_timeout = 600 * HZ;
 const struct cred *id_resolver_cache;
 
-
 /**
  * nfs_fattr_init_names - initialise the nfs_fattr owner_name/group_name fields
  * @fattr: fully initialised struct nfs_fattr
@@ -154,6 +153,7 @@ void nfs_fattr_map_and_free_names(struct nfs_server *server, struct nfs_fattr *f
 		nfs_fattr_free_group_name(fattr);
 }
 
+#ifdef CONFIG_KEYS
 static int nfs_map_string_to_numeric(const char *name, size_t namelen, __u32 *res)
 {
 	unsigned long val;
@@ -342,6 +342,7 @@ static int nfs_idmap_lookup_id(const char *name, size_t namelen,
 	}
 	return ret;
 }
+#endif
 
 /* idmap classic begins here */
 static int param_set_idmap_timeout(const char *val, struct kernel_param *kp)
@@ -819,6 +820,7 @@ static unsigned int fnvhash32(const void *buf, size_t buflen)
 int nfs_map_name_to_uid(const struct nfs_server *server, const char *name, size_t namelen, __u32 *uid)
 {
 	struct idmap *idmap = server->nfs_client->cl_idmap;
+#ifdef CONFIG_KEYS
 	int ret = -EINVAL;
 
 	if (nfs_map_string_to_numeric(name, namelen, uid))
@@ -827,11 +829,15 @@ int nfs_map_name_to_uid(const struct nfs_server *server, const char *name, size_
 	if (ret < 0)
 		ret = nfs_idmap_id(idmap, &idmap->idmap_user_hash, name, namelen, uid);
 	return ret;
+#else
+	return nfs_idmap_id(idmap, &idmap->idmap_user_hash, name, namelen, uid);
+#endif
 }
 
 int nfs_map_group_to_gid(const struct nfs_server *server, const char *name, size_t namelen, __u32 *gid)
 {
 	struct idmap *idmap = server->nfs_client->cl_idmap;
+#ifdef CONFIG_KEYS
 	int ret = -EINVAL;
 
 	if (nfs_map_string_to_numeric(name, namelen, gid))
@@ -840,11 +846,15 @@ int nfs_map_group_to_gid(const struct nfs_server *server, const char *name, size
 	if (ret < 0)
 		ret = nfs_idmap_id(idmap, &idmap->idmap_group_hash, name, namelen, gid);
 	return ret;
+#else
+	return nfs_idmap_id(idmap, &idmap->idmap_group_hash, name, namelen, gid);
+#endif
 }
 
 int nfs_map_uid_to_name(const struct nfs_server *server, __u32 uid, char *buf, size_t buflen)
 {
 	struct idmap *idmap = server->nfs_client->cl_idmap;
+#ifdef CONFIG_KEYS
 	int ret = -EINVAL;
 
 	if (!(server->caps & NFS_CAP_UIDGID_NOMAP)) {
@@ -855,10 +865,14 @@ int nfs_map_uid_to_name(const struct nfs_server *server, __u32 uid, char *buf, s
 	if (ret < 0)
 		ret = nfs_map_numeric_to_string(uid, buf, buflen);
 	return ret;
+#else
+	return nfs_idmap_name(idmap, &idmap->idmap_user_hash, uid, buf);
+#endif
 }
 int nfs_map_gid_to_group(const struct nfs_server *server, __u32 gid, char *buf, size_t buflen)
 {
 	struct idmap *idmap = server->nfs_client->cl_idmap;
+#ifdef CONFIG_KEYS
 	int ret = -EINVAL;
 
 	if (!(server->caps & NFS_CAP_UIDGID_NOMAP)) {
@@ -869,4 +883,7 @@ int nfs_map_gid_to_group(const struct nfs_server *server, __u32 gid, char *buf, 
 	if (ret < 0)
 		ret = nfs_map_numeric_to_string(gid, buf, buflen);
 	return ret;
+#else
+	return nfs_idmap_name(idmap, &idmap->idmap_group_hash, gid, buf);
+#endif
 }

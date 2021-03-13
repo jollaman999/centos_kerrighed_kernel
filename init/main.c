@@ -75,6 +75,10 @@
 #include <linux/kaiser.h>
 #include <trace/boot.h>
 
+#ifdef CONFIG_KRG_HOTPLUG
+#include <kerrighed/krgsyms.h>
+#endif
+
 #include <asm/io.h>
 #include <asm/bugs.h>
 #include <asm/setup.h>
@@ -104,6 +108,10 @@ extern void tc_init(void);
 
 enum system_states system_state __read_mostly;
 EXPORT_SYMBOL(system_state);
+
+#ifdef CONFIG_KRGRPC
+extern void kerrighed_init(void);
+#endif
 
 /*
  * Boot command-line arguments
@@ -573,7 +581,7 @@ void __init __weak thread_info_cache_init(void)
 /*
  * Set up kernel memory allocators
  */
-static void __init mm_init(void)
+static void __init kernel_mm_init(void)
 {
 	/*
 	 * page_cgroup requires countinous pages as memmap
@@ -648,7 +656,7 @@ asmlinkage void __init start_kernel(void)
 	sort_main_extable();
 	kaiser_early_init(0);
 	trap_init();
-	mm_init();
+	kernel_mm_init();
 	/*
 	 * Set up the scheduler prior starting any interrupts (such as the
 	 * timer interrupt). Full topology setup happens at smp_init()
@@ -927,6 +935,9 @@ static void __init do_basic_setup(void)
 	cgroup_wq_init();
 	cpuset_init_smp();
 	usermodehelper_init();
+#ifdef CONFIG_KRG_HOTPLUG
+	init_krgsyms();
+#endif
 	shmem_init();
 	driver_init();
 	init_irq_proc();
@@ -954,8 +965,21 @@ static void run_init_process(char *init_filename)
 static noinline int init_post(void)
 	__releases(kernel_lock)
 {
+#if defined(CONFIG_KERRIGHED) || defined(CONFIG_KRGRPC)
+	/* 
+	 * In a perfect world we would like to call global_pid_init and
+	 * kerrighed_init just after async_synchronize_full
+	 * Since we use early_kerrighed_* vars and such vars are tagged by
+	 * __initdata, this raise some WARNINGs.
+	 * In order to fix that we move async_synchronise_full just before
+	 * to call init_post
+	 */
+	
+#else
 	/* need to finish all async __init code before freeing the memory */
 	async_synchronize_full();
+#endif
+
 	free_initmem();
 	unlock_kernel();
 	mark_rodata_ro();
@@ -1035,6 +1059,13 @@ static int __init kernel_init(void * unused)
 		ramdisk_execute_command = NULL;
 		prepare_namespace();
 	}
+
+#if defined(CONFIG_KERRIGHED) || defined(CONFIG_KRGRPC)
+	/* need to finish all async __init code before freeing the memory */
+	async_synchronize_full();
+
+	kerrighed_init();
+#endif
 
 	/*
 	 * Ok, we have completed the initial bootup, and

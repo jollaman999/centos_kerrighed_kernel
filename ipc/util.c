@@ -40,6 +40,15 @@
 
 #include "util.h"
 
+#ifdef CONFIG_KRG_IPC
+#include <kddm/kddm.h>
+#include "ipcmap_io_linker.h"
+#include "ipc_handler.h"
+#include "msg_handler.h"
+#include "sem_handler.h"
+#include "shm_handler.h"
+#endif
+
 struct ipc_proc_iface {
 	const char *path;
 	const char *header;
@@ -131,6 +140,9 @@ void ipc_init_ids(struct ipc_ids *ids)
 	}
 
 	idr_init(&ids->ipcs_idr);
+#ifdef CONFIG_KRG_IPC
+	ids->krgops = NULL;
+#endif
 }
 
 #ifdef CONFIG_PROC_FS
@@ -184,6 +196,15 @@ static struct kern_ipc_perm *ipc_findkey(struct ipc_ids *ids, key_t key)
 	int next_id;
 	int total;
 
+#ifdef CONFIG_KRG_IPC
+	if (is_krg_ipc(ids)) {
+		ipc = ids->krgops->ipc_findkey(ids, key);
+		if (IS_ERR(ipc))
+			ipc = NULL;
+		return ipc;
+	}
+#endif
+
 	for (total = 0, next_id = 0; total < ids->in_use; next_id++) {
 		ipc = idr_find(&ids->ipcs_idr, next_id);
 
@@ -215,6 +236,11 @@ int ipc_get_maxid(struct ipc_ids *ids)
 	int max_id = -1;
 	int total, id;
 
+#ifdef CONFIG_KRG_IPC
+	if (is_krg_ipc(ids))
+		return krg_ipc_get_maxid(ids);
+#endif
+
 	if (ids->in_use == 0)
 		return -1;
 
@@ -233,6 +259,114 @@ int ipc_get_maxid(struct ipc_ids *ids)
 	return max_id;
 }
 
+#ifdef CONFIG_KRG_IPC
+bool ipc_used(struct ipc_namespace *ns)
+{
+	bool used = false;
+	int i;
+	struct ipc_ids *ids;
+
+	for (i = 0; i < ARRAY_SIZE(ns->ids); i++) {
+		ids = &ns->ids[i];
+
+		down_read(&ids->rw_mutex);
+		used |= ipc_get_maxid(ids) != -1;
+		up_read(&ids->rw_mutex);
+	}
+
+	return used;
+}
+
+static int krg_idr_get_new(struct ipc_ids *ids, struct kern_ipc_perm *new, int *id)
+{
+	int err;
+
+	if (is_krg_ipc(ids)) {
+		int ipcid, lid;
+
+		ipcid = krg_ipc_get_new_id(ids);
+		if (ipcid == -1) {
+			err = -ENOMEM;
+			goto error;
+		}
+
+		lid = ipcid_to_idx(ipcid);
+		err = idr_get_new_above(&ids->ipcs_idr, new, lid, id);
+		if (!err && lid != *id) {
+			idr_remove(&ids->ipcs_idr, *id);
+			err = -EINVAL;
+		}
+	} else
+		err = idr_get_new(&ids->ipcs_idr, new, id);
+
+error:
+	return err;
+}
+
+static int ipc_reserveid(struct ipc_ids *ids, struct kern_ipc_perm *new,
+			 int requested_id)
+{
+	uid_t euid;
+	gid_t egid;
+	int lid, id, err;
+
+	spin_lock_init(&new->lock);
+	new->deleted = 0;
+	rcu_read_lock();
+
+	spin_lock(&new->lock);
+
+	lid = ipcid_to_idx(requested_id);
+
+	err = krg_ipc_get_this_id(ids, lid);
+	if (err)
+		goto out;
+
+	err = idr_pre_get(&ids->ipcs_idr, GFP_KERNEL);
+	if (!err) {
+		err = -ENOMEM;
+		goto out;
+	}
+
+	err = idr_get_new_above(&ids->ipcs_idr, new, lid, &id);
+	if (err)
+		goto out_free_krg_id;
+
+	if (lid != id) {
+		err = -EINVAL;
+		goto out_free_idr_id;
+	}
+
+	ids->in_use++;
+
+	current_euid_egid(&euid, &egid);
+	new->cuid = new->uid = euid;
+	new->gid = new->cgid = egid;
+
+	new->seq = (requested_id - lid) / SEQ_MULTIPLIER;
+
+	if (ids->seq <= new->seq)
+		ids->seq = new->seq+1;
+
+	if (ids->seq > ids->seq_max)
+		ids->seq = 0;
+
+	new->id = requested_id;
+
+	return requested_id;
+
+out_free_idr_id:
+	idr_remove(&ids->ipcs_idr, id);
+out_free_krg_id:
+	krg_ipc_rmid(ids, lid);
+out:
+	spin_unlock(&new->lock);
+	rcu_read_unlock();
+
+	return err;
+}
+#endif
+
 /**
  *	ipc_addid 	-	add an IPC identifier
  *	@ids: IPC identifier set
@@ -247,7 +381,12 @@ int ipc_get_maxid(struct ipc_ids *ids)
  *	Called with ipc_ids.rw_mutex held as a writer.
  */
  
+#ifdef CONFIG_KRG_IPC
+int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size,
+	      int requested_id)
+#else
 int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
+#endif
 {
 	uid_t euid;
 	gid_t egid;
@@ -259,6 +398,11 @@ int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
 	if (ids->in_use >= size)
 		return -ENOSPC;
 
+#ifdef CONFIG_KRG_IPC
+	if (requested_id != -1)
+		return ipc_reserveid(ids, new, requested_id);
+#endif
+
 	spin_lock_init(&new->lock);
 	new->deleted = 0;
 	rcu_read_lock();
@@ -268,7 +412,11 @@ int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
 	new->cuid = new->uid = euid;
 	new->gid = new->cgid = egid;
 
+#ifdef CONFIG_KRG_IPC
+	err = krg_idr_get_new(ids, new, &id);
+#else
 	err = idr_get_new(&ids->ipcs_idr, new, &id);
+#endif
 	if (err) {
 		spin_unlock(&new->lock);
 		rcu_read_unlock();
@@ -284,6 +432,68 @@ int ipc_addid(struct ipc_ids* ids, struct kern_ipc_perm* new, int size)
 	new->id = ipc_buildid(id, new->seq);
 	return id;
 }
+
+#ifdef CONFIG_KRG_IPC
+int local_ipc_reserveid(struct ipc_ids* ids, struct kern_ipc_perm* new,
+                        int size)
+{
+	int original_idx, idx, err;
+
+	if (size > IPCMNI)
+		size = IPCMNI;
+
+	if (ids->in_use >= size) {
+		/* IPC quota is not clusterwide, returning an error here
+		   might lead to kernel crash within the IO linker */
+		printk("%s:%d - Number of Kerrighed IPC objects is locally"
+		       " exceeding quota (%d >= %d)\n",
+		       __PRETTY_FUNCTION__, __LINE__,
+		       ids->in_use, size);
+		/*return -ENOSPC;*/
+	}
+
+	err = idr_pre_get(&ids->ipcs_idr, GFP_KERNEL);
+	if (!err)
+		return -ENOMEM;
+
+	spin_lock_init(&new->lock);
+
+	new->deleted = 0;
+
+	rcu_read_lock();
+
+	spin_lock(&new->lock);
+
+	original_idx = ipcid_to_idx(new->id);
+
+	BUG_ON(new->id != SEQ_MULTIPLIER * new->seq + original_idx);
+
+	err = idr_get_new_above(&ids->ipcs_idr, new, original_idx, &idx);
+
+	if (err)
+		goto error;
+
+	if (original_idx != idx) {
+		idr_remove(&ids->ipcs_idr, idx);
+		err = -EINVAL;
+		goto error;
+	}
+
+	ids->in_use++;
+
+	if (ids->seq <= new->seq)
+		ids->seq = new->seq+1;
+
+	if (ids->seq > ids->seq_max)
+		ids->seq = 0;
+
+	return 0;
+
+error:
+	spin_unlock(&new->lock);
+	return err;
+}
+#endif
 
 /**
  *	ipcget_new	-	create a new ipc object
@@ -407,7 +617,6 @@ retry:
 
 	return err;
 }
-
 
 /**
  *	ipc_rmid	-	remove an IPC identifier
@@ -619,7 +828,11 @@ struct kern_ipc_perm *ipc_obtain_object(struct ipc_ids *ids, int id)
  *
  * The ipc object is locked on successful exit.
  */
+#ifdef CONFIG_KRG_IPC
+struct kern_ipc_perm *local_ipc_lock(struct ipc_ids *ids, int id)
+#else
 struct kern_ipc_perm *ipc_lock(struct ipc_ids *ids, int id)
+#endif
 {
 	struct kern_ipc_perm *out;
 
@@ -667,6 +880,16 @@ out:
 	return out;
 }
 
+#ifdef CONFIG_KRG_IPC
+struct kern_ipc_perm *ipc_lock(struct ipc_ids *ids, int id)
+{
+	if (is_krg_ipc(ids))
+		return ids->krgops->ipc_lock(ids, id);
+
+	return local_ipc_lock(ids, id);
+}
+#endif
+
 struct kern_ipc_perm *ipc_lock_check(struct ipc_ids *ids, int id)
 {
 	struct kern_ipc_perm *out;
@@ -683,6 +906,22 @@ struct kern_ipc_perm *ipc_lock_check(struct ipc_ids *ids, int id)
 	return out;
 }
 
+#ifdef CONFIG_KRG_IPC
+void local_ipc_unlock(struct kern_ipc_perm *perm)
+{
+	spin_unlock(&perm->lock);
+	rcu_read_unlock();
+}
+
+void ipc_unlock(struct kern_ipc_perm *perm)
+{
+	if (perm->krgops)
+		perm->krgops->ipc_unlock(perm);
+	else
+		local_ipc_unlock(perm);
+}
+#endif
+
 /**
  * ipcget - Common sys_*get() code
  * @ns : namsepace
@@ -696,6 +935,9 @@ struct kern_ipc_perm *ipc_lock_check(struct ipc_ids *ids, int id)
 int ipcget(struct ipc_namespace *ns, struct ipc_ids *ids,
 			struct ipc_ops *ops, struct ipc_params *params)
 {
+#ifdef CONFIG_KRG_IPC
+	params->requested_id = -1;
+#endif
 	if (params->key == IPC_PRIVATE)
 		return ipcget_new(ns, ids, ops, params);
 	else
@@ -741,6 +983,7 @@ struct kern_ipc_perm *ipcctl_pre_down(struct ipc_ids *ids, int id, int cmd,
 		goto out;
 
 	spin_lock(&ipcp->lock);
+
 out:
 	return ipcp;
 }
@@ -820,6 +1063,19 @@ static struct kern_ipc_perm *sysvipc_find_ipc(struct ipc_ids *ids, loff_t pos,
 					      loff_t *new_pos)
 {
 	struct kern_ipc_perm *ipc;
+#ifdef CONFIG_KRG_IPC
+	int total;
+
+	total = ipc_get_maxid(ids);
+
+	for (; pos <= total && pos < IPCMNI; pos++) {
+		ipc = ipc_lock(ids, pos);
+		if (!IS_ERR(ipc)) {
+			*new_pos = pos + 1;
+			return ipc;
+		}
+	}
+#else
 	int total, id;
 
 	total = 0;
@@ -840,6 +1096,7 @@ static struct kern_ipc_perm *sysvipc_find_ipc(struct ipc_ids *ids, loff_t pos,
 			return ipc;
 		}
 	}
+#endif
 
 	/* Out of range - return NULL to terminate iteration */
 	return NULL;
@@ -964,3 +1221,66 @@ static const struct file_operations sysvipc_proc_fops = {
 	.release = sysvipc_proc_release,
 };
 #endif /* CONFIG_PROC_FS */
+
+#ifdef CONFIG_KRG_IPC
+void unlink_queue(struct sem_array *sma, struct sem_queue *q)
+{
+	list_del(&q->list);
+	if (q->nsops > 1)
+		sma->complex_count--;
+}
+
+void msg_rcu_free(struct rcu_head *head)
+{
+	struct ipc_rcu *p = container_of(head, struct ipc_rcu, rcu);
+	struct msg_queue *msq = ipc_rcu_to_struct(p);
+
+	security_msg_queue_free(msq);
+	ipc_rcu_free(head);
+}
+
+void sem_rcu_free(struct rcu_head *head)
+{
+	struct ipc_rcu *p = container_of(head, struct ipc_rcu, rcu);
+	struct sem_array *sma = ipc_rcu_to_struct(p);
+
+	security_sem_free(sma);
+	ipc_rcu_free(head);
+}
+
+int is_krg_ipc(struct ipc_ids *ids)
+{
+	if (ids->krgops)
+		return 1;
+
+	return 0;
+}
+
+int init_keripc(void)
+{
+	printk("KrgIPC initialisation : start\n");
+
+	ipcmap_object_cachep = kmem_cache_create("ipcmap_object",
+						 sizeof(ipcmap_object_t),
+						 0, SLAB_PANIC, NULL);
+	register_io_linker (IPCMAP_LINKER, &ipcmap_linker);
+
+	ipc_handler_init();
+
+	msg_handler_init();
+
+	sem_handler_init();
+
+	shm_handler_init();
+
+	printk("KrgIPC initialisation done\n");
+
+	return 0;
+}
+
+void cleanup_keripc(void)
+{
+	ipc_handler_finalize();
+}
+
+#endif

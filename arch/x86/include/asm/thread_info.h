@@ -95,7 +95,14 @@ struct thread_info {
 #define TIF_FORCED_TF		24	/* true if TF in eflags artificially */
 #define TIF_BLOCKSTEP		25	/* set when we want DEBUGCTLMSR_BTF */
 #define TIF_LAZY_MMU_UPDATES	27	/* task is updating the mmu lazily */
-#define TIF_SYSCALL_TRACEPOINT	28	/* syscall tracepoint instrumentation */
+#define TIF_SYSCALL_FTRACE	28	/* for ftrace syscall instrumentation */
+#ifdef CONFIG_KRG_FAF
+#define TIF_RUACCESS            29
+#endif
+#ifdef CONFIG_KRG_EPM
+#define TIF_MIGRATION		30
+#endif
+#define TIF_SYSCALL_TRACEPOINT	31	/* syscall tracepoint instrumentation */
 
 #define _TIF_SYSCALL_TRACE	(1 << TIF_SYSCALL_TRACE)
 #define _TIF_NOTIFY_RESUME	(1 << TIF_NOTIFY_RESUME)
@@ -118,6 +125,13 @@ struct thread_info {
 #define _TIF_FORCED_TF		(1 << TIF_FORCED_TF)
 #define _TIF_BLOCKSTEP		(1 << TIF_BLOCKSTEP)
 #define _TIF_LAZY_MMU_UPDATES	(1 << TIF_LAZY_MMU_UPDATES)
+#define _TIF_SYSCALL_FTRACE	(1 << TIF_SYSCALL_FTRACE)
+#ifdef CONFIG_KRG_FAF
+#define _TIF_RUACCESS           (1 << TIF_RUACCESS)
+#endif
+#ifdef CONFIG_KRG_EPM
+#define _TIF_MIGRATION		(1 << TIF_MIGRATION)
+#endif
 #define _TIF_SYSCALL_TRACEPOINT	(1 << TIF_SYSCALL_TRACEPOINT)
 
 /* work to do in syscall_trace_enter() */

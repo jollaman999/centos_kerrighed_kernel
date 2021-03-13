@@ -2,6 +2,11 @@
 #define _LINUX_SEM_H
 
 #include <linux/ipc.h>
+#ifdef CONFIG_KRG_IPC
+#include <linux/unique_id.h>
+#include <kerrighed/krginit.h>
+#include <kerrighed/types.h>
+#endif
 
 /* semop flags */
 #define SEM_UNDO        0x1000  /* undo the operation on exit */
@@ -104,6 +109,9 @@ struct sem_array {
 	struct sem		*sem_base;	/* ptr to first semaphore in array */
 	struct list_head	sem_pending;	/* pending operations to be processed */
 	struct list_head	list_id;	/* undo requests on this array */
+#ifdef CONFIG_KRG_IPC
+	struct list_head	remote_sem_pending;
+#endif
 #ifdef __GENKSYMS__
 	unsigned long		sem_nsems;	/* no. of semaphores in array */
 #else
@@ -122,6 +130,10 @@ struct sem_undo_list {
 #endif
 
 struct sysv_sem {
+#ifdef CONFIG_KRG_IPC
+	unique_id_t undo_list_id;
+	/* pointer to undo_list is useless in KRG code */
+#endif
 	struct sem_undo_list *undo_list;
 };
 

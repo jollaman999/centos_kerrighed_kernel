@@ -35,7 +35,11 @@ unsigned long __read_mostly sysctl_hung_task_check_count = PID_MAX_LIMIT;
 /*
  * Zero means infinite timeout - no checking done:
  */
+#ifdef CONFIG_KERRIGHED
+unsigned long __read_mostly sysctl_hung_task_timeout_secs = 0;
+#else
 unsigned long __read_mostly sysctl_hung_task_timeout_secs = 120;
+#endif
 
 unsigned long __read_mostly sysctl_hung_task_warnings = 10;
 

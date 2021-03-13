@@ -1502,7 +1502,7 @@ long keyctl_session_to_parent(void)
 
 	me = current;
 	rcu_read_lock();
-	tasklist_write_lock_irq();
+	write_lock_irq(&tasklist_lock);
 
 	parent = me->real_parent;
 	ret = -EPERM;

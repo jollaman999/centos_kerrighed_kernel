@@ -385,7 +385,7 @@ int cifs_open(struct inode *inode, struct file *file)
 		goto out;
 	}
 
-	cFYI(1, "inode = 0x%p file flags are 0x%x for %s",
+	cFYI(1, "inode = 0x%p file flags are 0x%lx for %s",
 		 inode, file->f_flags, full_path);
 
 	if (tcon->ses->server->oplocks)

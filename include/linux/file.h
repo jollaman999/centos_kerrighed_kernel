@@ -10,7 +10,10 @@
 #include <linux/posix_types.h>
 
 struct file;
-
+#ifdef CONFIG_KRG_FAF
+struct files_struct;
+struct task_struct;
+#endif
 extern void __fput(struct file *);
 extern void fput(struct file *);
 extern void fput_pos_unlock(struct file *file);
@@ -46,9 +49,25 @@ extern void set_close_on_exec(unsigned int fd, int flag);
 extern void put_filp(struct file *);
 extern int alloc_fd(unsigned start, unsigned flags);
 extern int get_unused_fd(void);
+#ifdef CONFIG_KRG_FAF
+int __get_unused_fd(struct task_struct *task);
+#endif
+#ifdef CONFIG_KRG_FAF
+extern void __put_unused_fd(struct files_struct *files, unsigned int fd);
+#endif
 extern int get_unused_fd_flags(unsigned flags);
 extern void put_unused_fd(unsigned int fd);
-
+#ifdef CONFIG_KRG_FAF
+extern void __fd_install(struct files_struct *files,
+			 unsigned int fd, struct file *file);
+#endif
 extern void fd_install(unsigned int fd, struct file *file);
+
+#ifdef CONFIG_KRG_DVFS
+struct fdtable;
+int count_open_files(struct fdtable *fdt);
+
+struct fdtable * alloc_fdtable(unsigned int nr);
+#endif
 
 #endif /* __LINUX_FILE_H */

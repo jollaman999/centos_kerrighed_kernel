@@ -40,6 +40,13 @@
 #include <linux/irq_work.h>
 #include <linux/sched.h>
 
+#ifdef CONFIG_KRG_EPM
+#include <kerrighed/children.h>
+#endif
+#ifdef CONFIG_KRG_SCHED
+#include <kerrighed/scheduler/hooks.h>
+#endif
+
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 #include <asm/div64.h>
@@ -1290,7 +1297,11 @@ SYSCALL_DEFINE0(getppid)
 	int pid;
 
 	rcu_read_lock();
+#ifdef CONFIG_KRG_EPM
+	pid = krg_get_real_parent_tgid(current, task_active_pid_ns(current));
+#else
 	pid = task_tgid_vnr(current->real_parent);
+#endif
 	rcu_read_unlock();
 
 	return pid;

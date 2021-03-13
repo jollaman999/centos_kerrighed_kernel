@@ -24,6 +24,7 @@ if TIPC
 
 config TIPC_ADVANCED
 	bool "TIPC: Advanced configuration"
+	depends on TIPC
 	default n
 	help
 	  Saying Y here will open some advanced configuration
@@ -105,6 +106,7 @@ config TIPC_LOG
 
 config TIPC_DEBUG
 	bool "Enable debugging support"
+	depends on TIPC
 	default n
 	help
  	  This will enable debugging of TIPC.

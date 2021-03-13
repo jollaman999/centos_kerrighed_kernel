@@ -41,6 +41,10 @@
 #include <linux/freezer.h>
 #include <linux/crc32.h>
 
+#ifdef CONFIG_KRG_MM
+#include <kerrighed/krgsyms.h>
+#endif
+
 #include <asm/system.h>
 #include <asm/uaccess.h>
 
@@ -1714,9 +1718,16 @@ static int __init init_nfs_fs(void)
 {
 	int err;
 
+#ifdef CONFIG_KRG_MM
+	err = krgsyms_register(KRGSYMS_VM_OPS_NFS_FILE, (void *)&nfs_file_vm_ops);
+	if (err)
+		goto out10;
+#endif
+#ifdef CONFIG_KEYS
 	err = nfs_idmap_init();
 	if (err < 0)
 		goto out9;
+#endif
 
 	err = nfs_dns_resolver_init();
 	if (err < 0)
@@ -1782,8 +1793,14 @@ out6:
 out7:
 	nfs_dns_resolver_destroy();
 out8:
+#ifdef CONFIG_KEYS
 	nfs_idmap_quit();
 out9:
+#endif
+#ifdef CONFIG_KRG_MM
+	krgsyms_unregister(KRGSYMS_VM_OPS_NFS_FILE);
+out10:
+#endif
 	return err;
 }
 
@@ -1796,7 +1813,9 @@ static void __exit exit_nfs_fs(void)
 	nfs_destroy_nfspagecache();
 	nfs_fscache_unregister();
 	nfs_dns_resolver_destroy();
+#ifdef CONFIG_KEYS
 	nfs_idmap_quit();
+#endif
 #ifdef CONFIG_PROC_FS
 	rpc_proc_unregister("nfs");
 #endif
@@ -1804,6 +1823,9 @@ static void __exit exit_nfs_fs(void)
 	unregister_nfs_fs();
 	nfs_fs_proc_exit();
 	nfsiod_stop();
+#ifdef CONFIG_KRG_MM
+	krgsyms_unregister(KRGSYMS_VM_OPS_NFS_FILE);
+#endif
 }
 
 /* Not quite true; I just maintain it */

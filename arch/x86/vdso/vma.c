@@ -121,6 +121,24 @@ static unsigned long vdso_addr(unsigned long start, unsigned len)
 	return addr;
 }
 
+#ifdef CONFIG_KRG_MM
+void import_vdso_context(struct vm_area_struct *vma)
+{
+	if (!vdso_enabled)
+		return;
+
+	vma->vm_private_data = vdso_pages;
+
+	BUG_ON(vma->vm_start != (unsigned long)vma->vm_mm->context.vdso);
+	BUG_ON(vma->vm_end != vma->vm_start + vdso_size);
+}
+
+int import_mm_struct_end(struct mm_struct *mm, struct task_struct *task)
+{
+	return 0;
+}
+#endif
+
 /* Setup a VMA at program startup for the vsyscall page.
    Not called for compat tasks */
 int arch_setup_additional_pages(struct linux_binprm *bprm, int uses_interp)

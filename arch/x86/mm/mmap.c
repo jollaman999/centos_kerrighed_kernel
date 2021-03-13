@@ -146,6 +146,9 @@ void arch_pick_mmap_layout(struct mm_struct *mm)
  */
 bool pfn_modify_allowed(unsigned long pfn, pgprot_t prot)
 {
+#ifdef CONFIG_KRG_EPM
+	return true;
+#else
 	if (!boot_cpu_has_bug(X86_BUG_L1TF))
 		return true;
 	if (!__pte_needs_invert(pgprot_val(prot)))
@@ -156,4 +159,5 @@ bool pfn_modify_allowed(unsigned long pfn, pgprot_t prot)
 	if (pfn > l1tf_pfn_limit() && !capable(CAP_SYS_ADMIN))
 		return false;
 	return true;
+#endif
 }

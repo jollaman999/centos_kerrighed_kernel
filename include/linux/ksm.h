@@ -18,7 +18,11 @@ struct mem_cgroup;
 
 #ifdef CONFIG_KSM
 int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+#ifdef CONFIG_KRG_MM
+		unsigned long end, int advice, unsigned long long *vm_flags);
+#else
 		unsigned long end, int advice, unsigned long *vm_flags);
+#endif
 int __ksm_enter(struct mm_struct *mm);
 void __ksm_exit(struct mm_struct *mm);
 
@@ -73,8 +77,13 @@ static inline void set_page_stable_node(struct page *page,
 struct page *ksm_might_need_to_copy(struct page *page,
 			struct vm_area_struct *vma, unsigned long address);
 
+#ifdef CONFIG_KRG_MM
+int page_referenced_ksm(struct page *page,
+			struct mem_cgroup *memcg, unsigned long long *vm_flags);
+#else
 int page_referenced_ksm(struct page *page,
 			struct mem_cgroup *memcg, unsigned long *vm_flags);
+#endif
 int try_to_unmap_ksm(struct page *page, enum ttu_flags flags);
 int rmap_walk_ksm(struct page *page, struct rmap_walk_control *rwc);
 void ksm_migrate_page(struct page *newpage, struct page *oldpage);
@@ -97,7 +106,11 @@ static inline int PageKsm(struct page *page)
 
 #ifdef CONFIG_MMU
 static inline int ksm_madvise(struct vm_area_struct *vma, unsigned long start,
+#ifdef CONFIG_KRG_MM
+		unsigned long end, int advice, unsigned long long *vm_flags)
+#else
 		unsigned long end, int advice, unsigned long *vm_flags)
+#endif
 {
 	return 0;
 }
@@ -109,7 +122,11 @@ static inline struct page *ksm_might_need_to_copy(struct page *page,
 }
 
 static inline int page_referenced_ksm(struct page *page,
+#ifdef CONFIG_KRG_MM
+			struct mem_cgroup *memcg, unsigned long long *vm_flags)
+#else
 			struct mem_cgroup *memcg, unsigned long *vm_flags)
+#endif
 {
 	return 0;
 }

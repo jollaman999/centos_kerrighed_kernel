@@ -27,6 +27,7 @@
 #include <linux/kdebug.h>
 #include <linux/smp.h>
 
+#include <asm/nmi.h>
 #include <asm/i8259.h>
 #include <asm/io_apic.h>
 #include <asm/proto.h>

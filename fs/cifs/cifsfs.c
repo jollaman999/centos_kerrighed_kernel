@@ -1133,8 +1133,8 @@ out_unregister_slow_work:
 out_unregister_resolver_key:
 #ifdef CONFIG_CIFS_DFS_UPCALL
 	cifs_exit_dns_resolver();
-#endif
 out_init_cifs_idmap:
+#endif
 #ifdef CONFIG_CIFS_ACL
 	exit_cifs_idmap();
 out_register_key_type:

@@ -142,13 +142,24 @@ static inline unsigned long pmd_pfn(pmd_t pmd)
 {
 	phys_addr_t pfn = pmd_val(pmd);
 	pfn ^= protnone_mask(pfn);
+#ifdef CONFIG_KRG_MM
+	return (pfn & PTE_PFN_MASK) >> PAGE_SHIFT;
+#else
 	return (pfn & pmd_pfn_mask(pmd)) >> PAGE_SHIFT;
+#endif
 }
 
+#ifdef CONFIG_KRG_MM
+static inline unsigned long pud_pfn(pud_t pud)
+{
+	return (pud_val(pud) & PTE_PFN_MASK) >> PAGE_SHIFT;
+}
+#else
 static inline unsigned long pud_pfn(pud_t pud)
 {
 	return (pud_val(pud) & pud_pfn_mask(pud)) >> PAGE_SHIFT;
 }
+#endif
 
 static inline unsigned long pgd_pfn(pgd_t pgd)
 {
@@ -159,7 +170,12 @@ static inline unsigned long pgd_pfn(pgd_t pgd)
 
 static inline int pmd_large(pmd_t pte)
 {
+#ifdef CONFIG_KRG_MM
+	return (pmd_flags(pte) & (_PAGE_PSE | _PAGE_PRESENT)) ==
+		(_PAGE_PSE | _PAGE_PRESENT);
+#else
 	return pmd_flags(pte) & _PAGE_PSE;
+#endif
 }
 
 static inline pte_t pte_set_flags(pte_t pte, pteval_t set)
@@ -254,7 +270,9 @@ static inline pte_t pfn_pte(unsigned long page_nr, pgprot_t pgprot)
 {
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
 	pfn ^= protnone_mask(pgprot_val(pgprot));
+#ifndef CONFIG_KRG_MM
 	pfn &= PTE_PFN_MASK;
+#endif
 	return __pte(pfn | massage_pgprot(pgprot));
 }
 
@@ -262,7 +280,9 @@ static inline pmd_t pfn_pmd(unsigned long page_nr, pgprot_t pgprot)
 {
 	phys_addr_t pfn = (phys_addr_t)page_nr << PAGE_SHIFT;
 	pfn ^= protnone_mask(pgprot_val(pgprot));
+#ifndef CONFIG_KRG_MM
 	pfn &= PHYSICAL_PMD_PAGE_MASK;
+#endif
 	return __pmd(pfn | massage_pgprot(pgprot));
 }
 
@@ -449,6 +469,9 @@ static inline int pte_hidden(pte_t pte)
 
 static inline int pmd_present(pmd_t pmd)
 {
+#ifdef CONFIG_KRG_MM
+	return pmd_flags(pmd) & _PAGE_PRESENT;
+#else
 	/*
 	 * Checking for _PAGE_PSE is needed too because
 	 * split_huge_page will temporarily clear the present bit (but
@@ -456,6 +479,7 @@ static inline int pmd_present(pmd_t pmd)
 	 * _PAGE_PRESENT bit is clear).
 	 */
 	return pmd_flags(pmd) & (_PAGE_PRESENT | _PAGE_PROTNONE | _PAGE_PSE);
+#endif
 }
 
 static inline int pmd_none(pmd_t pmd)
@@ -465,10 +489,17 @@ static inline int pmd_none(pmd_t pmd)
 	return (unsigned long)native_pmd_val(pmd) == 0;
 }
 
+#ifdef CONFIG_KRG_MM
+static inline unsigned long pmd_page_vaddr(pmd_t pmd)
+{
+	return (unsigned long)__va(pmd_val(pmd) & PTE_PFN_MASK);
+}
+#else
 static inline unsigned long pmd_page_vaddr(pmd_t pmd)
 {
 	return (unsigned long)__va(pmd_val(pmd) & pmd_pfn_mask(pmd));
 }
+#endif
 
 /*
  * Currently stuck as a macro due to indirect forward reference to
@@ -536,10 +567,17 @@ static inline int pud_present(pud_t pud)
 	return pud_flags(pud) & _PAGE_PRESENT;
 }
 
+#ifdef CONFIG_KRG_MM
+static inline unsigned long pud_page_vaddr(pud_t pud)
+{
+	return (unsigned long)__va(pud_val(pud) & PTE_PFN_MASK);
+}
+#else
 static inline unsigned long pud_page_vaddr(pud_t pud)
 {
 	return (unsigned long)__va(pud_val(pud) & pud_pfn_mask(pud));
 }
+#endif
 
 /*
  * Currently stuck as a macro due to indirect forward reference to
@@ -768,13 +806,52 @@ static inline void clone_pgd_range(pgd_t *dst, pgd_t *src, int count)
 #endif
 }
 
+#ifdef CONFIG_KRG_MM
+struct kddm_obj;
+static inline void set_pte_obj_entry(pte_t *ptep, struct kddm_obj *obj)
+{
+	pte_t pte = __pte((unsigned long)obj);
+	pte = pte_set_flags(pte, _PAGE_OBJ_ENTRY);
+	set_pte(ptep, pte);
+}
+
+static inline void set_swap_pte_obj_entry(pte_t *ptep, struct kddm_obj *obj)
+{
+	pte_t pte = __pte((unsigned long)obj);
+	pte = pte_set_flags(pte, _PAGE_OBJ_ENTRY | _PAGE_FILE);
+	set_pte(ptep, pte);
+}
+
+static inline struct kddm_obj *get_pte_obj_entry(pte_t *ptep)
+{
+	return (struct kddm_obj *)(pte_val(*ptep) & (~(_PAGE_OBJ_ENTRY |
+						       _PAGE_FILE)));
+}
+
+static inline int pte_obj_entry(pte_t *ptep)
+{
+	return ((pte_val(*ptep) & _PAGE_OBJ_ENTRY) && (!pte_present(*ptep)));
+}
+
+static inline int swap_pte_obj_entry(pte_t *ptep)
+{
+	return ((pte_val(*ptep) & _PAGE_OBJ_ENTRY) &&
+		(pte_val(*ptep) & _PAGE_FILE) &&
+		(!pte_present(*ptep)));
+}
+
+#endif /* KRG_MM */
 
 #define __HAVE_ARCH_PFN_MODIFY_ALLOWED 1
 extern bool pfn_modify_allowed(unsigned long pfn, pgprot_t prot);
 
 static inline bool arch_has_pfn_modify_check(void)
 {
+#ifdef CONFIG_KRG_EPM
+	return false;
+#else
 	return boot_cpu_has_bug(X86_BUG_L1TF);
+#endif
 }
 
 #include <asm-generic/pgtable.h>

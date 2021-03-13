@@ -19,7 +19,9 @@
 #include <linux/fsnotify.h>
 #include <linux/audit.h>
 #include <asm/uaccess.h>
-
+#ifdef CONFIG_KRG_FAF
+#include <kerrighed/faf.h>
+#endif
 
 /*
  * Check permissions for extended attribute access.  This is a bit complicated
@@ -334,6 +336,13 @@ SYSCALL_DEFINE5(fsetxattr, int, fd, const char __user *, name,
 	f = fget(fd);
 	if (!f)
 		return error;
+
+#ifdef CONFIG_KRG_FAF
+	if (f->f_flags & O_FAF_CLT) {
+		error = krg_faf_fsetxattr(f, name, value, size, flags);
+		goto out;
+	}
+#endif
 	dentry = f->f_path.dentry;
 	audit_inode(NULL, dentry, 0);
 	error = mnt_want_write_file(f);
@@ -341,6 +350,9 @@ SYSCALL_DEFINE5(fsetxattr, int, fd, const char __user *, name,
 		error = setxattr(dentry, name, value, size, flags);
 		mnt_drop_write(f->f_path.mnt);
 	}
+#ifdef CONFIG_KRG_FAF
+out:
+#endif
 	fput(f);
 	return error;
 }
@@ -425,8 +437,18 @@ SYSCALL_DEFINE4(fgetxattr, int, fd, const char __user *, name,
 	f = fget(fd);
 	if (!f)
 		return error;
+
+#ifdef CONFIG_KRG_FAF
+	if (f->f_flags & O_FAF_CLT) {
+		error = krg_faf_fgetxattr(f, name, value, size);
+		goto out;
+	}
+#endif
 	audit_inode(NULL, f->f_path.dentry, 0);
 	error = getxattr(f->f_path.dentry, name, value, size);
+#ifdef CONFIG_KRG_FAF
+out:
+#endif
 	fput(f);
 	return error;
 }
@@ -507,8 +529,18 @@ SYSCALL_DEFINE3(flistxattr, int, fd, char __user *, list, size_t, size)
 	f = fget(fd);
 	if (!f)
 		return error;
+
+#ifdef CONFIG_KRG_FAF
+	if (f->f_flags & O_FAF_CLT) {
+		error = krg_faf_flistxattr(f, list, size);
+		goto out;
+	}
+#endif
 	audit_inode(NULL, f->f_path.dentry, 0);
 	error = listxattr(f->f_path.dentry, list, size);
+#ifdef CONFIG_KRG_FAF
+out:
+#endif
 	fput(f);
 	return error;
 }
@@ -586,6 +618,13 @@ SYSCALL_DEFINE2(fremovexattr, int, fd, const char __user *, name)
 	f = fget(fd);
 	if (!f)
 		return error;
+
+#ifdef CONFIG_KRG_FAF
+	if (f->f_flags & O_FAF_CLT) {
+		error = krg_faf_fremovexattr(f, name);
+		goto out;
+	}
+#endif
 	dentry = f->f_path.dentry;
 	audit_inode(NULL, dentry, 0);
 	error = mnt_want_write_file(f);
@@ -593,6 +632,9 @@ SYSCALL_DEFINE2(fremovexattr, int, fd, const char __user *, name)
 		error = removexattr(dentry, name);
 		mnt_drop_write(f->f_path.mnt);
 	}
+#ifdef CONFIG_KRG_FAF
+out:
+#endif
 	fput(f);
 	return error;
 }

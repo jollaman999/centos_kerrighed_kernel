@@ -11,6 +11,10 @@
 #include <linux/blk_types.h>
 #include <linux/types.h>
 
+#ifdef CONFIG_KRG_FAF
+#include <asm/statfs.h>
+#endif
+
 /*
  * It's silly to have NR_OPEN bigger than NR_FILE, but you can change
  * the file limit at runtime and only root can increase the per-process
@@ -273,6 +277,9 @@ struct inodes_stat_t {
 #define S_NOCMTIME	128	/* Do not update file c/mtime */
 #define S_SWAPFILE	256	/* Do not truncate: swapon got its bmaps */
 #define S_PRIVATE	512	/* Inode is fs-internal */
+#ifdef CONFIG_KRG_FAF
+#define S_IFAF          1024
+#endif
 #define S_AUTOMOUNT	2048	/* Automount/referral quasi-directory */
 #define S_AOP_EXT	16384 /* fs supports extended aops */
 
@@ -701,6 +708,9 @@ struct address_space {
 	spinlock_t		private_lock;	/* for use by the address_space */
 	struct list_head	private_list;	/* ditto */
 	struct address_space	*assoc_mapping;	/* ditto */
+#ifdef CONFIG_KRG_DVFS
+	struct kddm_set         *kddm_set;
+#endif
 } __attribute__((aligned(sizeof(long))));
 	/*
 	 * On most architectures that alignment is already the case; but
@@ -829,9 +839,18 @@ struct inode {
 
 	__u32			i_generation;
 
+#ifdef CONFIG_KRG_DVFS
+	unsigned long           i_objid;
+#endif
+
 #ifdef CONFIG_FSNOTIFY
 	__u32			i_fsnotify_mask; /* all events this inode cares about */
 	struct hlist_head	i_fsnotify_mark_entries; /* fsnotify mark entries */
+#endif
+
+#ifdef CONFIG_DNOTIFY
+	unsigned long		i_dnotify_mask; /* Directory notify events */
+	struct dnotify_struct	*i_dnotify; /* for directory notifications */
 #endif
 
 #ifdef CONFIG_INOTIFY
@@ -995,7 +1014,11 @@ struct file {
 	const struct file_operations	*f_op;
 	spinlock_t		f_lock;  /* f_ep_links, f_flags, no IRQ */
 	atomic_long_t		f_count;
+#ifdef CONFIG_KRG_FAF
+	unsigned long           f_flags;
+#else
 	unsigned int 		f_flags;
+#endif
 	fmode_t			f_mode;
 	loff_t			f_pos;
 	struct fown_struct	f_owner;
@@ -1006,6 +1029,13 @@ struct file {
 #ifdef CONFIG_SECURITY
 	void			*f_security;
 #endif
+#ifdef CONFIG_KRG_DVFS
+	unsigned long           f_objid;
+#endif
+#ifdef CONFIG_KRG_FAF
+	unsigned long           f_faf_srv_index;
+#endif
+
 	/* needed for tty driver, and maybe others */
 	void			*private_data;
 
@@ -2058,7 +2088,12 @@ extern void drop_collected_mounts(struct vfsmount *);
 
 extern int vfs_statfs(struct path *, struct kstatfs *);
 extern int user_statfs(const char __user *, struct kstatfs *);
+#ifdef CONFIG_KRG_FAF
+extern int fd_statfs(int fd, struct kstatfs *, int *,
+	      struct statfs __user *);
+#else
 extern int fd_statfs(int, struct kstatfs *);
+#endif
 extern int statfs_by_dentry(struct dentry *, struct kstatfs *);
 
 extern int current_umask(void);
@@ -2464,6 +2499,7 @@ static inline void insert_inode_hash(struct inode *inode) {
 	__insert_inode_hash(inode, inode->i_ino);
 }
 
+extern struct file * get_empty_filp(void);
 extern void file_move(struct file *f, struct list_head *list);
 extern void file_kill(struct file *f);
 #ifdef CONFIG_BLOCK
@@ -2622,6 +2658,9 @@ void inode_set_bytes(struct inode *inode, loff_t bytes);
 
 extern int vfs_readdir(struct file *, filldir_t, void *);
 
+#ifdef CONFIG_KRG_DVFS
+extern int do_fstat(struct file *file, struct kstat *stat);
+#endif
 extern int vfs_stat(char __user *, struct kstat *);
 extern int vfs_lstat(char __user *, struct kstat *);
 extern int vfs_fstat(unsigned int, struct kstat *);
