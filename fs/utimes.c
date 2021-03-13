@@ -11,10 +11,6 @@
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
-
 #ifdef __ARCH_WANT_SYS_UTIME
 
 /*
@@ -153,13 +149,6 @@ long do_utimes(int dfd, char __user *filename, struct timespec *times, int flags
 		if (!file)
 			goto out;
 
-#ifdef CONFIG_KRG_EPM
-		if (file->f_flags & O_FAF_CLT) {
-			error = krg_faf_utimes(file, times, flags);
-			fput(file);
-			goto out;
-		}
-#endif
 		error = utimes_common(&file->f_path, times);
 		fput(file);
 	} else {

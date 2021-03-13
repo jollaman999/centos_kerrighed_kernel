@@ -23,14 +23,6 @@
 #include <linux/syscalls.h>
 #include <linux/rcupdate.h>
 
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
-
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
-
 struct timerfd_ctx {
 	struct hrtimer tmr;
 	ktime_t tintv;
@@ -255,10 +247,7 @@ static ssize_t timerfd_read(struct file *file, char __user *buf, size_t count,
 	return res;
 }
 
-#ifndef CONFIG_KRG_DVFS
-static
-#endif
-const struct file_operations timerfd_fops = {
+static const struct file_operations timerfd_fops = {
 	.release	= timerfd_release,
 	.poll		= timerfd_poll,
 	.read		= timerfd_read,
@@ -271,13 +260,6 @@ static struct file *timerfd_fget(int fd)
 	file = fget(fd);
 	if (!file)
 		return ERR_PTR(-EBADF);
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		faf_error(file, "timerfd");
-		fput(file);
-		return ERR_PTR(-ENOSYS);
-	}
-#endif
 	if (file->f_op != &timerfd_fops) {
 		fput(file);
 		return ERR_PTR(-EINVAL);

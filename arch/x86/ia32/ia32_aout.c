@@ -26,9 +26,6 @@
 #include <linux/personality.h>
 #include <linux/init.h>
 #include <linux/jiffies.h>
-#ifdef CONFIG_KRG_EPM
-#include <kerrighed/krgsyms.h>
-#endif
 
 #include <asm/system.h>
 #include <asm/uaccess.h>
@@ -536,24 +533,11 @@ out:
 
 static int __init init_aout_binfmt(void)
 {
-#ifdef CONFIG_KRG_EPM
-	int retval;
-
-	krgsyms_register(KRGSYMS_BINFMTS_ARCH, &aout_format);
-	retval = register_binfmt(&aout_format);
-	if (retval)
-		krgsyms_unregister(KRGSYMS_BINFMTS_ARCH);
-	return retval;
-#else
 	return register_binfmt(&aout_format);
-#endif
 }
 
 static void __exit exit_aout_binfmt(void)
 {
-#ifdef CONFIG_KRG_EPM
-	krgsyms_unregister(KRGSYMS_BINFMTS_ARCH);
-#endif
 	unregister_binfmt(&aout_format);
 }
 

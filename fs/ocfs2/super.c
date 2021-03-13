@@ -46,10 +46,6 @@
 #define MLOG_MASK_PREFIX ML_SUPER
 #include <cluster/masklog.h>
 
-#ifdef CONFIG_KRG_MM
-#include <kerrighed/krgsyms.h>
-#endif
-
 #include "ocfs2.h"
 
 /* this should be the only file to include a version 1 header */
@@ -75,12 +71,6 @@
 #include "refcounttree.h"
 
 #include "buffer_head_io.h"
-
-#ifdef CONFIG_KRG_MM
-struct vm_operations_struct;
-
-extern struct vm_operations_struct ocfs2_file_vm_ops;
-#endif
 
 static struct kmem_cache *ocfs2_inode_cachep = NULL;
 struct kmem_cache *ocfs2_dquot_cachep;
@@ -1558,12 +1548,6 @@ static int __init ocfs2_init(void)
 	if (status)
 		goto leave;
 
-#ifdef CONFIG_KRG_MM
-	status = krgsyms_register(KRGSYMS_VM_OPS_OCFS2_FILE, &ocfs2_file_vm_ops);
-	if (status)
-		goto leave;
-#endif
-
 	ocfs2_set_locking_protocol();
 
 	status = register_quota_format(&ocfs2_quota_format);
@@ -1572,9 +1556,6 @@ leave:
 		ocfs2_quota_shutdown();
 		ocfs2_free_mem_caches();
 		exit_ocfs2_uptodate_cache();
-#ifdef CONFIG_KRG_MM
-		krgsyms_unregister(KRGSYMS_VM_OPS_OCFS2_FILE);
-#endif
 	}
 
 	mlog_exit(status);
@@ -1587,10 +1568,6 @@ leave:
 
 static void __exit ocfs2_exit(void)
 {
-#ifdef CONFIG_KRG_MM
-	krgsyms_unregister(KRGSYMS_VM_OPS_OCFS2_FILE);
-#endif
-
 	mlog_entry_void();
 
 	ocfs2_quota_shutdown();

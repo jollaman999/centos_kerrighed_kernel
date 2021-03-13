@@ -100,10 +100,6 @@
 #include <linux/sched.h>		/* For struct task_struct.  */
 #include <linux/err.h>			/* for IS_ERR_VALUE */
 
-#ifdef CONFIG_KRG_EPM
-#include <kerrighed/children.h>
-#endif
-
 extern void ptrace_notify_stop(struct task_struct *tracee);
 extern long arch_ptrace(struct task_struct *child, long request, long addr, long data);
 extern int ptrace_traceme(void);
@@ -130,22 +126,9 @@ extern void exit_ptrace(struct task_struct *tracer);
 extern int __ptrace_may_access(struct task_struct *task, unsigned int mode);
 /* Returns true on success, false on denial. */
 extern bool ptrace_may_access(struct task_struct *task, unsigned int mode);
-#ifdef CONFIG_KRG_EPM
-extern
-int krg_ptrace_link(struct task_struct *task, struct task_struct *tracer);
-extern void krg_ptrace_unlink(struct task_struct *task);
-extern void krg_ptrace_reparent_ptraced(struct task_struct *real_parent,
-					struct task_struct *task);
-#endif /* CONFIG_KRG_EPM */
 
 static inline int ptrace_reparented(struct task_struct *child)
 {
-#ifdef CONFIG_KRG_EPM
-/*
- * if (child->parent == baby_sitter || child->real_parent == baby_sitter)
- *		return child->task_obj->parent != child->task_obj->real_parent;
- */
-#endif
 	return child->real_parent != child->parent;
 }
 
@@ -208,21 +191,8 @@ static inline void ptrace_init_task(struct task_struct *child, bool ptrace)
 	child->parent = child->real_parent;
 	child->ptrace = 0;
 	if (unlikely(ptrace) && (current->ptrace & PT_PTRACED)) {
-#ifdef CONFIG_KRG_EPM
-		int ret;
-#endif
-
 		child->ptrace = current->ptrace;
-#ifdef CONFIG_KRG_EPM
-		ret = krg_ptrace_link(child, current->parent);
-		BUG_ON(ret);
-		ret = krg_set_child_ptraced(child->parent_children_obj,
-					    child, 1);
-		BUG_ON(ret);
 		__ptrace_link(child, current->parent);
-#else
-		__ptrace_link(child, current->parent);
-#endif
 	}
 }
 

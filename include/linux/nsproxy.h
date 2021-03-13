@@ -10,12 +10,6 @@ struct ipc_namespace;
 struct pid_namespace;
 struct fs_struct;
 
-#ifdef CONFIG_KRG_EPM
-struct kmem_cache;
-
-extern struct kmem_cache *nsproxy_cachep;
-#endif
-
 /*
  * A structure to contain pointers to all per-process
  * namespaces - fs (mount), uts, network, sysvipc, etc.
@@ -35,9 +29,6 @@ struct nsproxy {
 	struct mnt_namespace *mnt_ns;
 	struct pid_namespace *pid_ns;
 	struct net 	     *net_ns;
-#ifdef CONFIG_KRG_HOTPLUG
-	struct krg_namespace *krg_ns;
-#endif
 };
 extern struct nsproxy init_nsproxy;
 

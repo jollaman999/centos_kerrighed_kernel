@@ -253,10 +253,6 @@ extern void oops_exit(void);
 extern int oops_may_print(void);
 NORET_TYPE void do_exit(long error_code)
 	ATTRIB_NORET;
-#ifdef CONFIG_KRG_EPM
-NORET_TYPE void do_exit_wo_notify(long code)
-	ATTRIB_NORET;
-#endif
 NORET_TYPE void complete_and_exit(struct completion *, long)
 	ATTRIB_NORET;
 
@@ -709,12 +705,6 @@ extern int hex_to_bin(char ch);
 #define pr_debug_ratelimited(fmt, ...) \
 	({ if (0) printk_ratelimited(KERN_DEBUG pr_fmt(fmt), \
 				     ##__VA_ARGS__); 0; })
-#endif
-
-#ifdef CONFIG_KERRIGHED
-#define pr_kerrighed(fmt, ...) do { \
-		dynamic_pr_kerrighed(fmt, ##__VA_ARGS__);	\
-	} while (0)
 #endif
 
 /*

@@ -57,25 +57,10 @@
 #include <linux/pipe_fs_i.h>
 #include <linux/oom.h>
 
-#ifdef CONFIG_KRG_CAP
-#include <kerrighed/capabilities.h>
-#endif
-#ifdef CONFIG_KRG_PROC
-#include <kerrighed/task.h>
-#include <kerrighed/krginit.h>
-#endif
-#ifdef CONFIG_KRG_EPM
-#include <kerrighed/signal.h>
-#endif
-
 #include <asm/uaccess.h>
 #include <asm/mmu_context.h>
 #include <asm/tlb.h>
 #include "internal.h"
-
-#ifdef CONFIG_KRG_MM
-extern unique_id_root_t mm_struct_unique_id_root;
-#endif
 
 int core_uses_pid;
 char core_pattern[CORENAME_MAX_SIZE] = "core";
@@ -654,11 +639,7 @@ int setup_arg_pages(struct linux_binprm *bprm,
 	struct mm_struct *mm = current->mm;
 	struct vm_area_struct *vma = bprm->vma;
 	struct vm_area_struct *prev = NULL;
-#ifdef CONFIG_KRG_MM
-	unsigned long long vm_flags;
-#else
 	unsigned long vm_flags;
-#endif
 	unsigned long stack_base;
 	unsigned long stack_size;
 	unsigned long stack_expand;
@@ -727,11 +708,6 @@ int setup_arg_pages(struct linux_binprm *bprm,
 
 	/* mprotect_fixup is overkill to remove the temporary stack flags */
 	vma->vm_flags &= ~VM_STACK_INCOMPLETE_SETUP;
-
-#ifdef CONFIG_KRG_MM
-	if (mm->anon_vma_kddm_set)
-		krg_check_vma_link(vma);
-#endif
 
 	stack_expand = EXTRA_STACK_VM_PAGES * PAGE_SIZE;
 	stack_size = vma->vm_end - vma->vm_start;
@@ -819,12 +795,6 @@ static int exec_mmap(struct mm_struct *mm)
 {
 	struct task_struct *tsk;
 	struct mm_struct * old_mm, *active_mm;
-#ifdef CONFIG_KRG_MM
-	unique_id_t mm_id = 0;
-
-	if (kh_mm_release)
-		mm->mm_id = get_unique_id(&mm_struct_unique_id_root);
-#endif
 
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
@@ -838,10 +808,6 @@ static int exec_mmap(struct mm_struct *mm)
 		 * through with the exec.  We must hold mmap_sem around
 		 * checking core_state and changing tsk->mm.
 		 */
-#ifdef CONFIG_KRG_MM
-		if (!krgnodes_empty(old_mm->copyset))
-			mm_id = old_mm->mm_id;
-#endif
 		down_read(&old_mm->mmap_sem);
 		if (unlikely(old_mm->core_state)) {
 			up_read(&old_mm->mmap_sem);
@@ -864,10 +830,6 @@ static int exec_mmap(struct mm_struct *mm)
 		BUG_ON(active_mm != old_mm);
 		mm_update_next_owner(old_mm);
 		mmput(old_mm);
-#ifdef CONFIG_KRG_MM
-		if (mm_id)
-			kh_mm_release(old_mm, 1);
-#endif
 		return 0;
 	}
 	mmdrop(active_mm);
@@ -923,20 +885,11 @@ static int de_thread(struct task_struct *tsk)
 	 */
 	if (!thread_group_leader(tsk)) {
 		struct task_struct *leader = tsk->group_leader;
-#ifdef CONFIG_KRG_PROC
-		struct task_kddm_object *obj;
-#endif
-#ifdef CONFIG_KRG_EPM
-		struct children_kddm_object *parent_children_obj;
-#endif
 
-#ifdef CONFIG_KRG_PROC
-		down_read(&kerrighed_init_sem);
-#endif
 		sig->notify_count = -1;	/* for exit_notify() */
 		for (;;) {
 			threadgroup_change_begin(tsk);
-			write_lock_irq(&tasklist_lock);
+			tasklist_write_lock_irq();
 			if (likely(leader->exit_state))
 				break;
 			__set_current_state(TASK_UNINTERRUPTIBLE);
@@ -945,33 +898,6 @@ static int de_thread(struct task_struct *tsk)
 			schedule();
 		}
 
-#ifdef CONFIG_KRG_EPM
-		parent_children_obj = rcu_dereference(tsk->parent_children_obj);
-#endif
-#ifdef CONFIG_KRG_PROC
-		/* tsk's pid will disappear just below. */
-		obj = leader->task_obj;
-		BUG_ON(!obj ^ !tsk->task_obj);
-		if (
-		    obj
-#ifdef CONFIG_KRG_EPM
-		    || parent_children_obj
-#endif
-		   ) {
-			write_unlock_irq(&tasklist_lock);
-
-#ifdef CONFIG_KRG_EPM
-			parent_children_obj =
-				krg_children_prepare_de_thread(tsk);
-#endif
-			krg_task_free(tsk);
-
-			if (obj)
-				__krg_task_writelock(leader);
-
-			write_lock_irq(&tasklist_lock);
-		}
-#endif /* CONFIG_KRG_PROC */
 		/*
 		 * The only record we have of the real-time age of a
 		 * process, regardless of execs it's done, is start_time.
@@ -1004,12 +930,6 @@ static int de_thread(struct task_struct *tsk)
 		transfer_pid(leader, tsk, PIDTYPE_PGID);
 		transfer_pid(leader, tsk, PIDTYPE_SID);
 		list_replace_rcu(&leader->tasks, &tsk->tasks);
-#ifdef CONFIG_KRG_PROC
-		rcu_assign_pointer(leader->task_obj, NULL);
-		if (obj)
-			rcu_assign_pointer(obj->task, tsk);
-		rcu_assign_pointer(tsk->task_obj, obj);
-#endif
 
 		tsk->group_leader = tsk;
 		leader->group_leader = tsk;
@@ -1019,20 +939,9 @@ static int de_thread(struct task_struct *tsk)
 		BUG_ON(leader->exit_state != EXIT_ZOMBIE);
 		leader->exit_state = EXIT_DEAD;
 		write_unlock_irq(&tasklist_lock);
-#ifdef CONFIG_KRG_PROC
-		/* tsk has taken leader's pid. */
-		if (obj)
-			__krg_task_unlock(tsk);
-#endif /* CONFIG_KRG_PROC */
-#ifdef CONFIG_KRG_EPM
-		krg_children_finish_de_thread(parent_children_obj, tsk);
-#endif
 		threadgroup_change_end(tsk);
 
 		release_task(leader);
-#ifdef CONFIG_KRG_PROC
-		up_read(&kerrighed_init_sem);
-#endif
 	}
 
 	sig->group_exit_task = NULL;
@@ -1058,25 +967,14 @@ no_thread_group:
 		atomic_set(&newsighand->count, 1);
 		memcpy(newsighand->action, oldsighand->action,
 		       sizeof(newsighand->action));
-#ifdef CONFIG_KRG_EPM
-		down_read(&kerrighed_init_sem);
 
-		krg_sighand_alloc_unshared(tsk, newsighand);
-#endif
-
-		write_lock_irq(&tasklist_lock);
+		tasklist_write_lock_irq();
 		spin_lock(&oldsighand->siglock);
 		rcu_assign_pointer(tsk->sighand, newsighand);
 		spin_unlock(&oldsighand->siglock);
 		write_unlock_irq(&tasklist_lock);
 
-#ifdef CONFIG_KRG_EPM
-		krg_sighand_cleanup(oldsighand);
-
-		up_read(&kerrighed_init_sem);
-#else
 		__cleanup_sighand(oldsighand);
-#endif
 	}
 
 	BUG_ON(!thread_group_leader(tsk));
@@ -1235,9 +1133,6 @@ void setup_new_exec(struct linux_binprm * bprm)
 	   group */
 
 	current->self_exec_id++;
-#ifdef CONFIG_KRG_EPM
-	krg_update_self_exec_id(current);
-#endif
 			
 	flush_signal_handlers(current, 0);
 	flush_old_files(current->files);
@@ -1412,12 +1307,6 @@ int prepare_binprm(struct linux_binprm *bprm)
 	if (retval)
 		return retval;
 	bprm->cred_prepared = 1;
-
-#ifdef CONFIG_KRG_CAP
-	retval = krg_cap_prepare_binprm(bprm);
-	if (retval)
-		return retval;
-#endif
 
 	memset(bprm->buf, 0, BINPRM_BUF_SIZE);
 	return kernel_read(bprm->file, 0, bprm->buf, BINPRM_BUF_SIZE);
@@ -1626,18 +1515,9 @@ int do_execve(const char * filename,
 	if (retval < 0)
 		goto out;
 
-#ifdef CONFIG_KRG_MM
-	retval = krg_do_execve(current, current->mm);
-	if (retval)
-		goto out;
-#endif
-
 	/* execve succeeded */
 	current->fs->in_exec = 0;
 	current->in_execve = 0;
-#ifdef CONFIG_KRG_CAP
-	krg_cap_finish_exec(bprm);
-#endif
 	acct_update_integrals(current);
 	free_bprm(bprm);
 	if (displaced)
@@ -1645,13 +1525,6 @@ int do_execve(const char * filename,
 	return retval;
 
 out:
-#ifdef CONFIG_KRG_EPM
-	/* Quiet the BUG_ON() in mmput() */
-	if (bprm->mm) {
-		acct_arg_size(bprm, 0);
-		atomic_dec(&bprm->mm->mm_ltasks);
-	}
-#endif
 	if (bprm->mm) {
 		acct_arg_size(bprm, 0);
 		mmput(bprm->mm);

@@ -131,10 +131,7 @@ ext4_file_write(struct kiocb *iocb, const struct iovec *iov,
 	return ret;
 }
 
-#ifndef CONFIG_KRG_MM
-static
-#endif
-const struct vm_operations_struct ext4_file_vm_ops = {
+static const struct vm_operations_struct ext4_file_vm_ops = {
 	.fault		= filemap_fault,
 	.page_mkwrite   = ext4_page_mkwrite,
 };

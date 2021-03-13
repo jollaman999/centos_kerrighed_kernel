@@ -42,12 +42,6 @@
 #include <asm/current.h>
 #include <asm/uaccess.h>
 #include "util.h"
-#ifdef CONFIG_KRG_IPC
-#include "krgmsg.h"
-#ifdef CONFIG_KRG_EPM
-#include <kerrighed/action.h>
-#endif
-#endif
 
 /*
  * one msg_receiver structure for each sleeping receiver:
@@ -74,15 +68,12 @@ struct msg_sender {
 #define SEARCH_NOTEQUAL		3
 #define SEARCH_LESSEQUAL	4
 
-#ifndef CONFIG_KRG_IPC
 #define msg_ids(ns)	((ns)->ids[IPC_MSG_IDS])
+
 #define msg_unlock(msq)		ipc_unlock(&(msq)->q_perm)
-#endif
 
 static void freeque(struct ipc_namespace *, struct kern_ipc_perm *);
-#ifndef CONFIG_KRG_IPC
 static int newque(struct ipc_namespace *, struct ipc_params *);
-#endif
 #ifdef CONFIG_PROC_FS
 static int sysvipc_msg_proc_show(struct seq_file *s, void *it);
 #endif
@@ -150,7 +141,6 @@ void __init msg_init(void)
 				IPC_MSG_IDS, sysvipc_msg_proc_show);
 }
 
-#ifndef CONFIG_KRG_IPC
 /*
  * msg_lock_(check_) routines are called in the paths where the rw_mutex
  * is not held.
@@ -164,7 +154,6 @@ static inline struct msg_queue *msg_lock(struct ipc_namespace *ns, int id)
 
 	return container_of(ipcp, struct msg_queue, q_perm);
 }
-#endif
 
 static inline struct msg_queue *msg_lock_check(struct ipc_namespace *ns,
 						int id)
@@ -182,7 +171,6 @@ static inline void msg_rmid(struct ipc_namespace *ns, struct msg_queue *s)
 	ipc_rmid(&msg_ids(ns), &s->q_perm);
 }
 
-#ifndef CONFIG_KRG_IPC
 static void msg_rcu_free(struct rcu_head *head)
 {
 	struct ipc_rcu *p = container_of(head, struct ipc_rcu, rcu);
@@ -191,7 +179,6 @@ static void msg_rcu_free(struct rcu_head *head)
 	security_msg_queue_free(msq);
 	ipc_rcu_free(head);
 }
-#endif
 
 /**
  * newque - Create a new msg queue
@@ -200,10 +187,7 @@ static void msg_rcu_free(struct rcu_head *head)
  *
  * Called with msg_ids.rw_mutex held (writer)
  */
-#ifndef CONFIG_KRG_IPC
-static
-#endif
-int newque(struct ipc_namespace *ns, struct ipc_params *params)
+static int newque(struct ipc_namespace *ns, struct ipc_params *params)
 {
 	struct msg_queue *msq;
 	int id, retval;
@@ -236,30 +220,11 @@ int newque(struct ipc_namespace *ns, struct ipc_params *params)
 	/*
 	 * ipc_addid() locks msq
 	 */
-#ifdef CONFIG_KRG_IPC
-	id = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni,
-		       params->requested_id);
-#else
 	id = ipc_addid(&msg_ids(ns), &msq->q_perm, ns->msg_ctlmni);
-#endif
 	if (id < 0) {
 		ipc_rcu_putref(msq, msg_rcu_free);
 		return id;
 	}
-
-#ifdef CONFIG_KRG_IPC
-	if (is_krg_ipc(&msg_ids(ns))) {
-		retval = krg_ipc_msg_newque(ns, msq) ;
-		if (retval) {
-			/* release locks held by ipc_addid */
-			local_ipc_unlock(&msq->q_perm);
-
-			ipc_rcu_putref(msq, msg_rcu_free);
-			return retval;
-		}
-	} else
-		msq->q_perm.krgops = NULL;
-#endif
 
 	msg_unlock(msq);
 
@@ -320,19 +285,7 @@ static void expunge_all(struct msg_queue *msq, int res)
  * msg_ids.rw_mutex (writer) and the spinlock for this message queue are held
  * before freeque() is called. msg_ids.rw_mutex remains locked on exit.
  */
-#ifdef CONFIG_KRG_IPC
 static void freeque(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp)
-{
-	if (is_krg_ipc(&msg_ids(ns)))
-		krg_ipc_msg_freeque(ns, ipcp);
-	else
-		local_master_freeque(ns, ipcp);
-}
-
-void local_master_freeque(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp)
-#else
-static void freeque(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp)
-#endif
 {
 	struct list_head *tmp;
 	struct msg_queue *msq = container_of(ipcp, struct msg_queue, q_perm);
@@ -340,11 +293,7 @@ static void freeque(struct ipc_namespace *ns, struct kern_ipc_perm *ipcp)
 	expunge_all(msq, -EIDRM);
 	ss_wakeup(&msq->q_senders, 1);
 	msg_rmid(ns, msq);
-#ifdef CONFIG_KRG_IPC
-	local_msg_unlock(msq);
-#else
 	msg_unlock(msq);
-#endif
 
 	tmp = msq->q_messages.next;
 	while (tmp != &msq->q_messages) {
@@ -586,32 +535,15 @@ SYSCALL_DEFINE3(msgctl, int, msqid, int, cmd, struct msqid_ds __user *, buf)
 		if (!buf)
 			return -EFAULT;
 
-#ifdef CONFIG_KRG_IPC
-		down_read(&msg_ids(ns).rw_mutex);
-#endif
 		if (cmd == MSG_STAT) {
 			msq = msg_lock(ns, msqid);
 			if (IS_ERR(msq))
-#ifdef CONFIG_KRG_IPC
-			{
-				up_read(&msg_ids(ns).rw_mutex);
 				return PTR_ERR(msq);
-			}
-#else
-				return PTR_ERR(msq);
-#endif
 			success_return = msq->q_perm.id;
 		} else {
 			msq = msg_lock_check(ns, msqid);
 			if (IS_ERR(msq))
-#ifdef CONFIG_KRG_IPC
-			{
-				up_read(&msg_ids(ns).rw_mutex);
 				return PTR_ERR(msq);
-			}
-#else
-				return PTR_ERR(msq);
-#endif
 			success_return = 0;
 		}
 		err = -EACCES;
@@ -634,9 +566,6 @@ SYSCALL_DEFINE3(msgctl, int, msqid, int, cmd, struct msqid_ds __user *, buf)
 		tbuf.msg_lspid  = msq->q_lspid;
 		tbuf.msg_lrpid  = msq->q_lrpid;
 		msg_unlock(msq);
-#ifdef CONFIG_KRG_IPC
-		up_read(&msg_ids(ns).rw_mutex);
-#endif
 		if (copy_msqid_to_user(buf, &tbuf, version))
 			return -EFAULT;
 		return success_return;
@@ -651,9 +580,6 @@ SYSCALL_DEFINE3(msgctl, int, msqid, int, cmd, struct msqid_ds __user *, buf)
 
 out_unlock:
 	msg_unlock(msq);
-#ifdef CONFIG_KRG_IPC
-	up_read(&msg_ids(ns).rw_mutex);
-#endif
 	return err;
 }
 
@@ -714,42 +640,12 @@ static inline int pipelined_send(struct msg_queue *msq, struct msg_msg *msg)
 	return 0;
 }
 
-#ifdef CONFIG_KRG_IPC
-long do_msgsnd(int msqid, long mtype, void __user *mtext,
-	       size_t msgsz, int msgflg)
-{
-	long r;
-	struct ipc_namespace *ns;
-	ns = current->nsproxy->ipc_ns;
-
-	if (msgsz > ns->msg_ctlmax || (long) msgsz < 0 || msqid < 0)
-		return -EINVAL;
-	if (mtype < 1)
-		return -EINVAL;
-
-	if (is_krg_ipc(&msg_ids(ns)))
-		r = krg_ipc_msgsnd(msqid, mtype, mtext, msgsz, msgflg,
-				  ns, task_tgid_vnr(current));
-	else {
-		r = __do_msgsnd(msqid, mtype, mtext, msgsz, msgflg,
-				ns, task_tgid_vnr(current));
-	}
-
-	return r;
-}
-
-long __do_msgsnd(int msqid, long mtype, void __user *mtext,
-		 size_t msgsz, int msgflg, struct ipc_namespace *ns,
-		 pid_t tgid)
-#else
 long do_msgsnd(int msqid, long mtype, void __user *mtext,
 		size_t msgsz, int msgflg)
-#endif
 {
 	struct msg_queue *msq;
 	struct msg_msg *msg;
 	int err;
-#ifndef CONFIG_KRG_IPC
 	struct ipc_namespace *ns;
 
 	ns = current->nsproxy->ipc_ns;
@@ -758,7 +654,6 @@ long do_msgsnd(int msqid, long mtype, void __user *mtext,
 		return -EINVAL;
 	if (mtype < 1)
 		return -EINVAL;
-#endif
 
 	msg = load_msg(mtext, msgsz);
 	if (IS_ERR(msg))
@@ -767,9 +662,6 @@ long do_msgsnd(int msqid, long mtype, void __user *mtext,
 	msg->m_type = mtype;
 	msg->m_ts = msgsz;
 
-#ifdef CONFIG_KRG_IPC
-	down_read(&msg_ids(ns).rw_mutex);
-#endif
 	msq = msg_lock_check(ns, msqid);
 	if (IS_ERR(msq)) {
 		err = PTR_ERR(msq);
@@ -798,57 +690,30 @@ long do_msgsnd(int msqid, long mtype, void __user *mtext,
 			goto out_unlock_free;
 		}
 		ss_add(msq, &s);
-#ifndef CONFIG_KRG_IPC
+
 		if (!ipc_rcu_getref(msq)) {
 			err = -EIDRM;
 			goto out_unlock_free;
 		}
-#endif
 
 		msg_unlock(msq);
-#ifdef CONFIG_KRG_IPC
-		up_read(&msg_ids(ns).rw_mutex);
-#endif
 		schedule();
 
-#ifdef CONFIG_KRG_IPC
-		down_read(&msg_ids(ns).rw_mutex);
-		msq = msg_lock_check(ns, msqid);
-		if (IS_ERR(msq)) {
-			err = -EIDRM;
-			goto out_free;
-		}
-#else
 		ipc_lock_by_ptr(&msq->q_perm);
 		ipc_rcu_putref(msq, ipc_rcu_free);
 		if (msq->q_perm.deleted) {
 			err = -EIDRM;
 			goto out_unlock_free;
 		}
-#endif
 		ss_del(&s);
 
-#if defined(CONFIG_KRG_IPC) && defined(CONFIG_KRG_EPM)
-		if (krg_action_any_pending(current)) {
-#ifdef CONFIG_KRG_DEBUG
-			printk("%s:%d - action kerrighed! --> need replay!!\n",
-			       __PRETTY_FUNCTION__, __LINE__);
-#endif
-			err = -ERESTARTSYS;
-			goto out_unlock_free;
-		}
-#endif
 		if (signal_pending(current)) {
 			err = -ERESTARTNOHAND;
 			goto out_unlock_free;
 		}
 	}
 
-#ifdef CONFIG_KRG_IPC
-	msq->q_lspid = tgid;
-#else
 	msq->q_lspid = task_tgid_vnr(current);
-#endif
 	msq->q_stime = get_seconds();
 
 	if (!pipelined_send(msq, msg)) {
@@ -868,11 +733,6 @@ out_unlock_free:
 out_free:
 	if (msg != NULL)
 		free_msg(msg);
-
-#ifdef CONFIG_KRG_IPC
-	up_read(&msg_ids(ns).rw_mutex);
-#endif
-
 	return err;
 }
 
@@ -905,58 +765,22 @@ static inline int convert_mode(long *msgtyp, int msgflg)
 	return SEARCH_EQUAL;
 }
 
-#ifdef CONFIG_KRG_IPC
-long do_msgrcv(int msqid, long *pmtype, void __user *mtext,
-	       size_t msgsz, long msgtyp, int msgflg)
-{
-	long r;
-	struct ipc_namespace *ns = current->nsproxy->ipc_ns;
-
-	if (is_krg_ipc(&msg_ids(ns)))
-		r = krg_ipc_msgrcv(msqid, pmtype, mtext, msgsz, msgtyp, msgflg,
-				  ns, task_tgid_vnr(current));
-	else
-		r = __do_msgrcv(msqid, pmtype, mtext, msgsz, msgtyp, msgflg,
-				ns, task_tgid_vnr(current));
-
-	return r;
-}
-
-long __do_msgrcv(int msqid, long *pmtype, void __user *mtext,
-		 size_t msgsz, long msgtyp, int msgflg,
-		 struct ipc_namespace *ns, pid_t tgid)
-#else
 long do_msgrcv(int msqid, long *pmtype, void __user *mtext,
 		size_t msgsz, long msgtyp, int msgflg)
-#endif
 {
 	struct msg_queue *msq;
 	struct msg_msg *msg;
 	int mode;
-#ifndef CONFIG_KRG_IPC
 	struct ipc_namespace *ns;
-#endif
 
 	if (msqid < 0 || (long) msgsz < 0)
 		return -EINVAL;
 	mode = convert_mode(&msgtyp, msgflg);
-#ifndef CONFIG_KRG_IPC
 	ns = current->nsproxy->ipc_ns;
-#endif
 
-#ifdef CONFIG_KRG_IPC
-	down_read(&msg_ids(ns).rw_mutex);
-#endif
 	msq = msg_lock_check(ns, msqid);
 	if (IS_ERR(msq))
-#ifdef CONFIG_KRG_IPC
-	{
-		up_read(&msg_ids(ns).rw_mutex);
 		return PTR_ERR(msq);
-	}
-#else
-		return PTR_ERR(msq);
-#endif
 
 	for (;;) {
 		struct msg_receiver msr_d;
@@ -1000,19 +824,12 @@ long do_msgrcv(int msqid, long *pmtype, void __user *mtext,
 			list_del(&msg->m_list);
 			msq->q_qnum--;
 			msq->q_rtime = get_seconds();
-#ifdef CONFIG_KRG_IPC
-			msq->q_lrpid = tgid;
-#else
 			msq->q_lrpid = task_tgid_vnr(current);
-#endif
 			msq->q_cbytes -= msg->m_ts;
 			atomic_sub(msg->m_ts, &ns->msg_bytes);
 			atomic_dec(&ns->msg_hdrs);
 			ss_wakeup(&msq->q_senders, 0);
 			msg_unlock(msq);
-#ifdef CONFIG_KRG_IPC
-			up_read(&msg_ids(ns).rw_mutex);
-#endif
 			break;
 		}
 		/* No message waiting. Wait for a message */
@@ -1031,21 +848,9 @@ long do_msgrcv(int msqid, long *pmtype, void __user *mtext,
 		msr_d.r_msg = ERR_PTR(-EAGAIN);
 		current->state = TASK_INTERRUPTIBLE;
 		msg_unlock(msq);
-#ifdef CONFIG_KRG_IPC
-		up_read(&msg_ids(ns).rw_mutex);
-#endif
 
 		schedule();
 
-
-#ifdef CONFIG_KRG_IPC
-		down_read(&msg_ids(ns).rw_mutex);
-		msq = msg_lock_check(ns, msqid);
-		if (IS_ERR(msq)) {
-			up_read(&msg_ids(ns).rw_mutex);
-			return -EIDRM;
-		}
-#else
 		/* Lockless receive, part 1:
 		 * Disable preemption.  We don't hold a reference to the queue
 		 * and getting a reference would defeat the idea of a lockless
@@ -1087,30 +892,15 @@ long do_msgrcv(int msqid, long *pmtype, void __user *mtext,
 		/* Lockless receive, part 4:
 		 * Repeat test after acquiring the spinlock.
 		 */
-#endif
 		msg = (struct msg_msg*)msr_d.r_msg;
 		if (msg != ERR_PTR(-EAGAIN))
 			goto out_unlock;
 
 		list_del(&msr_d.r_list);
-
-#if defined(CONFIG_KRG_IPC) && defined(CONFIG_KRG_EPM)
-		if (krg_action_any_pending(current)) {
-#ifdef CONFIG_KRG_DEBUG
-			printk("%s:%d - action kerrighed! --> need replay!!\n",
-			       __PRETTY_FUNCTION__, __LINE__);
-#endif
-			msg = ERR_PTR(-ERESTARTSYS);
-			goto out_unlock;
-		}
-#endif
 		if (signal_pending(current)) {
 			msg = ERR_PTR(-ERESTARTNOHAND);
 out_unlock:
 			msg_unlock(msq);
-#ifdef CONFIG_KRG_IPC
-			up_read(&msg_ids(ns).rw_mutex);
-#endif
 			break;
 		}
 	}

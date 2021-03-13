@@ -46,11 +46,6 @@
  * Native API
  */
 
-#ifdef CONFIG_KRGRPC
-extern int tipc_net_id;
-int tipc_core_start_net(unsigned long addr);
-#endif
-
 /*
  * TIPC operating mode routines
  */

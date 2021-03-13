@@ -3329,12 +3329,10 @@ static int __init pci_setup(char *str)
 				pcie_bus_config = PCIE_BUS_PERFORMANCE;
 			} else if (!strncmp(str, "pcie_bus_peer2peer", 18)) {
 				pcie_bus_config = PCIE_BUS_PEER2PEER;
-#ifdef CONFIG_PCI_IOV
 			} else if (!strncmp(str, "nosriov", 7)) {
 				pci_sriov_enabled = 0;
 			} else if (!strncmp(str, "sriov", 5)) {
 				pci_sriov_enabled = 1;
-#endif
 			} else {
 				printk(KERN_ERR "PCI: Unknown option `%s'\n",
 						str);

@@ -1260,7 +1260,7 @@ static int __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part);
 static int __blkdev_get(struct block_device *bdev, fmode_t mode, int for_part)
 {
 	struct gendisk *disk;
-	struct module *owner = NULL;
+	struct module *owner;
 	int ret;
 	int partno;
 	int perm = 0;

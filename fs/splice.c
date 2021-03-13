@@ -31,14 +31,6 @@
 #include <linux/uio.h>
 #include <linux/security.h>
 
-#ifdef CONFIG_KRG_EPM
-#include <kerrighed/file_stat.h>
-#endif
-
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
-
 /*
  * Attempt to steal a page from a pipe buffer. This should perhaps go into
  * a vm helper function, it's already simplified quite a bit by the
@@ -1098,10 +1090,7 @@ EXPORT_SYMBOL(generic_splice_sendpage);
 /*
  * Attempt to initiate a splice from pipe to file.
  */
-#ifndef CONFIG_KRG_EPM
-static
-#endif
-long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
+static long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
 			   loff_t *ppos, size_t len, unsigned int flags)
 {
 	ssize_t (*splice_write)(struct pipe_inode_info *, struct file *,
@@ -1134,10 +1123,7 @@ long do_splice_from(struct pipe_inode_info *pipe, struct file *out,
 /*
  * Attempt to initiate a splice from a file to a pipe.
  */
-#ifndef CONFIG_KRG_EPM
-static
-#endif
-long do_splice_to(struct file *in, loff_t *ppos,
+static long do_splice_to(struct file *in, loff_t *ppos,
 			 struct pipe_inode_info *pipe, size_t len,
 			 unsigned int flags)
 {
@@ -1341,18 +1327,6 @@ static inline struct pipe_inode_info *pipe_info(struct inode *inode)
 	return NULL;
 }
 
-#ifdef CONFIG_KRG_EPM
-long krg_do_splice(struct file *in, struct file *out,
-		   loff_t *offset, size_t len, unsigned int flags)
-{
-	/*
-	 * returns -EINVAL as for file that does not have
-	 * splice_write() / splice_read()
-	 */
-	return -EINVAL;
-}
-#endif
-
 /*
  * Determine where to splice to/from.
  */
@@ -1365,24 +1339,8 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 	loff_t offset, *off;
 	long ret;
 
-#ifdef CONFIG_KRG_EPM
-	if (is_pipe(in)) {
-		if (!(in->f_flags & O_FAF_CLT))
-			ipipe = pipe_info(in->f_path.dentry->d_inode);
-		else
-			ipipe = NULL;
-	}
-
-	if (is_pipe(out)) {
-		if (!(out->f_flags & O_FAF_CLT))
-			opipe = pipe_info(out->f_path.dentry->d_inode);
-		else
-			opipe = NULL;
-	}
-#else
 	ipipe = pipe_info(in->f_path.dentry->d_inode);
 	opipe = pipe_info(out->f_path.dentry->d_inode);
-#endif
 
 	if (ipipe && opipe) {
 		if (off_in || off_out)
@@ -1401,11 +1359,7 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 		return splice_pipe_to_pipe(ipipe, opipe, len, flags);
 	}
 
-#ifdef CONFIG_KRG_EPM
-	if (is_pipe(in)) {
-#else
 	if (ipipe) {
-#endif
 		if (off_in)
 			return -ESPIPE;
 		if (off_out) {
@@ -1418,11 +1372,6 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 		} else
 			off = &out->f_pos;
 
-#ifdef CONFIG_KRG_EPM
-		if (!ipipe)
-			ret = krg_do_splice(in, out, off, len, flags);
-		else
-#endif
 		ret = do_splice_from(ipipe, out, off, len, flags);
 
 		if (off_out && copy_to_user(off_out, off, sizeof(loff_t)))
@@ -1431,11 +1380,7 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 		return ret;
 	}
 
-#ifdef CONFIG_KRG_EPM
-	if (is_pipe(out)) {
-#else
 	if (opipe) {
-#endif
 		if (off_out)
 			return -ESPIPE;
 		if (off_in) {
@@ -1448,11 +1393,6 @@ static long do_splice(struct file *in, loff_t __user *off_in,
 		} else
 			off = &in->f_pos;
 
-#ifdef CONFIG_KRG_EPM
-		if (!opipe)
-			ret = krg_do_splice(in, out, off, len, flags);
-		else
-#endif
 		ret = do_splice_to(in, off, opipe, len, flags);
 
 		if (off_in && copy_to_user(off_in, off, sizeof(loff_t)))
@@ -1748,12 +1688,6 @@ SYSCALL_DEFINE4(vmsplice, int, fd, const struct iovec __user *, iov,
 	error = -EBADF;
 	file = fget_light(fd, &fput);
 	if (file) {
-#ifdef CONFIG_KRG_FAF
-		if (file->f_flags & O_FAF_CLT) {
-			error = -ENOSYS;
-			faf_error(file, "vmsplice");
-		} else
-#endif
 		if (file->f_mode & FMODE_WRITE)
 			error = vmsplice_to_pipe(file, iov, nr_segs, flags);
 		else if (file->f_mode & FMODE_READ)
@@ -1996,10 +1930,7 @@ retry:
 /*
  * Link contents of ipipe to opipe.
  */
-#ifndef CONFIG_KRG_EPM
-static
-#endif
-int link_pipe(struct pipe_inode_info *ipipe,
+static int link_pipe(struct pipe_inode_info *ipipe,
 		     struct pipe_inode_info *opipe,
 		     size_t len, unsigned int flags)
 {
@@ -2128,24 +2059,7 @@ SYSCALL_DEFINE4(tee, int, fdin, int, fdout, size_t, len, unsigned int, flags)
 
 			if (out) {
 				if (out->f_mode & FMODE_WRITE)
-#ifdef CONFIG_KRG_FAF
-				{
-					if (in->f_flags & O_FAF_CLT) {
-						faf_error(in, "tee");
-						error = -ENOSYS;
-						goto out_put;
-					}
-					if (out->f_flags & O_FAF_CLT) {
-						faf_error(out, "tee");
-						error = -ENOSYS;
-						goto out_put;
-					}
-#endif
 					error = do_tee(in, out, len, flags);
-#ifdef CONFIG_KRG_FAF
-				}
-				out_put:
-#endif
 				fput_light(out, fput_out);
 			}
 		}

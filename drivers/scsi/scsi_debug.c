@@ -2009,7 +2009,7 @@ static sector_t map_index_to_lba(unsigned long index)
 	return lba;
 }
 
-static unsigned int scsi_map_state(sector_t lba, unsigned int *num)
+static unsigned int map_state(sector_t lba, unsigned int *num)
 {
 	sector_t end;
 	unsigned int mapped;
@@ -2030,7 +2030,7 @@ static unsigned int scsi_map_state(sector_t lba, unsigned int *num)
 	return mapped;
 }
 
-static void scsi_map_region(sector_t lba, unsigned int len)
+static void map_region(sector_t lba, unsigned int len)
 {
 	sector_t end = lba + len;
 
@@ -2044,7 +2044,7 @@ static void scsi_map_region(sector_t lba, unsigned int len)
 	}
 }
 
-static void scsi_unmap_region(sector_t lba, unsigned int len)
+static void unmap_region(sector_t lba, unsigned int len)
 {
 	sector_t end = lba + len;
 
@@ -2084,7 +2084,7 @@ static int resp_write(struct scsi_cmnd *SCpnt, unsigned long long lba,
 	write_lock_irqsave(&atomic_rw, iflags);
 	ret = do_device_access(SCpnt, devip, lba, num, 1);
 	if (scsi_debug_unmap_granularity)
-		scsi_map_region(lba, num);
+		map_region(lba, num);
 	write_unlock_irqrestore(&atomic_rw, iflags);
 	if (-1 == ret)
 		return (DID_ERROR << 16);
@@ -2117,7 +2117,7 @@ static int resp_write_same(struct scsi_cmnd *scmd, unsigned long long lba,
 	write_lock_irqsave(&atomic_rw, iflags);
 
 	if (unmap && scsi_debug_unmap_granularity) {
-		scsi_unmap_region(lba, num);
+		unmap_region(lba, num);
 		goto out;
 	}
 
@@ -2141,7 +2141,7 @@ static int resp_write_same(struct scsi_cmnd *scmd, unsigned long long lba,
 		       scsi_debug_sector_size);
 
 	if (scsi_debug_unmap_granularity)
-		scsi_map_region(lba, num);
+		map_region(lba, num);
 out:
 	write_unlock_irqrestore(&atomic_rw, iflags);
 
@@ -2189,7 +2189,7 @@ static int resp_unmap(struct scsi_cmnd * scmd, struct sdebug_dev_info * devip)
 		if (ret)
 			goto out;
 
-		scsi_unmap_region(lba, num);
+		unmap_region(lba, num);
 	}
 
 	ret = 0;
@@ -2224,7 +2224,7 @@ static int resp_get_lba_status(struct scsi_cmnd * scmd,
 	if (ret)
 		return ret;
 
-	mapped = scsi_map_state(lba, &num);
+	mapped = map_state(lba, &num);
 
 	memset(arr, 0, SDEBUG_GET_LBA_STATUS_LEN);
 	put_unaligned_be32(16, &arr[0]);	/* Parameter Data Length */
@@ -3416,7 +3416,7 @@ static int __init scsi_debug_init(void)
 
 		/* Map first 1KB for partition table */
 		if (scsi_debug_num_parts)
-			scsi_map_region(0, 2);
+			map_region(0, 2);
 	}
 
 	ret = device_register(&pseudo_primary);

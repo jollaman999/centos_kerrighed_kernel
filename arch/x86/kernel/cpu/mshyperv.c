@@ -130,11 +130,7 @@ static bool __init ms_hyperv_platform(void)
 	 * Xen and KVM emulates Hyper-V to support enlightened Windows.
 	 * Check to see first if we are on a Xen or KVM Hypervisor.
 	 */
-#ifdef CONFIG_XEN
 	if (xen_cpuid_base() || kvm_para_available())
-#else
-	if (kvm_para_available())
-#endif
 		return false;
 
 	cpuid(HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS,

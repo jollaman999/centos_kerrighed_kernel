@@ -292,32 +292,10 @@ fail:
 	return error;
 }
 
-#ifdef CONFIG_KRG_MM
 SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
 		unsigned long, prot)
 {
-	int res;
-
-	res = do_mprotect(current->mm, start, len, prot, current->personality);
-
-	if (!res && current->mm->anon_vma_kddm_set)
-		krg_do_mprotect(current->mm, start, len, prot,
-				current->personality);
-
-	return res;
-}
-int do_mprotect(struct mm_struct *mm, unsigned long start, size_t len,
-		unsigned long prot, int personality)
-#else
-SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
-		unsigned long, prot)
-#endif
-{
-#ifdef CONFIG_KRG_MM
-	unsigned long long vm_flags, nstart, end, tmp, reqprot;
-#else
 	unsigned long vm_flags, nstart, end, tmp, reqprot;
-#endif
 	struct vm_area_struct *vma, *prev;
 	int error = -EINVAL;
 	const int grows = prot & (PROT_GROWSDOWN|PROT_GROWSUP);
@@ -340,22 +318,14 @@ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
 	/*
 	 * Does the application expect PROT_READ to imply PROT_EXEC:
 	 */
-#ifdef CONFIG_KRG_MM
-	if ((prot & PROT_READ) && (personality & READ_IMPLIES_EXEC))
-#else
 	if ((prot & PROT_READ) && (current->personality & READ_IMPLIES_EXEC))
-#endif
 		prot |= PROT_EXEC;
 
 	vm_flags = calc_vm_prot_bits(prot);
 
-#ifdef CONFIG_KRG_MM
-	down_write(&mm->mmap_sem);
-	vma = find_vma_prev(mm, start, &prev);
-#else
 	down_write(&current->mm->mmap_sem);
+
 	vma = find_vma_prev(current->mm, start, &prev);
-#endif
 	error = -ENOMEM;
 	if (!vma)
 		goto out;
@@ -417,10 +387,6 @@ SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
 		}
 	}
 out:
-#ifdef CONFIG_KRG_MM
-	up_write(&mm->mmap_sem);
-#else
 	up_write(&current->mm->mmap_sem);
-#endif
 	return error;
 }

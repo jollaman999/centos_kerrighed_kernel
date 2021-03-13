@@ -25,13 +25,6 @@
 
 #include <asm/atomic.h>
 
-#ifdef CONFIG_KRG_DVFS
-#include <kerrighed/dvfs.h>
-#endif
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
-
 #include "internal.h"
 
 /* sysctl tunables... */
@@ -57,10 +50,6 @@ static inline void file_free_rcu(struct rcu_head *head)
 
 static inline void file_free(struct file *f)
 {
-#ifdef CONFIG_KRG_DVFS
-	if (f->f_objid)
-		krg_put_file(f);
-#endif
 	percpu_counter_dec(&nr_files);
 	file_check_state(f);
 	call_rcu(&f->f_u.fu_rcuhead, file_free_rcu);
@@ -245,25 +234,10 @@ void __fput(struct file *file)
 {
 	struct dentry *dentry = file->f_path.dentry;
 	struct vfsmount *mnt = file->f_path.mnt;
-#ifdef CONFIG_KRG_FAF
-	struct inode *inode;
-#else
 	struct inode *inode = dentry->d_inode;
-#endif
 
 	might_sleep();
 
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		eventpoll_release(file);
-		security_file_free(file);
-		put_pid(file->f_owner.pid);
-		file_kill(file);
-		file_free(file);
-		return;
-	}
-	inode = dentry->d_inode;
-#endif
 	fsnotify_close(file);
 	/*
 	 * The function eventpoll_release() should be the first called

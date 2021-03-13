@@ -240,10 +240,6 @@ int copy_thread(unsigned long clone_flags, unsigned long sp,
 
 	childregs = task_pt_regs(p);
 	*childregs = *regs;
-#ifdef CONFIG_KRG_EPM
-	/* Do not corrupt ax in migration/restart */
-	if (!krg_current || in_krg_do_fork())
-#endif
 	childregs->ax = 0;
 	childregs->sp = sp;
 
@@ -252,9 +248,6 @@ int copy_thread(unsigned long clone_flags, unsigned long sp,
 
 	p->thread.ip = (unsigned long) ret_from_fork;
 
-#ifdef CONFIG_KRG_EPM
-	if (!krg_current)
-#endif
 	task_user_gs(p) = get_user_gs(regs);
 
 	p->fpu_counter = 0;

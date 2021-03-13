@@ -15,9 +15,6 @@
 #define __LINUX_WW_MUTEX_H
 
 #include <linux/mutex.h>
-#ifdef CONFIG_KRG_EPM
-#include <linux/sched.h>
-#endif
 
 struct ww_class {
 	atomic_long_t stamp;

@@ -36,12 +36,6 @@
 #include <asm/tlb.h>
 #include <asm/mmu_context.h>
 
-#ifdef CONFIG_KRG_MM
-#include <kerrighed/krgsyms.h>
-#include <kerrighed/dynamic_node_info_linker.h>
-#include <kerrighed/faf.h>
-#endif
-
 #include "internal.h"
 
 #ifndef arch_mmap_check
@@ -63,11 +57,10 @@
 #define arch_remove_exec_range(mm, limit)	do { ; } while (0)
 #endif
 
-#ifndef CONFIG_KRG_MM
+
 static void unmap_region(struct mm_struct *mm,
 		struct vm_area_struct *vma, struct vm_area_struct *prev,
 		unsigned long start, unsigned long end);
-#endif
 
 /*
  * WARNING: the debugging will use recursive algorithms so never enable this
@@ -95,11 +88,7 @@ pgprot_t protection_map[16] = {
 	__S000, __S001, __S010, __S011, __S100, __S101, __S110, __S111
 };
 
-#ifdef CONFIG_KRG_MM
-pgprot_t vm_get_page_prot(unsigned long long vm_flags)
-#else
 pgprot_t vm_get_page_prot(unsigned long vm_flags)
-#endif
 {
 	return __pgprot(pgprot_val(protection_map[vm_flags &
 				(VM_READ|VM_WRITE|VM_EXEC|VM_SHARED)]) |
@@ -147,10 +136,6 @@ EXPORT_SYMBOL_GPL(vm_memory_committed);
 int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin)
 {
 	long free, allowed;
-#ifdef CONFIG_KRG_MM
-	krg_dynamic_node_info_t *dyn_info;
-	kerrighed_node_t node;
-#endif
 
 	vm_acct_memory(pages);
 
@@ -206,24 +191,6 @@ int __vm_enough_memory(struct mm_struct *mm, long pages, int cap_sys_admin)
 
 		if (free > pages)
 			return 0;
-
-#ifdef CONFIG_KRG_MM
-		/* Now, check for cluster wide memory space if the process
-		 * has the USE_REMOTE_MEMORY capability.
-		 */
-		if (!can_use_krg_cap(current, CAP_USE_REMOTE_MEMORY))
-			goto error;
-
-		for_each_online_krgnode(node) {
-			if (node == kerrighed_node_id)
-				continue;
-			dyn_info = get_dynamic_node_info(node);
-			free += dyn_info->freeram - dyn_info->freeram / 32;
-			free += dyn_info->nr_file_pages;
-			if (free > pages)
-				return 0;
-		}
-#endif
 
 		goto error;
 	}
@@ -286,10 +253,7 @@ void unlink_file_vma(struct vm_area_struct *vma)
 /*
  * Close a vm structure and free it, returning the next.
  */
-#ifndef CONFIG_KRG_MM
-static
-#endif
-struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
+static struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 {
 	struct vm_area_struct *next = vma->vm_next;
 
@@ -306,15 +270,6 @@ struct vm_area_struct *remove_vma(struct vm_area_struct *vma)
 	return next;
 }
 
-#ifdef CONFIG_KRG_MM
-unsigned long __sys_brk(struct mm_struct *mm, unsigned long brk,
-			unsigned long lock_limit, unsigned long data_limit)
-{
-	unsigned long rlim = data_limit, retval;
-	unsigned long newbrk, oldbrk;
-	struct vm_area_struct *next;
-	unsigned long min_brk;
-#else
 SYSCALL_DEFINE1(brk, unsigned long, brk)
 {
 	unsigned long rlim, retval;
@@ -324,7 +279,6 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 	unsigned long min_brk;
 
 	down_write(&mm->mmap_sem);
-#endif
 
 #ifdef CONFIG_COMPAT_BRK
 	/*
@@ -348,9 +302,7 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 	 * segment grow beyond its set limit the in case where the limit is
 	 * not page aligned -Ram Gupta
 	 */
-#ifndef CONFIG_KRG_MM
 	rlim = current->signal->rlim[RLIMIT_DATA].rlim_cur;
-#endif
 	if (rlim < RLIM_INFINITY && (brk - mm->start_brk) +
 			(mm->end_data - mm->start_data) > rlim)
 		goto out;
@@ -373,44 +325,15 @@ SYSCALL_DEFINE1(brk, unsigned long, brk)
 		goto out;
 
 	/* Ok, looks good - let it rip. */
-#ifdef CONFIG_KRG_MM
-	if (__do_brk(mm, oldbrk, newbrk-oldbrk, lock_limit) != oldbrk)
-#else
 	if (do_brk(oldbrk, newbrk-oldbrk) != oldbrk)
-#endif
 		goto out;
 set_brk:
 	mm->brk = brk;
 out:
 	retval = mm->brk;
-#ifndef CONFIG_KRG_MM
 	up_write(&mm->mmap_sem);
-#endif
 	return retval;
 }
-
-#ifdef CONFIG_KRG_MM
-SYSCALL_DEFINE1(brk, unsigned long, brk)
-{
-	struct mm_struct *mm = current->mm;
-	unsigned long retval;
-
-	down_write(&mm->mmap_sem);
-
-	retval = __sys_brk(mm, brk,
-			   current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur,
-			   current->signal->rlim[RLIMIT_DATA].rlim_cur);
-
-	if (mm->anon_vma_kddm_set)
-		krg_do_brk(mm, brk,
-			   current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur,
-			   current->signal->rlim[RLIMIT_DATA].rlim_cur);
-
-	up_write(&mm->mmap_sem);
-
-	return retval;
-}
-#endif
 
 #ifdef DEBUG_MM_RB
 static int browse_rb(struct rb_root *root)
@@ -532,10 +455,7 @@ void __vma_link_rb(struct mm_struct *mm, struct vm_area_struct *vma,
 	rb_insert_color(&vma->vm_rb, &mm->mm_rb);
 }
 
-#ifndef CONFIG_KRG_MM
-static
-#endif
-void __vma_link_file(struct vm_area_struct *vma)
+static void __vma_link_file(struct vm_area_struct *vma)
 {
 	struct file *file;
 
@@ -803,28 +723,15 @@ again:			remove_next = 1 + (end > next->vm_end);
  * per-vma resources, so we don't attempt to merge those.
  */
 static inline int is_mergeable_vma(struct vm_area_struct *vma,
-#ifdef CONFIG_KRG_MM
-			struct file *file, unsigned long long vm_flags)
-#else
 			struct file *file, unsigned long vm_flags)
-#endif
 {
 	/* VM_CAN_NONLINEAR may get set later by f_op->mmap() */
-#ifdef CONFIG_KRG_MM
-	if ((vma->vm_flags ^ vm_flags) & ~(VM_CAN_NONLINEAR|VM_KDDM))
-#else
 	if ((vma->vm_flags ^ vm_flags) & ~VM_CAN_NONLINEAR)
-#endif
 		return 0;
 	if (vma->vm_file != file)
 		return 0;
 	if (vma->vm_ops && vma->vm_ops->close)
 		return 0;
-
-#ifdef CONFIG_KRG_MM
-	if (!(vma->vm_flags & VM_KDDM) && (vm_flags & VM_KDDM))
-		return 0;
-#endif
 	return 1;
 }
 
@@ -854,11 +761,7 @@ static inline int is_mergeable_anon_vma(struct anon_vma *anon_vma1,
  * wrap, nor mmaps which cover the final page at index -1UL.
  */
 static int
-#ifdef CONFIG_KRG_MM
-can_vma_merge_before(struct vm_area_struct *vma, unsigned long long vm_flags,
-#else
 can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
-#endif
 	struct anon_vma *anon_vma, struct file *file, pgoff_t vm_pgoff)
 {
 	if (is_mergeable_vma(vma, file, vm_flags) &&
@@ -877,11 +780,7 @@ can_vma_merge_before(struct vm_area_struct *vma, unsigned long vm_flags,
  * anon_vmas, nor if same anon_vma is assigned but offsets incompatible.
  */
 static int
-#ifdef CONFIG_KRG_MM
-can_vma_merge_after(struct vm_area_struct *vma, unsigned long long vm_flags,
-#else
 can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
-#endif
 	struct anon_vma *anon_vma, struct file *file, pgoff_t vm_pgoff)
 {
 	if (is_mergeable_vma(vma, file, vm_flags) &&
@@ -925,11 +824,7 @@ can_vma_merge_after(struct vm_area_struct *vma, unsigned long vm_flags,
  */
 struct vm_area_struct *vma_merge(struct mm_struct *mm,
 			struct vm_area_struct *prev, unsigned long addr,
-#ifdef CONFIG_KRG_MM
-			unsigned long end, unsigned long long vm_flags,
-#else
 			unsigned long end, unsigned long vm_flags,
-#endif
 		     	struct anon_vma *anon_vma, struct file *file,
 			pgoff_t pgoff, struct mempolicy *policy)
 {
@@ -1134,20 +1029,10 @@ unsigned long do_mmap_pgoff(struct file *file, unsigned long addr,
 {
 	struct mm_struct * mm = current->mm;
 	struct inode *inode;
-#ifdef CONFIG_KRG_MM
-	unsigned long long vm_flags;
-#else
 	unsigned int vm_flags;
-#endif
 	int error;
 	unsigned long reqprot = prot;
 
-#ifdef CONFIG_KRG_FAF
-	if (file && (file->f_flags & O_FAF_CLT)) {
-		faf_error(file, "mmap");
-		return -ENOSYS;
-	}
-#endif
 	/*
 	 * Does the application expect PROT_READ to imply PROT_EXEC?
 	 *
@@ -1285,11 +1170,7 @@ EXPORT_SYMBOL(do_mmap_pgoff);
  */
 int vma_wants_writenotify(struct vm_area_struct *vma)
 {
-#ifdef CONFIG_KRG_MM
-	unsigned long long vm_flags = vma->vm_flags;
-#else
 	unsigned int vm_flags = vma->vm_flags;
-#endif
 
 	/* If it was private or non-writable, the write bit is already clear */
 	if ((vm_flags & (VM_WRITE|VM_SHARED)) != ((VM_WRITE|VM_SHARED)))
@@ -1317,11 +1198,7 @@ int vma_wants_writenotify(struct vm_area_struct *vma)
  * We account for memory if it's a private writeable mapping,
  * not hugepages and VM_NORESERVE wasn't set.
  */
-#ifdef CONFIG_KRG_MM
-static inline int accountable_mapping(struct file *file, unsigned long long vm_flags)
-#else
 static inline int accountable_mapping(struct file *file, unsigned int vm_flags)
-#endif
 {
 	/*
 	 * hugetlb has its own accounting separate from the core VM
@@ -1333,26 +1210,11 @@ static inline int accountable_mapping(struct file *file, unsigned int vm_flags)
 	return (vm_flags & (VM_NORESERVE | VM_SHARED | VM_WRITE)) == VM_WRITE;
 }
 
-#ifdef CONFIG_KRG_MM
-unsigned long mmap_region(struct file *file, unsigned long addr,
-			  unsigned long len, unsigned long flags,
-			  unsigned long long vm_flags, unsigned long pgoff)
-{
-	return __mmap_region(current->mm, file, addr, len, flags, vm_flags,
-			     pgoff, 0);
-}
-unsigned long __mmap_region(struct mm_struct *mm, struct file *file,
-			    unsigned long addr, unsigned long len,
-			    unsigned long flags, unsigned long long vm_flags,
-			    unsigned long pgoff, int handler_call)
-{
-#else
 unsigned long mmap_region(struct file *file, unsigned long addr,
 			  unsigned long len, unsigned long flags,
 			  unsigned int vm_flags, unsigned long pgoff)
 {
 	struct mm_struct *mm = current->mm;
-#endif
 	struct vm_area_struct *vma, *prev;
 	int correct_wcount = 0;
 	int error;
@@ -1393,11 +1255,7 @@ munmap_back:
 	 */
 	if (accountable_mapping(file, vm_flags)) {
 		charged = len >> PAGE_SHIFT;
-#ifdef CONFIG_KRG_MM
-		if (security_vm_enough_memory_mm(mm, charged))
-#else
 		if (security_vm_enough_memory(charged))
-#endif
 			return -ENOMEM;
 		vm_flags |= VM_ACCOUNT;
 	}
@@ -1496,10 +1354,6 @@ out:
 		mm->locked_vm += (len >> PAGE_SHIFT) - nr_pages;
 	} else if ((flags & MAP_POPULATE) && !(flags & MAP_NONBLOCK))
 		make_pages_present(addr, addr + len);
-#ifdef CONFIG_KRG_MM
-	if (!handler_call && mm->anon_vma_kddm_set)
-		krg_do_mmap_region(vma, flags, vm_flags);
-#endif
 	return addr;
 
 unmap_and_free_vma:
@@ -1791,23 +1645,9 @@ void arch_unmap_area_topdown(struct mm_struct *mm, unsigned long addr)
 	}
 }
 
-#ifdef CONFIG_KRG_MM
-unsigned long
-get_unmapped_area_prot(struct file *file, unsigned long addr, unsigned long len,
-		  unsigned long pgoff, unsigned long flags, int exec)
-{
-	return __get_unmapped_area_prot(current->mm, file, addr, len, pgoff, flags, exec);
-}
-
-unsigned long
-	__get_unmapped_area_prot(struct mm_struct *mm, struct file *file,
-			    unsigned long addr, unsigned long len,
-			    unsigned long pgoff, unsigned long flags, int exec)
-#else
 unsigned long
 get_unmapped_area_prot(struct file *file, unsigned long addr, unsigned long len,
 		unsigned long pgoff, unsigned long flags, int exec)
-#endif
 {
 	unsigned long (*get_area)(struct file *, unsigned long,
 				  unsigned long, unsigned long, unsigned long);
@@ -1820,17 +1660,10 @@ get_unmapped_area_prot(struct file *file, unsigned long addr, unsigned long len,
 	if (len > TASK_SIZE)
 		return -ENOMEM;
 
-#ifdef CONFIG_KRG_MM
-	if (exec && mm->get_unmapped_exec_area)
-		get_area = mm->get_unmapped_exec_area;
-	else
-		get_area = mm->get_unmapped_area;
-#else
 	if (exec && current->mm->get_unmapped_exec_area)
 		get_area = current->mm->get_unmapped_exec_area;
 	else
 		get_area = current->mm->get_unmapped_area;
-#endif
 
 	if (file && file->f_op && file->f_op->get_unmapped_area)
 		get_area = file->f_op->get_unmapped_area;
@@ -2211,11 +2044,7 @@ static int __init cmdline_parse_stack_guard_gap(char *p)
 __setup("stack_guard_gap=", cmdline_parse_stack_guard_gap);
 
 #ifdef CONFIG_STACK_GROWSUP
-#ifdef CONFIG_KRG_MM
-int __expand_stack(struct vm_area_struct *vma, unsigned long address)
-#else
 int expand_stack(struct vm_area_struct *vma, unsigned long address)
-#endif
 {
 	return expand_upwards(vma, address);
 }
@@ -2238,11 +2067,7 @@ find_extend_vma(struct mm_struct *mm, unsigned long addr)
 	return prev;
 }
 #else
-#ifdef CONFIG_KRG_MM
-int __expand_stack(struct vm_area_struct *vma, unsigned long address)
-#else
 int expand_stack(struct vm_area_struct *vma, unsigned long address)
-#endif
 {
 	return expand_downwards(vma, address);
 }
@@ -2278,10 +2103,7 @@ find_extend_vma(struct mm_struct * mm, unsigned long addr)
  *
  * Called with the mm semaphore held.
  */
-#ifndef CONFIG_KRG_MM
-static
-#endif
-void remove_vma_list(struct mm_struct *mm, struct vm_area_struct *vma)
+static void remove_vma_list(struct mm_struct *mm, struct vm_area_struct *vma)
 {
 	unsigned int unmap_factor = sysctl_unmap_area_factor;
 	/* Update high watermark before we lower total_vm */
@@ -2303,10 +2125,7 @@ void remove_vma_list(struct mm_struct *mm, struct vm_area_struct *vma)
  *
  * Called with the mm semaphore held.
  */
-#ifndef CONFIG_KRG_MM
-static
-#endif
-void unmap_region(struct mm_struct *mm,
+static void unmap_region(struct mm_struct *mm,
 		struct vm_area_struct *vma, struct vm_area_struct *prev,
 		unsigned long start, unsigned long end)
 {
@@ -2327,10 +2146,7 @@ void unmap_region(struct mm_struct *mm,
  * Create a list of vma's touched by the unmap, removing them from the mm's
  * vma list as we go..
  */
-#ifndef CONFIG_KRG_MM
-static
-#endif
-void
+static void
 detach_vmas_to_be_unmapped(struct mm_struct *mm, struct vm_area_struct *vma,
 	struct vm_area_struct *prev, unsigned long end)
 {
@@ -2551,12 +2367,6 @@ SYSCALL_DEFINE2(munmap, unsigned long, addr, size_t, len)
 	down_write(&mm->mmap_sem);
 	ret = do_munmap(mm, addr, len);
 	up_write(&mm->mmap_sem);
-
-#ifdef CONFIG_KRG_MM
-	if (!ret && mm->anon_vma_kddm_set)
-		krg_do_munmap(mm, addr, len);
-#endif
-
 	return ret;
 }
 
@@ -2575,20 +2385,9 @@ static inline void verify_mm_writelocked(struct mm_struct *mm)
  *  anonymous maps.  eventually we may be able to do some
  *  brk-specific accounting here.
  */
-#ifdef CONFIG_KRG_MM
-unsigned long do_brk(unsigned long addr, unsigned long len)
-{
-	return __do_brk(current->mm, addr, len,
-			current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur);
-}
-unsigned long __do_brk(struct mm_struct * mm, unsigned long addr,
-		       unsigned long len, unsigned long _lock_limit)
-{
-#else
 unsigned long do_brk(unsigned long addr, unsigned long len)
 {
 	struct mm_struct * mm = current->mm;
-#endif
 	struct vm_area_struct * vma, * prev;
 	unsigned long flags;
 	struct rb_node ** rb_link, * rb_parent;
@@ -2599,27 +2398,14 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	if (!len)
 		return addr;
 
-#ifdef CONFIG_KRG_MM
-	if ((addr + len) > TASK_SIZE || (addr + len) < addr)
-		return -EINVAL;
-
-	if (is_hugepage_only_range(mm, addr, len))
-		return -EINVAL;
-#endif
-
 	error = security_file_mmap(NULL, 0, 0, 0, addr, 1);
 	if (error)
 		return error;
 
 	flags = VM_DATA_DEFAULT_FLAGS | VM_ACCOUNT | mm->def_flags;
 
-#ifdef CONFIG_KRG_MM
-	error = arch_mmap_check(addr, len, flags);
-	if (error)
-#else
 	error = get_unmapped_area(NULL, addr, len, 0, MAP_FIXED);
 	if (error & ~PAGE_MASK)
-#endif
 		return error;
 
 	/*
@@ -2629,11 +2415,7 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 		unsigned long locked, lock_limit;
 		locked = len >> PAGE_SHIFT;
 		locked += mm->locked_vm;
-#ifdef CONFIG_KRG_MM
-		lock_limit = _lock_limit;
-#else
 		lock_limit = current->signal->rlim[RLIMIT_MEMLOCK].rlim_cur;
-#endif
 		lock_limit >>= PAGE_SHIFT;
 		if (locked > lock_limit && !capable(CAP_IPC_LOCK))
 			return -EAGAIN;
@@ -2663,11 +2445,7 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	if (mm->map_count > sysctl_max_map_count)
 		return -ENOMEM;
 
-#ifdef CONFIG_KRG_MM
-	if (security_vm_enough_memory_mm(mm, len >> PAGE_SHIFT))
-#else
 	if (security_vm_enough_memory(len >> PAGE_SHIFT))
-#endif
 		return -ENOMEM;
 
 	/* Can we just expand an old private anonymous mapping? */
@@ -2695,10 +2473,6 @@ unsigned long do_brk(unsigned long addr, unsigned long len)
 	vma_link(mm, vma, prev, rb_link, rb_parent);
 out:
 	perf_event_mmap(vma);
-#ifdef CONFIG_KRG_MM
-	if (mm->anon_vma_kddm_set)
-		krg_check_vma_link(vma);
-#endif
 	mm->total_vm += len >> PAGE_SHIFT;
 	if (flags & VM_LOCKED) {
 		if (!mlock_vma_pages_range(vma, addr, addr + len))
@@ -2706,6 +2480,7 @@ out:
 	}
 	return addr;
 }
+
 EXPORT_SYMBOL(do_brk);
 
 /* Release all mmaps. */
@@ -2923,25 +2698,10 @@ static void special_mapping_close(struct vm_area_struct *vma)
 {
 }
 
-#ifndef CONFIG_KRG_MM
-static
-#endif
-const struct vm_operations_struct special_mapping_vmops = {
+static const struct vm_operations_struct special_mapping_vmops = {
 	.close = special_mapping_close,
 	.fault = special_mapping_fault,
 };
-
-#ifdef CONFIG_KRG_MM
-int special_mapping_vm_ops_krgsyms_register(void)
-{
-	return krgsyms_register(KRGSYMS_VM_OPS_SPECIAL_MAPPING, (void *)&special_mapping_vmops);
-}
-
-int special_mapping_vm_ops_krgsyms_unregister(void)
-{
-	return krgsyms_unregister(KRGSYMS_VM_OPS_SPECIAL_MAPPING);
-}
-#endif
 
 /*
  * Called with mm->mmap_sem held for writing.
@@ -2954,11 +2714,7 @@ int special_mapping_vm_ops_krgsyms_unregister(void)
  */
 int install_special_mapping(struct mm_struct *mm,
 			    unsigned long addr, unsigned long len,
-#ifdef CONFIG_KRG_MM
-			    unsigned long long vm_flags, struct page **pages)
-#else
 			    unsigned long vm_flags, struct page **pages)
-#endif
 {
 	int ret;
 	struct vm_area_struct *vma;

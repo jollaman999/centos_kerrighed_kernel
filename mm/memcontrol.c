@@ -2516,7 +2516,6 @@ void mem_cgroup_uncharge_cache_page(struct page *page)
 	VM_BUG_ON(page->mapping);
 	__mem_cgroup_uncharge_common(page, MEM_CGROUP_CHARGE_TYPE_CACHE);
 }
-
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 /*
  * When a hugepage is charged, PCG_USED bit (see mem_cgroup_commit_charge())
@@ -2526,6 +2525,7 @@ void mem_cgroup_uncharge_cache_page(struct page *page)
  * The caller must guarantee all pages under splitting will never be used
  * for other purpose than we currently use it now.
  */
+
 void mem_cgroup_split_hugepage_commit(struct page *tail, struct page *head)
 {
 	struct mem_cgroup *mem;
@@ -2551,6 +2551,7 @@ void mem_cgroup_split_hugepage_commit(struct page *tail, struct page *head)
 	if (PageCgroupAcctLRU(origin))
 		SetPageCgroupAcctLRU(target);
 }
+
 #endif
 
 /*

@@ -21,13 +21,6 @@
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
 
-#ifdef CONFIG_KRG_DVFS
-#include <kerrighed/dvfs.h>
-#endif
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
-
 const struct file_operations generic_ro_fops = {
 	.llseek		= generic_file_llseek,
 	.read		= do_sync_read,
@@ -208,25 +201,13 @@ loff_t vfs_llseek(struct file *file, loff_t offset, int origin)
 {
 	loff_t (*fn)(struct file *, loff_t, int);
 
-#ifdef CONFIG_KRG_DVFS
-	loff_t pos;
-	if (file->f_flags & O_KRG_SHARED)
-		file->f_pos = krg_file_pos_read(file);
-#endif
 	fn = no_llseek;
 	if (file->f_mode & FMODE_LSEEK) {
 		fn = default_llseek;
 		if (file->f_op && file->f_op->llseek)
 			fn = file->f_op->llseek;
 	}
-#ifdef CONFIG_KRG_DVFS
-	pos = fn(file, offset, origin);
-	if (file->f_flags & O_KRG_SHARED)
-		krg_file_pos_write(file, file->f_pos);
-	return pos;
-#else
 	return fn(file, offset, origin);
-#endif
 }
 EXPORT_SYMBOL(vfs_llseek);
 
@@ -241,13 +222,6 @@ SYSCALL_DEFINE3(lseek, unsigned int, fd, off_t, offset, unsigned int, origin)
 	if (!file)
 		goto bad;
 
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		retval = krg_faf_lseek(file, offset, origin);
-		fput_light(file, fput_needed);
-		return retval;
-	}
-#endif
 	retval = -EINVAL;
 	if (origin <= SEEK_MAX) {
 		loff_t res = vfs_llseek(file, offset, origin);
@@ -279,19 +253,10 @@ SYSCALL_DEFINE5(llseek, unsigned int, fd, unsigned long, offset_high,
 	if (origin > SEEK_MAX)
 		goto out_putf;
 
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		retval = krg_faf_llseek(file, offset_high, offset_low,
-					&offset, origin);
-	} else {
-#endif
 	offset = vfs_llseek(file, ((loff_t) offset_high << 32) | offset_low,
 			origin);
 
 	retval = (int)offset;
-#ifdef CONFIG_KRG_FAF
-	}
-#endif
 	if (offset >= 0) {
 		retval = -EFAULT;
 		if (!copy_to_user(result, &offset, sizeof(offset)))
@@ -315,11 +280,6 @@ int rw_verify_area(int read_write, struct file *file, loff_t *ppos, size_t count
 	loff_t pos;
 	int retval = -EINVAL;
 
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT)
-		inode = NULL;
-	else
-#endif
 	inode = file->f_path.dentry->d_inode;
 	if (unlikely((ssize_t) count < 0))
 		return retval;
@@ -327,9 +287,6 @@ int rw_verify_area(int read_write, struct file *file, loff_t *ppos, size_t count
 	if (unlikely((pos < 0) || (loff_t) (pos + count) < 0))
 		return retval;
 
-#ifdef CONFIG_KRG_FAF
-	if (inode)
-#endif
 	if (unlikely(inode->i_flock && mandatory_lock(inode))) {
 		retval = locks_mandatory_area(
 			read_write == READ ? FLOCK_VERIFY_READ : FLOCK_VERIFY_WRITE,
@@ -385,10 +342,6 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
 
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT)
-		return krg_faf_read(file, buf, count, pos);
-#endif
 	if (!file->f_op || (!file->f_op->read && !file->f_op->aio_read))
 		return -EINVAL;
 	if (unlikely(!access_ok(VERIFY_WRITE, buf, count)))
@@ -444,10 +397,6 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT)
-		return krg_faf_write(file, buf, count, pos);
-#endif
 	if (!file->f_op || (!file->f_op->write && !file->f_op->aio_write))
 		return -EINVAL;
 	if (unlikely(!access_ok(VERIFY_READ, buf, count)))
@@ -472,7 +421,6 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
 
 EXPORT_SYMBOL(vfs_write);
 
-#ifndef CONFIG_KRG_DVFS
 static inline loff_t file_pos_read(struct file *file)
 {
 	return file->f_pos;
@@ -482,7 +430,6 @@ static inline void file_pos_write(struct file *file, loff_t pos)
 {
 	file->f_pos = pos;
 }
-#endif
 
 SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 {
@@ -791,10 +738,6 @@ ssize_t vfs_readv(struct file *file, const struct iovec __user *vec,
 {
 	if (!(file->f_mode & FMODE_READ))
 		return -EBADF;
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT)
-		return krg_faf_readv(file, vec, vlen, pos);
-#endif
 	if (!file->f_op || (!file->f_op->aio_read && !file->f_op->read))
 		return -EINVAL;
 
@@ -808,10 +751,6 @@ ssize_t vfs_writev(struct file *file, const struct iovec __user *vec,
 {
 	if (!(file->f_mode & FMODE_WRITE))
 		return -EBADF;
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT)
-		return krg_faf_writev(file, vec, vlen, pos);
-#endif
 	if (!file->f_op || (!file->f_op->aio_write && !file->f_op->write))
 		return -EINVAL;
 
@@ -918,10 +857,7 @@ SYSCALL_DEFINE5(pwritev, unsigned long, fd, const struct iovec __user *, vec,
 	return ret;
 }
 
-#ifndef CONFIG_KRG_FAF
-static
-#endif
-ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 			   size_t count, loff_t max)
 {
 	struct file * in_file, * out_file;
@@ -939,21 +875,12 @@ ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
 		goto out;
 	if (!(in_file->f_mode & FMODE_READ))
 		goto fput_in;
-#ifdef CONFIG_KRG_FAF
-	if (in_file->f_flags & O_FAF_CLT) {
-		in_inode = NULL; /* to please gcc */
-		goto check_outfile;
-	}
-#endif
 	retval = -ESPIPE;
 	if (!ppos)
 		ppos = &in_file->f_pos;
 	else
 		if (!(in_file->f_mode & FMODE_PREAD))
 			goto fput_in;
-#ifdef CONFIG_KRG_FAF
-check_outfile:
-#endif
 	retval = rw_verify_area(READ, in_file, ppos, count);
 	if (retval < 0)
 		goto fput_in;
@@ -968,34 +895,14 @@ check_outfile:
 		goto fput_in;
 	if (!(out_file->f_mode & FMODE_WRITE))
 		goto fput_out;
-#ifdef CONFIG_KRG_FAF
-	if (out_file->f_flags & O_FAF_CLT) {
-		out_inode = NULL; /* to please gcc */
-		goto faf_sendfile;
-	}
-#endif
 	retval = -EINVAL;
 	in_inode = in_file->f_path.dentry->d_inode;
 	out_inode = out_file->f_path.dentry->d_inode;
-#ifdef CONFIG_KRG_FAF
-faf_sendfile:
-#endif
 	retval = rw_verify_area(WRITE, out_file, &out_file->f_pos, count);
 	if (retval < 0)
 		goto fput_out;
 	count = retval;
 
-#ifdef CONFIG_KRG_FAF
-	if (in_file->f_flags & O_FAF_CLT
-	    || out_file->f_flags & O_FAF_CLT) {
-
-		if (!max)
-			max = *ppos + count;
-
-		retval = krg_faf_sendfile(out_file, in_file, ppos, count, max);
-		goto update_stat;
-	}
-#endif
 	if (!max)
 		max = min(in_inode->i_sb->s_maxbytes, out_inode->i_sb->s_maxbytes);
 
@@ -1020,9 +927,6 @@ faf_sendfile:
 #endif
 	retval = do_splice_direct(in_file, ppos, out_file, count, fl);
 
-#ifdef CONFIG_KRG_FAF
-update_stat:
-#endif
 	if (retval > 0) {
 		add_rchar(current, retval);
 		add_wchar(current, retval);

@@ -2123,9 +2123,6 @@ extern const struct file_operations ext4_dir_operations;
 /* file.c */
 extern const struct inode_operations ext4_file_inode_operations;
 extern const struct file_operations ext4_file_operations;
-#ifdef CONFIG_KRG_MM
-extern const struct vm_operations_struct ext4_file_vm_ops;
-#endif
 extern loff_t ext4_llseek(struct file *file, loff_t offset, int origin);
 extern void ext4_unwritten_wait(struct inode *inode);
 

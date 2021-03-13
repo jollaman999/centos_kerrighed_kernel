@@ -35,9 +35,6 @@
 #include <linux/init.h>
 #include <linux/flat.h>
 #include <linux/syscalls.h>
-#ifdef CONFIG_KRG_EPM
-#include <kerrighed/krgsyms.h>
-#endif
 
 #include <asm/byteorder.h>
 #include <asm/system.h>
@@ -942,17 +939,7 @@ static int load_flat_binary(struct linux_binprm * bprm, struct pt_regs * regs)
 
 static int __init init_flat_binfmt(void)
 {
-#ifdef CONFIG_KRG_EPM
-	int retval;
-
-	krgsyms_register(KRGSYMS_BINFMTS_FLAT, &flat_format);
-	retval = register_binfmt(&flat_format);
-	if (retval)
-		krgsyms_unregister(KRGSYMS_BINFMTS_FLAT);
-	return retval;
-#else
 	return register_binfmt(&flat_format);
-#endif
 }
 
 /****************************************************************************/

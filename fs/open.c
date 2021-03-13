@@ -33,10 +33,6 @@
 #include <linux/ima.h>
 #include <linux/nospec.h>
 
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
-
 #include "internal.h"
 
 int do_truncate(struct dentry *dentry, loff_t length, unsigned int time_attrs,
@@ -163,13 +159,6 @@ static long do_sys_ftruncate(unsigned int fd, loff_t length, int small)
 	if (!file)
 		goto out;
 
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		error = krg_faf_ftruncate(file, length, small);
-		goto out_putf;
-	}
-#endif
-
 	/* explicitly opened as large or we are on 64-bit box */
 	if (file->f_flags & O_LARGEFILE)
 		small = 0;
@@ -268,13 +257,6 @@ int do_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 
 	if (IS_IMMUTABLE(inode))
 		return -EPERM;
-
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		ret = krg_faf_fallocate(file, mode, offset, len);
-		return ret;
-	}
-#endif
 
 	/*
 	 * Revalidate the write permissions, in case security policy has
@@ -451,14 +433,6 @@ SYSCALL_DEFINE1(fchdir, unsigned int, fd)
 	if (!file)
 		goto out;
 
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		faf_error(file, "fchdir");
-		error = -ENOSYS;
-		goto out_putf;
-	}
-#endif
-
 	inode = file->f_path.dentry->d_inode;
 
 	error = -ENOTDIR;
@@ -515,13 +489,6 @@ SYSCALL_DEFINE2(fchmod, unsigned int, fd, mode_t, mode)
 	file = fget(fd);
 	if (!file)
 		goto out;
-
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		err = krg_faf_fchmod(file, mode);
-		goto out_putf;
-	}
-#endif
 
 	dentry = file->f_path.dentry;
 	inode = dentry->d_inode;
@@ -659,13 +626,6 @@ SYSCALL_DEFINE3(fchown, unsigned int, fd, uid_t, user, gid_t, group)
 	file = fget(fd);
 	if (!file)
 		goto out;
-
-#ifdef CONFIG_KRG_FAF
-	if (file->f_flags & O_FAF_CLT) {
-		error = krg_faf_fchown(file, user, group);
-		goto out_fput;
-	}
-#endif
 
 	error = mnt_want_write_file(file);
 	if (error)
@@ -893,10 +853,7 @@ struct file *dentry_open(struct dentry *dentry, struct vfsmount *mnt, int flags,
 }
 EXPORT_SYMBOL(dentry_open);
 
-#ifndef CONFIG_KRG_FAF
-static
-#endif
-void __put_unused_fd(struct files_struct *files, unsigned int fd)
+static void __put_unused_fd(struct files_struct *files, unsigned int fd)
 {
 	struct fdtable *fdt = files_fdtable(files);
 	fd = array_index_nospec(fd, fdt->max_fds);
@@ -927,16 +884,6 @@ EXPORT_SYMBOL(put_unused_fd);
  * It should never happen - if we allow dup2() do it, _really_ bad things
  * will follow.
  */
-#ifdef CONFIG_KRG_FAF
-void __fd_install(struct files_struct *files,
-		  unsigned int fd, struct file *file)
-{
-	struct fdtable *fdt;
-	fdt = files_fdtable(files);
-	BUG_ON(fdt->fd[fd] != NULL);
-	rcu_assign_pointer(fdt->fd[fd], file);
-}
-#endif
 
 void fd_install(unsigned int fd, struct file *file)
 {
@@ -956,12 +903,6 @@ long do_sys_open(int dfd, const char __user *filename, int flags, int mode)
 	struct filename *tmp = getname(filename);
 	int fd = PTR_ERR(tmp);
 
-#ifdef CONFIG_KRG_FAF
-       /* Flush Kerrighed O_flags to prevent kernel crashes due to wrong
-        * flags passed from userland.
-        */
-	flags = flags & (~O_KRG_FLAGS);
-#endif
 	if (!IS_ERR(tmp)) {
 		fd = get_unused_fd_flags(flags);
 		if (fd >= 0) {
@@ -970,9 +911,6 @@ long do_sys_open(int dfd, const char __user *filename, int flags, int mode)
 				put_unused_fd(fd);
 				fd = PTR_ERR(f);
 			} else {
-#ifdef CONFIG_KRG_FAF
-				if (!(f->f_flags & O_FAF_CLT))
-#endif
 				fsnotify_open(f->f_path.dentry);
 				fd_install(fd, f);
 			}
@@ -1029,9 +967,6 @@ SYSCALL_DEFINE2(creat, const char __user *, pathname, int, mode)
 int filp_close(struct file *filp, fl_owner_t id)
 {
 	int retval = 0;
-#ifdef CONFIG_KRG_FAF
-	int flags = filp->f_flags;
-#endif
 
 	if (!file_count(filp)) {
 		printk(KERN_ERR "VFS: Close: file count is 0\n");
@@ -1041,19 +976,9 @@ int filp_close(struct file *filp, fl_owner_t id)
 	if (filp->f_op && filp->f_op->flush)
 		retval = filp->f_op->flush(filp, id);
 
-#ifdef CONFIG_KRG_FAF
-	if (filp->f_flags & O_FAF_CLT) {
-		fput(filp);
-		return retval;
-	}
-#endif
 	dnotify_flush(filp, id);
 	locks_remove_posix(filp, id);
 	fput(filp);
-#ifdef CONFIG_KRG_FAF
-	if ((flags & O_FAF_SRV) && (file_count(filp) == 1))
-		krg_faf_srv_close(filp);
-#endif
 	return retval;
 }
 

@@ -4,9 +4,6 @@
 #include <linux/threads.h>
 #include <linux/mm.h>		/* for struct page */
 #include <linux/pagemap.h>
-#ifdef CONFIG_KRG_MM
-#include <linux/interrupt.h>
-#endif
 
 static inline int  __paravirt_pgd_alloc(struct mm_struct *mm) { return 0; }
 
@@ -83,11 +80,6 @@ static inline void pmd_populate(struct mm_struct *mm, pmd_t *pmd,
 #if PAGETABLE_LEVELS > 2
 static inline pmd_t *pmd_alloc_one(struct mm_struct *mm, unsigned long addr)
 {
-#ifdef CONFIG_KRG_MM
-	if (in_atomic())
-		return (pmd_t *)get_zeroed_page(GFP_ATOMIC);
-	else
-#endif
 	return (pmd_t *)get_zeroed_page(GFP_KERNEL|__GFP_REPEAT);
 }
 
@@ -124,11 +116,6 @@ static inline void pgd_populate(struct mm_struct *mm, pgd_t *pgd, pud_t *pud)
 
 static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long addr)
 {
-#ifdef CONFIG_KRG_MM
-	if (in_atomic())
-		return (pud_t *)get_zeroed_page(GFP_ATOMIC);
-	else
-#endif
 	return (pud_t *)get_zeroed_page(GFP_KERNEL|__GFP_REPEAT);
 }
 

@@ -14,9 +14,6 @@
 #include <linux/security.h>
 #include <linux/syscalls.h>
 #include <linux/pagemap.h>
-#ifdef CONFIG_KRG_FAF
-#include <kerrighed/faf.h>
-#endif
 
 #include <asm/uaccess.h>
 #include <asm/unistd.h>
@@ -58,33 +55,13 @@ int vfs_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat *stat)
 
 EXPORT_SYMBOL(vfs_getattr);
 
-#ifdef CONFIG_KRG_DVFS
-int do_fstat(struct file *f, struct kstat *stat)
-{
-	int error;
-
-#ifdef CONFIG_KRG_FAF
-	if (f->f_flags & O_FAF_CLT)
-		error = krg_faf_fstat(f, stat);
-	else
-#endif
-		error = vfs_getattr(f->f_path.mnt, f->f_path.dentry, stat);
-
-	return error;
-}
-#endif
-
 int vfs_fstat(unsigned int fd, struct kstat *stat)
 {
 	struct file *f = fget(fd);
 	int error = -EBADF;
 
 	if (f) {
-#ifdef CONFIG_KRG_DVFS
-		error = do_fstat(f, stat);
-#else
 		error = vfs_getattr(f->f_path.mnt, f->f_path.dentry, stat);
-#endif
 		fput(f);
 	}
 	return error;
@@ -107,15 +84,6 @@ retry:
 	if (error)
 		goto out;
 
-#ifdef CONFIG_KRG_FAF
-	if ((!path.dentry) && (path.mnt)) {
-		struct file *file = (struct file *)path.mnt;
-		get_file (file);
-		error = krg_faf_fstat(file, stat);
-		fput(file);
-		return error;
-	}
-#endif
 	error = vfs_getattr(path.mnt, path.dentry, stat);
 	path_put(&path);
 	if (retry_estale(error, lookup_flags)) {

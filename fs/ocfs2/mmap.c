@@ -202,10 +202,7 @@ out:
 	return ret;
 }
 
-#ifndef CONFIG_KRG_MM
-static
-#endif
-struct const vm_operations_struct ocfs2_file_vm_ops = {
+static const struct vm_operations_struct ocfs2_file_vm_ops = {
 	.fault		= ocfs2_fault,
 	.page_mkwrite	= ocfs2_page_mkwrite,
 };

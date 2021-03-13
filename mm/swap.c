@@ -318,19 +318,10 @@ void  rotate_reclaimable_page(struct page *page)
 }
 
 static void update_page_reclaim_stat(struct zone *zone, struct page *page,
-#ifdef CONFIG_KRG_MM
-				     int file, int kddm, int rotated)
-#else
 				     int file, int rotated)
-#endif
 {
 	struct zone_reclaim_stat *reclaim_stat = &zone->reclaim_stat;
 	struct zone_reclaim_stat *memcg_reclaim_stat;
-#ifdef CONFIG_KRG_MM
-	/* Not clean but limit the patch on this function */
-	file = RECLAIM_STAT_INDEX(file, kddm);
-	BUG_ON ((file > 2) || (file < 0));
-#endif
 
 	memcg_reclaim_stat = mem_cgroup_get_reclaim_stat_from_page(page);
 
@@ -363,12 +354,8 @@ void activate_page(struct page *page)
 		lru += LRU_ACTIVE;
 		add_page_to_lru_list(zone, page, lru);
 		__count_vm_event(PGACTIVATE);
-#ifdef CONFIG_KRG_MM
-		update_page_reclaim_stat(zone, page, file,
-					 page_is_migratable(page), 1);
-#else
+
 		update_page_reclaim_stat(zone, page, file, 1);
-#endif
 	}
 	spin_unlock_irq(&zone->lru_lock);
 }
@@ -509,12 +496,7 @@ static void lru_deactivate(struct page *page, struct zone *zone)
 
 	if (active)
 		__count_vm_event(PGDEACTIVATE);
-#ifdef CONFIG_KRG_MM
-	update_page_reclaim_stat(zone, page, file,
-				 page_is_migratable(page), 0);
-#else
 	update_page_reclaim_stat(zone, page, file, 0);
-#endif
 }
 
 static void ____pagevec_lru_deactivate(struct pagevec *pvec)
@@ -716,9 +698,6 @@ void release_pages(struct page **pages, int nr, int cold)
 			continue;
 		}
 
-#if defined(CONFIG_KRG_MM) && defined(CONFIG_DEBUG_PAGEALLOC)
-		ClearPageInVec(page);
-#endif
 		if (!put_page_testzero(page))
 			continue;
 
@@ -797,12 +776,7 @@ void lru_add_page_tail(struct zone* zone,
 			active = 0;
 			lru = LRU_INACTIVE_ANON;
 		}
-#ifdef CONFIG_KRG_MM
-		update_page_reclaim_stat(zone, page_tail, file,
-					page_is_migratable(page), active);
-#else
 		update_page_reclaim_stat(zone, page_tail, file, active);
-#endif
 	} else {
 		SetPageUnevictable(page_tail);
 		lru = LRU_UNEVICTABLE;
@@ -841,9 +815,6 @@ void ____pagevec_lru_add(struct pagevec *pvec, enum lru_list lru)
 		struct page *page = pvec->pages[i];
 		struct zone *pagezone = page_zone(page);
 		int file;
-#ifdef CONFIG_KRG_MM
-		int kddm;
-#endif
 		int active;
 
 		if (pagezone != zone) {
@@ -855,23 +826,12 @@ void ____pagevec_lru_add(struct pagevec *pvec, enum lru_list lru)
 		VM_BUG_ON(PageActive(page));
 		VM_BUG_ON(PageUnevictable(page));
 		VM_BUG_ON(PageLRU(page));
-#if defined(CONFIG_KRG_MM) && defined(CONFIG_DEBUG_PAGEALLOC)
-		ClearPageInVec(page);
-#endif
 		SetPageLRU(page);
 		active = is_active_lru(lru);
 		file = is_file_lru(lru);
-#ifdef CONFIG_KRG_MM
-		kddm = is_kddm_lru(lru);
-#endif
 		if (active)
 			SetPageActive(page);
-#ifdef CONFIG_KRG_MM
-		update_page_reclaim_stat(zone, page, file,
-					 kddm, active);
-#else
 		update_page_reclaim_stat(zone, page, file, active);
-#endif
 		add_page_to_lru_list(zone, page, lru);
 	}
 	if (zone)

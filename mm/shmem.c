@@ -68,38 +68,12 @@ static struct vfsmount *shm_mnt;
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
 
-#ifdef CONFIG_KRG_EPM
-#include <kerrighed/krgsyms.h>
-#endif
-
-/*
- * The maximum size of a shmem/tmpfs file is limited by the maximum size of
- * its triple-indirect swap vector - see illustration at shmem_swp_entry().
- *
- * With 4kB page size, maximum file size is just over 2TB on a 32-bit kernel,
- * but one eighth of that on a 64-bit kernel.  With 8kB page size, maximum
- * file size is just over 4TB on a 64-bit kernel, but 16TB on a 32-bit kernel,
- * MAX_LFS_FILESIZE being then more restrictive than swap vector layout.
- *
- * We use / and * instead of shifts in the definitions below, so that the swap
- * vector can be tested with small even values (e.g. 20) for ENTRIES_PER_PAGE.
- */
-#define ENTRIES_PER_PAGE (PAGE_CACHE_SIZE/sizeof(unsigned long))
-#define ENTRIES_PER_PAGEPAGE ((unsigned long long)ENTRIES_PER_PAGE*ENTRIES_PER_PAGE)
-
-#define SHMSWP_MAX_INDEX (SHMEM_NR_DIRECT + (ENTRIES_PER_PAGEPAGE/2) * (ENTRIES_PER_PAGE+1))
-#define SHMSWP_MAX_BYTES (SHMSWP_MAX_INDEX << PAGE_CACHE_SHIFT)
-
-#define SHMEM_MAX_BYTES  min_t(unsigned long long, SHMSWP_MAX_BYTES, MAX_LFS_FILESIZE)
-#define SHMEM_MAX_INDEX  ((unsigned long)((SHMEM_MAX_BYTES+1) >> PAGE_CACHE_SHIFT))
-
 #define BLOCKS_PER_PAGE  (PAGE_CACHE_SIZE/512)
 #define VM_ACCT(size)    (PAGE_CACHE_ALIGN(size) >> PAGE_SHIFT)
 
 /* Pretend that each entry is of this size in directory's i_size */
 #define BOGO_DIRENT_SIZE 20
 
-#ifndef CONFIG_KRG_EPM
 /* Flag allocation requirements to shmem_getpage */
 enum sgp_type {
 	SGP_READ,	/* don't exceed i_size, don't allocate page */
@@ -107,7 +81,6 @@ enum sgp_type {
 	SGP_DIRTY,	/* like SGP_CACHE, but set new page dirty */
 	SGP_WRITE,	/* may exceed i_size, may allocate page */
 };
-#endif
 
 #ifdef CONFIG_TMPFS
 static unsigned long shmem_default_max_blocks(void)
@@ -127,10 +100,7 @@ static int shmem_replace_page(struct page **pagep, gfp_t gfp,
 static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
 	struct page **pagep, enum sgp_type sgp, gfp_t gfp, int *fault_type);
 
-#ifndef CONFIG_KRG_EPM
-static
-#endif
-inline int shmem_getpage(struct inode *inode, pgoff_t index,
+static inline int shmem_getpage(struct inode *inode, pgoff_t index,
 	struct page **pagep, enum sgp_type sgp, int *fault_type)
 {
 	return shmem_getpage_gfp(inode, index, pagep, sgp,
@@ -180,10 +150,7 @@ static inline void shmem_unacct_blocks(unsigned long flags, long pages)
 
 static const struct super_operations shmem_ops;
 static const struct address_space_operations shmem_aops;
-#ifndef CONFIG_KRG_EPM
-static
-#endif
-const struct file_operations shmem_file_operations;
+static const struct file_operations shmem_file_operations;
 static const struct inode_operations shmem_inode_operations;
 static const struct inode_operations shmem_dir_inode_operations;
 static const struct inode_operations shmem_special_inode_operations;
@@ -2209,10 +2176,7 @@ static const struct address_space_operations shmem_aops = {
 	.error_remove_page = generic_error_remove_page,
 };
 
-#ifndef CONFIG_KRG_EPM
-static
-#endif
-const struct file_operations shmem_file_operations = {
+static const struct file_operations shmem_file_operations = {
 	.mmap		= shmem_mmap,
 #ifdef CONFIG_TMPFS
 	.llseek		= generic_file_llseek,
@@ -2326,16 +2290,8 @@ int __init shmem_init(void)
 		goto out2;
 	}
 
-#ifdef CONFIG_KRG_EPM
-	error = krgsyms_register(KRGSYMS_VM_OPS_SHMEM, (void *)&shmem_vm_ops);
-	if (error) {
-		printk(KERN_ERR "Could not register shmem_vm_ops\n");
-		goto out1_1;
-	}
-#endif
-
 	shm_mnt = vfs_kern_mount(&shmem_fs_type, MS_NOUSER,
-				shmem_fs_type.name, NULL);
+				 shmem_fs_type.name, NULL);
 	if (IS_ERR(shm_mnt)) {
 		error = PTR_ERR(shm_mnt);
 		printk(KERN_ERR "Could not kern_mount tmpfs\n");
@@ -2344,10 +2300,6 @@ int __init shmem_init(void)
 	return 0;
 
 out1:
-#ifdef CONFIG_KRG_EPM
-	krgsyms_unregister(KRGSYMS_VM_OPS_SHMEM);
-out1_1:
-#endif
 	unregister_filesystem(&shmem_fs_type);
 out2:
 	shmem_destroy_inodecache();
